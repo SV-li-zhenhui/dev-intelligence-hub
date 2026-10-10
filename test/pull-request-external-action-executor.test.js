@@ -485,6 +485,96 @@ test("all five actions execute once and reconcile from action-specific proof", a
   }
 });
 
+function ownPrRepairEnvelope() {
+  const binding = pullRequestExternalActionBinding();
+  return pullRequestExternalActionEnvelope(pullRequestExternalActionPlan({
+    type: "push",
+    controlledCommitEvidence: externalActionControlledCommit(binding, { reviewRepair: true }),
+  }, { binding }));
+}
+
+test("automatic repair push requires its authorization before acquiring credentials", async () => {
+  const envelope = ownPrRepairEnvelope();
+  const credential = recordingCredentialSource();
+  const transport = mutableTransport(envelope);
+  const executor = executorFor(envelope, transport, {
+    enabledActions: ["push"],
+    credentialSource: credential.source,
+    pushAuthorization: { async verifyPush(actual) { assert.deepEqual(actual, envelope); return false; } },
+  });
+  assert.deepEqual(await executor.execute(envelope), { status: "stale" });
+  assert.equal(credential.calls.acquire.length, 0);
+  assert.deepEqual(transport.calls, []);
+});
+
+test("automatic repair push rechecks authorization immediately before publishing", async () => {
+  for (const revoke of [false, true]) {
+    const envelope = ownPrRepairEnvelope();
+    const transport = mutableTransport(envelope);
+    let checks = 0;
+    const executor = executorFor(envelope, transport, {
+      enabledActions: ["push"],
+      pushAuthorization: { async verifyPush() { checks += 1; return !revoke || checks < 3; } },
+    });
+    const result = await executor.execute(envelope);
+    assert.equal(checks, 3);
+    assert.equal(result.status, revoke ? "stale" : "applied");
+    assert.equal(transport.calls.filter(({ method }) => method === "perform").length, revoke ? 0 : 1);
+  }
+});
+
+test("unavailable automatic repair authorization preserves an unknown recovery outcome", async () => {
+  const envelope = ownPrRepairEnvelope();
+  const transport = mutableTransport(envelope);
+  const executor = executorFor(envelope, transport, {
+    enabledActions: ["push"],
+    pushAuthorization: { async verifyPush() {
+      throw Object.assign(new Error("authorization is recovering"), { code: "GITHUB_AUTHORIZATION_UNAVAILABLE" });
+    } },
+  });
+  const result = await executor.reconcile(envelope);
+  assert.equal(result.status, "error");
+  assert.equal(result.error.trust, "unknown");
+  assert.equal(transport.calls.filter(({ method }) => method === "perform").length, 0);
+});
+
+test("revoked automatic repair authorization cannot clear an unknown push recovery fence", async () => {
+  const envelope = ownPrRepairEnvelope();
+  const transport = mutableTransport(envelope);
+  const executor = executorFor(envelope, transport, {
+    enabledActions: ["push"],
+    pushAuthorization: { async verifyPush() { return false; } },
+  });
+  const result = await executor.reconcile(envelope);
+  assert.equal(result.status, "error");
+  assert.equal(result.error.trust, "unknown");
+  assert.equal(transport.calls.filter(({ method }) => method === "perform").length, 0);
+});
+
+test("disabling own PR repair across restart preserves an admitted unknown push", async () => {
+  const envelope = ownPrRepairEnvelope();
+  const transport = mutableTransport(envelope);
+  const disabled = executorFor(envelope, transport, { enabledActions: [] });
+  assert.deepEqual(await disabled.execute(envelope), { status: "stale" });
+  const result = await disabled.reconcile(envelope);
+  assert.equal(result.status, "error");
+  assert.equal(result.error.trust, "unknown");
+  assert.deepEqual(transport.calls, []);
+});
+
+test("ordinary push permission cannot clear a repair recovery fence after its switch is disabled", async () => {
+  const envelope = ownPrRepairEnvelope();
+  const transport = mutableTransport(envelope);
+  const executor = executorFor(envelope, transport, {
+    enabledActions: ["push"],
+    inputAuthorityVerifier: { async verify() { throw new Error("revoked source"); } },
+  });
+  const result = await executor.reconcile(envelope);
+  assert.equal(result.status, "error");
+  assert.equal(result.error.trust, "unknown");
+  assert.equal(transport.calls.filter(({ method }) => method === "perform").length, 0);
+});
+
 test("a lost mutation response is unknown until reconciliation proves already", async () => {
   for (const type of ACTION_TYPES) {
     const envelope = envelopeFor(type);

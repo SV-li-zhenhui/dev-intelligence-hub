@@ -58,7 +58,7 @@ export const CONFIGURATION_FORM_GROUPS = deepFreeze([
   {
     id: "delivery",
     label: "变更包与 GitHub 动作",
-    description: "本地变更包和需要逐项确认的外部 GitHub 动作。",
+    description: "本地变更包、GitHub 动作，以及自动 Review 和我的 PR 修复开关。",
     roots: ["changePackages", "githubActions"],
   },
   {
@@ -137,6 +137,7 @@ const LABELS = deepFreeze({
   githubActions: "GitHub 动作",
   automaticReview: "自动 Review（最近 24 小时 Assign 给我的 PR，自动发布）",
   assignAfterAutomaticReview: "自动分配 Review 后续（通过交测试，需修改或评论交作者）",
+  automaticOwnPrRepair: "自动修复我的 PR",
   enabledActions: "启用的 PR 外部动作",
   actorAccountId: "GitHub 操作账号",
   credentialMode: "GitHub 凭据来源",
@@ -350,6 +351,12 @@ const FIELD_RULES = deepFreeze([
   { pattern: ["**", "enabled"], control: "checkbox", kind: "boolean" },
   { pattern: ["githubActions", "automaticReview"], control: "checkbox", kind: "boolean" },
   { pattern: ["githubActions", "assignAfterAutomaticReview"], control: "checkbox", kind: "boolean" },
+  {
+    pattern: ["githubActions", "automaticOwnPrRepair"],
+    control: "checkbox",
+    kind: "boolean",
+    help: "自己的 PR 收到评审修改意见后，交给开发工程师在受控工作区修复、运行已配置的验证并推送到原 PR，无需逐项确认。与评审他人的 PR 分别开关；不自动合并，也无需另行开启通用 push 权限。",
+  },
   { pattern: ["codeExecutor", "workspaces", "#", "gitHeadSnapshot"], control: "checkbox", kind: "boolean" },
   { pattern: ["**", "initialPaused"], control: "checkbox", kind: "boolean" },
   { pattern: ["employees", "prReviewer", "allowRemoteCodeContext"], control: "checkbox", kind: "boolean" },
@@ -556,6 +563,7 @@ const COLLECTIONS = deepFreeze([
 const SLOTS = deepFreeze([
   { pattern: ["githubActions", "automaticReview"], label: "自动 Review", template: "automatic-review-enabled", optional: true, operations: ["add", "remove", "replace"] },
   { pattern: ["githubActions", "assignAfterAutomaticReview"], label: "Review 后自动分配", template: "automatic-review-enabled", optional: true, operations: ["add", "remove", "replace"] },
+  { pattern: ["githubActions", "automaticOwnPrRepair"], label: "自动修复我的 PR", template: "automatic-own-pr-repair-disabled", optional: true, operations: ["add", "remove", "replace"] },
   {
     pattern: ["githubRead", "pullRequestUpdatedWindow"],
     label: "自动发现 PR 更新时间",
@@ -635,6 +643,7 @@ const TEMPLATES = deepFreeze({
   "pr-updated-window-rolling": { mode: "rolling", days: 7 },
   "issue-active-window-days": 14,
   "automatic-review-enabled": true,
+  "automatic-own-pr-repair-disabled": false,
   repository: "owner/repository",
   provider: {
     kind: "openai-compatible",

@@ -398,6 +398,8 @@ function projectHistoryItem(item) {
       event: item.action.reviewEvent, headRefOid: item.target.version,
       resourceId: item.target.resourceId, publishedUrl: item.receipt?.url || null,
     } } : {}),
+    ...(/^auto-own-pr-repair-v1-[a-f0-9]{48}$/.test(item.execution?.requestId || "")
+      ? { automaticOwnPrRepair: { stage: item.kind === "github.pull-request-push" ? "push" : "code_task" } } : {}),
     ...(item.reviewHandoff ? { reviewHandoff: clone(item.reviewHandoff) } : {}),
     ...(item.failure ? { diagnosticCode: item.failure.code } : {}),
     ...(ownerDecision === null ? {} : { ownerDecision }),

@@ -5,7 +5,7 @@ import {
   normalizeCodeJobGrant,
 } from "../src/domain/code-job-contract.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
-import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import {
@@ -254,6 +254,24 @@ function factory(overrides = {}) {
     ...overrides,
   });
 }
+
+test("review repair grant uses live Head authority and exact configured paths without conflict evidence", async () => {
+  const { contentDigest: _contentDigest, ...current } = proposal();
+  const bound = normalizeBoundWorkProposal({ ...current, binding: { ...current.binding,
+    executionSource: createReviewRepairCodeExecutionSource({ inputBinding: current.binding.inputBinding, writablePaths: ["src", "test"] }),
+  } });
+  const grantFactory = factory();
+  const { grant } = await grantFactory.create(bound);
+  assert.equal(grant.schemaVersion, 3);
+  assert.equal(grant.executionSource.kind, "review_repair");
+  assert.deepEqual(grant.writablePaths, ["src", "test"]);
+  assert.deepEqual(await grantFactory.verify(grant), grant);
+  await assert.rejects(async () => factory({ inputAuthorityVerifier: { verify: (binding) => ({ ...binding, inputRevision: 2 }) } }).create(bound));
+  const changed = normalizeBoundWorkProposal({ ...current, binding: { ...current.binding,
+    executionSource: createReviewRepairCodeExecutionSource({ inputBinding: current.binding.inputBinding, writablePaths: ["src"] }),
+  } });
+  assert.throws(() => grantFactory.create(changed), /写范围/);
+});
 
 function localBrain({
   provider = "ollama",

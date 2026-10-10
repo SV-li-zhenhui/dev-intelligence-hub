@@ -1801,6 +1801,32 @@ test("PR external action capabilities can be configured without editing JSON", (
   assert.equal(configurationDocumentFromForm(unknown).ok, false);
 });
 
+test("own PR repair can be added, toggled and removed without granting generic push", () => {
+  const configuration = structuredClone(representativeConfiguration());
+  delete configuration.githubActions.automaticOwnPrRepair;
+  const initial = createConfigurationFormState(configuration);
+  const path = ["githubActions", "automaticOwnPrRepair"];
+  const added = applyConfigurationStructureOperation(initial, {
+    operation: "add", path, value: false,
+  });
+  const replaced = applyConfigurationStructureOperation(added, {
+    operation: "replace", path, value: true,
+  });
+  const enabled = configurationDocumentFromForm(replaced);
+  assert.equal(enabled.ok, true);
+  assert.equal(normalizeConfigurationDocument(enabled.configuration).githubActions.automaticOwnPrRepair, true);
+  assert.deepEqual(enabled.configuration.githubActions.enabledActions, configuration.githubActions.enabledActions);
+
+  const toggled = setConfigurationFormField(replaced, {
+    path, kind: "boolean", rawValue: false,
+  });
+  assert.equal(configurationDocumentFromForm(toggled).configuration.githubActions.automaticOwnPrRepair, false);
+  const removed = applyConfigurationStructureOperation(toggled, { operation: "remove", path });
+  const restored = configurationDocumentFromForm(removed);
+  assert.equal(restored.ok, true);
+  assert.deepEqual(normalizeConfigurationDocument(restored.configuration), configuration);
+});
+
 test("structured operation boundary rejects getters, aliases, prototypes and disallowed paths", () => {
   const initial = createConfigurationFormState(representativeConfiguration());
   let getterCalled = false;

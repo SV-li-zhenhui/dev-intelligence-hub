@@ -73,6 +73,7 @@ const FACTORY_KEYS = new Set([
   "enabled",
   "runner",
   "confirmationProducer",
+  "automaticOwnPrRepair",
   "codeJobReader",
   "grantFactory",
   "clock",
@@ -520,11 +521,13 @@ export class CodeActionProposalHandler {
   #createGrant;
   #clock;
   #pollIntervalMs;
+  #automaticOwnPrRepair;
 
   constructor({
     confirmationProducer,
     codeJobReader,
     grantFactory,
+    automaticOwnPrRepair = null,
     clock = () => new Date(),
     pollIntervalMs = 15_000,
   } = {}) {
@@ -534,6 +537,7 @@ export class CodeActionProposalHandler {
       "confirmationProducer",
     );
     this.#enqueue = confirmation.enqueue;
+    this.#automaticOwnPrRepair = automaticOwnPrRepair;
     this.#getConfirmation = confirmation.get;
     this.#invalidateConfirmation = confirmation.invalidate;
     this.#getCodeJob = requirePort(codeJobReader, ["get"], "codeJobReader").get;
@@ -653,14 +657,14 @@ export class CodeActionProposalHandler {
 
     if (input.status === "waiting_confirmation") {
       return this.#transitionConfirmation(
-        normalizeConfirmationItem(existingValue, expected),
+        normalizeConfirmationItem(await this.#approveAutomatically(existingValue), expected),
         grant,
       );
     }
 
     if (input.status === "waiting_retry" && input.downstreamRef !== null) {
       return this.#transitionConfirmation(
-        normalizeConfirmationItem(existingValue, expected),
+        normalizeConfirmationItem(await this.#approveAutomatically(existingValue), expected),
         grant,
       );
     }
@@ -681,8 +685,12 @@ export class CodeActionProposalHandler {
       );
       return this.#invalidateChangedAuthorization(owned, input.proposal);
     }
-    const item = normalizeConfirmationItem(queued, expected);
+    const item = normalizeConfirmationItem(await this.#approveAutomatically(queued), expected);
     return this.#transitionConfirmation(item, grant);
+  }
+
+  #approveAutomatically(item) {
+    return this.#automaticOwnPrRepair === null ? item : this.#automaticOwnPrRepair.approveCodeJob(item);
   }
 
   async #findOwnedConfirmation(proposal, knownMissingId = null) {
@@ -835,6 +843,7 @@ export function createCodeActionProposalRunnerService(value = {}) {
     confirmationProducer: options.confirmationProducer,
     codeJobReader: options.codeJobReader,
     grantFactory: options.grantFactory,
+    automaticOwnPrRepair: options.automaticOwnPrRepair,
     clock: options.clock,
     pollIntervalMs: options.pollIntervalMs,
   });

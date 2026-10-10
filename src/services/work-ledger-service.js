@@ -999,12 +999,14 @@ export class WorkLedgerService {
           (candidate) => candidate.itemId === inputBinding.rootItemId,
         );
         const author = root?.source?.current?.event?.payload?.author;
+        const reviewFeedbackDigest = root?.source?.current?.event?.payload?.reviewFeedbackDigest;
         return cloneLedgerValue({
           inputBinding,
           author:
             typeof author === "string" && GITHUB_LOGIN.test(author)
               ? author
               : null,
+          ...(typeof reviewFeedbackDigest === "string" ? { reviewFeedbackDigest } : {}),
         });
       }),
     );

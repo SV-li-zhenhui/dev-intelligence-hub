@@ -168,6 +168,18 @@ function globalExecutorAuthority(configuration) {
 
 function conflictPreparationAuthority(configuration, executionSource) {
   if (executionSource === null) return null;
+  if (executionSource.kind === "review_repair") {
+    const headRepository = executionSource.inputBinding.gitTarget.headRepository.toLowerCase();
+    const headMirror = Object.entries(configuration.codeExecutor.conflictPreparation?.headMirrorsByRepository ?? {})
+      .find(([repository]) => repository.toLowerCase() === headRepository)?.[1] ?? null;
+    return {
+      kind: "review_repair",
+      enabled: configuration.githubActions?.automaticOwnPrRepair === true,
+      gitCommand: configuration.codeExecutor.gitCommand ?? null,
+      headRepository,
+      headMirror,
+    };
+  }
   const conflict = configuration.codeExecutor.conflictPreparation;
   const gitTarget = executionSource.preparationBinding.gitTarget;
   const mirrorFor = (mirrors, repository) => {
@@ -251,13 +263,16 @@ function grantAuthorityDigest(authority, scope, brainBindingSchema) {
 
 export function codeJobAuthorityScopeCacheIdentity(scope) {
   const executionSource = scope.executionSource;
-  const gitTarget = executionSource?.preparationBinding?.gitTarget;
+  const gitTarget = executionSource?.kind === "review_repair"
+    ? executionSource.inputBinding.gitTarget
+    : executionSource?.preparationBinding?.gitTarget;
   return {
     ...scope,
     executionSource:
       executionSource === null || executionSource === undefined
         ? null
         : {
+            ...(executionSource.kind === "review_repair" ? { kind: "review_repair" } : {}),
             baseRepository: gitTarget.baseRepository.toLowerCase(),
             headRepository: gitTarget.headRepository.toLowerCase(),
           },
@@ -621,7 +636,11 @@ function configurationAdmitsGrant(configuration, grant, executorAuthority) {
   if (grant.schemaVersion === 3) {
     if (
       grant.operation !== "modify" ||
-      !workspace.capabilities?.includes("conflict_preparation_snapshot")
+      !workspace.capabilities?.includes(grant.executionSource.kind === "review_repair"
+        ? "git_head_snapshot" : "conflict_preparation_snapshot") ||
+      (grant.executionSource.kind === "review_repair" &&
+        (configuration.githubActions?.automaticOwnPrRepair !== true ||
+          canonicalJsonDigest(expectedWritablePaths) !== canonicalJsonDigest([...workspace.writablePaths].sort((left, right) => left.localeCompare(right, "en")))))
     ) {
       return false;
     }
@@ -965,7 +984,7 @@ export class VersionedCodeJobAuthority {
         );
         if (
           !conflict.enabled ||
-          conflict.baseMirror === null ||
+          (scope.executionSource.kind !== "review_repair" && conflict.baseMirror === null) ||
           conflict.headMirror === null
         ) {
           throw invalid("Conflict preparation 的仓库镜像授权未配置");

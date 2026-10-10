@@ -18,6 +18,7 @@ import test from "node:test";
 
 import { createControlledGitRuntimeBundle } from "../src/controlled-git-runtime.js";
 import { createChangePackage } from "../src/domain/change-package-contract.js";
+import { createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { canonicalJsonStringify } from "../src/lib/canonical-json-digest.js";
 import { ChangePackageControlledCommitService } from "../src/services/change-package-controlled-commit-service.js";
 import { ChangePackageStore } from "../src/services/change-package-store.js";
@@ -323,6 +324,67 @@ async function createFixture(t, gitCommand) {
 }
 
 const gitCommand = locateGit();
+
+test("review repair builds a single-parent Head commit with creation and deletion, and publishes without force", {
+  skip: gitCommand === null ? "trusted Git is unavailable" : false,
+}, async (t) => {
+  const setup = await createFixture(t, gitCommand);
+  const runner = new PublicationProcessRunner();
+  const config = { enabled: true, gitCommand, preparationRoot: setup.preparationRoot,
+    baseMirrorsByRepository: { "acme/runtime-test": setup.baseMirrorRoot },
+    headMirrorsByRepository: { "contributor/runtime-test": setup.headMirrorRoot } };
+  const bundle = await createControlledGitRuntimeBundle(config, { processRunner: runner });
+  const binding = inputBinding(setup);
+  const executionSource = createReviewRepairCodeExecutionSource({ inputBinding: binding, writablePaths: ["src"] });
+  const workspaceRevision = "e".repeat(64);
+  const changePackage = createChangePackage({
+    job: { id: "review-repair-job", revision: 3, recordDigest: "3".repeat(64) },
+    proposal: { id: "review-repair-proposal", contentDigest: "4".repeat(64) },
+    grant: { digest: "5".repeat(64) },
+    workspace: { id: "runtime-workspace", sourceRevision: "d".repeat(64), workspaceRevision },
+    passedProfiles: [passedProfile(workspaceRevision)],
+    created: [{ path: "src/regression.txt", content: Buffer.from("regression test\n") }],
+    modified: [{ path: "src/conflict.txt", beforeSha256: sha256(Buffer.from("head content\n")), content: Buffer.from("review repaired\n") }],
+    deleted: [{ path: "src/untouched.txt", beforeSha256: sha256(Buffer.from("common file\n")) }],
+  });
+  const request = { executionSource, manifest: changePackage.manifest,
+    blobs: changePackage.blobs.map(({ sha256, content }) => ({ sha256, content })), createdAt: "2026-10-10T08:00:00.000Z" };
+  const immutableBefore = await Promise.all([directorySnapshot(setup.sourceRoot), directorySnapshot(setup.baseMirrorRoot), directorySnapshot(setup.headMirrorRoot)]);
+  const evidence = await bundle.commitBuilder.create(request);
+  assert.deepEqual(evidence.commit.parents, [setup.headOid]);
+  assert.equal(Object.hasOwn(evidence.resolution, "preparationId"), false);
+  const objectDirectory = path.join(setup.preparationRoot, "commits", evidence.evidenceId, "objects");
+  const env = { ...process.env, GIT_OBJECT_DIRECTORY: objectDirectory,
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: path.join(setup.headMirrorRoot, "objects"), GIT_NO_REPLACE_OBJECTS: "1" };
+  assert.equal((await git(gitCommand, setup.headMirrorRoot, ["show", `${evidence.commit.oid}:src/conflict.txt`], { env })).stdout, "review repaired\n");
+  assert.equal((await git(gitCommand, setup.headMirrorRoot, ["show", `${evidence.commit.oid}:src/regression.txt`], { env })).stdout, "regression test\n");
+  await assert.rejects(git(gitCommand, setup.headMirrorRoot, ["show", `${evidence.commit.oid}:src/untouched.txt`], { env }));
+  assert.deepEqual(await bundle.commitBuilder.verify({ evidenceId: evidence.evidenceId }), evidence);
+  runner.remoteHead = "f".repeat(40);
+  const publication = { credential: "test-review-repair-credential", actorAccountId: binding.gitTarget.sourceAccountId,
+    repository: binding.repository, pullRequestNumber: binding.pullRequestNumber,
+    marker: `<!-- mydashboard-action:v1:${"a".repeat(64)} -->`,
+    action: { type: "pull_request_push", expectedOldOid: setup.headOid,
+      remote: { repository: binding.gitTarget.headRepository, refName: binding.gitTarget.headRefName },
+      controlledCommitEvidence: evidence, inputBinding: binding } };
+  assert.deepEqual(await bundle.publisher.publish(publication), { status: "stale" });
+  assert.equal(runner.pushCount, 0);
+  runner.remoteHead = setup.headOid;
+  assert.equal((await bundle.publisher.publish(publication)).status, "applied");
+  assert.equal(runner.publicationCalls.find(({ operation }) => operation === "push").args.some((arg) => arg.startsWith("--force")), false);
+  const restarted = await createControlledGitRuntimeBundle(config, { processRunner: runner });
+  assert.equal((await restarted.publisher.publish(publication)).status, "already");
+  assert.equal(runner.pushCount, 1);
+  assert.deepEqual(await Promise.all([directorySnapshot(setup.sourceRoot), directorySnapshot(setup.baseMirrorRoot), directorySnapshot(setup.headMirrorRoot)]), immutableBefore);
+  const wrongManifest = createChangePackage({
+    job: changePackage.manifest.job, proposal: changePackage.manifest.proposal, grant: changePackage.manifest.grant,
+    workspace: changePackage.manifest.workspace, passedProfiles: changePackage.manifest.passedProfiles,
+    created: [], deleted: [], modified: [{ path: "src/conflict.txt", beforeSha256: "0".repeat(64), content: Buffer.from("wrong\n") }],
+  });
+  await assert.rejects(bundle.commitBuilder.create({ ...request, manifest: wrongManifest.manifest,
+    blobs: wrongManifest.blobs.map(({ sha256, content }) => ({ sha256, content })) }),
+    (error) => error.code === "CONTROLLED_GIT_CHANGE_PACKAGE_MISMATCH");
+});
 
 class MemoryDeliveryStore {
   value = null;

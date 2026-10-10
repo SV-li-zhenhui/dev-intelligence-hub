@@ -137,7 +137,15 @@ function assessAuthoredPullRequest(item) {
       ACTION_STATES.ACTION_NOW,
       "me",
       "resolve_conflict",
-      "需要你解决合并冲突",
+      "先解决合并冲突，再处理审核意见",
+    );
+  }
+  if (item.reviewFeedbackAvailable === true && Number.isSafeInteger(item.reviewFeedbackCount) && item.reviewFeedbackCount > 0) {
+    return assessment(
+      ACTION_STATES.ACTION_NOW,
+      "me",
+      "address_review",
+      "有尚未解决的他人审核意见，需要结合当前代码处理",
     );
   }
 
@@ -160,26 +168,17 @@ function assessAuthoredPullRequest(item) {
   }
 
   if (item.reviewDecision === "CHANGES_REQUESTED") {
-    const outstandingChangeRequests =
-      item.outstandingChangeRequestCommitOids || [];
-    if (
-      outstandingChangeRequests.length &&
-      outstandingChangeRequests.every(
-        (commitOid) => commitOid !== item.headRefOid,
-      )
-    ) {
+    if (item.reviewFeedbackAvailable === false) {
       return assessment(
-        ACTION_STATES.WAITING_OTHER,
-        "reviewer",
-        "wait_rereview",
-        "你已在修改意见后提交更新，等待复审",
+        ACTION_STATES.UNCERTAIN,
+        "unknown",
+        "confirm",
+        "审核意见明细未能完整读取，不能自动判断修复范围",
       );
     }
-    if (
-      outstandingChangeRequests.some(
-        (commitOid) => commitOid === item.headRefOid,
-      )
-    ) {
+    const outstandingChangeRequests =
+      item.outstandingChangeRequestCommitOids || [];
+    if (outstandingChangeRequests.length > 0) {
       return assessment(
         ACTION_STATES.ACTION_NOW,
         "me",

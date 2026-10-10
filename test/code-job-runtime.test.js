@@ -182,6 +182,7 @@ async function runtimeFixture({
   guard = new FakeGuard(),
   executor,
   brainDirectory,
+  reviewRepairContextReader,
   workerFactory,
   memoryReceiptVerifier,
   completedChangeExporter,
@@ -200,6 +201,7 @@ async function runtimeFixture({
     },
     ...(executor === undefined ? {} : { executor }),
     ...(brainDirectory === undefined ? {} : { brainDirectory }),
+    ...(reviewRepairContextReader === undefined ? {} : { reviewRepairContextReader }),
     ...(workerFactory === undefined ? {} : { workerFactory }),
     ...(memoryReceiptVerifier === undefined
       ? {}
@@ -215,6 +217,17 @@ async function runtimeFixture({
   });
   return { runtime, store, guard };
 }
+
+test("runtime forwards the trusted own PR feedback reader to the worker", async () => {
+  const reader = { async read() { throw new Error("unused"); } };
+  let captured;
+  const { runtime } = await runtimeFixture({
+    executor: {}, brainDirectory: {}, reviewRepairContextReader: reader,
+    workerFactory(options) { captured = options; return { async runCycle() { return { selected: 0, outcomes: [] }; }, requestCancellation() { return false; } }; },
+  });
+  assert.equal(captured.reviewRepairContextReader, reader);
+  await runtime.close();
+});
 
 test("runtime acquires and recovers before exposing local approval and reader ports", async () => {
   const events = [];

@@ -175,7 +175,9 @@ test("external confirmation renders the exact authorization context", async () =
   assert.match(app, /关闭页面不影响推进/);
   assert.match(app, /data-review-testing-person/);
   assert.match(app, /handoffResponsiblePerson/);
-  assert.match(app, /\/api\/work\/requests/);
+  assert.match(app, /bindManualWorkAssignment/);
+  const assignment = await readFile(path.join(root, "public", "manual-work-assignment.js"), "utf8");
+  assert.match(assignment, /\/api\/work\/requests/);
   assert.match(app, /confirmationResult\?\.item\?\.status === "completed"/);
   assert.match(
     app,

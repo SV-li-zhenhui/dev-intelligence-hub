@@ -53,6 +53,7 @@ const GITHUB_ACTION_CONFIG_KEYS = new Set([
   "enabledActions",
   "automaticReview",
   "assignAfterAutomaticReview",
+  "automaticOwnPrRepair",
 ]);
 const GITHUB_EXTERNAL_ACTIONS = new Set(
   Object.keys(PULL_REQUEST_EXTERNAL_CONFIRMATION_KINDS),
@@ -195,13 +196,15 @@ function normalizeEnabledConfig(config) {
   }
   const enabledActionsSource = dataProperty(githubActions, "enabledActions");
   const enabledActions = normalizeEnabledActions(enabledActionsSource);
+  const automaticOwnPrRepair = dataProperty(githubActions, "automaticOwnPrRepair");
+  if (automaticOwnPrRepair !== undefined && typeof automaticOwnPrRepair !== "boolean") throw invalidConfig("自动修复开关必须是布尔值");
 
   return Object.freeze({
     actorAccountId,
     ghCommand,
     credentialMode,
     ...(credentialMode === "token-env" ? { tokenEnv } : {}),
-    enabledActions,
+    enabledActions: Object.freeze([...new Set([...enabledActions, ...(automaticOwnPrRepair === true ? ["push"] : [])])]),
     reviewEnabled:
       enabledActionsSource === undefined || enabledActions.includes("review"),
     networkEnv: normalizeNetworkEnv(dataProperty(githubActions, "networkEnv")),

@@ -5,7 +5,9 @@ import {
   createCodeJobGrant,
 } from "../src/domain/code-job-contract.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
-import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { summarizeOwnReviewFeedback } from "../src/adapters/github-own-review-feedback.js";
+import { ReviewRepairContextReader } from "../src/services/review-repair-context-reader.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
@@ -787,6 +789,108 @@ function verifier(events, error = null) {
     },
   };
 }
+
+function reviewRepairFixture() {
+  const inputBinding = conflictInputBinding();
+  const threads = Array.from({ length: 12 }, (_, index) => ({
+    id: `thread-${index}`, path: `src/file-${index}.js`, line: index + 1,
+    isResolved: false, isOutdated: false,
+    comments: [
+      { id: `external-${index}`, author: { login: "reviewer" }, body: `Request ${index}: ${"完整意见".repeat(2500)}`, createdAt: "2026-10-10T01:00:00Z" },
+      { id: `reply-${index}`, author: { login: "runtime-user" }, body: "Already considered; inspect the code", createdAt: "2026-10-10T02:00:00Z" },
+    ],
+  }));
+  let live;
+  const refresh = () => { live = {
+    state: "open", author: "runtime-user", currentUser: "runtime-user",
+    repo: "acme/dashboard", number: 42, headRefOid: inputBinding.headRefOid,
+    ...summarizeOwnReviewFeedback({ reviews: [], threads }, "runtime-user"),
+  }; };
+  refresh();
+  const reader = new ReviewRepairContextReader({
+    github: { async readOwnPullRequestFeedback() { return structuredClone(live); } },
+    executionContextReader: { async readPullRequestExecutionContext() { return { inputBinding, author: "runtime-user", reviewFeedbackDigest: live.reviewFeedbackDigest }; } },
+  });
+  const initial = job({ grant: grant({
+    schemaVersion: 3, inputBinding,
+    executionSource: createReviewRepairCodeExecutionSource({ inputBinding, writablePaths: ["src", "test"] }),
+  }) });
+  return { initial, reader, get feedback() { return live; }, changeFeedback() { threads[0].comments[0].body += " Another requirement"; refresh(); } };
+}
+
+test("own PR repair worker delivers every full request and author reply through the actual code brain directory", async () => {
+  const fixture = reviewRepairFixture();
+  const store = new FakeJobStore([fixture.initial]);
+  const executor = new FakeExecutor(fixture.initial);
+  const calls = [];
+  const directory = new CodeJobBrainDirectory({
+    roles: { developer: { taskBrain: { provider: "local", model: "code", remoteData: { requirements: false, code: false, memory: false } } } },
+    brainRouter: {
+      describe(value) { return { ...value, remote: false }; },
+      async generate(value) {
+        calls.push(structuredClone(value));
+        return JSON.stringify({ schemaVersion: 1, confidence: 90, summary: "Inspect code", reason: "Assess the full review requests", action: { type: "read_text", path: "src/app.js" } });
+      },
+    },
+  });
+  const worker = new CodeJobWorkerService({ jobStore: store, executor, brainDirectory: directory, grantVerifier: verifier([]), reviewRepairContextReader: fixture.reader });
+  const result = await worker.runCycle({ limit: 1, roleId: "developer" });
+  assert.equal(result.outcomes[0].status, "active");
+  assert.equal(calls.length, 1);
+  const parts = calls[0].messages.slice(2);
+  assert.ok(parts.length > 1);
+  assert.ok(parts.every(({ content }) => Buffer.byteLength(content) < 128 * 1024));
+  const received = JSON.parse(parts.map(({ content }) => content.slice(content.indexOf("\n") + 1)).join(""));
+  assert.equal(received.headRefOid, fixture.initial.grant.inputBinding.headRefOid);
+  assert.equal(received.reviewFeedbackDigest, fixture.feedback.reviewFeedbackDigest);
+  assert.deepEqual(received.feedback, fixture.feedback.feedback);
+  assert.equal(received.feedback.threads.length, 12);
+  assert.ok(received.feedback.threads.every(({ comments, discussion }) => comments[0].body.length > 2 * 1024 && discussion[1].author === "runtime-user"));
+  assert.equal(executor.calls.filter(({ method }) => method === "perform").length, 1);
+});
+
+test("own PR repair fences feedback changed while deciding before performing any action", async () => {
+  const fixture = reviewRepairFixture();
+  const store = new FakeJobStore([fixture.initial]);
+  const executor = new FakeExecutor(fixture.initial);
+  const directory = brain([{ type: "read_text", path: "src/app.js" }]);
+  const decide = directory.decide.bind(directory);
+  directory.decide = async (value) => { const result = await decide(value); fixture.changeFeedback(); return result; };
+  const worker = new CodeJobWorkerService({ jobStore: store, executor, brainDirectory: directory, grantVerifier: verifier([]), reviewRepairContextReader: fixture.reader });
+  const result = await worker.runCycle({ limit: 1 });
+  assert.equal(result.outcomes[0].status, "fenced");
+  assert.equal(result.outcomes[0].code, "CODE_REVIEW_REPAIR_CONTEXT_STALE");
+  assert.equal(directory.calls.length, 1);
+  assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
+});
+
+test("own PR repair missing feedback reader pauses and temporary read failure retries without fallback", async () => {
+  for (const unavailable of [false, true]) {
+    const fixture = reviewRepairFixture();
+    const store = new FakeJobStore([fixture.initial]);
+    const executor = new FakeExecutor(fixture.initial);
+    const directory = brain([{ type: "read_text", path: "src/app.js" }]);
+    const worker = new CodeJobWorkerService({
+      jobStore: store, executor, brainDirectory: directory, grantVerifier: verifier([]),
+      ...(unavailable ? { reviewRepairContextReader: { async read() {
+        if (directory.calls.length === 0 && !this.recovered) {
+          this.recovered = true;
+          throw Object.assign(new Error("offline"), { code: "CODE_REVIEW_REPAIR_CONTEXT_UNAVAILABLE" });
+        }
+        return fixture.reader.read({ job: fixture.initial });
+      } } } : {}),
+    });
+    const result = await worker.runCycle({ limit: 1 });
+    assert.equal(result.outcomes[0].status, unavailable ? "retry" : "paused");
+    assert.equal(directory.calls.length, 0);
+    assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
+    if (unavailable) {
+      await worker.runCycle({ limit: 1 });
+      assert.equal(directory.calls.length, 1, "recovered read resumes on the next cycle without owner approval");
+      assert.equal(executor.calls.some(({ method }) => method === "perform"), true);
+    }
+  }
+});
 
 test("a queued job is started and one semantic action is durably executed", async () => {
   const events = [];

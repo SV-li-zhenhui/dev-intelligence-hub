@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
-import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { CodeWorkspaceBroker } from "../src/services/code-workspace-broker.js";
 
 async function fixture(t, {
@@ -399,6 +399,27 @@ test("a PR-bound execution materializes only its sealed Git Head and echoes a de
       expectedGitExecutableGid: 0,
     },
   ]);
+});
+
+test("review repair snapshots the Head and permits configured descendants without conflict materialization", async (t) => {
+  const snapshotter = fixedSnapshotter({ "src/app.js": "original Head\n" });
+  let conflictCalls = 0;
+  const { broker, sourceRoot } = await fixture(t, { gitSnapshotter: snapshotter,
+    gitBoundaryDigest: "f".repeat(64), writablePaths: ["src", "test"],
+    conflictMaterializer: { materialize() { conflictCalls += 1; throw new Error("wrong port"); } },
+  });
+  const inputBinding = conflictExecutionSource().inputBinding;
+  const executionSource = createReviewRepairCodeExecutionSource({ inputBinding, writablePaths: ["src", "test"] });
+  const execution = await broker.createExecution({ workspaceId: "dashboard", executionId: "review-repair", inputBinding, executionSource });
+  assert.equal(snapshotter.calls.length, 1);
+  assert.equal(conflictCalls, 0);
+  const current = await broker.readFile({ ...execution, path: "src/app.js" });
+  await broker.writeFile({ ...execution, path: "src/app.js", content: "fixed Head\n", expectedSha256: current.sha256 });
+  await broker.writeFile({ ...execution, path: "test/review.test.js", content: "regression\n", expectedSha256: null });
+  assert.equal(await readFile(path.join(sourceRoot, "src", "app.js"), "utf8"), "export const value = 1;\n");
+  await assert.rejects(broker.createExecution({ workspaceId: "dashboard", executionId: "wrong-scope", inputBinding,
+    executionSource: createReviewRepairCodeExecutionSource({ inputBinding, writablePaths: ["src"] }) }),
+    (error) => error.code === "INVALID_EXECUTION_REQUEST");
 });
 
 test("a conflict execution uses only its bound materializer and exact-file write scope", async (t) => {

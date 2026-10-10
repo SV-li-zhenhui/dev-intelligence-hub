@@ -360,6 +360,7 @@ export class WorkCoordinationService {
   #projectCodeJobMemory;
   #runProposals;
   #runReviewProposals;
+  #runOwnPrRepairs;
   #reconcileProposals;
   #reconcileAttention;
   #wakeConditions;
@@ -378,6 +379,7 @@ export class WorkCoordinationService {
     codeJobMemoryProjector,
     proposalRunner,
     reviewProposalRunner = null,
+    automaticOwnPrRepair = null,
     proposalResultReconciler,
     attentionResultReconciler,
     conditionWaker,
@@ -393,6 +395,7 @@ export class WorkCoordinationService {
     codeJobMemoryLimit = 50,
   } = {}) {
     this.#intake = requirePort(ledger, "intake", "ledger");
+    this.#runOwnPrRepairs = automaticOwnPrRepair === null ? null : requirePort(automaticOwnPrRepair, "runCycle", "automaticOwnPrRepair");
     this.#runCodeJobs = codeJobRunner == null
       ? skipCodeJobs
       : requirePort(codeJobRunner, "runCycle", "codeJobRunner");
@@ -500,6 +503,8 @@ export class WorkCoordinationService {
             this.#dispatchCodeJobChangePackages({
               limit: this.#defaults.codeJobLimit,
             })],
+          ...(this.#runOwnPrRepairs === null ? [] : [["own_pr_repairs", () =>
+            this.#runOwnPrRepairs({ limit: this.#defaults.codeJobLimit })]]),
           ["change_package_application_results", () =>
             this.#reconcileChangePackageApplicationResults()],
           ["code_job_memory", () =>

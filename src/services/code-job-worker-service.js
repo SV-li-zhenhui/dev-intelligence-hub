@@ -4,6 +4,7 @@ import {
   canCreateCodeJobChangePackageEvent,
 } from "../domain/code-job-change-package-event.js";
 import { packCodeJobBrainContext } from "./code-job-context-packer.js";
+import { normalizeReviewRepairFeedbackContext } from "./review-repair-context-reader.js";
 import { githubEntitySessionKey } from "../lib/session-key.js";
 import {
   assertSessionBinding,
@@ -224,6 +225,7 @@ export class CodeJobWorkerService {
   #jobs;
   #executor;
   #brain;
+  #reviewRepairContextReader;
   #verifyGrant;
   #actionAdmission;
   #queue;
@@ -240,6 +242,7 @@ export class CodeJobWorkerService {
     jobStore,
     executor,
     brainDirectory,
+    reviewRepairContextReader,
     grantVerifier,
     actionAdmissionGate = DIRECT_ACTION_ADMISSION,
     operationQueue = new OperationQueue(),
@@ -286,6 +289,8 @@ export class CodeJobWorkerService {
       "controlled code executor",
     );
     this.#brain = requirePort(brainDirectory, ["decide"], "code job brain");
+    this.#reviewRepairContextReader = reviewRepairContextReader === undefined
+      ? null : requirePort(reviewRepairContextReader, ["read"], "review repair context reader");
     this.#verifyGrant = requirePort(
       grantVerifier,
       ["verify"],
@@ -567,6 +572,7 @@ export class CodeJobWorkerService {
     );
     await this.#verifyAuthority(job.grant);
     const brainContext = this.#brainContext(job, remainingProfiles);
+    const reviewRepairFeedback = await this.#readReviewRepairFeedback(job);
     const sessionKey = Number.isSafeInteger(job.grant.subject?.number) &&
         job.grant.subject.number > 0
       ? githubEntitySessionKey({
@@ -580,12 +586,17 @@ export class CodeJobWorkerService {
         roleId: job.grant.requestedBy.roleId,
         ...(sessionKey === null ? {} : { sessionKey }),
         ...brainContext,
+        ...(reviewRepairFeedback === null ? {} : { reviewRepairFeedback }),
       },
       {
         beforeGenerate: () => this.#verifyAuthority(job.grant),
         brainDigest: job.grant.brainDigest,
       },
     );
+    if (reviewRepairFeedback !== null) {
+      const currentFeedback = await this.#readReviewRepairFeedback(job);
+      if (currentFeedback.reviewFeedbackDigest !== reviewRepairFeedback.reviewFeedbackDigest) throw workerError("CODE_REVIEW_REPAIR_CONTEXT_STALE", "Review feedback changed while the code brain was deciding");
+    }
     const action = bindTrustedAction(
       job,
       session,
@@ -622,6 +633,14 @@ export class CodeJobWorkerService {
         .slice(-this.#observationLimit)
         .map(modelObservation),
     });
+  }
+
+  async #readReviewRepairFeedback(job) {
+    if (executionSourceForJob(job)?.kind !== "review_repair") return null;
+    if (this.#reviewRepairContextReader === null) throw workerError("CODE_REVIEW_REPAIR_CONTEXT_NOT_CONFIGURED", "Own PR repair requires the complete trusted feedback context reader");
+    const context = normalizeReviewRepairFeedbackContext(await this.#reviewRepairContextReader.read({ job }));
+    if (context.headRefOid !== job.grant.executionSource.inputBinding.headRefOid) throw workerError("CODE_REVIEW_REPAIR_CONTEXT_STALE", "Review feedback does not match the code job Head");
+    return context;
   }
 
   async #reconcileStartingPause(job, knownSession = null) {

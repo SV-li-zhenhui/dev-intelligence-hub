@@ -119,6 +119,24 @@ function machinePaths(markup, attribute) {
   );
 }
 
+test("own PR repair checkbox renders its scope with accessible help", () => {
+  const configuration = configurationWithCredentialReferences();
+  configuration.githubActions.automaticOwnPrRepair = false;
+  const markup = renderConfigurationSettingsSkeleton({
+    state: createConfigurationFormState(configuration),
+  });
+  assert.match(markup, /自动修复我的 PR/u);
+  const ownRepairControl = [...markup.matchAll(/<input[^>]+>/g)]
+    .map(([control]) => control)
+    .find((control) => control.includes("data-configuration-field=") && control.includes("automaticOwnPrRepair"));
+  assert.ok(ownRepairControl);
+  assert.match(ownRepairControl, /type="checkbox"/);
+  assert.doesNotMatch(ownRepairControl, / checked/);
+  const helpId = ownRepairControl.match(/aria-describedby="([^"]+)"/)?.[1];
+  assert.ok(helpId);
+  assert.match(markup, new RegExp(`id="${helpId}"[^>]*>[^<]*无需逐项确认`));
+});
+
 function primitivePaths(value, path = [], result = []) {
   if (value === null || typeof value !== "object") {
     result.push(path);

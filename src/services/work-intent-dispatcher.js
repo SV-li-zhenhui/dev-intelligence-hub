@@ -945,6 +945,7 @@ export class WorkIntentDispatcher {
   #isIntentDispatchCurrent;
   #verifyInputAuthority;
   #prepareConflictExecutionSource;
+  #prepareReviewRepairSource;
   #verifyControlledCommitEvidence;
   #clock;
   #dispatcherId;
@@ -957,6 +958,7 @@ export class WorkIntentDispatcher {
     attentionProducer,
     proposalProducer,
     conflictExecutionSourcePreparer,
+    reviewRepairSourcePreparer,
     controlledCommitEvidenceReader,
     actionAdmissionGate,
     clock = () => new Date(),
@@ -997,6 +999,9 @@ export class WorkIntentDispatcher {
       conflictExecutionSourcePreparer,
       ["prepare"],
       "conflictExecutionSourcePreparer",
+    )?.prepare ?? null;
+    this.#prepareReviewRepairSource = optionalDependency(
+      reviewRepairSourcePreparer, ["prepare"], "reviewRepairSourcePreparer",
     )?.prepare ?? null;
     this.#verifyControlledCommitEvidence = optionalDependency(
       controlledCommitEvidenceReader,
@@ -1274,7 +1279,7 @@ export class WorkIntentDispatcher {
             code: "conflict-binding-unsealed",
           });
         }
-      } else if (hasExecutionSource) {
+      } else if (hasExecutionSource && bound.binding.executionSource.kind !== "review_repair") {
         return this.#ackFailure(claimed, item, {
           nextStatus: "blocked",
           code: "conflict-source-unexpected",
@@ -1311,6 +1316,11 @@ export class WorkIntentDispatcher {
             },
           };
         }
+      }
+      if (executionSource === undefined && conflictRequirement !== "required" && this.#prepareReviewRepairSource !== null) {
+        executionSource = await this.#admitAction(() => this.#prepareReviewRepairSource({
+          item, inputBinding, intent: claimed.intent, roleId: requester.roleId,
+        }));
       }
       let controlledCommitEvidence;
       if (isPullRequestPushIntent(claimed.intent)) {

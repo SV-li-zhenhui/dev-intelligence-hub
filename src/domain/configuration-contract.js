@@ -1105,6 +1105,7 @@ function normalizeGithubActions(value) {
     "enabledActions",
     "automaticReview",
     "assignAfterAutomaticReview",
+    "automaticOwnPrRepair",
   ];
   const config = fields(value, path, allowed, ["enabled"]);
   const enabled = boolean(config.enabled, `${path}.enabled`);
@@ -1132,6 +1133,7 @@ function normalizeGithubActions(value) {
     enabled,
     ...optional(config, "automaticReview", (entry) => boolean(entry, `${path}.automaticReview`)),
     ...optional(config, "assignAfterAutomaticReview", (entry) => boolean(entry, `${path}.assignAfterAutomaticReview`)),
+    ...optional(config, "automaticOwnPrRepair", (entry) => boolean(entry, `${path}.automaticOwnPrRepair`)),
     ...(Object.hasOwn(config, "credentialMode") ? { credentialMode } : {}),
     ...optional(config, "actorAccountId", (entry) =>
       text(entry, `${path}.actorAccountId`, 40, {
@@ -1792,7 +1794,7 @@ function authorityDirection(change) {
     );
     return { tightening: direction.removed, expansion: direction.added };
   }
-  if (["githubActions.automaticReview", "githubActions.assignAfterAutomaticReview"].includes(path)) {
+  if (["githubActions.automaticReview", "githubActions.assignAfterAutomaticReview", "githubActions.automaticOwnPrRepair"].includes(path)) {
     const effective = (value) => path.endsWith("assignAfterAutomaticReview") ? value !== false : value === true;
     return { tightening: effective(before) && !effective(after), expansion: !effective(before) && effective(after) };
   }
@@ -1918,7 +1920,8 @@ function requiresInfrastructureRestart(path) {
     path.startsWith("githubActions.networkEnv") ||
     path === "githubActions.enabledActions" ||
     path === "githubActions.automaticReview" ||
-    path === "githubActions.assignAfterAutomaticReview"
+    path === "githubActions.assignAfterAutomaticReview" ||
+    path === "githubActions.automaticOwnPrRepair"
   );
 }
 

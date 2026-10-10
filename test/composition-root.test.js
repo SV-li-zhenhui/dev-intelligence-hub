@@ -4098,6 +4098,103 @@ test("an explicit empty PR action allow-list remains inert and never reads trans
   await application.close();
 });
 
+test("automatic own PR repair composes internal push with ownership guards and complete feedback readers", async (t) => {
+  for (const explicitPush of [false, true]) {
+    await t.test(explicitPush ? "generic push enabled" : "generic push disabled", async () => {
+      const config = structuredClone(defaultCodeJobConfiguration());
+      config.githubActions = {
+        enabled: true, actorAccountId: "review-account", tokenEnv: "TEST_GITHUB_TOKEN",
+        ghCommand: process.execPath, automaticOwnPrRepair: true,
+        enabledActions: explicitPush ? ["push"] : [],
+      };
+      config.changePackages = { enabled: true, gitCommand: "C:\\Program Files\\Git\\cmd\\git.exe" };
+      config.workCoordination.policy.configurationChangeRoles = [];
+      const calls = {};
+      const closeCalls = [];
+      const repairEnvelope = {
+        id: "unowned-repair-push", kind: "github.pull-request-push",
+        requestedBy: { roleId: "developer", workItemId: "work-42" },
+        action: { controlledCommitEvidence: { executionSource: { kind: "review_repair", inputBinding: {} } } },
+      };
+      const conflictEnvelope = {
+        ...repairEnvelope, id: "ordinary-conflict-push",
+        action: { controlledCommitEvidence: { executionSource: { kind: "conflict_preparation" } } },
+      };
+      const base = defaultCodeJobApplicationOptions({
+        config, calls, closeCalls, versioned: true,
+        lifecycle: createApplicationRuntimeLifecycle(),
+        confirmationRuntimeFactory: async (_config, dependencies) => {
+          calls.confirmation = dependencies;
+          assert.throws(() => calls.externalExecutor.pushAuthorization.verifyPush(repairEnvelope), { code: "GITHUB_AUTHORIZATION_UNAVAILABLE" });
+          return {
+            queue: confirmationQueuePort(), producerQueue: confirmationProducerPort(),
+            memoryProjectionSource: confirmationMemoryProjectionSourcePort(),
+            applicationResultSource: { async readSnapshot() {} },
+            async close() { await dependencies.pullRequestExternalActionExecutor.close(); },
+          };
+        },
+      });
+      const application = await createApplication({
+        ...base,
+        workLedgerRuntimeFactory: async (options) => ({
+          ...await base.workLedgerRuntimeFactory(options),
+          async readPullRequestExecutionContext() { throw new Error("unused in composition test"); },
+        }),
+        workProposalRuntimeFactory: async (options) => {
+          calls.proposalRuntime = options;
+          const runner = { async claim() {}, async advance() {} };
+          return workProposalRuntimePort({ runners: {
+            "code-action-runner": runner, "github-pr-action-runner": runner, "github-review-runner": runner,
+          } });
+        },
+        versionedCodeJobAuthorityFactory: () => ({ async create() {}, async verify(value) { return value; }, async decide() {}, async close() {} }),
+        codeExecutorRuntimeFactory: async () => ({
+          ...await base.codeExecutorRuntimeFactory(),
+          changePackageTargets: [{ workspaceId: "dashboard" }],
+          completedChangeExporter: { async export() {} },
+          controlledCommitBuilder: { async create() {}, async find() {}, async verify() {} },
+          controlledCommitPublisher: { async publish() {} },
+          auditArtifactReader: { async read() {} },
+        }),
+        codeJobRuntimeFactory: async (options) => ({
+          ...await base.codeJobRuntimeFactory(options),
+          changePackageDelivery: { async runCycle() {} },
+        }),
+        changePackageRuntimeFactory: async () => ({
+          packageProducer: { async create() {} }, packageReader: { async get() {} },
+          applicationProducer: { async prepareConfirmation() {} },
+          applicationExecutor: { async execute() {}, async reconcile() {} },
+          applicationReader: { async getResult() {} },
+          applicationProjectionReader: { async getForJob() {} },
+          applicationProjectionWriter: { async getCheckpoint() {}, async applySnapshot() {} },
+          async close() {},
+        }),
+        changePackageApplicationResultReconcilerFactory: () => ({ async runCycle() {}, async runThrough() {} }),
+        codeJobEvidenceReaderFactory: () => ({ async read() {} }),
+        githubCredentialSourceFactory: async () => Object.freeze({ async acquire() {} }),
+        pullRequestExternalActionDependencies: { transport: { async observe() {}, async perform() {} } },
+        pullRequestExternalActionExecutorFactory(options) {
+          calls.externalExecutor = options;
+          return { async execute() {}, async reconcile() {}, async close() {} };
+        },
+        pullRequestExternalActionProposalRunnerFactory: () => ({ async runCycle() {} }),
+        githubReviewProposalRunnerFactory: () => ({ async runCycle() {} }),
+      });
+      try {
+        assert.deepEqual(calls.externalExecutor.enabledActions, ["push"]);
+        assert.deepEqual(config.githubActions.enabledActions, explicitPush ? ["push"] : []);
+        assert.equal(typeof calls.codeJobRuntime.reviewRepairContextReader.read, "function");
+        assert.equal(typeof calls.codeJobRuntime.reviewRepairContextReader.readBinding, "function");
+        assert.strictEqual(calls.loop.reviewRepairContextReader, calls.codeJobRuntime.reviewRepairContextReader);
+        assert.equal(await calls.externalExecutor.pushAuthorization.verifyPush(repairEnvelope), false);
+        assert.equal(await calls.externalExecutor.pushAuthorization.verifyPush(conflictEnvelope), explicitPush);
+      } finally {
+        await application.close();
+      }
+    });
+  }
+});
+
 test("an explicit Review keeps legacy intake while unified execution owns work-proposal side effects", async () => {
   const calls = {};
   const closeCalls = [];

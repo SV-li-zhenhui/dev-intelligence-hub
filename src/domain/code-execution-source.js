@@ -6,6 +6,7 @@ import {
   normalizeConflictPreparationBinding,
 } from "./conflict-preparation-binding.js";
 import { normalizePullRequestExecutionBinding } from "./pull-request-execution-binding.js";
+import { CodeExecutionPolicy, normalizeWorkspacePath } from "./code-execution-policy.js";
 
 const SOURCE_KEYS = Object.freeze([
   "schemaVersion",
@@ -13,6 +14,9 @@ const SOURCE_KEYS = Object.freeze([
   "inputBinding",
   "preparationBinding",
   "writeScope",
+]);
+const REVIEW_REPAIR_KEYS = Object.freeze([
+  "schemaVersion", "kind", "inputBinding", "writeScope",
 ]);
 const WRITE_SCOPE_KEYS = Object.freeze(["mode", "paths"]);
 const MAX_EXECUTION_PATH_BYTES = 512;
@@ -93,11 +97,38 @@ function exactStringArray(value, expected, error) {
   });
 }
 
+function normalizeReviewPaths(value, error) {
+  if (!Array.isArray(value) || utilTypes.isProxy(value) ||
+      value.length < 1 || value.length > 64) throw error;
+  if (Object.getPrototypeOf(value) !== Array.prototype ||
+      Reflect.ownKeys(value).length !== value.length + 1) throw error;
+  const values = Array.from({ length: value.length }, (_, index) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor?.enumerable || !("value" in descriptor)) throw error;
+    return descriptor.value;
+  });
+  const paths = values.map((entry) => {
+    const normalized = normalizeWorkspacePath(entry);
+    if (normalized !== entry || CONTROL_CHARACTER.test(entry) ||
+        Buffer.byteLength(entry, "utf8") > MAX_EXECUTION_PATH_BYTES ||
+        entry.split("/").some((segment) =>
+          Buffer.byteLength(segment, "utf8") > MAX_EXECUTION_SEGMENT_BYTES)) {
+      throw error;
+    }
+    return normalized;
+  });
+  if (new Set(paths).size !== paths.length) throw error;
+  const policy = new CodeExecutionPolicy({ writablePaths: paths });
+  for (const entry of paths) policy.assertWritable(entry);
+  return paths.sort((left, right) => left.localeCompare(right, "en"));
+}
+
 function normalize(value, error) {
-  const source = exact(value, SOURCE_KEYS, error);
+  const kind = new Map(dataEntries(value, error)).get("kind");
+  const source = exact(value, kind === "review_repair" ? REVIEW_REPAIR_KEYS : SOURCE_KEYS, error);
   if (
     source.get("schemaVersion") !== 1 ||
-    source.get("kind") !== "conflict_preparation"
+    !["conflict_preparation", "review_repair"].includes(kind)
   ) {
     throw error;
   }
@@ -107,6 +138,16 @@ function normalize(value, error) {
     error,
   );
   if (inputBinding.schemaVersion !== 2) throw error;
+  if (kind === "review_repair") {
+    const scope = exact(source.get("writeScope"), WRITE_SCOPE_KEYS, error);
+    if (scope.get("mode") !== "configured_paths") throw error;
+    return {
+      schemaVersion: 1,
+      kind,
+      inputBinding,
+      writeScope: { mode: "configured_paths", paths: normalizeReviewPaths(scope.get("paths"), error) },
+    };
+  }
   const preparationBinding = normalizeConflictPreparationBinding(
     source.get("preparationBinding"),
     error,
@@ -153,6 +194,17 @@ function normalize(value, error) {
     preparationBinding,
     writeScope: { mode: "exact_files", paths },
   };
+}
+
+export function createReviewRepairCodeExecutionSource(value) {
+  const error = invalid();
+  const fields = exact(value, ["inputBinding", "writablePaths"], error);
+  return normalizeCodeExecutionSource({
+    schemaVersion: 1,
+    kind: "review_repair",
+    inputBinding: fields.get("inputBinding"),
+    writeScope: { mode: "configured_paths", paths: fields.get("writablePaths") },
+  }, error);
 }
 
 export function normalizeCodeExecutionSource(

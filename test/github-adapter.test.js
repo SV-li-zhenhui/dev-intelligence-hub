@@ -516,7 +516,7 @@ test("relevant PR search uses the active account, returns every result, and fetc
 
   assert.equal(items.length, 2);
   assert.deepEqual(
-    calls.filter((args) => args[0] === "api"),
+    calls.filter((args) => args[0] === "api" && args.at(-1) === "user"),
     [
       ["api", "--hostname", "github.com", "user"],
       ["api", "--hostname", "github.com", "user"],

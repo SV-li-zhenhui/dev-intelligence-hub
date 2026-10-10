@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 
 import { createChangePackage } from "../src/domain/change-package-contract.js";
-import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import {
@@ -193,6 +193,25 @@ function hasControlledEvidenceError(error) {
 function mutableClone(value) {
   return structuredClone(value);
 }
+
+test("review repair evidence binds actual changed files and one exact Head parent", () => {
+  const source = createReviewRepairCodeExecutionSource({ inputBinding: pullRequestBinding(gitTarget()), writablePaths: ["src", "test"] });
+  const manifest = manifestFor(source, { modified: [{ path: "src/value.js", beforeSha256: "1".repeat(64), content: Buffer.from("fixed\n") }] });
+  const finalTreeOid = oid("5");
+  const commit = commitFor({ source, manifest, finalTreeOid, overrides: { parents: [source.inputBinding.headRefOid] } });
+  const input = evidenceInput({ source, manifest, commit, resolution: { resolvedPaths: ["src/value.js"], finalTreeOid } });
+  const evidence = createControlledCommitEvidence(input);
+  assert.equal(evidence.executionSource.kind, "review_repair");
+  assert.equal(Object.hasOwn(evidence.resolution, "preparationId"), false);
+  assert.deepEqual(evidence.commit.parents, [source.inputBinding.headRefOid]);
+  assert.match(createControlledCommitMessage({ executionSource: source, manifest }), /controlled review repair/);
+  assert.deepEqual(normalizeControlledCommitEvidence(evidence), evidence);
+  for (const changed of [
+    { ...input, commit: { ...commit, parents: [source.inputBinding.gitTarget.baseRefOid] } },
+    { ...input, commit: { ...commit, parents: [source.inputBinding.headRefOid, source.inputBinding.gitTarget.baseRefOid] } },
+    { ...input, resolution: { resolvedPaths: ["src/other.js"], finalTreeOid } },
+  ]) assert.throws(() => createControlledCommitEvidence(changed));
+});
 
 test("creates deterministic, detached, deeply frozen controlled commit evidence", () => {
   const input = evidenceInput();

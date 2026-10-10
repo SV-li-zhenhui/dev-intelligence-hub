@@ -348,13 +348,17 @@ export class ControlledGitCommitBuilder {
       blobs.map(({ sha256, content }) => [sha256, content]),
     );
     const records = [];
-    for (const change of manifest.changes.modified) {
+    const modes = new Map(preparation.treeEntries?.map(({ path, mode }) => [path, mode]) ?? []);
+    for (const change of [...manifest.changes.created, ...manifest.changes.modified]) {
       const oid = await this.#git.hashObject({
         ...context,
         content: contentByDigest.get(change.blob.sha256),
         oidLength: preparation.baseBoundary.oidLength,
       });
-      records.push(`100644 blob ${oid}\t${change.path}\0`);
+      records.push(`${modes.get(change.path) ?? "100644"} blob ${oid}\t${change.path}\0`);
+    }
+    for (const change of manifest.changes.deleted) {
+      records.push(`0 ${"0".repeat(preparation.baseBoundary.oidLength)}\t${change.path}\0`);
     }
     await this.#git.updateIndex({
       ...context,
@@ -371,10 +375,12 @@ export class ControlledGitCommitBuilder {
       );
     }
     const target = executionSource.inputBinding.gitTarget;
+    const parents = executionSource.kind === "review_repair"
+      ? [target.headRefOid] : [target.headRefOid, target.baseRefOid];
     const commitOid = await this.#git.commitTree({
       ...context,
       treeOid: finalTreeOid,
-      parents: [target.headRefOid, target.baseRefOid],
+      parents,
       message: Buffer.from(message, "utf8"),
       oidLength: preparation.baseBoundary.oidLength,
     });
@@ -392,14 +398,17 @@ export class ControlledGitCommitBuilder {
         executionSource,
         manifest,
         resolution: {
-          resolvedPaths: [...executionSource.writeScope.paths],
+          resolvedPaths: executionSource.kind === "review_repair"
+            ? [...manifest.changes.created, ...manifest.changes.modified, ...manifest.changes.deleted]
+              .map(({ path }) => path).sort()
+            : [...executionSource.writeScope.paths],
           finalTreeOid,
         },
         commit: {
           objectFormat: preparation.baseBoundary.objectFormat,
           oid: commitOid,
           treeOid: finalTreeOid,
-          parents: [target.headRefOid, target.baseRefOid],
+          parents,
           author: identity,
           committer: identity,
           messageDigest: rawSha256(Buffer.from(message, "utf8")),
@@ -422,7 +431,7 @@ export class ControlledGitCommitBuilder {
   }
 
   #environment({ objectDirectory, indexFile, preparation, createdAt }) {
-    const preparationObjects = path.join(
+    const preparationObjects = preparation.kind === "review_repair" ? null : path.join(
       this.#preparationRoot,
       "preparations",
       preparation.preparationId,
@@ -433,7 +442,7 @@ export class ControlledGitCommitBuilder {
     return Object.freeze({
       ...this.#createObjectEnvironment(
         objectDirectory,
-        preparationObjects,
+        ...(preparationObjects === null ? [] : [preparationObjects]),
         preparation.baseBoundary.objectDirectory,
         preparation.headBoundary.objectDirectory,
       ),

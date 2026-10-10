@@ -113,7 +113,7 @@ test("an authored PR with unresolved review feedback needs my action", () => {
   assert.equal(result.nextAction, "address_review");
 });
 
-test("an authored PR updated after requested changes waits for re-review", () => {
+test("new commits alone do not resolve requested changes on an authored PR", () => {
   const result = assess({
     reviewDecision: "CHANGES_REQUESTED",
     latestOtherDecisionState: "CHANGES_REQUESTED",
@@ -122,9 +122,33 @@ test("an authored PR updated after requested changes waits for re-review", () =>
     outstandingChangeRequestCommitOids: ["reviewed-head"],
   });
 
-  assert.equal(result.actionState, ACTION_STATES.WAITING_OTHER);
-  assert.equal(result.nextActor, "reviewer");
-  assert.equal(result.nextAction, "wait_rereview");
+  assert.equal(result.actionState, ACTION_STATES.ACTION_NOW);
+  assert.equal(result.nextActor, "me");
+  assert.equal(result.nextAction, "address_review");
+});
+
+test("unresolved inline feedback on an authored PR starts repair even with an approval or draft", () => {
+  for (const overrides of [{ reviewDecision: "APPROVED" }, { isDraft: true }, { ciStatus: "FAILURE" }]) {
+    const result = assess({ ...overrides, reviewFeedbackAvailable: true, reviewFeedbackCount: 1, reviewFeedbackDigest: "a".repeat(64) });
+    assert.equal(result.actionState, ACTION_STATES.ACTION_NOW);
+    assert.equal(result.nextAction, "address_review");
+  }
+});
+
+test("authored merged and closed PRs cannot become actionable from remaining feedback", () => {
+  for (const state of ["merged", "closed"]) {
+    assert.equal(assess({ state, reviewFeedbackAvailable: true, reviewFeedbackCount: 1 }).actionState, ACTION_STATES.HISTORICAL);
+  }
+});
+
+test("own feedback with a merge conflict routes to conflict preparation before ordinary repair", () => {
+  const result = assess({ mergeStateStatus: "DIRTY", reviewFeedbackAvailable: true, reviewFeedbackCount: 1 });
+  assert.equal(result.nextAction, "resolve_conflict");
+  assert.equal(result.actionState, ACTION_STATES.ACTION_NOW);
+});
+
+test("failed own-feedback reads cannot infer repairs from a request-changes summary", () => {
+  assert.equal(assess({ reviewFeedbackAvailable: false, reviewDecision: "CHANGES_REQUESTED", outstandingChangeRequestCommitOids: ["head-2"] }).actionState, ACTION_STATES.UNCERTAIN);
 });
 
 test("current authored blockers override an old change request", () => {

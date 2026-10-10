@@ -187,6 +187,22 @@ function dataObject(value, { allowed, required = allowed, code, message }) {
   return fields;
 }
 
+function exactRepositoryMirrorEntries(value) {
+  if (!isPlainRecord(value)) throw controlledGitError("INVALID_CONTROLLED_GIT_CONFIG", "Head mirror 配置无效");
+  const entries = dataObject(value, { allowed: Reflect.ownKeys(value),
+    code: "INVALID_CONTROLLED_GIT_CONFIG", message: "Head mirror 配置无效" });
+  const seen = new Set();
+  return [...entries].map(([repository, root]) => {
+    if (!GITHUB_REPOSITORY.test(repository) || seen.has(repository.toLowerCase())) {
+      throw controlledGitError("INVALID_CONTROLLED_GIT_CONFIG", "Head mirror 仓库标识无效");
+    }
+    seen.add(repository.toLowerCase());
+    const mirrorRoot = requireAbsolutePath(root, "INVALID_CONTROLLED_GIT_CONFIG", "Head mirror 路径无效");
+    if (isNetworkPath(mirrorRoot)) throw controlledGitError("INVALID_CONTROLLED_GIT_CONFIG", "Head mirror 必须为本地路径");
+    return [repository, mirrorRoot];
+  });
+}
+
 function bindDataMethod(port, name) {
   if (port === null || typeof port !== "object" || utilTypes.isProxy(port)) {
     throw controlledGitError(
@@ -1242,7 +1258,8 @@ function normalizeControlledCommitPublicationAction(value) {
       inputBinding,
     ) ||
     evidence.commit.parents[0] !== target.headRefOid ||
-    evidence.commit.parents[1] !== target.baseRefOid
+    (evidence.executionSource.kind !== "review_repair" &&
+      evidence.commit.parents[1] !== target.baseRefOid)
   ) {
     throw controlledGitError(
       "INVALID_CONTROLLED_GIT_PUBLISH_REQUEST",
@@ -1465,6 +1482,7 @@ export class ControlledGitService {
   #preparationRoot;
   #run;
   #limits;
+  #reviewHeadMirrors;
 
   constructor(value = {}) {
     const fields = dataObject(value, {
@@ -1475,6 +1493,7 @@ export class ControlledGitService {
         "processRunner",
         "limits",
         "commitIdentity",
+        "headMirrorsByRepository",
       ],
       required: ["gitCommand", "mirrorInspector", "preparationRoot"],
       code: "INVALID_CONTROLLED_GIT_CONFIG",
@@ -1519,6 +1538,11 @@ export class ControlledGitService {
     this.#mirrorInspector = bindDataMethod(mirrorInspector, "preflight");
     this.#run = bindDataMethod(processRunner, "run");
     this.#limits = validateLimits(limits);
+    this.#reviewHeadMirrors = new Map();
+    for (const [repository, mirrorRoot] of fields.has("headMirrorsByRepository")
+      ? exactRepositoryMirrorEntries(fields.get("headMirrorsByRepository")) : []) {
+      this.#reviewHeadMirrors.set(repository.toLowerCase(), mirrorRoot);
+    }
     this.#commitIdentity = normalizeCommitIdentity(commitIdentity);
     this.#commitBuilder = new ControlledGitCommitBuilder({
       preparationRoot: this.#preparationRoot,
@@ -2012,7 +2036,8 @@ export class ControlledGitService {
         "--no-follow-tags",
         "--no-signed",
         "--recurse-submodules=no",
-        `--force-with-lease=${fullRefName}:${target.headRefOid}`,
+        ...(finalSource.evidence.executionSource.kind === "review_repair"
+          ? [] : [`--force-with-lease=${fullRefName}:${target.headRefOid}`]),
         "--",
         remoteUrl,
         `${commitOid}:${fullRefName}`,
@@ -2059,7 +2084,7 @@ export class ControlledGitService {
     return Object.freeze({
       evidence: source.evidence,
       commitObjectDirectory: source.objectDirectory,
-      preparationObjectDirectory: path.join(
+      preparationObjectDirectory: preparation.kind === "review_repair" ? null : path.join(
         this.#preparationRoot,
         "preparations",
         preparation.preparationId,
@@ -2118,7 +2143,7 @@ export class ControlledGitService {
       ...this.#gitEnvironment(
         scratch.objectDirectory,
         source.commitObjectDirectory,
-        source.preparationObjectDirectory,
+        ...(source.preparationObjectDirectory === null ? [] : [source.preparationObjectDirectory]),
         source.baseObjectDirectory,
         source.headObjectDirectory,
       ),
@@ -2194,6 +2219,9 @@ export class ControlledGitService {
   }
 
   async #verifiedCommitPreparation(executionSource, manifest) {
+    if (executionSource.kind === "review_repair") {
+      return this.#verifiedReviewRepairHead(executionSource, manifest);
+    }
     const binding = executionSource.preparationBinding;
     const preparation = await this.#verifiedManifest(binding.preparationId);
     if (preparation.status !== "conflicted") {
@@ -2224,6 +2252,60 @@ export class ControlledGitService {
       );
     }
     return preparation;
+  }
+
+  async #verifiedReviewRepairHead(executionSource, manifest) {
+    const target = executionSource.inputBinding.gitTarget;
+    const mirrorRoot = this.#reviewHeadMirrors.get(target.headRepository.toLowerCase());
+    if (mirrorRoot === undefined) {
+      throw controlledGitError("CONTROLLED_GIT_MIRROR_NOT_CONFIGURED", "Review repair 原 PR Head 缺少可信 mirror");
+    }
+    const headBoundary = await this.#preflight({
+      repository: target.headRepository,
+      mirrorRoot,
+      expectedCommitOid: target.headRefOid,
+    });
+    if ([headBoundary.canonicalRoot, headBoundary.objectDirectory].some((entry) =>
+      pathsOverlap(entry, this.#preparationRoot) || pathsOverlap(entry, this.#gitCommand))) {
+      throw controlledGitError("CONTROLLED_GIT_BOUNDARY_OVERLAP", "Review repair Head mirror 与运行边界重叠");
+    }
+    const gitExecutable = await executableIdentity(this.#gitCommand);
+    const prefix = [...SAFE_GIT_PREFIX, `--git-dir=${headBoundary.canonicalRoot}`,
+      "-c", "core.fsmonitor=false", "-c", "protocol.allow=never"];
+    const run = async (args, maximum) => checkedProcessOutput(await this.#runGit({
+      args: [...prefix, ...args], cwd: headBoundary.canonicalRoot,
+      env: this.#gitEnvironment(headBoundary.objectDirectory, headBoundary.objectDirectory, headBoundary.objectDirectory), maxOutputBytes: maximum,
+    }), [0], maximum).stdout;
+    const resultTreeOid = parseSingleOid(await run(["rev-parse", `${target.headRefOid}^{tree}`], 256), headBoundary.oidLength, "CONTROLLED_GIT_PROTOCOL_ERROR");
+    const records = splitNullProtocol(await run(["ls-tree", "-rz", "--full-tree", resultTreeOid], this.#limits.maxProtocolBytes),
+      "CONTROLLED_GIT_PROTOCOL_ERROR", "Review repair Head tree 输出无效");
+    if (records.length > this.#limits.maxFiles) {
+      throw controlledGitError("CONTROLLED_GIT_UNSUPPORTED_TREE", "Review repair Head 文件数超过配置限制");
+    }
+    const treeEntries = records.map((record) => {
+      const match = /^(\d{6}) (blob|commit) ([a-f0-9]{40}|[a-f0-9]{64})\t(.+)$/u.exec(record);
+      if (!match || !oidPattern(headBoundary.oidLength).test(match[3])) {
+        throw controlledGitError("CONTROLLED_GIT_PROTOCOL_ERROR", "Review repair Head tree 记录无效");
+      }
+      return { path: normalizeWorkspacePath(match[4]), mode: match[1], oid: match[3] };
+    });
+    const byPath = new Map(treeEntries.map((entry) => [entry.path, entry]));
+    for (const change of [...manifest.changes.modified, ...manifest.changes.deleted]) {
+      const entry = byPath.get(change.path);
+      if (!entry || !["100644", "100755"].includes(entry.mode)) {
+        throw controlledGitError("CONTROLLED_GIT_CHANGE_PACKAGE_MISMATCH", "Review repair 修改路径不是原 PR 普通文件");
+      }
+      const before = validatedBlob(await run(["cat-file", "blob", entry.oid], this.#limits.maxBlobBytes),
+        entry.oid, this.#limits, headBoundary.objectFormat);
+      if (before.sha256 !== change.beforeSha256) {
+        throw controlledGitError("CONTROLLED_GIT_CHANGE_PACKAGE_MISMATCH", "Review repair beforeSha256 未绑定原 PR Head");
+      }
+    }
+    if (manifest.changes.created.some(({ path }) => byPath.has(path))) {
+      throw controlledGitError("CONTROLLED_GIT_CHANGE_PACKAGE_MISMATCH", "Review repair 新建路径已存在于原 PR Head");
+    }
+    return Object.freeze({ kind: "review_repair", headBoundary, baseBoundary: headBoundary,
+      resultTreeOid, treeEntries, gitExecutable });
   }
 
   async #inspectInScratch({
@@ -2776,10 +2858,7 @@ export class ControlledGitService {
           ...prefix,
           "commit-tree",
           request.treeOid,
-          "-p",
-          request.parents[0],
-          "-p",
-          request.parents[1],
+          ...request.parents.flatMap((parent) => ["-p", parent]),
         ];
         input = request.message;
         returnsOid = true;

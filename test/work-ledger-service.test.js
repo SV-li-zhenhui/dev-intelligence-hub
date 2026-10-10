@@ -997,6 +997,15 @@ test("PR execution context returns the current author with the verified binding"
   );
 });
 
+test("PR execution context exposes current feedback digest for trusted repair reads", async () => {
+  const reviewFeedbackDigest = "e".repeat(64);
+  const fixture = await createFixture({ records: [prAssignment(1, { author: "review-account", gitFacts: { ...prGitFacts(PR_HEAD_A), reviewFeedbackDigest } })] });
+  await fixture.service.intake();
+  const item = (await fixture.service.listItems()).items[0];
+  const inputBinding = prExecutionBinding(item);
+  assert.deepEqual(await fixture.service.readPullRequestExecutionContext(inputBinding), { inputBinding, author: "review-account", reviewFeedbackDigest });
+});
+
 test("PR engineer intake keeps one durable task across events on the same Head", async () => {
   const records = [
     prAssignment(1, {

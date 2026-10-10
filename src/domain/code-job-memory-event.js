@@ -346,14 +346,16 @@ function terminalSummary(job) {
 function executionSourceSummary(value) {
   const source = normalizeCodeExecutionSource(value);
   const binding = source.preparationBinding;
-  const writablePaths = codeExecutionSourceWritablePaths(source);
+  const writablePaths = codeExecutionSourceWritablePaths(source).sort((left, right) => left.localeCompare(right, "en"));
   return {
     kind: source.kind,
+    ...(source.kind === "review_repair" ? { sourceDigest: safeDigest(source) } : {
     preparationId: binding.preparationId,
     resultTreeOid: binding.resultTreeOid,
     boundaryDigest: binding.boundaryDigest,
     evidenceDigest: binding.evidenceDigest,
     resultObjectDigest: binding.resultObjectDigest,
+    }),
     writablePathCount: writablePaths.length,
     writablePathsDigest: safeDigest(writablePaths),
     writablePathSamples: writablePaths.slice(
@@ -412,7 +414,9 @@ function memoryEvidence(snapshot) {
   }
   if (snapshot.executionSource !== undefined) {
     values.push(
-      `conflict-preparation:${snapshot.executionSource.preparationId}`,
+      snapshot.executionSource.kind === "review_repair"
+        ? `review-repair:${snapshot.executionSource.sourceDigest}`
+        : `conflict-preparation:${snapshot.executionSource.preparationId}`,
     );
   }
   if (snapshot.latestObservation !== null) {
@@ -427,7 +431,7 @@ function memoryEvidence(snapshot) {
   }
   if (snapshot.executionSource !== undefined) {
     values.push(...snapshot.executionSource.writablePathSamples.map(
-      (relativePath) => `conflict-path:${relativePath}`,
+      (relativePath) => `${snapshot.executionSource.kind === "review_repair" ? "review-repair-path" : "conflict-path"}:${relativePath}`,
     ));
   }
   return [...new Set(values)].slice(0, 20);
@@ -455,7 +459,7 @@ function memoryRecordFromSnapshot(event, snapshot) {
       snapshot.operation,
       ...(snapshot.executionSource === undefined
         ? []
-        : ["conflict-preparation"]),
+        : [snapshot.executionSource.kind === "review_repair" ? "review-repair" : "conflict-preparation"]),
     ])],
     sourceUrl: null,
     subjectNumber: snapshot.subjectNumber,
@@ -655,15 +659,18 @@ function normalizeTerminalSummary(value) {
 }
 
 function normalizeExecutionSourceSummary(value) {
+  const reviewRepair = dataFieldsOrNull(value)?.get("kind") === "review_repair";
   const fields = exact(
     value,
     [
       "kind",
+      ...(reviewRepair ? ["sourceDigest"] : [
       "preparationId",
       "resultTreeOid",
       "boundaryDigest",
       "evidenceDigest",
       "resultObjectDigest",
+      ]),
       "writablePathCount",
       "writablePathsDigest",
       "writablePathSamples",
@@ -671,10 +678,10 @@ function normalizeExecutionSourceSummary(value) {
     ],
     "executionSource",
   );
-  if (fields.get("kind") !== "conflict_preparation") {
+  if (!["conflict_preparation", "review_repair"].includes(fields.get("kind"))) {
     throw invalid("executionSource.kind 无效");
   }
-  const resultTreeOid = text(
+  const resultTreeOid = reviewRepair ? null : text(
     fields.get("resultTreeOid"),
     "executionSource.resultTreeOid",
     64,
@@ -685,7 +692,7 @@ function normalizeExecutionSourceSummary(value) {
     "executionSource.writablePathCount",
     1,
   );
-  if (writablePathCount > 32) {
+  if (writablePathCount > (reviewRepair ? 64 : 32)) {
     throw invalid("executionSource.writablePathCount 无效");
   }
   const writablePathSamples = denseArray(
@@ -726,7 +733,8 @@ function normalizeExecutionSourceSummary(value) {
     throw invalid("executionSource.writablePathSamples 无效");
   }
   return {
-    kind: "conflict_preparation",
+    kind: fields.get("kind"),
+    ...(reviewRepair ? { sourceDigest: digest(fields.get("sourceDigest"), "executionSource.sourceDigest") } : {
     preparationId: digest(
       fields.get("preparationId"),
       "executionSource.preparationId",
@@ -744,6 +752,7 @@ function normalizeExecutionSourceSummary(value) {
       fields.get("resultObjectDigest"),
       "executionSource.resultObjectDigest",
     ),
+    }),
     writablePathCount,
     writablePathsDigest,
     writablePathSamples,

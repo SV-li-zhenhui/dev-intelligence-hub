@@ -2,6 +2,7 @@ import { types as utilTypes } from "node:util";
 
 import { runCommand, runJson } from "../lib/command-runner.js";
 import { INCOMING_REVIEW_QUERY, projectIncomingReview } from "./github-incoming-review.js";
+import { readOwnReviewFeedback } from "./github-own-review-feedback.js";
 import {
   normalizePullRequestGitTarget,
   samePullRequestGitTarget,
@@ -744,6 +745,7 @@ export class GitHubAdapter {
     maxReadBodyBytes,
     maxReadFactBytes,
     readIncomingReviews = false,
+    readOwnReviewFeedback: readOwnReviewFeedbackEnabled = true,
     clock = () => new Date(),
   } = {}) {
     const commandEnvironment = Object.freeze({ ...env, GH_HOST: GITHUB_HOST });
@@ -754,6 +756,7 @@ export class GitHubAdapter {
         ? maxPatchCharacters
         : 24_000;
     this.readIncomingReviews = readIncomingReviews;
+    this.readOwnReviewFeedbackEnabled = readOwnReviewFeedbackEnabled;
     if (typeof clock !== "function") {
       throw new TypeError("GitHubAdapter clock is invalid");
     }
@@ -937,6 +940,18 @@ export class GitHubAdapter {
       account: currentUser,
     });
     let incoming = {};
+    let ownFeedback = {};
+    if (this.readOwnReviewFeedbackEnabled && author.toLowerCase() === currentUser.toLowerCase()) {
+      try {
+        ownFeedback = await readOwnReviewFeedback(this.run, { repository: repo, number: record.number, account: currentUser }, options);
+        if (ownFeedback.headRefOid !== detail.headRefOid || ownFeedback.state !== (record.state?.toLowerCase() || "open")) throw new Error("GitHub own PR feedback changed during refresh");
+        const { feedback, reviewFeedbackIds, ...summary } = ownFeedback;
+        ownFeedback = summary;
+      } catch (error) {
+        options.signal?.throwIfAborted();
+        ownFeedback = { reviewFeedbackAvailable: false };
+      }
+    }
     if (this.readIncomingReviews && author.toLowerCase() !== currentUser.toLowerCase()) {
       try {
         // The enclosing discovery verifies the account before and after the
@@ -988,6 +1003,7 @@ export class GitHubAdapter {
       reviewFactsAvailable: true,
       ...incoming,
       ...summarizeReviewFacts(detail.reviews, currentUser),
+      ...ownFeedback,
     };
   }
 
@@ -1030,6 +1046,14 @@ export class GitHubAdapter {
     if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository) || !Number.isSafeInteger(number) || number < 1) throw new TypeError("Invalid incoming Review target");
     if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
     const facts = await this.#readIncomingReviewRequest({ repository, number, account }, options);
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    return facts;
+  }
+
+  async readOwnPullRequestFeedback({ repository, number, account }, options = {}) {
+    if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository) || !Number.isSafeInteger(number) || number < 1 || typeof account !== "string" || !account) throw new TypeError("Invalid own PR feedback target");
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    const facts = await readOwnReviewFeedback(this.run, { repository, number, account }, options);
     if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
     return facts;
   }

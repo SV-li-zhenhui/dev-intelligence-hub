@@ -810,7 +810,7 @@ function assertSupportedConfigurationShape(value) {
   assertFields(
     value.githubActions,
     "configuration.githubActions",
-    ["enabled", "credentialMode", "actorAccountId", "tokenEnv", "ghCommand", "networkEnv", "timeoutMs", "enabledActions", "automaticReview", "assignAfterAutomaticReview"],
+    ["enabled", "credentialMode", "actorAccountId", "tokenEnv", "ghCommand", "networkEnv", "timeoutMs", "enabledActions", "automaticReview", "assignAfterAutomaticReview", "automaticOwnPrRepair"],
     ["enabled"],
   );
   if (Object.hasOwn(value.githubActions, "enabledActions")) {

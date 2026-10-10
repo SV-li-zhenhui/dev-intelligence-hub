@@ -6,6 +6,9 @@ import {
 import { DingTalkAdapter } from "./adapters/dingtalk-adapter.js";
 import { GitHubAdapter } from "./adapters/github-adapter.js";
 import { AutomaticReviewPublisher } from "./services/automatic-review-publisher.js";
+import { AutomaticOwnPrRepair } from "./services/automatic-own-pr-repair.js";
+import { ReviewRepairContextReader } from "./services/review-repair-context-reader.js";
+import { OwnPrRepairObjectSync } from "./adapters/own-pr-repair-object-sync.js";
 import { createGitHubPullRequestActionTransport } from "./adapters/github-pull-request-action-transport.js";
 import { createGhLoginCredentialSource } from "./adapters/gh-login-credential-source.js";
 import { OllamaBrain } from "./adapters/ollama-brain.js";
@@ -1024,6 +1027,7 @@ export async function createApplication({
   let configurationConfirmationRequester = null;
   let codeExecutorRuntime = null;
   let changePackageRuntime = null;
+  let automaticOwnPrRepair = null;
   let workflowRouting = null;
   let workLedgerRuntime = null;
   let ownerWorkRetry = null;
@@ -1224,6 +1228,10 @@ export async function createApplication({
     )
       ? [...configuredGithubActions.enabledActions]
       : [];
+    const ownPrRepairEnabled = configuredGithubActions.automaticOwnPrRepair === true;
+    const executablePullRequestActions = [...new Set([
+      ...explicitPullRequestActions, ...(ownPrRepairEnabled ? ["push"] : []),
+    ])];
     const githubProposalExecutionEnabled =
       coordinationEnabled &&
       externalActions &&
@@ -1236,7 +1244,7 @@ export async function createApplication({
       coordinationEnabled &&
       externalActions &&
       configuredGithubActions.enabled === true &&
-      explicitPullRequestActions.length > 0;
+      executablePullRequestActions.length > 0;
     const githubReviewExecutionEnabled =
       externalActions &&
       configuredGithubActions.enabled === true &&
@@ -1561,6 +1569,16 @@ export async function createApplication({
       }
       codeJobBrainDirectory = trackRuntime(codeJobBrainDirectory);
       activeCodeJobOptions = {
+        ...(ownPrRepairEnabled ? {
+          reviewRepairContextReader: new ReviewRepairContextReader({
+            github,
+            executionContextReader: frozenPort(
+              workLedgerRuntime,
+              ["readPullRequestExecutionContext"],
+              "workLedgerRuntime",
+            ),
+          }),
+        } : {}),
         grantVerifier: frozenPort(
           grantFactory,
           ["verify"],
@@ -1775,7 +1793,7 @@ export async function createApplication({
               "codeExecutorRuntime.controlledCommitPublisher",
             );
       if (
-        explicitPullRequestActions.includes("push") &&
+        executablePullRequestActions.includes("push") &&
         controlledCommitVerifier === null
       ) {
         throw new Error("GitHub push 动作需要可核验的受控 commit 证据");
@@ -1784,7 +1802,7 @@ export async function createApplication({
       let transport = pullRequestExternalActionDependencies.transport;
       if (transport === undefined) {
         if (
-          explicitPullRequestActions.includes("push") &&
+          executablePullRequestActions.includes("push") &&
           controlledCommitPublisher === null
         ) {
           throw new Error("GitHub push 动作需要受控 commit 发布端口");
@@ -1808,7 +1826,22 @@ export async function createApplication({
       }
       const constructedPullRequestExternalActionExecutor =
         pullRequestExternalActionExecutorFactory({
-          enabledActions: explicitPullRequestActions,
+          enabledActions: executablePullRequestActions,
+          ...(!ownPrRepairEnabled ? {} : {
+            pushAuthorization: {
+              verifyPush(envelope) {
+                if (envelope.action?.controlledCommitEvidence?.executionSource?.kind !== "review_repair") {
+                  return explicitPullRequestActions.includes("push");
+                }
+                if (automaticOwnPrRepair === null) {
+                  throw Object.assign(new Error("自动修复授权仍在恢复中"), {
+                    code: "GITHUB_AUTHORIZATION_UNAVAILABLE",
+                  });
+                }
+                return automaticOwnPrRepair.verifyPush(envelope);
+              },
+            },
+          }),
           credentialSource: githubCredentialSource,
           ...(configuredGithubActions.timeoutMs === undefined
             ? {}
@@ -1867,6 +1900,20 @@ export async function createApplication({
         }),
       );
       pullRequestExternalActionExecutorOwned = confirmationRuntime !== null;
+    }
+    if (ownPrRepairEnabled) {
+      if (!localCodeExecutionEnabled || !confirmationRuntime || !configurationRuntime ||
+          !codeJobReader || !codeExecutorRuntime?.controlledCommitBuilder || !changePackageRuntime) {
+        throw new Error("自动修复我的 PR 需要版本化配置、开发执行器、验证配置及受控提交链路");
+      }
+      automaticOwnPrRepair = new AutomaticOwnPrRepair({
+        configurationReader: configurationRuntime.reader, store, ledger: workLedgerRuntime,
+        github, confirmations: Object.freeze({ ...confirmationRuntime.producerQueue, ...confirmationRuntime.queue }), codeJobReader,
+        controlledCommitReader: codeExecutorRuntime.controlledCommitBuilder,
+        grantVerifier: activeCodeJobOptions.grantVerifier,
+        objectSync: trackRuntime(new OwnPrRepairObjectSync({ credentialSource: githubCredentialSource })),
+      });
+      await automaticOwnPrRepair.recover();
     }
     if (localCodeExecutionEnabled && !confirmationRuntime) {
       throw new Error("本地代码工作提案需要可用的确认运行时");
@@ -2031,6 +2078,7 @@ export async function createApplication({
           confirmationProducer: confirmationRuntime.producerQueue,
           codeJobReader,
           grantFactory,
+          ...(automaticOwnPrRepair === null ? {} : { automaticOwnPrRepair }),
           leaseDurationMs: coordinationConfig.leaseDurationMs,
           retryBaseMs: coordinationConfig.retryBaseMs,
           retryMaxMs: coordinationConfig.retryMaxMs,
@@ -2379,6 +2427,10 @@ export async function createApplication({
         roleDirectory,
         roleContextAssembler,
         orchestratorService,
+        ...(automaticOwnPrRepair === null ? {} : { automaticOwnPrRepair }),
+        ...(activeCodeJobOptions?.reviewRepairContextReader === undefined ? {} : {
+          reviewRepairContextReader: activeCodeJobOptions.reviewRepairContextReader,
+        }),
         ...(agentMemoryQueries === null
           ? {}
           : {
@@ -2407,6 +2459,7 @@ export async function createApplication({
         policy,
         attentionProducer: attentionInboxRuntime.producer,
         proposalProducer: workProposalRuntime.producer,
+        ...(automaticOwnPrRepair === null ? {} : { reviewRepairSourcePreparer: automaticOwnPrRepair }),
         ...(codeExecutorRuntime?.controlledCommitBuilder == null
           ? {}
           : {
@@ -2435,6 +2488,7 @@ export async function createApplication({
         changePackageApplicationResultReconciler,
         proposalRunner,
         reviewProposalRunner,
+        ...(automaticOwnPrRepair === null ? {} : { automaticOwnPrRepair }),
         proposalResultReconciler,
         attentionResultReconciler,
         conditionWaker,

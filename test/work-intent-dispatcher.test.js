@@ -5,6 +5,7 @@ import { createDeliveryEvidenceTarget } from "../src/domain/delivery-evidence-co
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import {
   createConflictCodeExecutionSource,
+  createReviewRepairCodeExecutionSource,
   sameCodeExecutionSource,
 } from "../src/domain/code-execution-source.js";
 import { createPullRequestExecutionBinding } from "../src/domain/pull-request-execution-binding.js";
@@ -631,8 +632,9 @@ function fixture(pairs, options = {}) {
     policy: options.policy ?? policy(),
     attentionProducer: attention,
     proposalProducer: proposals,
-    conflictExecutionSourcePreparer:
-      options.conflictExecutionSourcePreparer,
+      conflictExecutionSourcePreparer:
+        options.conflictExecutionSourcePreparer,
+      reviewRepairSourcePreparer: options.reviewRepairSourcePreparer,
     controlledCommitEvidenceReader:
       options.controlledCommitEvidenceReader,
     actionAdmissionGate: options.actionAdmissionGate,
@@ -2025,6 +2027,29 @@ test("persisted conflict binding retries delivery without preparing a second sou
   assert.equal(recovered.delivered, 1);
   assert.equal(preparations, 1);
   assert.equal(proposals.calls.length, 1);
+});
+
+test("own review repair binds its trusted source once and resumes the persisted proposal", async () => {
+  const pair = conflictWorkPair(6, codeIntent(), { mergeStateStatus: "CLEAN", relation: "authored", nextAction: "address_review" });
+  const time = controlledClock();
+  const ledger = new FakeLedger([pair], time);
+  ledger.failBindAfterOnce = true;
+  let preparations = 0;
+  const { dispatcher, proposals } = fixture([pair], {
+    time, ledger,
+    reviewRepairSourcePreparer: { async prepare({ inputBinding, roleId }) {
+      assert.equal(roleId, "developer");
+      preparations += 1;
+      return createReviewRepairCodeExecutionSource({ inputBinding, writablePaths: ["src"] });
+    } },
+  });
+  assert.equal((await dispatcher.dispatchPending()).uncertain, 1);
+  assert.equal(preparations, 1);
+  assert.equal(proposals.calls.length, 0);
+  time.advance(1_001);
+  assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  assert.equal(preparations, 1);
+  assert.equal(proposals.calls[0].binding.executionSource.kind, "review_repair");
 });
 
 test("upgrade recovery blocks a persisted conflict proposal without a sealed source", async () => {

@@ -580,6 +580,11 @@ export class CodeWorkspaceBroker {
           hasExecutionSource,
         } = normalizeCreateExecutionRequest(request);
         const workspace = this.#workspace(workspaceId);
+        if (executionSource?.kind === "review_repair" &&
+            JSON.stringify(codeExecutionSourceWritablePaths(executionSource)) !==
+            JSON.stringify([...workspace.policy.writablePaths].sort((left, right) => left.localeCompare(right, "en")))) {
+          throw new CodeExecutionError("INVALID_EXECUTION_REQUEST", "Review repair 写范围与工作区配置不一致");
+        }
         validateExecutionId(executionId);
         const key = this.#executionKey(workspaceId, executionId);
         return this.#enqueueExecutionLifecycle(key, async () => {
@@ -619,7 +624,7 @@ export class CodeWorkspaceBroker {
           const baseline = new Map();
           const copyState = { fileCount: 0, totalBytes: 0 };
           try {
-            if (hasExecutionSource) {
+            if (hasExecutionSource && executionSource.kind === "conflict_preparation") {
               if (this.conflictMaterializer === null) {
                 throw new CodeExecutionError(
                   "CONFLICT_PREPARATION_MATERIALIZER_UNAVAILABLE",
@@ -749,7 +754,7 @@ export class CodeWorkspaceBroker {
             workspace,
             root: executionRoot,
             baseline,
-            exactWritablePaths: hasExecutionSource
+            exactWritablePaths: hasExecutionSource && executionSource.kind === "conflict_preparation"
               ? new Set(codeExecutionSourceWritablePaths(executionSource))
               : null,
             sourceRevision,

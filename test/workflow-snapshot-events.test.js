@@ -98,6 +98,21 @@ test("incoming review receipt facts survive snapshot routing and stored event va
   assert.throws(() => workflowEventsFromSnapshots(snapshot([]), snapshot([pullRequest(1, { ...receipt, incomingReviewFactsAvailable: "true" })])), /payload.incomingReviewFactsAvailable/);
 });
 
+test("new own PR feedback on the same head survives routing as a distinct source update", () => {
+  const facts = { relation: "authored", nextAction: "address_review", reviewFeedbackAvailable: true, reviewFeedbackCount: 1, reviewFeedbackDigest: "a".repeat(64), reviewFeedbackAt: "2026-08-02T01:30:00Z", reviewFeedbackIds: ["thread:1"] };
+  const previous = snapshot([pullRequest(1, facts)]);
+  const changed = snapshot([pullRequest(1, { ...facts, reviewFeedbackDigest: "b".repeat(64), reviewFeedbackIds: ["thread:1", "thread:2"], reviewFeedbackCount: 2 })]);
+  const events = workflowEventsFromSnapshots(previous, changed);
+  assert.ok(events.length > 0);
+  assert.ok(events.some(({ payload }) => payload.changedFields.includes("reviewFeedbackDigest")));
+  assert.ok(events.every(({ payload }) => payload.headRefOid === "head-1" && payload.reviewFeedbackDigest === "b".repeat(64)));
+  for (const event of events) assert.deepEqual(normalizeStoredWorkflowEvent(event), event);
+  assert.deepEqual(workflowEventsFromSnapshots(changed, changed), []);
+  const large = workflowEventsFromSnapshots(null, snapshot([pullRequest(1, { ...facts, reviewFeedbackCount: 1_250, reviewFeedbackIds: Array.from({ length: 1_250 }, (_, index) => `thread:${index}`) })]));
+  assert.equal(large[0].payload.reviewFeedbackCount, 1_250);
+  assert.equal(Object.hasOwn(large[0].payload, "reviewFeedbackIds"), false);
+});
+
 test("snapshot projection is a deterministic safe replay checkpoint", () => {
   const input = snapshot(
     [

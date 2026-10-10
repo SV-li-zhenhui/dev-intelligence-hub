@@ -816,6 +816,7 @@ function confirmationHistoryItemMarkup(item) {
     </div>
     <p>${escapeHtml(item.summary || "")}</p>
     ${item.automaticReview ? `<p><strong>自动 Review · ${escapeHtml({ APPROVE: "通过", REQUEST_CHANGES: "需修改", COMMENT: "评论" }[item.automaticReview.event] || "待核对")}</strong> · Head ${escapeHtml(item.automaticReview.headRefOid.slice(0, 8))} · <a href="${escapeHtml(item.automaticReview.url)}" target="_blank" rel="noreferrer">在 GitHub 查看</a></p>` : ""}
+    ${item.automaticOwnPrRepair ? `<p><strong>自动修复我的 PR · ${item.automaticOwnPrRepair.stage === "push" ? "更新原 PR" : "创建开发任务"}</strong></p>` : ""}
     <small>${escapeHtml(confirmationHistoryKindLabel(item.kind))} · ${escapeHtml(roleId)} · ${escapeHtml(workItemId)} · ${escapeHtml(relativeTime(item.updatedAt))}${item.retryable ? " · 可再次逐项确认" : ""}</small>
     ${item.diagnosticCode ? `<code class="confirmation-history-diagnostic">诊断：${escapeHtml(item.diagnosticCode)}</code>` : ""}
     ${item.ownerDecision?.type === "seal_unknown_and_forbid_replay" ? '<small class="confirmation-history-resolution">已承认结果未知并封存（禁止重放）</small>' : ""}
@@ -3160,6 +3161,8 @@ function normalizedConfirmationHistoryItems(value) {
       createdAt: item.createdAt,
       updatedAt: item.updatedAt,
       retryable: item.retryable === true,
+      ...(["push", "code_task"].includes(item.automaticOwnPrRepair?.stage)
+        ? { automaticOwnPrRepair: { stage: item.automaticOwnPrRepair.stage } } : {}),
       ...(item.automaticReview && ["APPROVE", "REQUEST_CHANGES", "COMMENT"].includes(item.automaticReview.event) &&
         /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(item.automaticReview.headRefOid || "") &&
         /^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+#[1-9]\d*$/.test(item.automaticReview.resourceId || "")

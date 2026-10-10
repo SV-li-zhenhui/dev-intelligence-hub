@@ -509,6 +509,7 @@ class PullRequestExternalActionExecutor {
   #transport;
   #inputAuthorityVerifier;
   #controlledCommitVerifier;
+  #pushAuthorization;
   #clock;
   #timeoutMs;
   #activeOperations;
@@ -520,10 +521,12 @@ class PullRequestExternalActionExecutor {
     transport,
     inputAuthorityVerifier,
     controlledCommitVerifier,
+    pushAuthorization = null,
     clock = () => Date.now(),
     timeoutMs = 60_000,
   } = {}) {
     this.#enabledActions = normalizeEnabledActions(enabledActions);
+    this.#pushAuthorization = pushAuthorization;
     if (typeof clock !== "function") throw new TypeError("clock is invalid");
     if (
       !Number.isSafeInteger(timeoutMs) ||
@@ -663,7 +666,13 @@ class PullRequestExternalActionExecutor {
     } catch (error) {
       return errorResult(error);
     }
-    if (!this.#isEnabled(envelope)) return { status: "stale" };
+    if (!this.#isEnabled(envelope)) {
+      if (envelope.action.type === "pull_request_push" &&
+          envelope.action.controlledCommitEvidence.executionSource.kind === "review_repair") {
+        return errorResult(new PullRequestExternalActionTransportError("GITHUB_OUTCOME_UNKNOWN", "unknown"));
+      }
+      return { status: "stale" };
+    }
     const operation = this.#beginOperation();
     try {
       return await this.#withCredential(
@@ -677,9 +686,16 @@ class PullRequestExternalActionExecutor {
             marker,
           );
           if (result.status !== "absent") return result;
-          return (await this.#authorityCurrent(envelope, operation))
-            ? result
-            : { status: "stale" };
+          if (await this.#authorityCurrent(envelope, operation)) return result;
+          // Revoked permission cannot establish that an admitted push never happened.
+          // Retain the recovery fence when the remote no longer shows its commit.
+          if (envelope.action.type === "pull_request_push" &&
+              (this.#pushAuthorization !== null || envelope.action.controlledCommitEvidence.executionSource.kind === "review_repair")) {
+            return errorResult(new PullRequestExternalActionTransportError(
+              "GITHUB_OUTCOME_UNKNOWN", "unknown",
+            ));
+          }
+          return { status: "stale" };
         },
       );
     } catch (error) {
@@ -748,6 +764,8 @@ class PullRequestExternalActionExecutor {
   }
 
   async #authorityCurrent(envelope, operation) {
+    if (envelope.action.type === "pull_request_push" && this.#pushAuthorization !== null &&
+        !(await this.#awaitOperation(operation, () => this.#pushAuthorization.verifyPush(envelope)))) return false;
     try {
       const verified = await this.#awaitOperation(
         operation,

@@ -93,6 +93,18 @@ test("agency executes proposals before reconciling their durable results", async
   assert.equal(result.stages.dispatch.ok, true);
 });
 
+test("own repair publication follows completed packages and remains outside independent PR review cycles", async () => {
+  const { service, calls } = fixture({
+    automaticOwnPrRepair: { async runCycle(options) { calls.push(["own_pr_repairs", options]); return { scanned: 1 }; } },
+  });
+  const result = await service.runCycle({ includeWork: false });
+  assert.deepEqual(calls.slice(0, 4).map(([name]) => name), ["code_jobs", "code_job_change_packages", "own_pr_repairs", "change_package_application_results"]);
+  assert.equal(result.stages.own_pr_repairs.ok, true);
+  calls.length = 0;
+  await service.runCycle({ roleId: "pr-engineer" });
+  assert.equal(calls.some(([name]) => name === "own_pr_repairs"), false);
+});
+
 test("the PR engineer publishes its Review without waiting for general code jobs", async () => {
   const calls = [];
   let reviewReady = false;

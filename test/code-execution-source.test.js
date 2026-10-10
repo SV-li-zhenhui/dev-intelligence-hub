@@ -5,9 +5,27 @@ import { createConflictPreparationBinding } from "../src/domain/conflict-prepara
 import {
   codeExecutionSourceWritablePaths,
   createConflictCodeExecutionSource,
+  createReviewRepairCodeExecutionSource,
   normalizeCodeExecutionSource,
   sameCodeExecutionSource,
 } from "../src/domain/code-execution-source.js";
+
+test("review repair binds the exact PR input and configured prefixes without conflict provenance", () => {
+  const source = createReviewRepairCodeExecutionSource({ inputBinding: inputBinding(), writablePaths: ["src", "test"] });
+  assert.equal(source.kind, "review_repair");
+  assert.equal(Object.hasOwn(source, "preparationBinding"), false);
+  assert.deepEqual(source.writeScope, { mode: "configured_paths", paths: ["src", "test"] });
+  assert.deepEqual(normalizeCodeExecutionSource(source), source);
+  assert.equal(sameCodeExecutionSource(source, { ...source, inputBinding: inputBinding(gitTarget({ headRefOid: "e".repeat(40) })) }), false);
+  for (const writablePaths of [[], ["../src"], [".git"], ["src", "src"], ["src\\file.js"], ["a\n.js"]]) {
+    assert.throws(() => createReviewRepairCodeExecutionSource({ inputBinding: inputBinding(), writablePaths }));
+  }
+  const paths = [];
+  Object.defineProperty(paths, "0", { enumerable: true, get() { throw new Error("getter invoked"); } });
+  assert.throws(() => createReviewRepairCodeExecutionSource({ inputBinding: inputBinding(), writablePaths: paths }),
+    (error) => error.code === "INVALID_CODE_EXECUTION_SOURCE");
+  assert.throws(() => normalizeCodeExecutionSource({ ...source, preparationBinding: preparationBinding() }));
+});
 
 function gitTarget(overrides = {}) {
   return {

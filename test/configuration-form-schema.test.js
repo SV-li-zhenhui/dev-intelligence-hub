@@ -381,6 +381,20 @@ test("test library profiles expose a dedicated script template and source editor
   assert.equal(source.maximumBytes, 65_536);
 });
 
+test("own PR repair exposes a disabled checkbox template and scoped help", () => {
+  const path = ["githubActions", "automaticOwnPrRepair"];
+  const field = configurationFieldDescriptor(path, false);
+  assert.equal(field.label, "自动修复我的 PR");
+  assert.equal(field.control, "checkbox");
+  assert.equal(field.kind, "boolean");
+  assert.match(field.help, /开发工程师/u);
+  assert.match(field.help, /无需逐项确认/u);
+  assert.match(field.help, /原 PR/u);
+  assert.match(field.help, /合并/u);
+  assert.deepEqual(configurationSlotDescriptor(path).operations, ["add", "remove", "replace"]);
+  assert.deepEqual(configurationStructureTemplate(path), { kind: "slot", value: false });
+});
+
 test("profile form fields use the sandbox ID boundary", () => {
   const profiles = configurationCollectionDescriptor(["codeExecutor", "profiles"]);
   assert.equal(profiles.keyFormat, "profile-id");

@@ -686,6 +686,7 @@ export async function createControlledGitRuntimeBundle(
       gitCommand: normalized.gitCommand,
       mirrorInspector,
       preparationRoot: normalized.preparationRoot,
+      headMirrorsByRepository: Object.fromEntries(normalized.headMirrors),
       ...(normalizedDependencies.processRunner
         ? { processRunner: normalizedDependencies.processRunner }
         : {}),

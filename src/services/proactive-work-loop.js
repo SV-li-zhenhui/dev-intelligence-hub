@@ -8,7 +8,7 @@ import {
   WORK_COORDINATION_EVIDENCE_MUTATION_MARGIN_MS,
   WORK_COORDINATION_EVIDENCE_VERIFICATION_TARGET_MS,
 } from "./work-coordination-timing.js";
-import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
+import { currentWorkItemEvent, currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
 import { isPreWriteGraphRevisionConflict } from "./work-ledger-graph-command-support.js";
 
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
@@ -649,8 +649,13 @@ export class ProactiveWorkLoop {
     memoryQueryService,
     issueActiveWindowDays = 14,
     automaticReviewPolicy = null,
+    automaticOwnPrRepair = null,
+    reviewRepairContextReader = null,
   } = {}) {
     this.automaticReviewPolicy = automaticReviewPolicy;
+    this.automaticOwnPrRepair = automaticOwnPrRepair;
+    this.readReviewRepairContext = optionalPortMethod(reviewRepairContextReader,
+      "readBinding", "reviewRepairContextReader.readBinding");
     this.ledger = requirePort(
       ledger,
       [
@@ -849,6 +854,7 @@ export class ProactiveWorkLoop {
         continue;
       }
       if (!isAvailable(item, normalizeLoopClock(this.clock))) continue;
+      if (this.automaticOwnPrRepair !== null && !(await this.automaticOwnPrRepair.shouldRun(item))) continue;
       if (this.automaticReviewPolicy !== null && item.currentTarget?.id === "pr-engineer") {
         const event = currentWorkItemEvent(item);
         if (event.source?.provider === "github" && event.payload?.relation === "review_requested" &&
@@ -1215,17 +1221,33 @@ export class ProactiveWorkLoop {
   async #decide(item, worker, options, context) {
     return normalizeWorkDecision(
       await withinAbortable(
-        (signal) => worker.decide({
-          item: workerItemDto(item),
-          trigger: options.trigger,
-          ...(context === undefined ? {} : { context }),
-          signal,
-        }),
+        (signal) => this.#workerDecision(item, worker, options.trigger, context, signal),
         this.decideTimeoutMs,
         "ROLE_DECISION_TIMEOUT",
         options.signal,
       ),
     );
+  }
+
+  async #workerDecision(item, worker, trigger, context, signal) {
+    const event = currentWorkItemEvent(item);
+    const needsFeedback = this.readReviewRepairContext !== null && worker.roleId === "developer" &&
+      event?.payload?.relation === "authored" && event.payload.nextAction === "address_review";
+    const inputBinding = needsFeedback ? currentWorkItemExecutionBinding(item) : null;
+    const feedback = needsFeedback ? await this.readReviewRepairContext({ inputBinding }) : null;
+    throwIfLoopAborted(signal);
+    const decision = await worker.decide({ item: workerItemDto(item), trigger,
+      ...(context === undefined ? {} : { context }), signal,
+      ...(feedback === null ? {} : { reviewRepairFeedback: feedback }),
+    });
+    if (needsFeedback) {
+      const current = await this.readReviewRepairContext({ inputBinding });
+      if (current.reviewFeedbackDigest !== feedback.reviewFeedbackDigest) {
+        throw Object.assign(new Error("Review 意见已变化，需要读取最新内容"), { code: "CODE_REVIEW_REPAIR_CONTEXT_STALE" });
+      }
+    }
+    throwIfLoopAborted(signal);
+    return decision;
   }
 
   async #decideWithMemory(item, worker, options, packet) {
@@ -1248,12 +1270,7 @@ export class ProactiveWorkLoop {
       signal.throwIfAborted();
       const decision = normalizeWorkDecision(
         await withinAbortable(
-          (stageSignal) => worker.decide({
-            item: workerItemDto(item),
-            trigger: options.trigger,
-            context,
-            signal: stageSignal,
-          }),
+          (stageSignal) => this.#workerDecision(item, worker, options.trigger, context, stageSignal),
           this.decideTimeoutMs,
           "ROLE_DECISION_TIMEOUT",
           signal,

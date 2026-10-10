@@ -501,6 +501,11 @@ function writablePathsForGrant(operation, executionSource, workspace) {
   if (operation !== "modify") {
     throw invalid("Conflict preparation 只能授权 modify 代码任务");
   }
+  if (executionSource.kind === "review_repair" &&
+      digestValue(codeExecutionSourceWritablePaths(executionSource)) !==
+      digestValue([...workspace.writablePaths].sort((left, right) => left.localeCompare(right, "en")))) {
+    throw invalid("Review repair 写范围必须与当前工作区配置一致");
+  }
   const configuredPolicy = new CodeExecutionPolicy({
     writablePaths: workspace.writablePaths,
     excludePaths: workspace.excludePaths,
@@ -682,7 +687,7 @@ export class CodeJobGrantFactory {
     const inputAuthorization = this.#verifyInputBinding(
       proposal.binding.inputBinding,
       workspace,
-      { requireGitHeadSnapshot: executionSource === null },
+      { requireGitHeadSnapshot: executionSource?.kind !== "conflict_preparation" },
     );
     return inputAuthorization instanceof Promise
       ? inputAuthorization.then(authorizeSource)
@@ -758,7 +763,7 @@ export class CodeJobGrantFactory {
     const inputAuthorization = this.#verifyInputBinding(
       grant.inputBinding,
       workspace,
-      { requireGitHeadSnapshot: executionSource === null },
+      { requireGitHeadSnapshot: executionSource?.kind !== "conflict_preparation" },
     );
     return inputAuthorization instanceof Promise
       ? inputAuthorization.then(verifySource)
@@ -826,6 +831,12 @@ export class CodeJobGrantFactory {
       })
     ) {
       throw invalid("Conflict preparation 与当前 PR Head 不匹配");
+    }
+    if (normalized.kind === "review_repair") {
+      if (!workspace.capabilities.includes("git_head_snapshot")) {
+        throw invalid("Review repair 工作区缺少固定 Head 快照能力");
+      }
+      return normalized;
     }
     if (!workspace.capabilities.includes("conflict_preparation_snapshot")) {
       throw invalid("代码工作区不具备 sealed conflict 快照能力");

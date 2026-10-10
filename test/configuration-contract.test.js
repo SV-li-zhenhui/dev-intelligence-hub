@@ -30,6 +30,7 @@ function legacyGithubCredentialDocument() {
   delete value.githubActions.credentialMode;
   delete value.githubActions.automaticReview;
   delete value.githubActions.assignAfterAutomaticReview;
+  delete value.githubActions.automaticOwnPrRepair;
   return value;
 }
 
@@ -736,6 +737,48 @@ test("versioned code executor profiles accept reusable Node script assets", () =
     normalized.codeExecutor.profiles["reusable-smoke"].asset,
     value.codeExecutor.profiles["reusable-smoke"].asset,
   );
+});
+
+test("own PR repair is an optional strict boolean and preserves legacy documents", () => {
+  const legacy = document();
+  delete legacy.githubActions.automaticOwnPrRepair;
+  const normalized = normalizeConfigurationDocument(legacy);
+  assert.equal(Object.hasOwn(normalized.githubActions, "automaticOwnPrRepair"), false);
+  assert.equal(configurationDocumentDigest(normalized), configurationDocumentDigest(legacy));
+
+  for (const enabled of [true, false]) {
+    const configured = structuredClone(legacy);
+    configured.githubActions.automaticOwnPrRepair = enabled;
+    assert.equal(normalizeConfigurationDocument(configured).githubActions.automaticOwnPrRepair, enabled);
+  }
+  for (const value of ["true", 1, null, {}, []]) {
+    const invalid = structuredClone(legacy);
+    invalid.githubActions.automaticOwnPrRepair = value;
+    assertInvalid(invalid);
+  }
+});
+
+test("own PR repair enabling expands authority and disabling or removal tightens it", () => {
+  const path = "githubActions.automaticOwnPrRepair";
+  const withSetting = (value) => {
+    const configuration = document();
+    if (value === undefined) delete configuration.githubActions.automaticOwnPrRepair;
+    else configuration.githubActions.automaticOwnPrRepair = value;
+    return configuration;
+  };
+  for (const [before, after, tightening, expansion] of [
+    [undefined, true, false, true],
+    [false, true, false, true],
+    [true, false, true, false],
+    [true, undefined, true, false],
+    [undefined, false, false, false],
+    [false, undefined, false, false],
+  ]) {
+    const impact = configurationDocumentImpact(withSetting(before), withSetting(after));
+    assert.deepEqual(impact.security_tightening, tightening ? [path] : []);
+    assert.deepEqual(impact.authority_expansion, expansion ? [path] : []);
+    assert.deepEqual(impact.restart_required, [path]);
+  }
 });
 
 test("executor profile IDs and bindings match the sandbox ID boundary", () => {

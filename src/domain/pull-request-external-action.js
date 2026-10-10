@@ -320,7 +320,8 @@ function normalizeProposalAction(value, binding) {
     const target = binding.inputBinding.gitTarget;
     if (
       evidence.commit.parents[0] !== target.headRefOid ||
-      evidence.commit.parents[1] !== target.baseRefOid
+      (evidence.executionSource.kind !== "review_repair" &&
+        evidence.commit.parents[1] !== target.baseRefOid)
     ) {
       throw invalid("受控 commit 证据 parents 与 PR Git target 不一致");
     }
@@ -605,7 +606,8 @@ function normalizeConfirmationAction(kind, value) {
         inputBinding,
       ) ||
       evidence.commit.parents[0] !== target.headRefOid ||
-      evidence.commit.parents[1] !== target.baseRefOid
+      (evidence.executionSource.kind !== "review_repair" &&
+        evidence.commit.parents[1] !== target.baseRefOid)
     ) {
       throw invalid("push 未精确绑定受控 commit 与远程 Head");
     }

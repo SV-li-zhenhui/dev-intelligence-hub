@@ -299,7 +299,7 @@ test("structured brain parser accepts orchestration and delivery decisions", () 
   assert.equal(
     variants.some(({ properties }) =>
       properties?.type?.const === "orchestrate" &&
-      properties.action?.oneOf?.length === 8),
+      properties.action?.oneOf?.length === 9),
     true,
   );
   assert.equal(

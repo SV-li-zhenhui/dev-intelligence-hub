@@ -11,7 +11,7 @@ import {
   normalizeCodeJobGrant,
 } from "../src/domain/code-job-contract.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
-import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
@@ -525,6 +525,31 @@ function deferred() {
   });
   return { promise, resolve };
 }
+
+test("review repair authority requires enablement and binds only its trusted Head mirror", async () => {
+  const context = fixture();
+  const enabled = structuredClone(context.startup);
+  enabled.githubActions.automaticOwnPrRepair = true;
+  context.activate(enabled);
+  const { contentDigest: _digest, ...ordinary } = proposal(context.startup);
+  const bound = normalizeBoundWorkProposal({ ...ordinary, binding: { ...ordinary.binding,
+    executionSource: createReviewRepairCodeExecutionSource({ inputBinding: ordinary.binding.inputBinding, writablePaths: ["src", "test"] }),
+  } });
+  const sealed = (await context.authority.create(bound)).grant;
+  assert.equal(sealed.executionSource.kind, "review_repair");
+  assert.deepEqual(await context.authority.verify(sealed), sealed);
+  const unrelated = structuredClone(enabled);
+  unrelated.codeExecutor.conflictPreparation.headMirrorsByRepository["contributor/other"] = "D:\\changed-unrelated.git";
+  context.activate(unrelated);
+  assert.deepEqual(await context.restart().verify(sealed), sealed);
+  const disabled = structuredClone(unrelated);
+  disabled.githubActions.automaticOwnPrRepair = false;
+  context.activate(disabled);
+  await assert.rejects(context.authority.create(bound));
+  await assert.rejects(context.restart().verify(sealed));
+  context.activate(unrelated);
+  await assert.rejects(context.restart().verify(sealed));
+});
 
 function activateHistory(context, targetVersion, change) {
   for (let version = 2; version <= targetVersion; version += 1) {

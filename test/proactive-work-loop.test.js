@@ -2416,6 +2416,44 @@ function structuredBrainFailure(code) {
   );
 }
 
+test("own PR repair decisions receive complete feedback before choosing an action", async () => {
+  for (const changedDuringDecision of [false, true]) {
+    const time = controlledClock();
+    const source = workItem(42, { type: "role", id: "developer" });
+    const event = {
+      schemaVersion: 1, eventId: "review-event-42", contentDigest: "3".repeat(64),
+      eventType: "pull_request.updated", occurredAt: time.clock(),
+      source: { provider: "github", scopeId: "github-dashboard" },
+      subject: { id: "github:pr:acme/repo#42", repository: "acme/repo", number: 42 },
+      payload: { relation: "authored", nextAction: "address_review", headRefOid: "2".repeat(40) },
+    };
+    source.event = event;
+    source.source = { kind: "pull_request", workKey: "pr:acme/repo#42", activeRevision: 1,
+      revisions: [{ headRevision: 1 }],
+      current: { event, eventId: event.eventId, eventDigest: event.contentDigest,
+        headRefOid: event.payload.headRefOid, inputDigest: "4".repeat(64) } };
+    const feedback = { schemaVersion: 1, headRefOid: event.payload.headRefOid,
+      reviewFeedbackDigest: "5".repeat(64), feedback: { changeRequests: [],
+        threads: Array.from({ length: 12 }, (_, id) => ({ id: `thread-${id}`, comments: [{ body: "review detail ".repeat(500) }] })) } };
+    let reads = 0;
+    let received;
+    const ledger = new FakeLedger({ source: [source], time });
+    const directory = new FakeRoleDirectory({ developer: worker({ roleId: "developer",
+      async decide(input) { received = input; return completeDecision(); } }) });
+    const loop = createLoop({ ledger, directory, time,
+      reviewRepairContextReader: { async readBinding({ inputBinding }) {
+        assert.equal(inputBinding.headRefOid, event.payload.headRefOid);
+        reads += 1;
+        return { ...clone(feedback), reviewFeedbackDigest: changedDuringDecision && reads > 1 ? "6".repeat(64) : feedback.reviewFeedbackDigest };
+      } },
+    });
+    await loop.runCycle({ trigger: "manual" });
+    assert.deepEqual(received.reviewRepairFeedback, feedback);
+    assert.equal(reads, 2);
+    assert.equal(ledger.outbox.length, changedDuringDecision ? 0 : 1);
+  }
+});
+
 test("automatic Review skips old incoming work and a disabled switch without consuming claims", async () => {
   for (const enabled of [true, false]) {
     const time = controlledClock();
