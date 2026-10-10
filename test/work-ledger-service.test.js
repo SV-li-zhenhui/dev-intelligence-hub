@@ -11507,6 +11507,13 @@ test("attention reads reuse validated state only when durable content is unchang
   const originalState = fixture.service.state;
   const originalVersion = fixture.service.durableContentVersion;
   const valueReads = store.versionedValueReads;
+  let authorityReads = 0;
+  const readVersioned = store.readVersioned.bind(store);
+  store.readVersioned = (...args) => { authorityReads += 1; return readVersioned(...args); };
+  assert.deepEqual(await fixture.service.areAttentionRequestsCurrent([
+    authority, { ...authority, requestKey: "not-the-active-intent" },
+  ]), [true, false]);
+  assert.equal(authorityReads, 1, "a maintenance batch must share one durable authority read");
   store.read = () => { throw new Error("Unchanged attention queries must not decode the entire ledger again"); };
   assert.equal(await fixture.service.isAttentionRequestCurrent(authority), true);
   assert.equal(await fixture.service.isAttentionRequestCurrent(authority), true);

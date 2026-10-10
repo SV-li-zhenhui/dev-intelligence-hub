@@ -3690,6 +3690,217 @@ test("scheduled and manual employees wait for refresh without an external queue"
   }
 });
 
+test("maintenance requests are a read-only separate endpoint", async () => {
+  let reads = 0;
+  const faults = { items: [{ requestId: `attention-${"a".repeat(64)}`, maintenanceCode: "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED" }], total: 1 };
+  await withServer(async ({ server }) => {
+    const result = await request(server, { path: "/api/attention/maintenance" });
+    assert.equal(result.status, 200);
+    assert.deepEqual(JSON.parse(result.body), faults);
+    assert.equal((await request(server, { path: "/api/attention/maintenance?unknown=1" })).status, 400);
+    assert.equal(reads, 1);
+  }, { attentionBrowser: { async listMaintenance() { reads += 1; return faults; } } });
+});
+
+test("Review runs while a developer is busy and drains on shutdown", async () => {
+  const developerStarted = deferred();
+  const releaseDeveloper = deferred();
+  let reviewRunning = false;
+  const releaseReview = deferred();
+  const timers = [];
+  const application = {
+    config: { refreshMinutes: 7 },
+    employeeRegistry: {
+      schedules: () => [{ id: "developer", intervalMinutes: 10 }, { id: "pr-engineer", intervalMinutes: 10 }],
+      async runSelected(ids) {
+        if (ids[0] === "developer") {
+          developerStarted.resolve();
+          await releaseDeveloper.promise;
+        }
+        if (ids[0] === "pr-engineer") {
+          reviewRunning = true;
+          await releaseReview.promise;
+        }
+      },
+    },
+    refreshService: { async refresh() {} },
+  };
+  const background = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) { const timer = { callback, unref() {} }; timers.push(timer); return timer; },
+    clearIntervalFn() {},
+  });
+  try {
+    await background.initialRefresh;
+    const developer = timers[1].callback();
+    await developerStarted.promise;
+    const review = timers[2].callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(reviewRunning, true,
+      "a busy developer must not hold the Review scheduler");
+    let stopped = false;
+    const stopping = background.stop().then(() => { stopped = true; });
+    releaseDeveloper.resolve();
+    await developer;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(stopped, false, "shutdown must still drain the independent Review");
+    releaseReview.resolve();
+    await Promise.all([review, stopping]);
+  } finally {
+    releaseDeveloper.resolve(); releaseReview.resolve();
+    await background.stop();
+  }
+});
+
+test("Review waits for fresh facts, coalesces ticks and cancels a startup wait on stop", async () => {
+  const releaseRefresh = deferred();
+  const releaseReview = deferred();
+  const timers = [];
+  let runs = 0;
+  const application = {
+    config: { refreshMinutes: 7 },
+    employeeRegistry: {
+      schedules: () => [{ id: "pr-engineer", intervalMinutes: 10 }],
+      async runSelected(ids) {
+        if (ids[0] !== "pr-engineer") return;
+        runs += 1;
+        await releaseReview.promise;
+      },
+    },
+    refreshService: { async refresh() { await releaseRefresh.promise; } },
+  };
+  const background = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) { const timer = { callback, unref() {} }; timers.push(timer); return timer; },
+    clearIntervalFn() {},
+  });
+  try {
+    const first = timers[1].callback();
+    const second = timers[1].callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(runs, 0);
+    releaseRefresh.resolve();
+    await background.initialRefresh;
+    assert.equal(runs, 1);
+    releaseReview.resolve();
+    await Promise.all([first, second]);
+  } finally {
+    releaseRefresh.resolve(); releaseReview.resolve();
+    await background.stop();
+  }
+
+  const pendingRefresh = deferred();
+  const pending = startApplicationBackgroundWork({ ...application, refreshService: {
+    async refresh() { await pendingRefresh.promise; },
+  } }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
+  const review = pending.runEmployee("pr-engineer");
+  const stopping = pending.stop();
+  pendingRefresh.resolve();
+  await Promise.all([review, stopping, pending.initialRefresh]);
+  assert.equal(runs, 1, "stopping before startup facts must not run Review");
+});
+
+test("Review without fresh facts does not hold maintenance admission", { timeout: 2_000 }, async () => {
+  const timers = [];
+  const gate = new OperationalQuiescenceGate({ drainTimeoutMs: 100 });
+  let runs = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7 },
+    operations: { admission: { run: gate.run.bind(gate) } },
+    employeeRegistry: {
+      schedules: () => [{ id: "pr-engineer", intervalMinutes: 10 }],
+      async runSelected() { runs += 1; },
+    },
+    refreshService: { async refresh() { throw new Error("upstream unavailable"); } },
+  }, {
+    setIntervalFn(callback) { const timer = { callback, unref() {} }; timers.push(timer); return timer; },
+    clearIntervalFn() {}, reportError() {},
+  });
+  try {
+    await assert.rejects(background.initialRefresh, /upstream unavailable/);
+    const review = timers[1].callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(gate.readStatus().activeOperations, 0);
+    const token = await gate.enter();
+    gate.leave(token);
+    await review;
+    assert.equal(runs, 0);
+  } finally { await background.stop(); }
+});
+
+test("maintenance drains active Review and blocks manual Review while closed", async () => {
+  const gate = new OperationalQuiescenceGate();
+  const started = deferred();
+  const release = deferred();
+  const errors = [];
+  let reviews = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7 },
+    operations: { admission: { run: gate.run.bind(gate) } },
+    employeeRegistry: {
+      schedules: () => [],
+      async runSelected(ids) {
+        if (ids[0] !== "pr-engineer") return;
+        reviews += 1; started.resolve(); await release.promise;
+      },
+    },
+    refreshService: { async refresh() {} },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError(error) { errors.push(error); } });
+  try {
+    await background.initialRefresh;
+    const review = background.runEmployee("pr-engineer");
+    await started.promise;
+    assert.equal(gate.readStatus().activeOperations, 1);
+    const closing = gate.enter();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(gate.readStatus().mode, "closing");
+    release.resolve();
+    await review;
+    const token = await closing;
+    await assert.rejects(background.runEmployee("pr-engineer"), { code: "SYSTEM_QUIESCING" });
+    assert.equal(reviews, 1);
+    gate.leave(token);
+    assert.equal(errors.length, 1);
+  } finally { release.resolve(); await background.stop(); }
+});
+
+test("Review waits for a newer refresh queued behind a developer", async () => {
+  const timers = [];
+  const developerStarted = deferred();
+  const releaseDeveloper = deferred();
+  const releaseRefresh = deferred();
+  let refreshes = 0;
+  let reviews = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7 },
+    employeeRegistry: {
+      schedules: () => [{ id: "developer", intervalMinutes: 10 }, { id: "pr-engineer", intervalMinutes: 11 }],
+      async runSelected(ids) {
+        if (ids[0] === "developer") { developerStarted.resolve(); await releaseDeveloper.promise; }
+        if (ids[0] === "pr-engineer") reviews += 1;
+      },
+    },
+    refreshService: { async refresh() { if (++refreshes > 1) await releaseRefresh.promise; } },
+  }, {
+    setIntervalFn(callback) { const timer = { callback, unref() {} }; timers.push(timer); return timer; },
+    clearIntervalFn() {},
+  });
+  try {
+    await background.initialRefresh;
+    const developer = timers[1].callback();
+    await developerStarted.promise;
+    const refresh = timers[0].callback();
+    const review = timers[2].callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(reviews, 0, "a known newer refresh must invalidate the admitted snapshot");
+    releaseDeveloper.resolve();
+    await developer;
+    releaseRefresh.resolve();
+    await Promise.all([refresh, review]);
+    assert.equal(reviews, 1);
+  } finally {
+    releaseDeveloper.resolve(); releaseRefresh.resolve(); await background.stop();
+  }
+});
+
 test("overlapping scheduled role and refresh ticks are coalesced", async () => {
   const roleStarted = deferred();
   const releaseRole = deferred();

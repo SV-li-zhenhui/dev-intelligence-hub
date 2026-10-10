@@ -86,6 +86,51 @@ async function readyInbox({
   return { inbox, store, lease };
 }
 
+test("maintenance failures stay readable without blocking business questions or creating answers", async () => {
+  const { inbox, store } = await readyInbox();
+  const maintenance = await inbox.create(attentionRequest({
+    requestKey: "session-failure",
+    context: [{ label: "判断依据", value: "系统已安全停止（STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED）" }],
+    choices: [{ id: "configured-retry", label: "修复后重试" }],
+  }));
+  const business = await inbox.create(attentionRequest({ requestKey: "business-question" }));
+  const before = structuredClone(store.value);
+  assert.equal((await inbox.next()).requestId, business.requestId);
+  const faults = await inbox.listMaintenance();
+  assert.equal(faults.total, 1);
+  assert.equal(faults.items[0].requestId, maintenance.requestId);
+  assert.equal(faults.items[0].maintenanceCode, "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+  assert.deepEqual(store.value, before, "reading maintenance must not answer, delete or retry tasks");
+  await inbox.answer(response(faults.items[0], { type: "choice", choiceId: "configured-retry" }));
+  assert.equal((await inbox.listMaintenance()).total, 0);
+  assert.equal((await inbox.readOutbox()).items.length, 1);
+});
+
+test("maintenance lists validate one batch and omit stale task bindings without writes", async () => {
+  const batches = [];
+  const { inbox, store } = await readyInbox({ authority: {
+    async isCurrent() { return true; },
+    async areAttentionRequestsCurrent(bindings) { batches.push(bindings); return [true, false]; },
+  } });
+  const requests = [];
+  for (const requestKey of ["current-fault", "stale-fault"]) {
+    requests.push(await inbox.create(attentionRequest({ requestKey,
+      context: [{ label: "判断依据", value: "系统已安全停止（STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED）" }],
+      choices: [{ id: "configured-retry", label: "修复后重试" }],
+    })));
+  }
+  const before = structuredClone(store.value);
+  const writes = store.writeCount;
+  const faults = await inbox.listMaintenance();
+  assert.deepEqual(batches, [["current-fault", "stale-fault"].map((requestKey) => ({
+    requestKey, producer: attentionRequest().producer,
+  }))]);
+  assert.equal(faults.total, 1);
+  assert.deepEqual(faults.items.map(({ requestId }) => requestId), [requests[0].requestId]);
+  assert.equal(store.writeCount, writes);
+  assert.deepEqual(store.value, before);
+});
+
 test("retired producer questions are archived without an answer, outbox effect, or history loss", async () => {
   const authority = {
     isCurrent: async ({ requestKey }) => requestKey === "current-question",

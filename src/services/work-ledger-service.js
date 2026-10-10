@@ -787,7 +787,21 @@ export class WorkLedgerService {
   }
 
   async isAttentionRequestCurrent(input = {}) {
+    return (await this.areAttentionRequestsCurrent([input]))[0];
+  }
+
+  async areAttentionRequestsCurrent(inputs) {
     this.#assertReady();
+    if (!Array.isArray(inputs) || inputs.length > 1_000) {
+      throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "内部请示授权查询无效");
+    }
+    const bindings = inputs.map((input) => this.#normalizeAttentionAuthority(input));
+    if (bindings.length === 0) return [];
+    const state = await this.#readAttentionAuthorityState();
+    return bindings.map((binding) => this.#attentionCurrentInState(state, binding));
+  }
+
+  #normalizeAttentionAuthority(input) {
     if (
       !hasExactLedgerKeys(input, ["requestKey", "producer"]) ||
       !isPlainLedgerObject(input.producer) ||
@@ -815,7 +829,10 @@ export class WorkLedgerService {
         "内部请示授权查询无效",
       );
     }
-    const state = await this.#readAttentionAuthorityState();
+    return { requestKey, roleId, workItemId };
+  }
+
+  #attentionCurrentInState(state, { requestKey, roleId, workItemId }) {
     const item = state.items.find(
       (candidate) => candidate.itemId === workItemId,
     );

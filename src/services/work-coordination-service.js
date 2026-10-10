@@ -359,6 +359,7 @@ export class WorkCoordinationService {
   #reconcileChangePackageApplicationResults;
   #projectCodeJobMemory;
   #runProposals;
+  #runReviewProposals;
   #reconcileProposals;
   #reconcileAttention;
   #wakeConditions;
@@ -376,6 +377,7 @@ export class WorkCoordinationService {
     changePackageApplicationResultReconciler,
     codeJobMemoryProjector,
     proposalRunner,
+    reviewProposalRunner = null,
     proposalResultReconciler,
     attentionResultReconciler,
     conditionWaker,
@@ -420,6 +422,9 @@ export class WorkCoordinationService {
     this.#runProposals = proposalRunner == null
       ? skipProposalExecution
       : requirePort(proposalRunner, "runCycle", "proposalRunner");
+    this.#runReviewProposals = reviewProposalRunner === null
+      ? null
+      : requirePort(reviewProposalRunner, "runCycle", "reviewProposalRunner");
     this.#reconcileProposals = requirePort(
       proposalResultReconciler,
       "runCycle",
@@ -518,7 +523,10 @@ export class WorkCoordinationService {
               signal: options.signal,
             })],
         ]
-      : [];
+      : options.roleId === "pr-engineer"
+        ? [["attention_results", () =>
+            this.#reconcileAttention({ limit: this.#defaults.attentionLimit })]]
+        : [];
     if (options.includeWork) {
       stages.push([
         "work",
@@ -534,8 +542,20 @@ export class WorkCoordinationService {
     }
     stages.push([
       "dispatch",
-      () => this.#dispatch({ limit: this.#defaults.dispatchLimit }),
+      () => this.#dispatch({
+        limit: this.#defaults.dispatchLimit,
+        ...(options.roleId === "pr-engineer" ? { roleId: options.roleId } : {}),
+      }),
     ]);
+    if (options.roleId === "pr-engineer" && this.#runReviewProposals !== null) {
+      stages.push(
+        ["review_publication", () => this.#runReviewProposals({
+          limit: this.#defaults.proposalLimit,
+          ...(options.signal === null ? {} : { signal: options.signal }),
+        })],
+        ["review_results", () => this.#reconcileProposals({ limit: this.#defaults.proposalLimit })],
+      );
+    }
     const result = {
       trigger: options.trigger,
       includeWork: options.includeWork,

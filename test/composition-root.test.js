@@ -479,6 +479,7 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
     consumer: { async readOutbox() {} },
     browser: {
       async next() {},
+      async listMaintenance() { return { items: [], total: 0 }; },
       async answer() {},
       async reject() {},
       async later() {},
@@ -1467,6 +1468,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   const attentionProducer = { async create() {} };
   const attentionConsumer = { async readOutbox() {} };
   const attentionBrowser = {
+    async listMaintenance() { return { items: [], total: 0 }; },
     async next() {
       return { id: "attention-1" };
     },
@@ -1860,6 +1862,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   assert.deepEqual(Object.keys(application.attentionBrowser).sort(), [
     "answer",
     "later",
+    "listMaintenance",
     "next",
     "reject",
   ]);
@@ -2368,6 +2371,7 @@ test("enabled unified memory exposes search only and projects the existing work 
       consumer: { async readOutbox() {} },
       browser: {
         async next() {}, async answer() {}, async reject() {}, async later() {},
+        async listMaintenance() { return { items: [], total: 0 }; },
       },
       async close() {},
     }),

@@ -1556,6 +1556,21 @@ test("legacy in-flight intents with unknowable bindings never call policy or dow
   assert.equal(proposals.calls.length, 0);
 });
 
+test("role dispatch filters before limiting and leaves other roles unclaimed", async () => {
+  const developer = conflictWorkPair(1);
+  const review = workPair(2, reviewIntent(), { target: { type: "role", id: "pr-engineer" } });
+  const { dispatcher, ledger, proposals } = fixture([developer, review], {
+    policy: policy({ githubReviewRoles: ["pr-engineer"] }),
+    conflictExecutionSourcePreparer: { async prepare() { throw new Error("unrelated developer preparation ran"); } },
+  });
+  const result = await dispatcher.dispatchPending({ limit: 1, roleId: "pr-engineer" });
+  assert.equal(result.delivered, 1);
+  assert.deepEqual(ledger.claimCalls.map(({ intentId }) => intentId), [review.outbox.intentId]);
+  assert.equal(ledger.outbox[0].status, "pending");
+  assert.equal(proposals.calls.length, 1);
+  await assert.rejects(dispatcher.dispatchPending({ roleId: "invalid role" }), /roleId is invalid/);
+});
+
 test("legacy binding quarantine does not consume the actionable dispatch limit", async () => {
   const time = controlledClock();
   const legacy = workPair(13, askUserIntent(), {

@@ -1970,9 +1970,9 @@ export async function createApplication({
       });
     }
     const proposalRunners = [];
+    let reviewProposalRunner = null;
     if (githubProposalExecutionEnabled) {
-      proposalRunners.push(
-        githubReviewProposalRunnerFactory({
+      reviewProposalRunner = githubReviewProposalRunnerFactory({
           enabled: true,
           runner:
             workProposalRuntime.runners[GITHUB_REVIEW_PROPOSAL_RUNNER_ID],
@@ -1998,8 +1998,8 @@ export async function createApplication({
           ...(workCoordinationDependencies.clock
             ? { clock: workCoordinationDependencies.clock }
             : {}),
-        }),
-      );
+        });
+      proposalRunners.push(reviewProposalRunner);
     }
     if (pullRequestExternalActionExecutionEnabled) {
       proposalRunners.push(
@@ -2434,6 +2434,7 @@ export async function createApplication({
         codeJobChangePackageDispatcher,
         changePackageApplicationResultReconciler,
         proposalRunner,
+        reviewProposalRunner,
         proposalResultReconciler,
         attentionResultReconciler,
         conditionWaker,
@@ -2493,7 +2494,7 @@ export async function createApplication({
       );
       attentionBrowser = frozenPort(
         attentionInboxRuntime.browser,
-        ["next", "answer", "reject", "later"],
+        ["next", "answer", "reject", "later", "listMaintenance"],
         "attentionInboxRuntime.browser",
       );
       attentionCoordinator = frozenPort(

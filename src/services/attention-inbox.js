@@ -1,3 +1,4 @@
+import { maintenanceAttentionCode } from "../domain/maintenance-attention.js";
 import {
   assertAttentionAllowedKeys,
   attentionDigest,
@@ -115,6 +116,9 @@ export class AttentionInbox {
     this.operationQueue = operationQueue;
     this.clock = clock;
     this.isCurrent = currentAuthority(authority);
+    this.areCurrent = typeof authority?.areAttentionRequestsCurrent === "function"
+      ? authority.areAttentionRequestsCurrent.bind(authority)
+      : (bindings) => Promise.all(bindings.map((binding) => this.isCurrent(binding)));
     this.readRetirement = typeof authority?.readAttentionRequestRetirement === "function"
       ? authority.readAttentionRequestRetirement.bind(authority)
       : async () => null;
@@ -195,6 +199,7 @@ export class AttentionInbox {
         .filter(
           (entry) =>
             entry.status === "pending" &&
+            maintenanceAttentionCode(entry) === null &&
             !deferredBindings.has(
               `${entry.requestId}\u0000${entry.contentDigest}`,
             ),
@@ -216,6 +221,20 @@ export class AttentionInbox {
       return Promise.reject(responsePortError("text 或 choice"));
     }
     return this.#resolve(response);
+  }
+
+  listMaintenance() {
+    return this.#query(async () => {
+      const candidates = this.state.items.filter((item) => item.status === "pending" && maintenanceAttentionCode(item) !== null);
+      const current = await this.areCurrent(candidates.map((item) => ({
+        requestKey: item.requestKey, producer: cloneAttentionValue(item.producer),
+      })));
+      const visible = candidates.filter((_item, index) => current[index] === true);
+      return {
+        items: visible.slice(0, 100).map((item) => ({ ...projectAttentionRequest(item), maintenanceCode: maintenanceAttentionCode(item) })),
+        total: visible.length,
+      };
+    });
   }
 
   reject(value) {

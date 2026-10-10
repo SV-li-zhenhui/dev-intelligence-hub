@@ -220,14 +220,20 @@ function validateDispatcherId(value) {
   return value;
 }
 
-function dispatchLimit(options) {
-  const entries = exactDataMap(options, Object.hasOwn(options, "limit") ? ["limit"] : []);
-  if (!entries) throw new TypeError("dispatchPending options are invalid");
+function dispatchOptions(options) {
+  const entries = dataMap(options);
+  if (!entries || [...entries.keys()].some((key) => !["limit", "roleId"].includes(key))) {
+    throw new TypeError("dispatchPending options are invalid");
+  }
   const limit = entries.has("limit") ? entries.get("limit") : 50;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_DISPATCH_BATCH) {
     throw new TypeError(`limit must be between 1 and ${MAX_DISPATCH_BATCH}`);
   }
-  return limit;
+  const roleId = entries.has("roleId") ? entries.get("roleId") : null;
+  if (entries.has("roleId") && (typeof roleId !== "string" || !SAFE_ROLE_ID.test(roleId))) {
+    throw new TypeError("roleId is invalid");
+  }
+  return { limit, roleId };
 }
 
 function normalizedTimestamp(value) {
@@ -1006,9 +1012,9 @@ export class WorkIntentDispatcher {
   }
 
   async dispatchPending(options = {}) {
-    const limit = dispatchLimit(options);
+    const { limit, roleId } = dispatchOptions(options);
     const now = this.#now();
-    const { candidates, quarantined } = await this.#eligibleOutbox(now, limit);
+    const { candidates, quarantined } = await this.#eligibleOutbox(now, limit, roleId);
     const result = emptyResult(candidates.length + quarantined.length);
     for (const candidate of quarantined) {
       const isolated = bindingUncertain(
@@ -1033,7 +1039,7 @@ export class WorkIntentDispatcher {
     return result;
   }
 
-  async #eligibleOutbox(now, limit) {
+  async #eligibleOutbox(now, limit, roleId) {
     const [pending, dispatching] = await Promise.all([
       this.#readAllPages(this.#ledger.listOutbox, { status: "pending" }, "outbox"),
       this.#readAllPages(
@@ -1076,6 +1082,7 @@ export class WorkIntentDispatcher {
     const candidates = [];
     const quarantined = [];
     for (const entry of ordered) {
+      if (roleId !== null && entry.requestedBy?.roleId !== roleId) continue;
       if (hasLegacyUnknownBinding(entry)) {
         if (quarantined.length < limit) quarantined.push(entry);
       } else if (candidates.length < limit) {

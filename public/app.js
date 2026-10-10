@@ -11,6 +11,7 @@ import {
 } from "./confirmation-dialog-support.js";
 import { postAttentionDuringFactRefresh } from "./attention-submission.js";
 import { internalAttentionDisplay } from "./internal-attention-display.js";
+import { maintenanceAttentionMarkup } from "./maintenance-attention.js";
 import { summarizeDashboardErrors } from "./status-error-summary.js";
 import { bindConfigurationFormController } from "./configuration-form-controller.js";
 import {
@@ -94,6 +95,9 @@ let employeeRolesError = "";
 let employeeRolesRequestSequence = 0;
 let lastAppliedEmployeeRolesRequest = 0;
 let employeeRolesAbortController = null;
+let maintenanceAttention = { items: [], total: 0, loaded: false, error: "" };
+let maintenanceRequestSequence = 0;
+let maintenanceReadInFlight = null;
 const manualWorkAssignmentAttempts = createManualWorkAssignmentAttempts();
 let currentView = "overview";
 let itemIndex = new Map();
@@ -358,7 +362,7 @@ function employeeStateLabel(value) {
   return {
     disabled: "未启用",
     paused: "已暂停",
-    observing: "主动观察中",
+    observing: "已启用",
     working: "正在工作",
     waiting_user: "等待你确认",
     degraded: "部分能力异常",
@@ -957,6 +961,7 @@ function employeesView() {
       : '<div class="empty">尚未配置数字员工。</div>';
   return `${reviewFlowMarkup()}
     ${confirmationCenterView()}
+    ${maintenanceAttentionMarkup(maintenanceAttention)}
     <section class="section">
       <div class="section-heading"><h2>岗位编制</h2><span>${employeeRoles.length} ROLES · 每个岗位可独立配置大脑与权限</span></div>
       ${loadError}
@@ -1788,6 +1793,13 @@ function render() {
   });
   content.querySelectorAll("[data-role-run]").forEach((button) => {
     button.addEventListener("click", handleRoleRun);
+  });
+  content.querySelector("[data-maintenance-reload]")?.addEventListener("click", () => void loadMaintenanceAttention());
+  content.querySelectorAll("[data-maintenance-attention]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const item = maintenanceAttention.items.find(({ requestId }) => requestId === button.dataset.maintenanceAttention);
+      if (item) showConfirmationEntry({ kind: "internal_request", item, key: `internal:${item.requestId}:${item.contentDigest}` }, 1);
+    });
   });
   content.querySelectorAll("[data-role-work]").forEach((button) => {
     button.addEventListener("click", handleRoleWork);
@@ -2842,6 +2854,7 @@ async function handleEmployeeRun(event) {
 }
 
 async function loadEmployeeRoles() {
+  if (currentView === "employees") void loadMaintenanceAttention();
   const sequence = ++employeeRolesRequestSequence;
   employeeRolesAbortController?.abort();
   const controller = new AbortController();
@@ -2883,6 +2896,39 @@ async function loadEmployeeRoles() {
       employeeRolesAbortController = null;
     }
   }
+}
+
+function loadMaintenanceAttention({ afterCurrent = false } = {}) {
+  if (maintenanceReadInFlight) {
+    return afterCurrent
+      ? maintenanceReadInFlight.then(() => loadMaintenanceAttention())
+      : maintenanceReadInFlight;
+  }
+  const tracked = readMaintenanceAttention().finally(() => {
+    if (maintenanceReadInFlight === tracked) maintenanceReadInFlight = null;
+  });
+  maintenanceReadInFlight = tracked;
+  return tracked;
+}
+
+async function readMaintenanceAttention() {
+  const sequence = ++maintenanceRequestSequence;
+  try {
+    const response = await fetch("/api/attention/maintenance", { cache: "no-store", signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) throw new Error(`读取系统故障失败（${response.status}）`);
+    const payload = await response.json();
+    if (!Array.isArray(payload.items) || !Number.isSafeInteger(payload.total) || payload.total < payload.items.length) {
+      throw new Error("系统故障列表格式无效");
+    }
+    if (sequence !== maintenanceRequestSequence) return;
+    const next = { items: payload.items, total: payload.total, loaded: true, error: "" };
+    if (JSON.stringify(next) === JSON.stringify(maintenanceAttention)) return;
+    maintenanceAttention = next;
+  } catch (error) {
+    if (sequence !== maintenanceRequestSequence) return;
+    maintenanceAttention = { ...maintenanceAttention, loaded: true, error: error.message || "读取系统故障失败" };
+  }
+  if (dashboard && currentView === "employees") render();
 }
 
 async function handleRoleControl(event) {
@@ -4396,6 +4442,7 @@ async function submitInternalAttention(operation, answer) {
   activeInternalAttention = null;
   activeConfirmationKey = "";
   invalidateConfirmationQueueSnapshot();
+  if (item.maintenanceCode) void loadMaintenanceAttention({ afterCurrent: true });
   const completedMessage = operation === "answer"
     ? `答复已写入本地台账，原任务将重新排队给 ${roleId} 继续处理；可在“主动工作台账”追踪。`
     : operation === "reject"
@@ -5461,6 +5508,7 @@ function activateView(view, { focusHeading = true } = {}) {
   }
   currentView = view;
   render();
+  if (currentView === "employees") void loadMaintenanceAttention();
   if (focusHeading) pageTitle.focus({ preventScroll: true });
   if (currentView === "configuration") {
     void loadConfiguration();

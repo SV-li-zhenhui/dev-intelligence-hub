@@ -3545,6 +3545,15 @@ export function createDashboardServer(
         sendJson(response, 200, next);
         return;
       }
+      if (request.method === "GET" && url.pathname === "/api/attention/maintenance") {
+        requireNoQuery(url, "维护故障查询参数无效");
+        const browser = application.attentionBrowser;
+        const result = typeof browser?.listMaintenance === "function"
+          ? await runConfirmationRead(backgroundWork, () => browser.listMaintenance())
+          : { items: [], total: 0 };
+        sendJson(response, 200, result);
+        return;
+      }
       const internalAttentionAction = url.pathname.match(
         /^\/api\/attention\/internal\/(attention-[a-f0-9]{64})\/(answer|reject|later)$/,
       );
@@ -4057,10 +4066,53 @@ export function startApplicationBackgroundWork(
   );
   let backgroundOperationActive = false;
   let factsReady = false;
+  const reviewFactWaiters = new Set();
+  let activeReviewCycles = 0;
   let pendingFactCycles = 0;
   let factCycleSequence = 0;
+  let readyFactCycleSequence = 0;
   const coalescedAgencyCycles = new Map();
   const coalescedRefreshCycles = new Map();
+
+  function releaseReviewFactWaiters(ready) {
+    for (const resolve of reviewFactWaiters) resolve(ready);
+    reviewFactWaiters.clear();
+  }
+
+  function waitForReviewFacts() {
+    if (stopped) return Promise.resolve(false);
+    if (factsReady && readyFactCycleSequence === factCycleSequence) return Promise.resolve(true);
+    if (pendingFactCycles === 0) return Promise.resolve(false);
+    return new Promise((resolve) => reviewFactWaiters.add(resolve));
+  }
+
+  function isIndependentReviewCycle(options) {
+    return !options.includeLegacyEmployees &&
+      options.employeeIds?.length === 1 && options.employeeIds[0] === "pr-engineer";
+  }
+
+  async function runIndependentReview(options) {
+    options.signal.throwIfAborted();
+    if (stopped || !factsReady || readyFactCycleSequence !== factCycleSequence) {
+      return { skipped: "facts_not_ready" };
+    }
+    activeReviewCycles += 1;
+    try {
+      // The role runs its own scoped coordination and publication. General
+      // code jobs and memory projection must not hold up incoming Reviews.
+      await runDrainParticipant(DRAIN_PARTICIPANTS.employeeExecution, () => {
+        const runOptions = backgroundOperationOptions({ trigger: options.trigger }, options.signal);
+        return typeof employeeRegistry.runSelected === "function"
+          ? employeeRegistry.runSelected(["pr-engineer"], runOptions)
+          : employeeRegistry.run("pr-engineer", runOptions);
+      });
+      options.signal.throwIfAborted();
+      await recoverReviewHandoffs(options.signal);
+      return { skipped: null };
+    } finally {
+      activeReviewCycles -= 1;
+    }
+  }
 
   function reportBackgroundError(error) {
     try {
@@ -4316,6 +4368,13 @@ export function startApplicationBackgroundWork(
     priority,
     { admitOnDequeue = false } = {},
   ) {
+    if (isIndependentReviewCycle(options)) {
+      // Waiting for a refresh is not active work: maintenance must be able to
+      // close admission without needing another admitted refresh to release it.
+      return waitForReviewFacts().then((ready) => ready && !stopped
+        ? operationalAdmission.run(() => runIndependentReview(options))
+        : { skipped: "facts_not_ready" });
+    }
     const operation = () => admitOnDequeue
       ? operationalAdmission.run(() => performAgencyCycle(options))
       : performAgencyCycle(options);
@@ -4368,6 +4427,7 @@ export function startApplicationBackgroundWork(
     priority,
     runOptions = {},
   ) {
+    if (isIndependentReviewCycle(options)) runOptions = { ...runOptions, admitOnDequeue: true };
     return runCoalescedTracked(
       coalescedAgencyCycles,
       key,
@@ -4385,7 +4445,7 @@ export function startApplicationBackgroundWork(
   }
 
   function enqueueFactCycle(factOperation, signal = workController.signal) {
-    factCycleSequence += 1;
+    const sequence = ++factCycleSequence;
     pendingFactCycles += 1;
     const operation = async () => {
       try {
@@ -4408,6 +4468,8 @@ export function startApplicationBackgroundWork(
         signal.throwIfAborted();
         if (stopped) return result;
         factsReady = true;
+        readyFactCycleSequence = sequence;
+        if (readyFactCycleSequence === factCycleSequence) releaseReviewFactWaiters(true);
         if (pendingFactCycles === 1) {
           confirmationAccess.open();
           try {
@@ -4425,6 +4487,7 @@ export function startApplicationBackgroundWork(
       } finally {
         pendingFactCycles -= 1;
         if (stopped) factsReady = false;
+        if (pendingFactCycles === 0 && !factsReady) releaseReviewFactWaiters(false);
       }
     };
     return enqueueBackgroundOperation(
@@ -4501,6 +4564,7 @@ export function startApplicationBackgroundWork(
     if (stopPromise) return stopPromise;
     stopped = true;
     factsReady = false;
+    releaseReviewFactWaiters(false);
     workController.abort(shutdownAbort());
     for (const timer of timers) clearIntervalFn(timer);
     const tasksToDrain = [...activeTasks];
@@ -4531,7 +4595,7 @@ export function startApplicationBackgroundWork(
     return backgroundDrainStatus({
       runDrainParticipant,
       activeTaskCount: activeTasks.size,
-      backgroundOperationActive,
+      backgroundOperationActive: backgroundOperationActive || activeReviewCycles > 0,
       confirmationOperationCount:
         confirmationAccess.activeCount() + confirmationReadAccess.activeCount(),
       queuedOperationCount: [...backgroundQueues.values()]

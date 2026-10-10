@@ -93,6 +93,26 @@ test("agency executes proposals before reconciling their durable results", async
   assert.equal(result.stages.dispatch.ok, true);
 });
 
+test("the PR engineer publishes its Review without waiting for general code jobs", async () => {
+  const calls = [];
+  let reviewReady = false;
+  const { service } = fixture({
+    codeJobRunner: { async runCycle() { throw new Error("must not run general code jobs"); } },
+    attentionResultReconciler: { async runCycle() { reviewReady = true; calls.push("attention_results"); } },
+    workLoop: { async runCycle() {
+      assert.equal(reviewReady, true, "answered Review must be requeued before scanning the role");
+    } },
+    reviewProposalRunner: { async runCycle() { calls.push("publish_review"); } },
+    proposalResultReconciler: { async runCycle() { calls.push("review_results"); } },
+    dispatcher: { async dispatchPending(options) {
+      assert.deepEqual(options, { limit: 50, roleId: "pr-engineer" });
+      calls.push("dispatch");
+    } },
+  });
+  await service.runCycle({ roleId: "pr-engineer" });
+  assert.deepEqual(calls, ["attention_results", "dispatch", "publish_review", "review_results"]);
+});
+
 test("proposal execution is a safe no-op when no runner is configured", async () => {
   const calls = [];
   const service = new WorkCoordinationService({
