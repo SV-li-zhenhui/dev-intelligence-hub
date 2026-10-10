@@ -11452,7 +11452,9 @@ test("new Issue evidence revokes an older question for the same role", async () 
 });
 
 test("attention authority reads a newer durable ledger written by another instance", async () => {
-  const fixture = await createFixture({ records: [issueAssignment(1)] });
+  const fixture = await createFixture({
+    records: [issueAssignment(1)], store: new ContentVersionMemoryStore(),
+  });
   await prepareAttentionResult(
     fixture,
     { type: "text", text: "old answer" },
@@ -11487,6 +11489,82 @@ test("attention authority reads a newer durable ledger written by another instan
   assert.deepEqual(await fixture.service.readAttentionRequestRetirement(authority), {
     status: "cancelled", workItemRevision: retired.revision, reason: "issue_assignment_superseded",
   });
+});
+
+test("attention reads reuse validated state only when durable content is unchanged", async () => {
+  const store = new ContentVersionMemoryStore();
+  const fixture = await createFixture({ records: [issueAssignment(1)], store });
+  await prepareAttentionResult(
+    fixture,
+    { type: "text", text: "old answer" },
+    { workerId: "configured-requirements-analyst", roleId: "requirements-analyst" },
+  );
+  const waiting = (await fixture.service.listItems()).items[0];
+  const authority = {
+    requestKey: waiting.activeIntentId,
+    producer: { roleId: "requirements-analyst", workItemId: waiting.itemId },
+  };
+  const originalState = fixture.service.state;
+  const originalVersion = fixture.service.durableContentVersion;
+  const valueReads = store.versionedValueReads;
+  store.read = () => { throw new Error("Unchanged attention queries must not decode the entire ledger again"); };
+  assert.equal(await fixture.service.isAttentionRequestCurrent(authority), true);
+  assert.equal(await fixture.service.isAttentionRequestCurrent(authority), true);
+  assert.equal(await fixture.service.readAttentionRequestRetirement(authority), null);
+  assert.equal(store.versionedValueReads, valueReads);
+  assert.equal(fixture.service.state, originalState);
+  assert.equal(fixture.service.durableContentVersion, originalVersion);
+});
+
+test("attention does not pair an old question with a newer durable version during reconciliation", async () => {
+  const store = new ContentVersionMemoryStore();
+  const fixture = await createFixture({ records: [issueAssignment(1)], store });
+  await prepareAttentionResult(
+    fixture,
+    { type: "text", text: "old answer" },
+    { workerId: "configured-requirements-analyst", roleId: "requirements-analyst" },
+  );
+  const waiting = (await fixture.service.listItems()).items[0];
+  const authority = {
+    requestKey: waiting.activeIntentId,
+    producer: { roleId: "requirements-analyst", workItemId: waiting.itemId },
+  };
+  const oldState = fixture.service.state;
+  const other = new WorkLedgerService({
+    store, assignmentSource: fixture.source, exclusiveLease: new ExclusiveLease(),
+    clock: fixture.time.clock, idFactory: incrementingIds(),
+  });
+  await other.recover();
+  fixture.source.records.push(issueAssignment(2, {
+    eventType: "issue.updated", occurredAt: "2026-08-02T02:05:00.000Z",
+  }));
+  fixture.source.highWatermark = 2;
+  await other.intake();
+  const readVersioned = store.readVersioned.bind(store);
+  const newer = await readVersioned(STATE_KEY);
+  const readStarted = deferred();
+  const readRelease = deferred();
+  let intercept = true;
+  store.readVersioned = (...args) => {
+    if (!intercept) return readVersioned(...args);
+    intercept = false;
+    readStarted.resolve();
+    return readRelease.promise;
+  };
+  const reconciliation = fixture.service.readItemForReconciliation({ itemId: waiting.itemId });
+  await readStarted.promise;
+  const checked = deferred();
+  readRelease.resolve(newer);
+  queueMicrotask(() => {
+    try {
+      assert.equal(fixture.service.durableContentVersion, newer.version);
+      assert.equal(fixture.service.state, oldState);
+      fixture.service.isAttentionRequestCurrent(authority).then(checked.resolve, checked.reject);
+    } catch (error) { checked.reject(error); }
+  });
+  const current = await checked.promise;
+  await reconciliation;
+  assert.equal(current, false);
 });
 
 test("one intake batch keeps only the newest Issue assignment for one role", async () => {

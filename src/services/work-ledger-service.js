@@ -607,6 +607,7 @@ export class WorkLedgerService {
     this.limits = normalizeWorkLedgerLimits(limits);
     this.state = emptyWorkLedgerState();
     this.durableContentVersion = undefined;
+    this.attentionAuthoritySnapshot = null;
     this.graphSnapshotCache = null;
     this.roleWorkloadCache = null;
     this.ready = false;
@@ -2519,6 +2520,9 @@ export class WorkLedgerService {
         isContentVersion(writtenVersion)
           ? writtenVersion
           : undefined;
+      this.attentionAuthoritySnapshot = {
+        version: this.durableContentVersion, state: normalized,
+      };
     } catch (error) {
       await this.#discardPreparedCandidate();
       throw workLedgerError(
@@ -2592,7 +2596,9 @@ export class WorkLedgerService {
         );
       }
       this.durableContentVersion = observedVersion;
-      return emptyWorkLedgerState();
+      const state = emptyWorkLedgerState();
+      this.attentionAuthoritySnapshot = { version: observedVersion, state };
+      return state;
     }
     const durable = normalizeWorkLedgerPersistedState(stored, this.limits);
     if (
@@ -2609,6 +2615,7 @@ export class WorkLedgerService {
       );
     }
     this.durableContentVersion = observedVersion;
+    this.attentionAuthoritySnapshot = { version: observedVersion, state: durable };
     return durable;
   }
 
@@ -2617,7 +2624,22 @@ export class WorkLedgerService {
     // committed ledger directly without taking another lease or changing the
     // work ledger's version cache, so another instance cannot leave an old
     // question authorized and no nested lease can deadlock.
-    const stored = await this.store.read(WORK_LEDGER_STATE_KEY, null);
+    let stored;
+    if (typeof this.store.readVersioned === "function") {
+      // The pair is published atomically after validation or a committed write.
+      const snapshot = this.attentionAuthoritySnapshot;
+      const version = snapshot?.version;
+      const result = normalizeVersionedRead(
+        await this.store.readVersioned(WORK_LEDGER_STATE_KEY, null, {
+          ifVersion: version,
+        }),
+        version,
+      );
+      if (!result.changed) return snapshot.state;
+      stored = result.value;
+    } else {
+      stored = await this.store.read(WORK_LEDGER_STATE_KEY, null);
+    }
     if (stored === null) {
       if (this.state.revision === 0) return emptyWorkLedgerState();
       throw workLedgerError(
