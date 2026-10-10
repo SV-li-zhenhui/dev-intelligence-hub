@@ -786,6 +786,120 @@ test("gh-login fixed cleanup cap bounds preparation and closes a late session", 
   }
 });
 
+test("gh-login preserves its cleanup session while a valid credential process takes over five seconds", async (t) => {
+  let now = 1_000_000;
+  const processStarted = deferred();
+  const processRelease = deferred();
+  let committed = false;
+  let cleanupSignal;
+  const current = await fixture(t, {
+    clock: () => now,
+    async prepareCleanupTrees(roots, { signal }) {
+      cleanupSignal = signal;
+      return {
+        async commit() {
+          signal.throwIfAborted();
+          for (const identity of roots) {
+            assert.deepEqual(await directoryIdentity(identity.path), identity);
+            await rm(identity.path, { recursive: true });
+          }
+          committed = true;
+        },
+        async close() {},
+      };
+    },
+    processRunner: {
+      async run() {
+        processStarted.resolve();
+        await processRelease.promise;
+        return {
+          exitCode: 0,
+          signal: null,
+          stdoutBytes: Buffer.from(`${TOKEN}\n`, "utf8"),
+          stderrBytes: Buffer.alloc(0),
+        };
+      },
+    },
+  });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const acquisition = acquire(current.source, { deadline: now + 30_000 });
+  try {
+    await processStarted.promise;
+    now += 6_000;
+    t.mock.timers.tick(6_000);
+    processRelease.resolve();
+    const lease = await acquisition;
+    lease.release();
+    assert.equal(cleanupSignal.aborted, false);
+    assert.equal(committed, true);
+    await assertEmptyDirectory(current.runtimeTemporaryRoot);
+  } finally {
+    processRelease.resolve();
+    await acquisition.catch(() => {});
+    t.mock.timers.reset();
+  }
+});
+
+test("gh-login bounds cleanup after waiting for a credential process", async (t) => {
+  for (const { name, deadlineMs, cleanupMs } of [
+    { name: "cleanup cap", deadlineMs: 30_000, cleanupMs: 5_000 },
+    { name: "shared deadline", deadlineMs: 8_000, cleanupMs: 2_000 },
+  ]) {
+    await t.test(name, async (t) => {
+      let now = 1_000_000;
+      const processStarted = deferred();
+      const processRelease = deferred();
+      const commitStarted = deferred();
+      let cleanupSignal;
+      const current = await fixture(t, {
+        clock: () => now,
+        async prepareCleanupTrees(_roots, { signal }) {
+          cleanupSignal = signal;
+          return {
+            async commit() {
+              signal.throwIfAborted();
+              commitStarted.resolve();
+              await new Promise((_, reject) => signal.addEventListener(
+                "abort", () => reject(signal.reason), { once: true },
+              ));
+            },
+            async close() {},
+          };
+        },
+        processRunner: {
+          async run() {
+            processStarted.resolve();
+            await processRelease.promise;
+            return { exitCode: 0, signal: null };
+          },
+        },
+      });
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const acquisition = acquire(current.source, { deadline: now + deadlineMs });
+      const settlement = trackSettlement(acquisition);
+      try {
+        await processStarted.promise;
+        now += 6_000;
+        t.mock.timers.tick(6_000);
+        processRelease.resolve();
+        await commitStarted.promise;
+        now += cleanupMs - 1;
+        t.mock.timers.tick(cleanupMs - 1);
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(settlement.read(), null);
+        assert.equal(cleanupSignal.aborted, false);
+        now += 1;
+        t.mock.timers.tick(1);
+        await assert.rejects(acquisition, { code: "GITHUB_CREDENTIAL_CLEANUP_FAILED" });
+        assert.equal(cleanupSignal.aborted, true);
+      } finally {
+        processRelease.resolve();
+        t.mock.timers.reset();
+      }
+    });
+  }
+});
+
 test("gh-login production factory constructs from sealed production ports", {
   skip: WINDOWS_PRODUCTION_SKIP,
 }, async (t) => {
