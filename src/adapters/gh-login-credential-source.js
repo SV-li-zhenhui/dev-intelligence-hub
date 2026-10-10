@@ -24,7 +24,7 @@ import {
 const MAX_CREDENTIAL_TIMEOUT_MS = 15_000;
 const MAX_STDOUT_BYTES = 4_096;
 const MAX_STDERR_BYTES = 8_192;
-const CLEANUP_TIMEOUT_MS = 5_000;
+const CLEANUP_TIMEOUT_MS = 30_000;
 const SAFE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TEST_CONSTRUCTION_TOKEN = Object.freeze({});
 const LOGIN_ENVIRONMENT_NAMES = Object.freeze([

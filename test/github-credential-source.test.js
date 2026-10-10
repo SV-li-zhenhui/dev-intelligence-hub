@@ -736,6 +736,42 @@ test("gh-login shared deadline bounds uncooperative cleanup preparation", async 
   }
 });
 
+test("gh-login cleanup preparation tolerates startup work taking over five seconds", async (t) => {
+  const now = 1_000_000;
+  const preparationStarted = deferred();
+  const preparationRelease = deferred();
+  let cleanupSignal;
+  let committed = false;
+  const current = await fixture(t, {
+    clock: () => now,
+    async prepareCleanupTrees(_roots, { signal }) {
+      cleanupSignal = signal;
+      preparationStarted.resolve();
+      await preparationRelease.promise;
+      return {
+        async commit() { signal.throwIfAborted(); committed = true; },
+        async close() {},
+      };
+    },
+  });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const acquisition = acquire(current.source, { deadline: now + 60_000 });
+  const settlement = trackSettlement(acquisition);
+  try {
+    await preparationStarted.promise;
+    t.mock.timers.tick(6_000);
+    preparationRelease.resolve();
+    const lease = await acquisition;
+    lease.release();
+    assert.equal(cleanupSignal.aborted, false);
+    assert.equal(committed, true);
+  } finally {
+    preparationRelease.resolve();
+    await settlementWithinTurns(settlement);
+    t.mock.timers.reset();
+  }
+});
+
 test("gh-login fixed cleanup cap bounds preparation and closes a late session", async (t) => {
   const now = 1_000_000;
   const preparationStarted = deferred();
@@ -758,7 +794,7 @@ test("gh-login fixed cleanup cap bounds preparation and closes a late session", 
     }));
     await preparationStarted.promise;
 
-    t.mock.timers.tick(4_999);
+    t.mock.timers.tick(29_999);
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(settlement.read(), null);
 
@@ -842,7 +878,7 @@ test("gh-login preserves its cleanup session while a valid credential process ta
 
 test("gh-login bounds cleanup after waiting for a credential process", async (t) => {
   for (const { name, deadlineMs, cleanupMs } of [
-    { name: "cleanup cap", deadlineMs: 30_000, cleanupMs: 5_000 },
+    { name: "cleanup cap", deadlineMs: 60_000, cleanupMs: 30_000 },
     { name: "shared deadline", deadlineMs: 8_000, cleanupMs: 2_000 },
   ]) {
     await t.test(name, async (t) => {
