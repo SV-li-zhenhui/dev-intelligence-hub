@@ -4,6 +4,10 @@ const IMPORTANT_TOPIC =
   /(?:@|公告|通知|提醒|预警|风险|阻塞|故障|截止|待办|确认|评审|审核|测试|发布|版本|研发|需求|客户|FDA|\bPR\b|\bIssue\b|日报|早报|周报|总结|关注|更新|重置)/iu;
 const REACTION_ONLY =
   /^(?:\[(?:赞|感谢|鼓掌|微笑|笑脸|OK|收到|加油|心|爱心)\]\s*)+$/iu;
+const MAIL_RELATION_PRIORITY = Object.freeze({
+  mentioned: 7, review_requested: 6, assigned: 5, authored: 4,
+  direct: 3, participated: 2, copied: 1, followed: 0,
+});
 
 function compactText(value, limit = 240) {
   return String(value || "").replace(/\s+/gu, " ").trim().slice(0, limit);
@@ -32,7 +36,7 @@ function rawMessages(item) {
   return [{
     id: item.id,
     author: item.author || "",
-    content: item.title || "",
+    content: item.content || item.title || "",
     updatedAt: item.updatedAt || "",
     url: item.url || "",
   }];
@@ -52,7 +56,7 @@ export function prepareDingTalkDigest(items) {
       continue;
     }
     if (item.kind === "conversation") continue;
-    if (!["announcement", "message", "mention"].includes(item.kind)) {
+    if (!["announcement", "message", "mention", "mail"].includes(item.kind)) {
       passthrough.push(item);
       continue;
     }
@@ -68,12 +72,18 @@ export function prepareDingTalkDigest(items) {
         kinds: new Set(),
         messages: [],
         signatures: new Set(),
+        relation: item.relation,
+        currentUser: item.currentUser || "",
+        bodyIncomplete: false,
       });
     }
     const group = groups.get(key);
     group.kinds.add(item.kind);
+    if (item.kind === "mail" && (MAIL_RELATION_PRIORITY[item.relation] ?? -1) >
+        (MAIL_RELATION_PRIORITY[group.relation] ?? -1)) group.relation = item.relation;
+    group.bodyIncomplete ||= item.bodyIncomplete === true;
     for (const message of rawMessages(item)) {
-      const content = cleanDingTalkMessage(message.content);
+      const content = item.kind === "mail" ? String(message.content || "").trim() : cleanDingTalkMessage(message.content);
       if (!content) continue;
       const author = compactText(message.author, 80);
       const signature = `${author}\u0000${content}`;
@@ -82,7 +92,7 @@ export function prepareDingTalkDigest(items) {
       group.messages.push({
         id: compactText(message.id || item.id, 180),
         author,
-        content: compactText(content),
+        content: item.kind === "mail" ? content : compactText(content),
         updatedAt: message.updatedAt || item.updatedAt || "",
         url: message.url || item.url || "",
       });
@@ -96,7 +106,8 @@ export function prepareDingTalkDigest(items) {
         groupId: group.groupId,
         context: group.context,
         kinds: [...group.kinds],
-        messages: group.messages.sort(newestFirst).slice(0, 12),
+        ...(group.kinds.has("mail") ? { relation: group.relation, currentUser: group.currentUser, bodyIncomplete: group.bodyIncomplete } : {}),
+        messages: group.kinds.has("mail") ? group.messages.sort(newestFirst) : group.messages.sort(newestFirst).slice(0, 12),
       }))
       .filter((group) => group.messages.length > 0),
   };
@@ -106,6 +117,7 @@ export function dingTalkDigestFacts(groups) {
   return groups.map((group) => ({
     groupId: group.groupId,
     context: group.context,
+    ...(group.kinds.includes("mail") ? { source: "mail", relation: group.relation, currentUser: group.currentUser, bodyIncomplete: group.bodyIncomplete } : {}),
     messages: group.messages.map(({ author, content, updatedAt }) => ({
       author,
       content,
@@ -128,7 +140,9 @@ function fallbackSummary(group) {
 }
 
 function fallbackResult(group) {
-  const important = group.kinds.some((kind) => kind !== "message") ||
+  const important = group.kinds.includes("mail")
+    ? ["mentioned", "assigned", "authored", "review_requested", "direct"].includes(group.relation)
+    : group.kinds.some((kind) => kind !== "message") ||
     group.messages.some((message) => IMPORTANT_TOPIC.test(message.content));
   return {
     groupId: group.groupId,
@@ -142,7 +156,9 @@ function fallbackResult(group) {
 function digestItem(group, result, summaryStatus) {
   const newest = group.messages[0];
   const authors = [...new Set(group.messages.map((message) => message.author).filter(Boolean))];
-  const kind = group.kinds.includes("announcement")
+  const kind = group.kinds.includes("mail")
+    ? "mail"
+    : group.kinds.includes("announcement")
     ? "announcement"
     : group.kinds.includes("mention")
       ? "mention"
@@ -150,7 +166,7 @@ function digestItem(group, result, summaryStatus) {
   return {
     id: `dingtalk:digest:${group.groupId}`,
     kind,
-    relation: kind === "mention" ? "mentioned" : "daily",
+    relation: kind === "mail" ? group.relation : kind === "mention" ? "mentioned" : "daily",
     title: compactText(result.summary, 120),
     summary: compactText(result.summary, 500),
     highlights: (result.highlights || []).map((value) => compactText(value, 240)).filter(Boolean).slice(0, 3),
@@ -163,6 +179,7 @@ function digestItem(group, result, summaryStatus) {
     messageCount: group.messages.length,
     sourceMessages: group.messages,
     summaryStatus,
+    ...(kind === "mail" ? { bodyIncomplete: group.bodyIncomplete } : {}),
   };
 }
 

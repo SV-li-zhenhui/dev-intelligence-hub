@@ -1801,6 +1801,20 @@ test("PR external action capabilities can be configured without editing JSON", (
   assert.equal(configurationDocumentFromForm(unknown).ok, false);
 });
 
+test("mail summary can be added, toggled and removed without altering other settings", () => {
+  const configuration = representativeConfiguration();
+  const initial = createConfigurationFormState(configuration);
+  const path = ["dingtalk", "mailEnabled"];
+  const added = applyConfigurationStructureOperation(initial, { operation: "add", path, value: false });
+  const enabled = setConfigurationFormField(added, { path, kind: "boolean", rawValue: true });
+  assert.equal(configurationDocumentFromForm(enabled).configuration.dingtalk.mailEnabled, true);
+  const disabled = setConfigurationFormField(enabled, { path, kind: "boolean", rawValue: false });
+  assert.equal(configurationDocumentFromForm(disabled).configuration.dingtalk.mailEnabled, false);
+  const removed = applyConfigurationStructureOperation(disabled, { operation: "remove", path });
+  assert.deepEqual(configurationDocumentFromForm(removed).configuration, configuration);
+  assert.equal(configurationFieldDescriptor(path, false).control, "checkbox");
+});
+
 test("own PR repair can be added, toggled and removed without granting generic push", () => {
   const configuration = structuredClone(representativeConfiguration());
   delete configuration.githubActions.automaticOwnPrRepair;

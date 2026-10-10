@@ -333,6 +333,7 @@ function kindLabel(item) {
     conversation: "CHAT",
     announcement: "NOTICE",
     message: "TODAY",
+    mail: "邮件",
   }[item.kind] || item.kind.toUpperCase();
 }
 
@@ -1755,7 +1756,7 @@ function render() {
     versions: versionsView,
     signals: () =>
       dingtalkReportView() +
-      section("钉钉今日重点", dashboard.groups.dingtalk, "今天没有重要消息、公告、@我或待办。"),
+      section("钉钉今日重点", dashboard.groups.dingtalk, "今天没有重要消息、邮件、公告、@我或待办。"),
     employees: employeesView,
     memory: memoryView,
     workflow: () => workflowView.render(),
@@ -2540,6 +2541,11 @@ function detailRows(item) {
   };
   const relationLabels = {
     assigned: "分配给我",
+    mentioned: "明确 @我",
+    direct: "直接收件",
+    copied: "抄送给我",
+    followed: "订阅动态",
+    participated: "我参与的讨论",
     authored: "我创建的",
     review_requested: "等待我 Review",
   };

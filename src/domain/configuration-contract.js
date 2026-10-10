@@ -1467,11 +1467,14 @@ function normalizeDingTalk(value) {
   const config = fields(
     value,
     path,
-    ["enabled", "selfUserId", "notifyMinimumScore", "maxNotificationsPerRun"],
+    ["enabled", "selfUserId", "notifyMinimumScore", "maxNotificationsPerRun", "mailEnabled"],
     ["enabled", "selfUserId", "notifyMinimumScore", "maxNotificationsPerRun"],
   );
   return {
     enabled: boolean(config.enabled, `${path}.enabled`),
+    ...(Object.hasOwn(config, "mailEnabled")
+      ? { mailEnabled: boolean(config.mailEnabled, `${path}.mailEnabled`) }
+      : {}),
     selfUserId: text(config.selfUserId, `${path}.selfUserId`, 128),
     notifyMinimumScore: integer(
       config.notifyMinimumScore,
@@ -1794,7 +1797,7 @@ function authorityDirection(change) {
     );
     return { tightening: direction.removed, expansion: direction.added };
   }
-  if (["githubActions.automaticReview", "githubActions.assignAfterAutomaticReview", "githubActions.automaticOwnPrRepair"].includes(path)) {
+  if (["githubActions.automaticReview", "githubActions.assignAfterAutomaticReview", "githubActions.automaticOwnPrRepair", "dingtalk.mailEnabled"].includes(path)) {
     const effective = (value) => path.endsWith("assignAfterAutomaticReview") ? value !== false : value === true;
     return { tightening: effective(before) && !effective(after), expansion: !effective(before) && effective(after) };
   }
@@ -1903,6 +1906,7 @@ function authorityDirection(change) {
 
 function requiresInfrastructureRestart(path) {
   return (
+    path === "dingtalk.mailEnabled" ||
     path === "port" ||
     path === "githubLogin" ||
     (path === "githubRead" ||

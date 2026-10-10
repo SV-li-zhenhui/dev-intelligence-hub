@@ -25,6 +25,22 @@ function document() {
   return structuredClone(committedDocument);
 }
 
+test("mail summary is opt in without rewriting historical configuration digests", () => {
+  const old = document();
+  const before = configurationDocumentDigest(old);
+  assert.equal(Object.hasOwn(normalizeConfigurationDocument(old).dingtalk, "mailEnabled"), false);
+  const enabled = structuredClone(old);
+  enabled.dingtalk.mailEnabled = true;
+  assert.equal(normalizeConfigurationDocument(enabled).dingtalk.mailEnabled, true);
+  assert.notEqual(configurationDocumentDigest(enabled), before);
+  assert.ok(configurationDocumentImpact(old, enabled).restart_required.includes("dingtalk.mailEnabled"));
+  assert.ok(configurationDocumentImpact(old, enabled).authority_expansion.includes("dingtalk.mailEnabled"));
+  delete enabled.dingtalk.mailEnabled;
+  assert.equal(configurationDocumentDigest(enabled), before);
+  enabled.dingtalk.mailEnabled = "true";
+  assert.throws(() => normalizeConfigurationDocument(enabled));
+});
+
 function legacyGithubCredentialDocument() {
   const value = document();
   delete value.githubActions.credentialMode;

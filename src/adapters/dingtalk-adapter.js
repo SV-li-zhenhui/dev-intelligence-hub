@@ -1,4 +1,5 @@
 import { runCommand, runJson } from "../lib/command-runner.js";
+import { DingTalkMailAdapter } from "./dingtalk-mail-adapter.js";
 
 function isoWithOffset(date) {
   const offset = -date.getTimezoneOffset();
@@ -90,21 +91,23 @@ function dailyMessageItems(data, fallback) {
 }
 
 export class DingTalkAdapter {
-  constructor({ run = runJson, runText = runCommand } = {}) {
+  constructor({ run = runJson, runText = runCommand, ownerLogin = "" } = {}) {
     this.run = run;
     this.runText = runText;
+    this.mail = new DingTalkMailAdapter({ run, ownerLogin });
   }
 
-  async collect(since, { signal = null } = {}) {
+  async collect(since, { signal = null, mailEnabled = false } = {}) {
     const now = new Date();
     const start = new Date(now);
     start.setHours(0, 0, 0, 0);
     const commandOptions = signal === null ? {} : { signal };
-    const [dailyMessages, unread, mentions, todos] = await Promise.allSettled([
+    const [dailyMessages, unread, mentions, todos, mail] = await Promise.allSettled([
       this.dailyMessages(start, now, commandOptions),
       this.unreadConversations(commandOptions),
       this.mentions(start, now, commandOptions),
       this.todos(commandOptions),
+      mailEnabled ? this.mail.collect(now, commandOptions) : Promise.resolve([]),
     ]);
     const errors = [];
     const failedSources = [];
@@ -120,6 +123,7 @@ export class DingTalkAdapter {
         ...value(unread, "unread"),
         ...value(mentions, "mentions"),
         ...value(todos, "todos"),
+        ...value(mail, "mail"),
       ],
       errors,
       failedSources,

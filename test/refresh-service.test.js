@@ -434,6 +434,33 @@ test("a failed DingTalk subsource retains only its old items while other sources
   assert.equal(snapshot.sourceStatus.dingtalk.stale, true);
 });
 
+test("a failed chat source cannot bypass mail grouping or relevance filtering", async () => {
+  const store = new MemoryStore();
+  let collectedOptions;
+  const service = new RefreshService({
+    github: { async searchRelevantPullRequests() { return []; }, async searchIssues() { return []; }, async versions() { return []; } },
+    dingtalk: { async collect(_since, options) {
+      collectedOptions = options;
+      return { items: ["first", "second"].map((id) => ({
+        id, kind: "mail", title: "订阅通知", content: "无关更新", relation: "followed", conversationId: "mail-thread",
+        updatedAt: REFRESH_STARTED_AT,
+      })), errors: ["mentions: unavailable"], failedSources: ["mentions"] };
+    } },
+    brain: { async summarizeDingTalk(groups) {
+      assert.equal(groups.length, 1);
+      assert.equal(groups[0].messages.length, 1);
+      return groups.map((group) => ({ groupId: group.groupId, important: false, summary: "订阅更新", highlights: [], actionRequired: "" }));
+    } },
+    store, notifier: {}, config: { githubRead: { enabled: false }, trackedRepositories: [],
+      dingtalk: { enabled: true, mailEnabled: true }, brain: { enabled: true, provider: "ollama", model: "local" } },
+    clock: () => new Date(REFRESH_STARTED_AT),
+  });
+  await service.refresh();
+  assert.equal(collectedOptions.mailEnabled, true);
+  assert.deepEqual((await store.read("snapshot")).items, []);
+  assert.equal((await store.read("snapshot")).sourceStatus.dingtalk.stale, true);
+});
+
 test("refresh freezes one effective PR window and publishes its completeness", async () => {
   const store = new MemoryStore();
   let receivedOptions;

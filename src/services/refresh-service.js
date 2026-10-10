@@ -1,4 +1,5 @@
 import { buildDashboard } from "../domain/dashboard-model.js";
+import { mergeMailNotifications } from "../domain/dingtalk-mail.js";
 import {
   ACTION_STATES,
   assessPullRequestResponsibility,
@@ -26,6 +27,7 @@ const DINGTALK_KINDS_BY_SOURCE = Object.freeze({
   unread: ["conversation"],
   mentions: ["mention"],
   todos: ["todo"],
+  mail: ["mail"],
 });
 
 const CONFIRMABLE_ACTION_STATES = new Set([
@@ -431,7 +433,7 @@ export class RefreshService {
       signal,
     );
     const dingtalkCollection = this.config.dingtalk.enabled
-      ? this.dingtalk.collect(since, { signal }).catch((error) => ({
+      ? this.dingtalk.collect(since, { signal, mailEnabled: this.config.dingtalk.mailEnabled === true }).catch((error) => ({
           items: previousItems.filter((item) =>
             [
               "announcement",
@@ -439,9 +441,11 @@ export class RefreshService {
               "mention",
               "todo",
               "conversation",
+              ...(this.config.dingtalk.mailEnabled ? ["mail"] : []),
             ].includes(item.kind),
           ),
           errors: [`钉钉: ${error.message}`],
+          retained: true,
         }))
       : Promise.resolve({ items: [], errors: [] });
     const [assessedPullRequests, dingtalkResult] = await Promise.all([
@@ -450,20 +454,18 @@ export class RefreshService {
     ]);
     signal?.throwIfAborted();
     errors.push(...dingtalkResult.errors);
+    dingtalkResult.items = mergeMailNotifications(dingtalkResult.items,
+      [...assessedPullRequests.items, ...githubValues[1]]);
     const staleDingTalkKinds = new Set(
       (dingtalkResult.failedSources || [])
         .flatMap((source) => DINGTALK_KINDS_BY_SOURCE[source] || []),
     );
-    const summarizedDingTalkItems = dingtalkResult.errors.length
-      ? deduplicate([
-          ...dingtalkResult.items,
-          ...previousItems.filter((item) => staleDingTalkKinds.has(item.kind)),
-        ])
-      : await this.#summarizeDingTalk(
-          dingtalkResult.items,
-          assessedPullRequests.meta,
-          signal,
-        );
+    const freshDingTalkItems = dingtalkResult.retained ? dingtalkResult.items :
+      await this.#summarizeDingTalk(dingtalkResult.items, assessedPullRequests.meta, signal);
+    const summarizedDingTalkItems = deduplicate([
+      ...freshDingTalkItems,
+      ...previousItems.filter((item) => staleDingTalkKinds.has(item.kind)),
+    ]);
     signal?.throwIfAborted();
 
     const snapshot = {

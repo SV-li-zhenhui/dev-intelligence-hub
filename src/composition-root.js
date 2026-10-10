@@ -1095,7 +1095,7 @@ export async function createApplication({
         ? { clock: workCoordinationDependencies.clock }
         : {}),
     });
-    const dingtalk = new DingTalkAdapter();
+    const dingtalk = new DingTalkAdapter({ ownerLogin: config.githubLogin });
     const brain = createBrain(
       config.brain,
       ordinaryActionAdmissionGate === null

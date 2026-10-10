@@ -238,6 +238,7 @@ const LABELS = deepFreeze({
   permissions: "权限",
   allowedIntents: "允许意图",
   dingtalk: "钉钉通知",
+  mailEnabled: "邮件自动摘要（最近 24 小时）",
   selfUserId: "钉钉本人 ID",
   notifyMinimumScore: "最低通知分数",
   maxNotificationsPerRun: "每轮通知上限",
@@ -349,6 +350,8 @@ const FIELD_RULES = deepFreeze([
     },
   },
   { pattern: ["**", "enabled"], control: "checkbox", kind: "boolean" },
+  { pattern: ["dingtalk", "mailEnabled"], control: "checkbox", kind: "boolean",
+    help: "只读采集当前企业邮箱最近 24 小时的收件箱，合并同主题 GitHub 通知，优先汇总与你相关且需要行动的邮件；加入每日 9 点总报及后续定时汇报。关闭后停止采集，不修改邮件。" },
   { pattern: ["githubActions", "automaticReview"], control: "checkbox", kind: "boolean" },
   { pattern: ["githubActions", "assignAfterAutomaticReview"], control: "checkbox", kind: "boolean" },
   {
@@ -561,6 +564,7 @@ const COLLECTIONS = deepFreeze([
 ]);
 
 const SLOTS = deepFreeze([
+  { pattern: ["dingtalk", "mailEnabled"], label: "邮件自动摘要", template: "mail-disabled", optional: true, operations: ["add", "remove", "replace"] },
   { pattern: ["githubActions", "automaticReview"], label: "自动 Review", template: "automatic-review-enabled", optional: true, operations: ["add", "remove", "replace"] },
   { pattern: ["githubActions", "assignAfterAutomaticReview"], label: "Review 后自动分配", template: "automatic-review-enabled", optional: true, operations: ["add", "remove", "replace"] },
   { pattern: ["githubActions", "automaticOwnPrRepair"], label: "自动修复我的 PR", template: "automatic-own-pr-repair-disabled", optional: true, operations: ["add", "remove", "replace"] },
@@ -640,6 +644,7 @@ const SLOTS = deepFreeze([
 ]);
 
 const TEMPLATES = deepFreeze({
+  "mail-disabled": false,
   "pr-updated-window-rolling": { mode: "rolling", days: 7 },
   "issue-active-window-days": 14,
   "automatic-review-enabled": true,

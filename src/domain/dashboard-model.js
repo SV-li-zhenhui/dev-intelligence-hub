@@ -126,6 +126,7 @@ export function buildDashboard(snapshot, previousSnapshot = null, options = {}) 
           "mention",
           "todo",
           "conversation",
+          "mail",
         ].includes(item.kind),
       ),
       versions: newestVersionsFirst(snapshot.versions || []),

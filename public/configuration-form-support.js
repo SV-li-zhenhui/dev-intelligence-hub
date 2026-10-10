@@ -838,7 +838,7 @@ function assertSupportedConfigurationShape(value) {
   assertFields(
     value.dingtalk,
     "configuration.dingtalk",
-    ["enabled", "selfUserId", "notifyMinimumScore", "maxNotificationsPerRun"],
+    ["enabled", "selfUserId", "notifyMinimumScore", "maxNotificationsPerRun", "mailEnabled"],
     ["enabled", "selfUserId", "notifyMinimumScore", "maxNotificationsPerRun"],
   );
 }

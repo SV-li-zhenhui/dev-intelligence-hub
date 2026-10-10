@@ -40,6 +40,28 @@ function ollamaResponse(assessment = validAssessment) {
   });
 }
 
+test("mail digest batches retain all groups and summarize an oversized body through its end", async () => {
+  const seen = [];
+  const brain = new OllamaBrain({ contextTokens: 8_192, async fetch(_url, options) {
+    const request = JSON.parse(options.body);
+    const facts = JSON.parse(request.messages[1].content);
+    seen.push(facts);
+    return jsonResponse({ message: { content: JSON.stringify({ summaries: facts.map((fact) => ({
+      groupId: fact.groupId, important: true, summary: "字段方案待确认", highlights: [], actionRequired: "确认方案",
+    })) }) } });
+  } });
+  const groups = Array.from({ length: 15 }, (_, index) => ({ groupId: `mail-${index}`, source: "mail",
+    context: "邮件主题", messages: [{ author: "同事", content: `确认字段 ${index}`, updatedAt: "" }] }));
+  const long = { groupId: "long", source: "mail", context: "完整邮件",
+    messages: [{ author: "同事", content: `${"正文段落".repeat(4_000)}END_OF_MAIL`, updatedAt: "" }] };
+  const results = await brain.summarizeDingTalk([...groups, long]);
+  assert.deepEqual(new Set(results.map((entry) => entry.groupId)), new Set([...groups, long].map((entry) => entry.groupId)));
+  const fragments = seen.flat().filter((fact) => fact.groupId === "long" && fact.messages[0].author === "同事");
+  assert.equal(fragments.flatMap((fact) => fact.messages.map((entry) => entry.content)).join(""), long.messages[0].content);
+  assert.ok(seen.length > 3);
+  assert.ok(seen.every((batch) => Buffer.byteLength(JSON.stringify(batch)) < 11_000));
+});
+
 function uncertainPullRequest(overrides = {}) {
   return {
     id: "github:pr:acme/repo#42",
