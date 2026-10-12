@@ -2212,7 +2212,7 @@ export async function createApplication({
             ),
             ledger: frozenPort(
               workLedgerRuntime,
-              ["intake", "listItems"],
+              ["intake", "listItems", "readItemProgress"],
               "owner work request ledger",
             ),
             roleReadiness: Object.freeze({

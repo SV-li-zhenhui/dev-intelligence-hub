@@ -300,7 +300,7 @@ export class OwnerWorkRequestService {
         this.exclusiveLease.run(() => this.#submitLocked(request, signal)),
       ),
     }));
-    return admitted.operation;
+    return (await this.#withProgress([await admitted.operation]))[0];
   }
 
   async get(idValue) {
@@ -312,7 +312,7 @@ export class OwnerWorkRequestService {
         const record = this.state.records.find(
           ({ requestId: candidate }) => candidate === id,
         );
-        return record ? publicRecord(record) : null;
+        return record ? (await this.#withProgress([publicRecord(record)]))[0] : null;
       }),
     );
   }
@@ -338,7 +338,7 @@ export class OwnerWorkRequestService {
         const start = cursorIndex + 1;
         const page = records.slice(start, start + options.limit);
         return {
-          items: page.map((record) => publicRecord(record)),
+          items: await this.#withProgress(page.map((record) => publicRecord(record))),
           nextCursor:
             start + page.length < records.length && page.length > 0
               ? page.at(-1).requestId
@@ -346,6 +346,17 @@ export class OwnerWorkRequestService {
         };
       }),
     );
+  }
+
+  async #withProgress(records) {
+    const itemIds = records.map((record) => record.workItemId).filter(Boolean);
+    const progress = itemIds.length && typeof this.ledger.readItemProgress === "function"
+      ? await this.ledger.readItemProgress(itemIds)
+      : [];
+    const byId = new Map(progress.map((item) => [item.itemId, item]));
+    return records.map((record) => ({
+      ...record, progress: byId.get(record.workItemId) ?? null,
+    }));
   }
 
   async #submitLocked(request, signal = null) {

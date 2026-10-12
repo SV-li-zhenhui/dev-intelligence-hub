@@ -767,12 +767,23 @@ test("runtime persists a manual Issue with its canonical Issue event", async (t)
     issue: { repository: "acme/repo", number: 430 },
   }));
   const sourceUrl = "https://github.com/ACME/REPO/issues/43";
+  await ledger.transition({
+    itemId: item.itemId, expectedRevision: item.revision, leaseId: null,
+    actorId: "work-ledger-system", toStatus: "blocked", reason: "test_dependency_missing",
+  });
   const firstPage = await owner.list({ sourceUrl, limit: 1 });
   assert.deepEqual(firstPage.items.map(({ requestId }) => requestId), [legacy.requestId]);
   assert.equal(firstPage.nextCursor, legacy.requestId);
   const secondPage = await owner.list({ sourceUrl, limit: 1, cursor: firstPage.nextCursor });
   assert.deepEqual(secondPage.items.map(({ requestId }) => requestId), [result.requestId]);
   assert.equal(secondPage.nextCursor, null);
+  assert.deepEqual(secondPage.items[0].progress, {
+    itemId: item.itemId, status: "blocked", statusReason: "test_dependency_missing",
+    currentTarget: item.currentTarget, updatedAt: (await ledger.listItems()).items
+      .find((entry) => entry.itemId === item.itemId).updatedAt,
+  });
+  assert.deepEqual((await owner.get(result.requestId)).progress, secondPage.items[0].progress);
+  assert.equal(secondPage.items[0].phase, "intaken");
   for (const invalidUrl of ["https://evil.example/acme/repo/issues/43", "https://github.com/acme/repo/issues/0"]) {
     await assert.rejects(owner.list({ sourceUrl: invalidUrl }), { statusCode: 400 });
   }

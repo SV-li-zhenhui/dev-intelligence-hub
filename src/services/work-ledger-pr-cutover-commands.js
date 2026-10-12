@@ -254,17 +254,30 @@ function pendingHeadChanged(source) {
   return active.headRevision !== pending.headRevision;
 }
 
-function latestRejectedProposalProof(item, timelineIndex) {
+function isExpiredCodeConfirmation(decision) {
+  const value = decision?.value;
+  // Authorization changes can leave a running job quarantined. Only the
+  // confirmation-only stale result proves that no code job was started.
+  return decision?.outcome === "stale" &&
+    value?.kind === "code_action_proposal" &&
+    typeof value.downstreamRef === "string" &&
+    value.downstreamRef.startsWith("confirmation-code-job-") &&
+    Array.isArray(value.evidence) && value.evidence.length === 1 &&
+    value.evidence[0] === `confirmation:${value.downstreamRef}`;
+}
+
+function latestSettledProposalProof(item, timelineIndex) {
   if (
     item.decisionContext?.source !== "proposal" ||
-    item.decisionContext?.outcome !== "rejected" ||
+    (item.decisionContext?.outcome !== "rejected" &&
+      !isExpiredCodeConfirmation(item.decisionContext)) ||
     typeof item.decisionContext.contentDigest !== "string"
   ) {
     return null;
   }
   const entry = latestCutoverTimelineEvent(timelineIndex, item.itemId);
   return entry?.type === "proposal_result_applied" &&
-    entry.details?.outcome === "rejected" &&
+    entry.details?.outcome === item.decisionContext.outcome &&
     entry.details?.decision?.contentDigest ===
       item.decisionContext.contentDigest &&
     Number.isSafeInteger(entry.details?.workItemRevision) &&
@@ -300,10 +313,10 @@ function definitiveBlockedSettlement(item, outboxById, timelineIndex) {
   ) {
     return { proposalProof: null };
   }
-  const proposalProof = latestRejectedProposalProof(item, timelineIndex);
+  const proposalProof = latestSettledProposalProof(item, timelineIndex);
   if (
     proposalProof !== null &&
-    (item.statusReason === "proposal_rejected" ||
+    (item.statusReason === `proposal_${item.decisionContext.outcome}` ||
       crossRootPullRequestCutoverPendingId(item) !== null)
   ) {
     return { proposalProof };

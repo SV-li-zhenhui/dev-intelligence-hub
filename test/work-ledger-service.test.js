@@ -702,6 +702,25 @@ test("intake atomically advances its cursor and preserves unresolved targets", a
   assert.equal(store.writes[0].value.items.length, 3);
 });
 
+test("assignment progress reads are bounded, detached, and do not expose task payloads", async () => {
+  const { service, store } = await createFixture({ records: [assignment(1), assignment(2)] });
+  await service.intake();
+  const item = (await service.listItems()).items[1];
+  const writes = store.writes.length;
+  const progress = await service.readItemProgress([item.itemId, "missing-item"]);
+  assert.deepEqual(progress, [{
+    itemId: item.itemId, status: item.status, statusReason: item.statusReason,
+    currentTarget: item.currentTarget, updatedAt: item.updatedAt,
+  }]);
+  progress[0].currentTarget.id = "caller-mutation";
+  assert.deepEqual((await service.readItemProgress([item.itemId]))[0].currentTarget, item.currentTarget);
+  assert.deepEqual(await service.readItemProgress([]), []);
+  for (const input of [null, [null], [""], Array(101).fill(item.itemId)]) {
+    await assert.rejects(service.readItemProgress(input), { code: "WORK_LEDGER_QUERY_INVALID" });
+  }
+  assert.equal(store.writes.length, writes);
+});
+
 test("role workloads expose exact counts and bounded recent task summaries", async () => {
   const records = [
     assignment(1, { type: "role", id: "developer" }),

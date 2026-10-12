@@ -150,6 +150,33 @@ test("assignment history loads every page and ignores detached dialogs", async (
   assert.equal(container.innerHTML, "different dialog");
 });
 
+test("assignment detail shows current blocking and folds retired tasks into history", async () => {
+  const container = { isConnected: true, innerHTML: "", querySelectorAll() { return []; } };
+  const record = (id, status, statusReason) => ({
+    requestId: id, workItemId: `work-${id}`, phase: "intaken", request: { workType: "general" },
+    assignment: { target: { id: "pr-engineer" } },
+    progress: { status, statusReason, currentTarget: { type: "role", id: "developer" } },
+  });
+  await bindManualWorkAssignment(container, pullRequest, {
+    async fetchImpl() { return { ok: true, async json() { return { items: [
+      record("active", "blocked", "pr_source_cross_root_cutover_pending:predecessor"),
+      record("retired", "blocked", "pr_source_cross_root_cutover_retired"),
+      record("replaced", "superseded", "pr_source_cross_root_cutover_replaced"),
+      { ...record("unknown", "queued"), progress: null },
+    ], nextCursor: null }; } }; },
+  });
+  const [current, history] = container.innerHTML.split('<details data-assignment-history>');
+  assert.match(current, /当前分配/);
+  assert.match(current, /等待旧任务交接/);
+  assert.match(current, /开发工程师/);
+  assert.match(current, /台账状态暂不可用/);
+  assert.doesNotMatch(current, /work-retired|work-replaced/);
+  assert.match(history, /历史分配（2）/);
+  assert.match(history, /已停用/);
+  assert.match(history, /已被替代/);
+  assert.doesNotMatch(container.innerHTML, /<details[^>]* open/);
+});
+
 test("failed assignment lookup offers a read retry without an unverified create form", async () => {
   let retry;
   let reads = 0;

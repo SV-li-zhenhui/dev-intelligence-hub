@@ -718,6 +718,21 @@ export class WorkLedgerService {
     return queryWorkItemPage(this.state.items, options);
   }
 
+  async readItemProgress(itemIds) {
+    this.#assertReady();
+    if (!Array.isArray(itemIds) || itemIds.length > MAX_WORK_LEDGER_QUERY_PAGE ||
+      itemIds.some((id) => typeof id !== "string" || !id || id.length > 192)) {
+      throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "工作项进度查询无效");
+    }
+    const requested = new Set(itemIds);
+    return this.state.items.filter((item) => requested.has(item.itemId)).map((item) =>
+      cloneLedgerValue({
+        itemId: item.itemId, status: item.status, statusReason: item.statusReason,
+        currentTarget: item.currentTarget, updatedAt: item.updatedAt,
+      }),
+    );
+  }
+
   async listClaimCandidates(options = {}) {
     this.#assertReady();
     return queryClaimCandidatePage(this.state.items, options);

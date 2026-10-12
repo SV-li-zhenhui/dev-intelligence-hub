@@ -251,19 +251,56 @@ const ROLE_LABELS = Object.freeze({
   orchestrator: "主控调度员",
 });
 
-function assignmentHistoryMarkup(item, records) {
-  if (!records.length) return manualWorkAssignmentMarkup(item);
-  return `<section class="manual-work-assignment" data-manual-work-assignment-result>
-    <h3>${records.some((record) => record.phase === "intaken") ? "已分配工作" : "分配请求已保存"}</h3>
-    ${records.map((record) => {
-      const target = record.assignment?.target?.id;
-      return `<p><strong>${escapeHtml(WORK_TYPE_LABELS[record.request?.workType] || "工作任务")}</strong> · ${escapeHtml(ROLE_LABELS[target] || target || "等待岗位分派")}<br>
-        <small>${record.phase === "intaken" ? "已接入台账" : "请求已保存，等待接入台账"} · 工作项 ${escapeHtml(record.workItemId || "待生成")} · 请求 ${escapeHtml(record.requestId)}</small></p>
+const ASSIGNMENT_STATUS_LABELS = Object.freeze({
+  queued: "等待岗位领取", working: "处理中", paused: "已暂停",
+  retry_wait: "等待重试", dispatch_pending: "等待执行",
+  waiting_user: "等待你答复", waiting_external: "等待外部结果",
+  waiting_condition: "等待条件", blocked: "已阻塞", completed: "已完成",
+  cancelled: "已取消", superseded: "已被替代",
+});
+
+function retiredAssignmentProgress(progress) {
+  return ["pr_source_cross_root_cutover_retired", "pr_source_authority_fenced"].includes(progress?.statusReason);
+}
+
+function historicalAssignment(record) {
+  const progress = record.progress;
+  return ["completed", "cancelled", "superseded"].includes(progress?.status) ||
+    retiredAssignmentProgress(progress);
+}
+
+function assignmentProgressLabel(record) {
+  if (record.phase !== "intaken") return "请求已保存，等待接入台账";
+  const progress = record.progress;
+  if (!progress) return "台账状态暂不可用";
+  const reason = progress.statusReason || "";
+  if (retiredAssignmentProgress(progress)) return "已停用";
+  if (reason.startsWith("pr_source_cross_root_cutover_pending:")) return "等待旧任务交接";
+  if (reason.startsWith("pr_source_cross_root_cutover_blocker:")) return "旧任务等待结束后交接";
+  const label = ASSIGNMENT_STATUS_LABELS[progress.status] || "状态暂不可用";
+  return progress.status === "blocked" && reason ? `${label}（${reason}）` : label;
+}
+
+function assignmentRecordMarkup(record) {
+  const target = record.progress?.currentTarget?.id || record.assignment?.target?.id;
+  return `<p><strong>${escapeHtml(WORK_TYPE_LABELS[record.request?.workType] || "工作任务")}</strong> · ${escapeHtml(ROLE_LABELS[target] || target || "等待岗位分派")}<br>
+        <span>${escapeHtml(assignmentProgressLabel(record))}</span><br>
+        <small>工作项 ${escapeHtml(record.workItemId || "待生成")} · 请求 ${escapeHtml(record.requestId)}</small></p>
         ${record.phase !== "intaken" ? `<form data-manual-work-assignment-resume="${escapeHtml(record.requestId)}">
           <button class="secondary-button" type="submit">继续原分配</button>
           <p data-manual-work-assignment-status aria-live="polite"></p>
         </form>` : ""}`;
-    }).join("")}
+}
+
+function assignmentHistoryMarkup(item, records) {
+  if (!records.length) return manualWorkAssignmentMarkup(item);
+  const current = records.filter((record) => !historicalAssignment(record));
+  const history = records.filter(historicalAssignment);
+  return `<section class="manual-work-assignment" data-manual-work-assignment-result>
+    <h3>${records.some((record) => record.phase === "intaken") ? "已分配工作" : "分配请求已保存"}</h3>
+    <h4>当前分配</h4>
+    ${current.length ? current.map(assignmentRecordMarkup).join("") : "<p>当前没有进行中的分配。</p>"}
+    ${history.length ? `<details data-assignment-history><summary>历史分配（${history.length}）</summary>${history.map(assignmentRecordMarkup).join("")}</details>` : ""}
     <p>可在左侧“工作台账”查看任务进度；已分配不代表已完成。</p>
     <details>
       <summary>另行分配工作</summary>
