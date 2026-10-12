@@ -66,7 +66,7 @@ exact native IDs for the next invocation; conflicting IDs cannot replace them.
 Validation separates fixture evidence from real execution:
 
 - Full test phase: 4,244 tests, 4,230 passed, 12 skipped and two managed-recovery
-  fixture setup failures caused by temporary port ownership. Both failed tests
+  fixture setup failures at unmanaged-listener checks. Both failed tests
   passed when rerun alone without source or assertion changes.
 - Review follow-up: native provider/runner 35/35; configured workforce/role and
   immutable review-reader integration 76/76.
@@ -87,10 +87,13 @@ Validation separates fixture evidence from real execution:
   completed manifest/diff reading, and returned the current source value after
   native resume. No real repository or GitHub operation was involved; this does
   not establish adversarial sandbox enforcement or real PR publication.
-- Distribution checks require committed release inputs. A separate clean
-  installation reached HTTP 200, but its readiness acceptance was blocked by
-  the data volume's approximately 97.5% utilization. Do not weaken the capacity
-  guard to make this test pass.
+- Committed-tree distribution validation: 19 tests, 16 passed and three failed.
+  Release-input consistency and privacy checks passed. One packaged-manager
+  test failed at an unmanaged-listener check and passed an unchanged isolated
+  rerun (1/1). The remaining parent/subtest failures were clean-install readiness:
+  HTTP 200 was reached, but the data volume's approximately 97.6% utilization
+  triggered the critical capacity guard. Do not weaken that guard to make this
+  test pass. The full distribution run is not green.
 
 The active service has not been migrated to native mode. A real configured PR
 Review, publication and assignment handoff remain separate operational
