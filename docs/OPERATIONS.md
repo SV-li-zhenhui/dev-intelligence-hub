@@ -228,7 +228,11 @@ missing, replaced, linked, or unverifiable binary remains unavailable.
 
 Choose one explicit credential mode before `Start` or `Restart`:
 
-- Recommended Codex `credentialMode: "codex-login"` proxies the current
+- Native Codex `credentialMode: "codex-native-login"` uses the service account's
+  startup `CODEX_HOME`, or its default Codex home, directly. Codex manages login
+  refresh and conversation storage. MyDashboard stores session references only;
+  it does not copy auth files, publish a private mirror, or copy session trees.
+- Compatibility Codex `credentialMode: "codex-login"` proxies the current
   service user's file login. If `CODEX_HOME` existed when the service started,
   that absolute directory is the fixed source root; otherwise the source is the
   same Windows user's default Codex directory. Configuration and browser input
@@ -243,10 +247,10 @@ Choose one explicit credential mode before `Start` or `Restart`:
 Keep API keys in the operating-system or service environment, not in
 `config.json`, the configuration UI, scripts, logs, or command history. The
 managed service must inherit the vendor package's npm binary directory in its
-`PATH`, but each model child receives an empty-origin environment and does not
-inherit that `PATH`.
+`PATH`. The service constructs a bounded mode-specific child environment; it
+does not pass its GitHub credential source to the model process.
 
-Login mode requires an existing regular `auth.json` owned by the same Windows
+Compatibility `codex-login` requires an existing regular `auth.json` owned by the same Windows
 user, with one link, a bounded size, no linked ancestor, and no unauthorized
 write/delete/owner/ACL rights. MyDashboard does not change the host file or its
 ACL. It copies only the validated authentication bytes into a private atomic
@@ -274,22 +278,29 @@ Run the fixed no-model readiness check against the managed loopback service:
 node scripts/verify-codex-login-readiness.mjs --origin http://127.0.0.1:4173
 ```
 
-The command performs one bounded GET to the sanitized status endpoint. It does
+The command performs one bounded GET to the sanitized status endpoint. Compare
+the reported credential mode with the active configuration when diagnosing a
+mode change. Readiness is an installation/login check, not proof that a real
+model call, PR Review, code job, or GitHub handoff succeeded. It does
 not invoke a model, inspect a repository or PR, accept credentials/headers, or
 print response details. A cold Windows CLI startup can take tens of seconds; the
 command keeps a 90-second client deadline while the broker retains its shorter
 bounded process and cleanup deadlines. Success prints exactly one of these
 states:
 
-- `available`: the supported CLI and safe file login are usable;
-- `file_login_unavailable`: no supported file login is available (logged out or
-  first-release-unsupported keyring storage);
+- `available`: the supported CLI and the selected login route passed readiness;
+- `file_login_unavailable`: the selected login is unavailable; compatibility
+  mode requires file storage, while native mode checks the CLI login status;
 - `unsafe_source`: the login file identity, owner, ACL, links, or size is unsafe;
-- `broker_blocked`: private mirror publication, integrity, or cleanup is blocked;
+- `broker_blocked`: compatibility mirror publication, integrity or cleanup is
+  blocked; in native mode it means execution/session state needs maintenance,
+  without implying a private credential mirror exists;
 - `cli_unavailable`: the fixed supported Codex CLI package is unavailable.
 
-For `file_login_unavailable`, run `codex login` under the same Windows user and
-select file credential storage. For `unsafe_source`, inspect and intentionally
+For compatibility `file_login_unavailable`, run `codex login` under the same
+Windows user and select file credential storage. Native mode uses the CLI's
+login in the fixed native home; check it under the service account, with the
+same startup `CODEX_HOME`. For `unsafe_source`, inspect and intentionally
 repair ownership/ACLs outside MyDashboard; the service will not weaken them for
 you. For `broker_blocked`, retain the private runtime evidence and investigate
 before retrying. For `cli_unavailable`, install a supported official npm version
@@ -297,21 +308,30 @@ in the managed service account's `PATH`. Restart only when configuration state
 says a confirmed active version is pending restart.
 
 Each claimed task starts at most one vendor process. It runs in a fresh private
-directory with shell tools, plugins, browser integration, slash commands, host
-rules, and host Git/GitHub/SSH context disabled. PR reviews using Codex receive
+task directory. Compatibility routes isolate the profile and disable host tool
+integration. Native mode uses the real Codex home, a fixed read-only sandbox and
+mode-specific overrides; native shell reads of staged task documents are
+allowed. It ignores host Codex user config, rules, custom MCP, plugins and
+hooks. The sandbox limits writes, not access to every file the service account
+can read; native mode is an explicit trust choice for that local read capability.
+PR reviews using Codex receive
 one invocation-scoped, read-only MCP endpoint. It supplies the complete file
 manifest and final diff, plus related source and directory listings at pinned
 head/base commits. Inline material is only a preview. GitHub credentials remain
 in the parent service; the endpoint has no write operations and closes when the
 invocation ends. Review proposals require complete manifest/diff reads and an
 unchanged target. Codex requests bound to the same
-PR or Issue restore their private task session; the isolated invocation is
+PR or Issue restore their bound task session. In compatibility mode, the isolated invocation is
 removed only after verified exit and successful session capture. An unarchived
 session is retained across service restarts, including legacy invocations with
 rollout files, and blocks fresh invocation with
 `STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED`. Do not delete it to clear the
 error: preserve the only copy of task history and investigate capture recovery.
 MyDashboard also keeps durable task context in its own ledger and memory.
+
+The following capture and cleanup rules describe compatibility invocation
+profiles. Native mode keeps conversations in the fixed Codex home and only
+cleans its task-owned input/output workspace after verified process exit.
 
 Invocation directories are temporary workspaces, not the permanent session
 store. Normal completion removes them automatically after process exit, session
@@ -342,9 +362,11 @@ logical archiving, not disk compaction: the bounded local audit history remains.
 After the first schema 2 write, older versions of the attention inbox reader
 cannot read the new state; use the preserved pre-upgrade data snapshot when
 performing an intentional code and data rollback.
-This is reasoning only: any code or GitHub action
-still crosses its independent policy, isolated execution, and owner-confirmation
-boundary.
+Code changes and test execution still use the controlled executor. GitHub
+publishing, Assign and Unassign still use the existing action pipeline. Ordinary
+actions require confirmation; explicitly enabled automatic Review and own-PR
+repair use their activated policy without per-item prompts. Changing the Codex
+login route grants none of these capabilities by itself.
 
 Operational failures are deliberately stable and redacted:
 
@@ -362,6 +384,83 @@ new trusted work revision be scheduled; do not manually retry external effects.
 Vendor calls may incur usage charges even though MyDashboard itself runs
 locally. Review vendor billing, retention, region, and training settings before
 resuming a role.
+
+### Native Codex migration and rollback
+
+Native mode is opt-in. An upgrade, opening the configuration page, or adding a
+new provider does not silently convert an existing provider. The Codex template
+and example configuration retain `codex-login`; a missing mode stays `api-key`.
+Claude rejects `codex-native-login`.
+
+1. Record the currently active configuration version and create a verified
+   MyDashboard backup. Preserve existing private task-session archives and any
+   retained failure evidence. Separately back up the native Codex home according
+   to the CLI's storage requirements and the app's native session references at
+   `<temporaryRoot>-native/sessions`. Managed startup normally places this at
+   `<privateRuntimeDirectory>/supervised-cli-v1-native/sessions`; standalone
+   construction defaults to `.mydashboard-supervised-cli-v1-native/sessions`
+   under the service user's home. Both are private state outside MyDashboard's
+   data backup manifest.
+2. Under the exact operating-system account that runs the managed service,
+   verify the official Codex CLI is installed and its login works. If using
+   `CODEX_HOME`, set the intended absolute home before starting the service;
+   changing it later in a browser or configuration document is unsupported.
+   Use the managed private runtime directory: its parent must pass the existing
+   owner/ACL checks. A general-purpose Windows TEMP or profile directory can
+   have extra write permissions and fail those checks before Codex starts.
+   Diagnose the runtime-directory preparation phase before reinstalling or
+   logging in again; never repair this by weakening the native home's ACL or
+   deleting its history.
+3. In **配置中心 → 大脑 Provider**, select **Codex 原生登录（会话由 CLI 保存）**
+   for one intended Codex provider. Keep its model, role assignments and
+   `remoteData` permissions explicit. Save, validate, inspect the impact, and
+   confirm activation. Use the managed `Restart` command after activation.
+4. Check the selected-mode readiness, then observe a bounded intended role task.
+   Verify its CLI start, structured result, session reference and ledger receipt.
+   For automatic Review, also verify the exact Head, published Review and
+   subsequent handoff. A web HTTP 200 or readiness `available` alone is
+   insufficient acceptance evidence.
+
+An existing archived compatibility conversation is not automatically imported
+into native mode. Its history remains available for maintenance; the new route
+creates its own entity-bound native conversation. Do not attempt a migration by
+copying an entire old invocation profile into the native home. Separate native
+invocations sharing the home are serialized by the service; avoid concurrent
+manual edits to that home during maintenance.
+
+To roll back, pause the affected role, allow supervised work to settle, select
+the previous credential mode in a new configuration version (or activate the
+previous version), confirm and perform a managed restart. Keep both sets of
+history and session references. Recheck execution and reconcile any `unknown`
+GitHub result before resuming; changing modes must not replay an external effect.
+
+**Never include the native Codex home in task-temp cleanup.** The task directory
+holds expendable staged documents and output; the Codex home holds login and
+conversation history that may be the only recoverable copy. The native runtime's
+`sessions/` directory holds persistent references, so do not delete the entire
+`<temporaryRoot>-native` root as temporary garbage either. MyDashboard does not
+archive or rotate native CLI history. Any intentional CLI history
+retention change requires separate verified backup and a stopped or settled
+writer. Do not clear a session error by deleting either history store.
+
+Native session references use a small `.json.pending` journal written before
+launch. A journal with a known thread ID resumes that exact conversation if
+final reference publication failed. An unknown ID blocks only that entity;
+unrelated tasks can continue after the prior process is confirmed stopped.
+When the supervised runner proves that it never attempted to spawn a process,
+the service removes that invocation's pending journal so the same entity can
+retry. A public error code or user-supplied flag is not such proof.
+Preserve the journal and native history. Maintenance must identify the correct
+native thread and publish its reference using `CodexNativeSessionStore.save`
+with the exact router-bound session key. Do not remove a pending journal merely
+to make retry succeed: that could silently start a new conversation.
+
+Codex PR review JSON traces can contain tool-read output. Their stdout transport
+budget is 64 MiB, separate from the configured structured final-response limit
+(at most 1 MiB). This is not a per-source-file or total-diff truncation rule;
+the read-only MCP reader supplies complete paginated documents. Exceeding the
+trace transport budget stops the invocation with an output-limit error rather
+than accepting an incomplete review.
 
 ## GitHub CLI login credentials
 
@@ -382,7 +481,7 @@ after the activated version reports that a restart is required. Do not set
 `GH_CONFIG_DIR` for the managed service and do not copy a host `hosts.yml` into
 the project or application data.
 
-At a confirmed execution or reconciliation boundary, MyDashboard supervises
+At an authorized execution or reconciliation boundary, MyDashboard supervises
 the equivalent of `gh auth token --hostname github.com --user
 <actorAccountId>` in a private temporary working directory and validates the
 bounded token output. The selected GitHub transport then uses that lease to run
@@ -390,7 +489,8 @@ bounded token output. The selected GitHub transport then uses that lease to run
 mutation. The token lives only in a short in-memory lease; it is not persisted
 or shown, and cleanup releases all retained references before another action
 can acquire the source. Every Review, comment, update branch, push, or merge
-still requires its own confirmation; selecting `gh-login` grants no action by
+still requires its individual confirmation or an applicable activated automatic
+workflow policy; selecting `gh-login` grants no action by
 itself.
 
 For compatibility, `credentialMode: "token-env"` reads only the environment

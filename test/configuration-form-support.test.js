@@ -2102,9 +2102,24 @@ test("CLI credential mode is added structurally without rewriting legacy provide
   assert.equal(result.ok, true);
   assert.equal(result.configuration.brainProviders["legacy-cli"].credentialMode, "api-key");
 
+  const nativeState = setConfigurationFormField(state, {
+    path: ["brainProviders", "legacy-cli", "credentialMode"],
+    kind: "text",
+    rawValue: "codex-native-login",
+  });
+  const native = configurationDocumentFromForm(nativeState);
+  assert.equal(native.ok, true);
+  assert.equal(native.configuration.brainProviders["legacy-cli"].credentialMode, "codex-native-login");
+  assert.doesNotThrow(() => normalizeConfigurationDocument(native.configuration));
+  assert.equal(
+    Object.hasOwn(configurationDocumentFromForm(initial).configuration.brainProviders["legacy-cli"], "credentialMode"),
+    false,
+  );
+
   for (const [kind, credentialMode] of [
     ["codex-cli", "unsupported"],
     ["claude-cli", "codex-login"],
+    ["claude-cli", "codex-native-login"],
     ["ollama", "api-key"],
   ]) {
     const invalid = structuredClone(configuration);

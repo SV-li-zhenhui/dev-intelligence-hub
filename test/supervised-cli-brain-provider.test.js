@@ -41,6 +41,26 @@ const SCHEMA = Object.freeze({
 });
 const PRIVATE_PROMPT = "PRIVATE_PROMPT_MUST_STAY_IN_STDIN";
 
+test("supervised factory routes native login without exposing the legacy credential broker", async (t) => {
+  const temporaryRoot = await temporaryDirectory(t, "native-cli-factory-");
+  const options = { id: "native", cliKind: "codex-cli", credentialMode: "codex-native-login" };
+  assert.throws(() => createProductionSupervisedCliBrainProvider(options, {}), /lexical composition grant/u);
+  const provider = createTestSupervisedCliBrainProvider(options, {
+    environment: { CODEX_HOME: path.join(temporaryRoot, "home") },
+    temporaryRoot: path.join(temporaryRoot, "runtime"),
+    processRunner: { async run() { throw new Error("not invoked by construction"); } },
+    commandLocator: { async resolve() { throw new Error("not invoked by construction"); } },
+    codexLoginCredentialBroker: { async acquire() { throw new Error("legacy broker must stay unused"); } },
+  });
+  assert.equal(provider.kind, "codex-cli");
+  assert.equal(provider.remote, true);
+  assert.equal(provider.singleAttempt, true);
+  assert.equal(provider.supportsEntitySessions, true);
+  assert.equal(provider.supportsReviewReading, true);
+  assert.equal(provider instanceof SupervisedCliBrainProvider, false);
+  await provider.close();
+});
+
 async function temporaryDirectory(t, prefix) {
   const directory = await mkdtemp(path.join(tmpdir(), prefix));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -388,6 +408,29 @@ function recordingCodexLoginBroker(events, options = {}) {
         state: "available",
         cliAvailable: true,
         fileLoginAvailable: true,
+      });
+    },
+  });
+}
+
+function fencingCodexLoginBroker(events) {
+  const recording = recordingCodexLoginBroker(events);
+  let blocked = false;
+  return Object.freeze({
+    readStatus: recording.readStatus,
+    async acquire(request) {
+      if (blocked) {
+        throw Object.assign(new Error("fictional credential fence"), {
+          code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+        });
+      }
+      const lease = await recording.acquire(request);
+      return Object.freeze({
+        ...lease,
+        release({ safe }) {
+          blocked ||= !safe;
+          lease.release({ safe });
+        },
       });
     },
   });
@@ -830,6 +873,213 @@ test("Codex login mode stages one isolated profile and omits every API credentia
     "capture",
     "release:true",
   ]);
+});
+
+test("settled login session preparation failure releases the broker for an independent task", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-login-preparation-failure-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const events = [];
+  let stageCalls = 0;
+  const sessionStore = {
+    async stage() {
+      stageCalls += 1;
+      if (stageCalls === 1) throw new Error("fictional session preparation failure");
+      return { sessionId: null };
+    },
+    async capture() {
+      events.push("session-capture");
+    },
+  };
+  const runner = recordingRunner(async (invocation) => {
+    events.push("run");
+    await writeFile(argumentValue(invocation.args, "--output-last-message"), codexOutput({ ok: true }));
+    return successfulProcess(Buffer.from(`${JSON.stringify({ type: "thread.started", thread_id: "fixture-next-task" })}\n`));
+  });
+  const provider = createTestSupervisedCliBrainProvider({
+    ...providerOptions("codex-cli"),
+    credentialMode: "codex-login",
+  }, {
+    processRunner: runner,
+    commandLocator: recordingLocator(testDescriptor("codex-cli")),
+    environment: {},
+    temporaryRoot,
+    codexLoginCredentialBroker: fencingCodexLoginBroker(events),
+    codexSessionStore: sessionStore,
+  });
+
+  await assert.rejects(provider.generate(brainRequest({
+    sessionKey: "github:pull_request:example/software#1",
+  })), { code: "STRUCTURED_PROVIDER_UNAVAILABLE" });
+  assert.equal(runner.calls.length, 0);
+  assert.deepEqual(await readdir(temporaryRoot), []);
+  assert.equal(events.at(-1), "release:true");
+
+  assert.equal(await provider.generate(brainRequest({
+    sessionKey: "github:pull_request:example/software#2",
+  })), '{"ok":true}');
+  assert.equal(runner.calls.length, 1);
+  assert.deepEqual(events, [
+    "acquire", "stage", "release:true",
+    "acquire", "stage", "run", "session-capture", "capture", "release:true",
+  ]);
+});
+
+test("cancelled login preparation waits for pending session writes before cleanup and safe release", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-login-preparation-cancel-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const events = [];
+  const controller = new AbortController();
+  const stageEntered = deferred();
+  const continueStage = deferred();
+  let codexHome;
+  let settled = false;
+  const runner = recordingRunner(async () => successfulProcess());
+  const provider = createTestSupervisedCliBrainProvider({
+    ...providerOptions("codex-cli"),
+    credentialMode: "codex-login",
+  }, {
+    processRunner: runner,
+    commandLocator: recordingLocator(testDescriptor("codex-cli")),
+    environment: {},
+    temporaryRoot,
+    codexLoginCredentialBroker: fencingCodexLoginBroker(events),
+    codexSessionStore: {
+      async stage(input) {
+        codexHome = input.codexHome;
+        stageEntered.resolve();
+        await continueStage.promise;
+        // Model a filesystem operation that cannot stop immediately on abort.
+        await writeFile(path.join(codexHome, "pending-session.json"), "fixture history");
+        return { sessionId: null };
+      },
+      async capture() { assert.fail("no process was started"); },
+    },
+  });
+  const generation = provider.generate(brainRequest({
+    sessionKey: "github:pull_request:example/software#1",
+    signal: controller.signal,
+  }));
+  void generation.then(() => { settled = true; }, () => { settled = true; });
+  await stageEntered.promise;
+  controller.abort();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  try {
+    assert.equal(settled, false);
+    assert.equal(events.some((event) => event.startsWith("release:")), false);
+    assert.equal(await readFile(path.join(codexHome, "auth.json"), "utf8"), "fictional-login-credential");
+  } finally {
+    continueStage.resolve();
+  }
+  await assert.rejects(generation, { code: "STRUCTURED_PROVIDER_CANCELLED" });
+  assert.equal(runner.calls.length, 0);
+  assert.equal(events.at(-1), "release:true");
+  assert.deepEqual(await readdir(temporaryRoot), []);
+});
+
+test("unsettled login preparation stays fenced after its recovery deadline", async (t) => {
+  for (const scenario of ["credential-stage", "session-stage"]) {
+    await t.test(scenario, async (child) => {
+      const parent = await temporaryDirectory(child, `supervised-login-pending-${scenario}-`);
+      const temporaryRoot = path.join(parent, "runtime");
+      const events = [];
+      const controller = new AbortController();
+      const stageEntered = deferred();
+      const continueStage = deferred();
+      const stageSettled = deferred();
+      let codexHome;
+      const waitForStage = async (home) => {
+        codexHome = home;
+        stageEntered.resolve();
+        await continueStage.promise;
+        try {
+          await writeFile(path.join(codexHome, "pending-stage.json"), "fixture state");
+        } finally {
+          stageSettled.resolve();
+        }
+      };
+      const broker = fencingCodexLoginBroker(events);
+      const runner = recordingRunner(async () => successfulProcess());
+      const provider = createTestSupervisedCliBrainProvider({
+        ...providerOptions("codex-cli"),
+        credentialMode: "codex-login",
+        timeoutMs: 1_000,
+      }, {
+        processRunner: runner,
+        commandLocator: recordingLocator(testDescriptor("codex-cli")),
+        environment: {},
+        temporaryRoot,
+        codexLoginCredentialBroker: scenario === "session-stage" ? broker : {
+          ...broker,
+          async acquire(input) {
+            const lease = await broker.acquire(input);
+            return Object.freeze({
+              ...lease,
+              async stage(request) {
+                const staged = await lease.stage(request);
+                await waitForStage(staged.codexHome);
+                return staged;
+              },
+            });
+          },
+        },
+        codexSessionStore: {
+          async stage(input) {
+            await waitForStage(input.codexHome);
+            return { sessionId: null };
+          },
+          async capture() { assert.fail("no process was started"); },
+        },
+      });
+      const generation = provider.generate(brainRequest({
+        ...(scenario === "session-stage" ? { sessionKey: "github:pull_request:example/software#1" } : {}),
+        signal: controller.signal,
+      }));
+      const rejected = assert.rejects(generation, { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" });
+      await stageEntered.promise;
+      controller.abort();
+      try {
+        await within(3_000, rejected);
+        assert.equal(runner.calls.length, 0);
+        assert.equal(events.at(-1), "release:false");
+        assert.equal(await readFile(path.join(codexHome, "auth.json"), "utf8"), "fictional-login-credential");
+        await assert.rejects(provider.generate(brainRequest()), { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" });
+      } finally {
+        continueStage.resolve();
+        await stageSettled.promise;
+      }
+      assert.equal(runner.calls.length, 0);
+    });
+  }
+});
+
+test("login preparation failure cannot release a credential lease after failed cleanup", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-login-preparation-cleanup-");
+  const events = [];
+  const runner = recordingRunner(async () => successfulProcess());
+  const provider = createTestSupervisedCliBrainProvider({
+    ...providerOptions("codex-cli"),
+    credentialMode: "codex-login",
+  }, {
+    processRunner: runner,
+    commandLocator: recordingLocator(testDescriptor("codex-cli")),
+    environment: {},
+    temporaryRoot: path.join(parent, "runtime"),
+    codexLoginCredentialBroker: fencingCodexLoginBroker(events),
+    codexSessionStore: {
+      async stage() { throw new Error("fictional preparation failure"); },
+      async capture() { assert.fail("no process was started"); },
+    },
+    cleanupFileSystem: cleanupFileSystem({
+      async unlink() { throw new Error("fictional cleanup failure"); },
+    }),
+  });
+
+  await assert.rejects(provider.generate(brainRequest({
+    sessionKey: "github:pull_request:example/software#1",
+  })), { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" });
+  assert.equal(events.at(-1), "release:false");
+  await assert.rejects(provider.generate(brainRequest()), { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" });
+  assert.equal(runner.calls.length, 0);
 });
 
 test("credential mode combinations fail at construction without touching a broker", async (t) => {

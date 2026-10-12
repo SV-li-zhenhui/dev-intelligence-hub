@@ -89,7 +89,7 @@ const PROVIDER_FIELDS = Object.freeze([
   "remote",
 ]);
 const CLI_PROVIDER_KINDS = new Set(["codex-cli", "claude-cli"]);
-const CLI_CREDENTIAL_MODES = new Set(["api-key", "codex-login"]);
+const CLI_CREDENTIAL_MODES = new Set(["api-key", "codex-login", "codex-native-login"]);
 const SUPPORTED_PROVIDER_KINDS = new Set([
   "ollama",
   "openai-compatible",

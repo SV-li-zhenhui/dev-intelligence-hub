@@ -22,7 +22,7 @@ GitHub / DingTalk / local imports
                                          |
                                   policy + dispatcher
                                     /           \
-                         owner confirmation   local waiting,
+                         authorized execution local waiting,
                           /             \      handoff, memory
                  controlled code     GitHub actions
                          \             /
@@ -55,14 +55,15 @@ not authority.
 Codex CLI and Claude CLI are remote reasoning providers behind the same brain
 router and data-class admission gate as HTTPS providers. The trusted controller
 remains deterministic MyDashboard code. For each admitted task revision it
-locates one version-admitted official Windows x64 npm binary, creates a fresh
-private invocation directory and empty profile roots, and starts one bounded
-child-process tree. Claude uses only its fixed API-key environment variable.
-Codex either uses the backward-compatible API-key mode or a brokered
-`credentialMode: "codex-login"`; missing mode remains API-key for legacy
-configurations.
+locates an admitted official Windows x64 npm binary, creates a private
+invocation directory, and automatically starts one supervised child-process
+tree with task input on stdin. The task ledger, source binding, cancellation,
+timeout and result validation belong to the service. Claude uses only its fixed
+API-key environment variable. Codex supports three explicit modes: `api-key`,
+brokered `codex-login`, and `codex-native-login`. A missing mode remains API-key;
+no mode silently falls back to another.
 
-The login broker derives the source only from startup `CODEX_HOME` or the
+The compatibility `codex-login` broker derives the source only from startup `CODEX_HOME` or the
 current Windows user's default Codex directory. It handle-validates the one
 file login source, synchronizes an atomic private mirror outside project/data/
 backup roots, and stages only the authentication file into the disposable
@@ -72,19 +73,60 @@ source synchronization, the model process, refreshed-credential capture, and
 cleanup. Login, account switch, and logout changes are therefore observed only
 at a task boundary without concurrent refresh overwrite.
 
-The child has no inherited `PATH`, host configuration beyond that isolated
-authentication file, Git/GitHub/SSH environment, repository working directory,
-plugin, MCP, browser, shell tool, or persistent session. The private credential
-mirror is not part of backup, restore, packaging, or open-source distribution.
+The compatibility and API-key routes use disposable profiles and an
+empty-origin environment, excluding inherited host Git/GitHub/SSH credentials.
+Codex task conversations are captured into the private task-session store and
+restored for the same bound entity. Capture or cleanup failures retain evidence
+and stop unsafe reuse. The private credential mirror is not part of backup,
+restore, packaging, or open-source distribution.
 
-The vendor strategies use fixed no-authority flags and accept only bounded,
-strict structured output. Output is untrusted: it returns to the existing
+The opt-in `codex-native-login` route passes the service account's startup
+`CODEX_HOME`, or its default Codex home, directly to Codex. Codex owns native
+authentication refresh and conversation files. MyDashboard neither stages auth
+bytes nor creates a credential mirror, and does not copy session directories.
+It persists only the task/entity-to-session reference, resumes that session for
+the same entity, and serializes native invocations sharing the home. Native
+conversation history is external private runtime state, not disposable task
+output. Existing compatibility archives remain preserved; there is no automatic
+history migration when changing modes.
+
+Native session references are stored under `<temporaryRoot>-native/sessions`.
+Managed startup normally uses
+`<privateRuntimeDirectory>/supervised-cli-v1-native/sessions`; standalone
+construction defaults to the service user's
+`.mydashboard-supervised-cli-v1-native/sessions`.
+Despite the runtime-root naming, this subdirectory is durable application-owned
+private state. It contains the native-home digest and thread ID, not transcripts
+or credentials; it is outside the project data backup and must be preserved
+alongside the native home for disaster recovery.
+
+Codex PR review invocations receive a scoped read-only MCP reader for the
+complete change manifest, final diff, and related source at immutable head/base
+commits. The MCP endpoint has no writes and retains GitHub credentials in the
+service. Native mode also permits Codex's own read-only shell tools for staged
+task documents. Inline previews are bounded; complete change-set reading is a
+separate enforced evidence condition. Neither native mode nor the MCP reader
+grants direct GitHub publishing authority.
+
+The native read-only sandbox restricts writes, not read confidentiality across
+the service account's filesystem. Native mode therefore trusts Codex's local
+read capability for that account. Automation ignores host Codex user config,
+execpolicy `.rules`, custom MCP registrations, plugins and hooks; only its fixed
+review MCP endpoint is configured. Native mode also disables automatic
+`AGENTS.md` instruction injection with `project_doc_max_bytes=0`. Sanitized
+environment and a read-only sandbox do not
+constitute isolation from all host-readable files or on-disk credentials.
+
+The vendor strategies use fixed mode-specific sandbox flags and accept only
+bounded, strict structured output. Output is untrusted: it returns to the existing
 decision schema, policy, ledger, memory, controlled-code, and confirmation
 boundaries. It cannot directly mutate a repository or GitHub. A timeout,
 cancellation, malformed result, output overflow, unavailable binary, or process
 reaping failure ends that attempt; the role does not ask the CLI to repair its
-own response. Cross-task continuity belongs to MyDashboard's durable ledger and
-memory. Persistent vendor conversations remain a deferred mode.
+own response. Cross-task coordination belongs to MyDashboard's durable ledger
+and memory, while same-entity conversations follow the selected mode's session
+storage. Native code modification and a general native build/test tool loop are
+not introduced by this route; code jobs retain the controlled executor.
 
 Owner-created work enters through a separate structured command-center
 contract. The browser supplies business content only; role, node, permission,
@@ -102,10 +144,14 @@ to its revision, digest, actor, source provenance, and target identity. The UI
 shows one request at a time and cannot replace server-owned payloads. Stale or
 revoked requests fail closed.
 
-Code work uses fixed semantic actions in isolated workspaces. Models never
-receive a raw shell or arbitrary host path. Applying a change package,
-publishing a commit, and every GitHub mutation are distinct authority and
-confirmation boundaries. Git operations bind the observing account, base and
+Code work uses fixed semantic actions in isolated workspaces. The code executor
+does not grant an arbitrary host shell; native brain reads run under its separate
+read-only sandbox. Applying a change package, publishing a commit, and GitHub
+mutations have separate authority checks. Ordinary actions require individual
+confirmation. Explicit `automaticReview`, `assignAfterAutomaticReview` and
+`automaticOwnPrRepair` settings permit the corresponding bounded workflows
+without individual prompts; they do not authorize automatic merge or Issue
+closure. Git operations bind the observing account, base and
 head repositories, refs, and object IDs. A changed binding invalidates derived
 work.
 
@@ -115,7 +161,8 @@ the result becomes `unknown`; duplicate execution remains blocked until a
 trusted observation resolves it.
 
 GitHub mutations select one credential source only after authority and the
-current confirmation have both been revalidated. The compatibility source,
+current individual confirmation or activated automatic policy have been
+revalidated. The compatibility source,
 `credentialMode: "token-env"`, resolves the configured environment-variable
 name. The recommended `credentialMode: "gh-login"` source supervises a fixed
 absolute GitHub CLI binary in a private temporary working directory and asks
@@ -127,7 +174,7 @@ write.
 
 The legacy GitHub action adapter and the PR external-action transport share
 this credential-source boundary and the same confirmation executor. A bounded
-credential lease exists only for confirmed execution or reconciliation, is
+credential lease exists only for authorized execution or reconciliation, is
 passed directly to the selected transport, and releases its references during
 cleanup. No credential enters intent state, receipts, logs, browser responses,
 model context, backup, or recovery data. Credential selection never changes
@@ -174,7 +221,8 @@ capacity. See [OPERATIONS.md](OPERATIONS.md) for procedures.
   responses, and recovery inputs are untrusted.
 - Secrets are injected from environment variables into the smallest possible
   adapter and must not enter model context, state, logs, or browser responses.
-- Privileged features are disabled by default; explicit configuration grants
-  capability but never bypasses confirmation or evidence checks.
+- Privileged features require explicit activation. Automatic workflow settings
+  replace per-item prompts only for their declared scope; current source,
+  authority, evidence and unknown-outcome checks still apply.
 - GitHub writes remain fake or disabled in ordinary tests and local acceptance
   unless the owner has separately confirmed the publishing account.

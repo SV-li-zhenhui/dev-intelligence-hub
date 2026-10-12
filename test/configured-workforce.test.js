@@ -403,6 +403,60 @@ test("configured Codex routing preserves stable entity sessions", async () => {
   assert.notEqual(calls[0].sessionKey, sessionKey);
 });
 
+test("configured routing forwards only explicit review reading support", async () => {
+  for (const supported of [undefined, false, true]) {
+    const router = createOwnedTestConfiguredBrainRouter(
+      { brainProviders: { cli: { kind: "codex-cli" } } },
+      {
+        supervisedCliProviderFactory(options) {
+          return {
+            id: options.id,
+            remote: true,
+            ...(supported === undefined ? {} : { supportsReviewReading: supported }),
+            async generate() { return '{"ok":true}'; },
+          };
+        },
+      },
+    );
+    const view = router.describe({
+      provider: "cli",
+      model: "gpt-6.1-sol",
+      remoteData: { requirements: true, code: true, memory: false },
+    });
+    assert.equal(Object.hasOwn(view, "supportsReviewReading"), supported === true);
+    if (supported === true) assert.equal(view.supportsReviewReading, true);
+    await router.close();
+  }
+});
+
+test("configured routing rejects invalid review reading declarations without invoking accessors", () => {
+  let getterCalls = 0;
+  for (const descriptor of [
+    { value: "true" },
+    { value: undefined },
+    { get() { getterCalls += 1; return true; } },
+  ]) {
+    assert.throws(
+      () => createOwnedTestConfiguredBrainRouter(
+        { brainProviders: { cli: { kind: "codex-cli" } } },
+        {
+          supervisedCliProviderFactory(options) {
+            const provider = {
+              id: options.id,
+              remote: true,
+              async generate() { return '{"ok":true}'; },
+            };
+            Object.defineProperty(provider, "supportsReviewReading", descriptor);
+            return provider;
+          },
+        },
+      ),
+      { name: "TypeError", message: "brain provider review reading support is invalid" },
+    );
+  }
+  assert.equal(getterCalls, 0);
+});
+
 test("configured routing preserves prototype-defined provider availability", async () => {
   let availabilityCalls = 0;
   class CliProvider {

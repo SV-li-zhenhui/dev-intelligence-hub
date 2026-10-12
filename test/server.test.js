@@ -1411,6 +1411,17 @@ test("brain provider status API exposes only the sanitized readiness projection"
   assert.deepEqual(fixture.application.config, originalConfig);
   assert.equal(response.body.includes(privateMarker), false);
 
+  fixture.application.brainProviderStatus.readStatus = async () => ({
+    schemaVersion: 1,
+    state: "available",
+    cliAvailable: true,
+    fileLoginAvailable: true,
+    credentialMode: "codex-native-login",
+  });
+  const native = await request(server, { path: "/api/brain-providers/status" });
+  assert.equal(native.status, 200);
+  assert.equal(JSON.parse(native.body).credentialMode, "codex-native-login");
+
   const query = await request(server, {
     path: "/api/brain-providers/status?source=private",
   });
@@ -1469,6 +1480,14 @@ test("brain provider status API exposes only the sanitized readiness projection"
   });
   assert.equal(invalid.status, 500);
   assert.equal(invalid.body.includes(privateMarker), false);
+
+  fixture.application.brainProviderStatus.readStatus = async () => ({
+    schemaVersion: 1, state: "available", cliAvailable: true,
+    fileLoginAvailable: true, credentialMode: privateMarker,
+  });
+  const invalidMode = await request(server, { path: "/api/brain-providers/status" });
+  assert.equal(invalidMode.status, 500);
+  assert.equal(invalidMode.body.includes(privateMarker), false);
 
   fixture.application.brainProviderStatus = null;
   const missing = await request(server, {

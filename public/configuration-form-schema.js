@@ -376,13 +376,15 @@ const FIELD_RULES = deepFreeze([
     kind: "text",
     providerKinds: ["codex-cli", "claude-cli"],
     optionsByProviderKind: {
-      "codex-cli": ["codex-login", "api-key"],
+      "codex-cli": ["codex-login", "codex-native-login", "api-key"],
       "claude-cli": ["api-key"],
     },
     optionLabels: {
-      "codex-login": "Codex 当前登录（受管代理，推荐）",
+      "codex-login": "Codex 受管登录（兼容）",
+      "codex-native-login": "Codex 原生登录（会话由 CLI 保存）",
       "api-key": "环境变量 API Key",
     },
+    help: "Codex 原生登录直接使用服务账号启动时的 CODEX_HOME（未设置时为该账号的 .codex），认证和会话由 CLI 保存；受管登录保留现有凭据镜像和会话归档流程。模式需明确选择，不自动切换，也不自动迁移旧会话。Claude 仅支持 API Key。",
   },
   {
     pattern: ["githubActions", "credentialMode"],

@@ -10,6 +10,9 @@ import { normalizeAbortSignal } from "./structured-provider-request.js";
 
 const MAX_TIMEOUT_MS = 3_600_000;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
+// Codex JSON traces include tool reads; the structured final response has its
+// own smaller bound in the provider. Keep stderr at the diagnostic bound.
+const MAX_STDOUT_BYTES = 64 * 1024 * 1024;
 const MAX_INPUT_BYTES = 1024 * 1024;
 const MAX_ARGUMENTS = 256;
 const MAX_ARGUMENT_BYTES = 128 * 1024;
@@ -23,6 +26,13 @@ const WINDOWS_WRAPPER_PATH = fileURLToPath(
 );
 const TEST_CONSTRUCTION_TOKEN = Object.freeze({});
 const REAPED_FAILURE_OUTPUT = new WeakMap();
+const PROCESS_NOT_STARTED = new WeakSet();
+
+// Only the runner can certify that execution failed before a spawn attempt.
+// Error codes and caller-created error objects cannot carry this authority.
+export function didSupervisedProcessNotStart(error) {
+  return PROCESS_NOT_STARTED.has(error);
+}
 
 // Failure output remains process-private instead of becoming loggable Error data.
 export function readReapedProcessFailureOutput(error) {
@@ -471,7 +481,20 @@ export class SupervisedProcessRunner {
     Object.freeze(this);
   }
 
-  async run({
+  async run(options) {
+    let spawnAttempted = false;
+    try {
+      return await this.#run(options, () => { spawnAttempted = true; });
+    } catch (error) {
+      if (!spawnAttempted && error !== null &&
+          (typeof error === "object" || typeof error === "function")) {
+        PROCESS_NOT_STARTED.add(error);
+      }
+      throw error;
+    }
+  }
+
+  async #run({
     executable,
     args = [],
     cwd,
@@ -481,7 +504,7 @@ export class SupervisedProcessRunner {
     timeoutMs,
     maxStdoutBytes,
     maxStderrBytes,
-  }) {
+  }, onSpawnAttempt) {
     const platform = this.#platform;
     const spawnImpl = this.#spawnImpl;
     const treeTerminator = this.#treeTerminator;
@@ -507,7 +530,7 @@ export class SupervisedProcessRunner {
       maxStdoutBytes: boundedInteger(
         maxStdoutBytes,
         "maxStdoutBytes",
-        MAX_OUTPUT_BYTES,
+        MAX_STDOUT_BYTES,
       ),
       maxStderrBytes: boundedInteger(
         maxStderrBytes,
@@ -579,6 +602,7 @@ export class SupervisedProcessRunner {
     return new Promise((resolve, reject) => {
       let child;
       try {
+        onSpawnAttempt();
         child = spawnImpl(spawnedInvocation.command, spawnedInvocation.args, {
           cwd: spawnedInvocation.cwd,
           env: spawnedInvocation.env,

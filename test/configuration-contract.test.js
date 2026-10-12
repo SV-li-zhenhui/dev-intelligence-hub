@@ -1259,7 +1259,7 @@ test("CLI provider credential modes remain optional legacy configuration and cla
     false,
   );
 
-  for (const credentialMode of ["api-key", "codex-login"]) {
+  for (const credentialMode of ["api-key", "codex-login", "codex-native-login"]) {
     const configured = structuredClone(legacy);
     configured.brainProviders.cli.credentialMode = credentialMode;
     assert.equal(
@@ -1277,9 +1277,20 @@ test("CLI provider credential modes remain optional legacy configuration and cla
     "brainProviders.cli.credentialMode",
   ]);
 
-  const claude = structuredClone(legacy);
-  claude.brainProviders.cli = { kind: "claude-cli", remote: true, credentialMode: "codex-login" };
-  assertInvalid(claude);
+  for (const credentialMode of ["codex-login", "codex-native-login"]) {
+    const claude = structuredClone(legacy);
+    claude.brainProviders.cli = { kind: "claude-cli", remote: true, credentialMode };
+    assertInvalid(claude);
+  }
+
+  const nativeLogin = structuredClone(login);
+  nativeLogin.brainProviders.cli.credentialMode = "codex-native-login";
+  assert.deepEqual(configurationDocumentImpact(login, nativeLogin).restart_required, [
+    "brainProviders.cli.credentialMode",
+  ]);
+  assert.deepEqual(configurationDocumentImpact(login, nativeLogin).authority_expansion, [
+    "brainProviders.cli.credentialMode",
+  ]);
 
   for (const provider of ["ollama", "openai-compatible"]) {
     const nonCli = document();

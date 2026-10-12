@@ -351,12 +351,21 @@ test("CLI provider controls and templates render exact process limits", () => {
   assert.match(templateTimeout, / min="1000"/);
   assert.match(templateTimeout, / max="3600000"/);
 
-  assert.match(markup, /<option value="codex-login" selected>Codex 当前登录（受管代理，推荐）<\/option>/);
+  assert.match(markup, /<option value="codex-login" selected>Codex 受管登录（兼容）<\/option>/);
+  assert.match(markup, /<option value="codex-native-login">Codex 原生登录（会话由 CLI 保存）<\/option>/);
   assert.match(markup, /<option value="api-key">环境变量 API Key<\/option>/);
   assert.match(
     markup,
-    /data-configuration-template-field="\[&quot;brainProviders&quot;,&quot;codex-cli&quot;,&quot;credentialMode&quot;\]" data-configuration-edit-kind="text"><option value="codex-login" selected>Codex 当前登录（受管代理，推荐）<\/option><option value="api-key">环境变量 API Key<\/option>/,
+    /data-configuration-template-field="\[&quot;brainProviders&quot;,&quot;codex-cli&quot;,&quot;credentialMode&quot;\]" data-configuration-edit-kind="text"><option value="codex-login" selected>Codex 受管登录（兼容）<\/option><option value="codex-native-login">Codex 原生登录（会话由 CLI 保存）<\/option><option value="api-key">环境变量 API Key<\/option>/,
   );
+
+  const native = configurationWithCliProvider();
+  native.brainProviders["employee-cli"].credentialMode = "codex-native-login";
+  const nativeMarkup = renderConfigurationSettingsSkeleton({
+    state: createConfigurationFormState(native),
+  });
+  assert.match(nativeMarkup, /<option value="codex-native-login" selected>Codex 原生登录（会话由 CLI 保存）<\/option>/);
+  assert.match(nativeMarkup, /CODEX_HOME/);
 
   const legacy = configurationWithCliProvider();
   legacy.brainProviders["employee-cli"].credentialMode = undefined;

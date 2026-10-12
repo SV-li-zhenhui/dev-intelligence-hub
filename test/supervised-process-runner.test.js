@@ -9,6 +9,7 @@ import test from "node:test";
 import { terminateProcessTree } from "../src/lib/managed-process.js";
 import {
   createTestSupervisedProcessRunner,
+  didSupervisedProcessNotStart,
   SupervisedProcessRunner,
 } from "../src/lib/supervised-process-runner.js";
 
@@ -152,6 +153,55 @@ test("supervised runner rejects a pre-aborted request without spawning", async (
       !error.message.includes("private cancellation reason"),
   );
   await assert.rejects(readFile(marker, "utf8"), { code: "ENOENT" });
+});
+
+test("only runner-owned failures before a spawn attempt certify that no process started", async (t) => {
+  const directory = await temporaryDirectory(t, "supervised-runner-no-start-");
+  let spawnCalls = 0;
+  const runner = testRunner({
+    descriptorMaterializer: async () => { throw new Error("private verification failure"); },
+    spawnImpl() { spawnCalls += 1; throw new Error("must not spawn"); },
+  });
+  let certified;
+  await assert.rejects(runner.run(request(directory, "")), (error) => {
+    certified = error;
+    return error.code === "STRUCTURED_PROVIDER_UNAVAILABLE" && didSupervisedProcessNotStart(error);
+  });
+  assert.equal(spawnCalls, 0);
+  assert.equal(didSupervisedProcessNotStart(new Error(certified.message)), false);
+  assert.equal(didSupervisedProcessNotStart(Object.assign(new Error(certified.message), {
+    code: certified.code, processNotStarted: true,
+  })), false);
+  assert.equal(didSupervisedProcessNotStart(null), false);
+  assert.equal(didSupervisedProcessNotStart("STRUCTURED_PROVIDER_UNAVAILABLE"), false);
+
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(testRunner().run(request(directory, "", { signal: controller.signal })),
+    (error) => error.code === "STRUCTURED_PROVIDER_CANCELLED" && didSupervisedProcessNotStart(error));
+  await assert.rejects(testRunner().run(request(directory, "", { maxStdoutBytes: 0 })),
+    (error) => error instanceof TypeError && didSupervisedProcessNotStart(error));
+});
+
+test("spawn attempts and confirmed unsuccessful exits never receive no-start certification", async (t) => {
+  const directory = await temporaryDirectory(t, "supervised-runner-started-");
+  const throwingSpawn = testRunner({ spawnImpl() { throw new Error("ambiguous spawn failure"); } });
+  await assert.rejects(throwingSpawn.run(request(directory, "")),
+    (error) => error.code === "STRUCTURED_PROVIDER_UNAVAILABLE" && !didSupervisedProcessNotStart(error));
+  await assert.rejects(testRunner().run(request(directory, "process.exit(3);")),
+    (error) => error.code === "STRUCTURED_PROVIDER_PROCESS_EXITED" && !didSupervisedProcessNotStart(error));
+});
+
+test("supervised runner admits review traces above one MiB independently of final response size", async (t) => {
+  const directory = await temporaryDirectory(t, "supervised-runner-review-trace-");
+  const result = await testRunner().run(request(
+    directory,
+    "process.stdout.write(Buffer.alloc(2 * 1024 * 1024, 65));",
+    { maxStdoutBytes: 64 * 1024 * 1024 },
+  ));
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdoutBytes.length, 2 * 1024 * 1024);
+  assert.equal(result.stdoutBytes.at(-1), 65);
 });
 
 test("descriptor verification is bounded by the request timeout", async (t) => {

@@ -551,9 +551,19 @@ test("provider variants expose fixed supervised Codex and Claude CLI forms", () 
     "codex-login",
     { providerKind: "codex-cli" },
   );
-  assert.deepEqual(descriptor.options, ["codex-login", "api-key"]);
-  assert.equal(descriptor.optionLabels["codex-login"], "Codex 当前登录（受管代理，推荐）");
+  assert.deepEqual(descriptor.options, ["codex-login", "codex-native-login", "api-key"]);
+  assert.equal(descriptor.optionLabels["codex-login"], "Codex 受管登录（兼容）");
+  assert.equal(descriptor.optionLabels["codex-native-login"], "Codex 原生登录（会话由 CLI 保存）");
   assert.equal(descriptor.optionLabels["api-key"], "环境变量 API Key");
+  assert.match(descriptor.help, /CODEX_HOME/);
+  assert.match(descriptor.help, /不自动切换/);
+
+  const claudeDescriptor = configurationFieldDescriptor(
+    ["brainProviders", "claude-cli", "credentialMode"],
+    "api-key",
+    { providerKind: "claude-cli" },
+  );
+  assert.deepEqual(claudeDescriptor.options, ["api-key"]);
 
   const legacySlot = configurationSlotDescriptor(
     ["brainProviders", "legacy-cli", "credentialMode"],

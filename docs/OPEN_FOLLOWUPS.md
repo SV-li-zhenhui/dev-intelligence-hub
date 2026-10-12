@@ -10,6 +10,68 @@ The service can be healthy while a configured high-capability role cannot run be
 
 **Progress (2026-09-29):** A retained invocation contained about 66.5 MiB: a successfully saved session plus SQLite state exceeded the aggregate 64 MiB cleanup bound. The saved and retained rollout hashes matched, but the old marker still required session recovery and blocked other roles sharing the root. Cleanup now accounts for captured session bytes under the existing session storage limit, with a separate 64 MiB transient allowance. A completion receipt and read-only saved-history verification distinguish an archived residue from the only copy of interrupted progress. Legacy evidence requires preservation during maintenance; this change does not settle pending owner consultations or prove all role workflows complete.
 
+**Reproduced (2026-10-12):** A compatibility-path fixture failed during session
+preparation before a vendor process started. Preparation settled and its task
+directory was removed, but the shared credential lease was released as unsafe;
+the next independent attempt failed with `STRUCTURED_PROVIDER_CLEANUP_FAILED`
+without starting a process. This is a confirmed pre-process fencing defect.
+The live service separately reported `broker_blocked`; available historical
+diagnostics do not prove that this fixture path caused the first live failure.
+The correction must prove preparation has settled, no process can subsequently
+start and cleanup is verified before releasing the lease. In-flight preparation,
+unknown process termination, credential publication and cleanup failures must
+remain fenced. Reproduction is not a passing regression or live acceptance
+receipt; record those separately after integration.
+
+**Verified in fixtures (2026-10-12):** Settled preparation failure now releases
+the compatibility lease only after verified cleanup; a subsequent independent
+task succeeds. Unsettled preparation, uncertain reaping and failed cleanup stay
+fenced. Native-provider fixtures verify direct use of the original home,
+entity-bound resume across provider recreation, cancellation after reaping,
+per-entity reference recovery and complete immutable PR reads. A separate
+regression reproduced the runner rejecting the provider's 64 MiB trace budget
+before spawn; stdout admission now matches that budget and a 2 MiB trace passes.
+These are fixture receipts, not evidence that a real PR has been published.
+
+**Live observation (2026-10-12):** The existing service still reports
+`broker_blocked` through the no-model readiness endpoint. Its private
+configuration remains unchanged; native mode has not been activated and this
+observation does not attribute the first live failure to one reproduced defect.
+
+**Native installation check (2026-10-12):** A separate no-model probe using the
+real official CLI locator, private-directory manager and supervised process
+runner returned native `available`. Only a newly created probe parent received
+private ACLs; existing configuration, login and history were unchanged. An
+ordinary TEMP/profile parent failed the directory trust check before CLI
+startup. This validates native installation/login in a trusted runtime root,
+not the active service's role execution, model output or GitHub publication.
+
+**Native execution check (2026-10-12):** The official CLI completed an ephemeral
+synthetic `gpt-6.1-sol` task, then a separate two-turn entity-bound task recovered
+the random marker from its first turn using the same native conversation. These
+checks supplied no project content and performed no GitHub operation. Original
+history was preserved; the synthetic conversation and its references remain
+private validation evidence. The configured-router regression also confirms
+that the pinned PR target reaches the native reader and incomplete reading is
+rejected. This does not replace a real PR publication/handoff acceptance check.
+
+**Native resumed-tool check (2026-10-12):** Two real CLI turns used the actual
+loopback MCP reader with synthetic GitHub responses. After resume, the second
+turn discovered its newly created endpoint, fully read that turn's manifest and
+diff, and returned the updated pinned source value. No real PR was read or
+published. Adversarial sandbox enforcement and business publication/handoff are
+still separate acceptance gates.
+
+**Implemented direction (2026-10-12):** Explicit `codex-native-login` alongside unchanged
+compatibility/API-key modes. Codex owns authentication and conversation files;
+the service owns task/session references, supervised invocation, scoped
+read-only review tools and validated results. No auth or session-directory
+copies, automatic mode fallback, historical-session migration or private
+configuration change is part of this opt-in route. Code modification and tests
+still use the controlled executor. This direction does not establish that all
+real PR workflows are unblocked; validate readiness, model execution, Review
+publication and handoff as separate steps.
+
 **Done when:** the bounded no-model readiness check reports `available`; one real configured role completes a bounded task and records its result; a forced broker failure leaves work unclaimed, explains the blocker to the owner, and preserves private evidence. Confirm that previously blocked work is reconciled by its own reason rather than bulk-retried.
 
 ## P1 — Prevent sensitive imported sessions from reaching remote brains
@@ -26,7 +88,7 @@ U12 lists AE1–AE8 but omits the supervised CLI acceptance example AE9. Its zer
 
 ## P1 — Give the owner a single actionable view of each work item
 
-For each PR or Issue task, show the current responsible party, source status, blocker and its cause, next action, linked evidence, and freshness. Add safe per-item controls for pausing, cancelling, or requesting reassignment of local AI work. Keep a GitHub Assignee change as its own confirmed external action. Reconcile stale merged or closed PRs and supersede old Head-bound work.
+For each PR or Issue task, show the current responsible party, source status, blocker and its cause, next action, linked evidence, and freshness. Add safe per-item controls for pausing, cancelling, or requesting reassignment of local AI work. Keep a GitHub Assignee change under its own external-action policy, including the explicitly enabled automatic Review handoff. Reconcile stale merged or closed PRs and supersede old Head-bound work.
 
 **Done when:** an owner can identify and act on one queued, waiting, or blocked item without pausing an entire role; a merged PR cannot remain presented as an active action; independent tasks continue when one task blocks.
 
@@ -38,7 +100,12 @@ The current `立即巡查` request waits for the whole role cycle. A PR-role run
 
 ## P2 — Remove duplicate attention without weakening confirmations
 
-Consultations and external actions stay in the one-at-a-time queue. Coalesce only duplicate requests for the same semantic action, target, source revision, and authority; preserve separate confirmations for distinct Review, code application, push, and merge actions.
+Consultations and ordinary external actions stay in the one-at-a-time queue.
+Explicit automatic Review and own-PR repair policies remove individual prompts
+only within their declared scope and preserve audit evidence. Coalesce only
+duplicate requests for the same semantic action, target, source revision, and
+authority; preserve distinct authorization boundaries for Review, code
+application, push and merge.
 
 **Progress (2026-09-29):** Pending internal consultations now gain an explicit archive record after a historically bound producer task is cancelled, completed, or superseded. Startup and coordination maintenance retain the question and audit evidence without emitting an answer or retry. Browser deferral bindings now reach the inbox runtime. Session recovery failures show maintenance instructions and “retry after repair”; the underlying session recovery fault and shared fault presentation still need repair. This change does not compact retained audit history or coalesce distinct approvals.
 

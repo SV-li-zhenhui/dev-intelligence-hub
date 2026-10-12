@@ -5340,6 +5340,46 @@ test("production composition shares one Codex login broker across every configur
   assert.deepEqual(closeOrder, ["broker"]);
 });
 
+test("native login diagnostics use the selected route even when the legacy broker is blocked", async () => {
+  const rawConfig = structuredClone(defaultCodeJobConfiguration());
+  rawConfig.brainProviders["offline-cli"].credentialMode = "codex-native-login";
+  const config = normalizeConfigurationDocument(rawConfig);
+  const calls = {};
+  const closeCalls = [];
+  const lifecycle = createApplicationRuntimeLifecycle();
+  let legacyStatusCalls = 0;
+  let nativeOptions;
+  const nativeStatus = Object.freeze({
+    schemaVersion: 1, state: "available", cliAvailable: true,
+    fileLoginAvailable: true, credentialMode: "codex-native-login",
+  });
+  const application = await createApplication({
+    ...defaultCodeJobApplicationOptions({ config, calls, closeCalls, lifecycle, versioned: false }),
+    codexLoginCredentialBrokerFactory: () => ({
+      async acquire() { throw new Error("legacy broker blocked"); },
+      async checkAvailability() { throw new Error("legacy broker blocked"); },
+      async readStatus() { legacyStatusCalls += 1; return { state: "broker_blocked" }; },
+      async close() { closeCalls.push("legacy-broker"); },
+    }),
+    nativeCodexStatusProviderFactory: (options, grant) => {
+      nativeOptions = options;
+      const facts = grant.consume((value) => value);
+      assert.ok(facts.protectedRoots.includes(path.resolve(".")));
+      return {
+        async readStatus() { return nativeStatus; },
+        async close() { closeCalls.push("native-status"); },
+      };
+    },
+  });
+  assert.equal(nativeOptions.credentialMode, "codex-native-login");
+  assert.equal(nativeOptions.cliKind, "codex-cli");
+  assert.deepEqual(Object.keys(application.brainProviderStatus), ["readStatus"]);
+  assert.deepEqual(await application.brainProviderStatus.readStatus(), nativeStatus);
+  assert.equal(legacyStatusCalls, 0);
+  await application.close();
+  assert.ok(closeCalls.indexOf("native-status") < closeCalls.indexOf("legacy-broker"));
+});
+
 test("application close stays bounded and incomplete while a configured provider activity never settles", async (t) => {
   const temporaryRoot = await mkdtemp(
     path.join(tmpdir(), "supervised-cli-application-close-"),

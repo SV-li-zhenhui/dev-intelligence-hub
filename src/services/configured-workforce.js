@@ -318,6 +318,10 @@ function providerWithBoundary(provider, remote, lifecycle, sessionIsolationKey =
     provider,
     "supportsEntitySessions",
   );
+  const reviewReadingDescriptor = Object.getOwnPropertyDescriptor(
+    provider,
+    "supportsReviewReading",
+  );
   const availability = provider.checkAvailability;
   if (
     attemptDescriptor &&
@@ -336,12 +340,22 @@ function providerWithBoundary(provider, remote, lifecycle, sessionIsolationKey =
   ) {
     throw new TypeError("brain provider entity session support is invalid");
   }
+  if (
+    reviewReadingDescriptor &&
+    (!("value" in reviewReadingDescriptor) ||
+      typeof reviewReadingDescriptor.value !== "boolean")
+  ) {
+    throw new TypeError("brain provider review reading support is invalid");
+  }
   const boundary = Object.freeze({
     id: provider.id,
     remote: provider.remote || remote,
     ...(attemptDescriptor?.value === true ? { singleAttempt: true } : {}),
     ...(sessionDescriptor?.value === true
       ? { supportsEntitySessions: true, sessionIsolationKey }
+      : {}),
+    ...(reviewReadingDescriptor?.value === true
+      ? { supportsReviewReading: true }
       : {}),
     generate: provider.generate.bind(provider),
     ...(availability

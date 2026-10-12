@@ -354,7 +354,7 @@ function assertProvider(value, path) {
   const isCli = CLI_PROVIDER_KINDS.has(value.kind);
   const credentialMode = value.credentialMode ?? "api-key";
   const invalidCredentialMode =
-    !["api-key", "codex-login"].includes(credentialMode) ||
+    !["api-key", "codex-login", "codex-native-login"].includes(credentialMode) ||
     (value.kind === "claude-cli" && credentialMode !== "api-key") ||
     (!isCli && Object.hasOwn(value, "credentialMode"));
   if (invalidCredentialMode) {
@@ -1285,7 +1285,7 @@ function providerConfigurationIssues(configuration) {
     const hasResponseFormat = Object.hasOwn(provider, "responseFormat");
     const credentialMode = provider.credentialMode ?? "api-key";
     const invalidCredentialMode =
-      !["api-key", "codex-login"].includes(credentialMode) ||
+      !["api-key", "codex-login", "codex-native-login"].includes(credentialMode) ||
       (provider.kind === "claude-cli" && credentialMode !== "api-key") ||
       (!isCli && Object.hasOwn(provider, "credentialMode"));
     if (

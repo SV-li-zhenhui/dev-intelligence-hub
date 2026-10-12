@@ -23,6 +23,7 @@ import { normalizeSessionKey } from "../lib/session-key.js";
 import { projectRoot } from "../lib/config.js";
 import { KnownCliLocator } from "../lib/known-cli-locator.js";
 import { ProductionCliCompositionGrant } from "../composition-root.js";
+import { createNativeCodexBrainProvider } from "./native-codex-brain-provider.js";
 import {
   prepareCleanupTreesByIdentity,
   PRODUCTION_PRIVATE_DIRECTORY_MANAGER,
@@ -2485,6 +2486,7 @@ export class SupervisedCliBrainProvider {
     let result;
     let failure = null;
     let credentialStaged = false;
+    let processAttempted = false;
     let processReaped = credentialLease === null;
     let credentialCaptured = credentialLease === null;
     let cleanupCompleted = false;
@@ -2497,6 +2499,15 @@ export class SupervisedCliBrainProvider {
     });
     let retainSession = false;
     let reviewReader = null;
+    // A request deadline may return before a filesystem operation settles.
+    // Queue preparation with cleanup so a cancelled stage cannot write into an
+    // invocation after its verified removal or after the credential lease ends.
+    const prepare = (operation) => runRootOperation(
+      this.#rootState,
+      deadline,
+      operation,
+      { blocking: true, requireSafe: true },
+    );
     const traceBytes = request.reviewTarget ? Math.max(this.#maxResponseBytes, 64 * 1024 * 1024) : this.#maxResponseBytes;
     try {
       if (request.reviewTarget) {
@@ -2529,12 +2540,12 @@ export class SupervisedCliBrainProvider {
       let codexHome = null;
       if (reviewReader) {
         for (const [name, text] of [["review.diff", reviewReader.diffText], ["review-manifest.json", reviewReader.manifestText]]) {
-          await deadline.run(({ signal }) => writeNewFile(path.join(invocation.path, name), Buffer.from(text, "utf8"), signal, () => this.#assertRunnable()));
+          await prepare((signal) => writeNewFile(path.join(invocation.path, name), Buffer.from(text, "utf8"), signal, () => this.#assertRunnable()));
         }
       }
       if (credentialLease !== null) {
         onCredentialStageStarted();
-        const staged = await deadline.run(({ signal }) =>
+        const staged = await prepare((signal) =>
           credentialLease.stage({
             invocation: credentialInvocationIdentity(invocation),
             signal,
@@ -2555,7 +2566,7 @@ export class SupervisedCliBrainProvider {
           throw providerError("STRUCTURED_PROVIDER_UNAVAILABLE");
         }
         codexHome ??= path.join(invocation.path, "codex-home");
-        await deadline.run(async ({ signal }) => {
+        await prepare(async (signal) => {
           await mkdir(codexHome, { recursive: true, mode: 0o700 });
           const stagedSession = await this.#codexSessionStore.stage({
             sessionKey: request.sessionKey,
@@ -2573,14 +2584,14 @@ export class SupervisedCliBrainProvider {
       if (this.kind === "codex-cli") {
         const schemaFile = path.join(invocation.path, "output-schema.json");
         const resultFile = path.join(invocation.path, "last-message.json");
-        await deadline.run(({ signal }) => writeNewFile(
+        await prepare((signal) => writeNewFile(
             schemaFile,
             Buffer.from(canonicalJsonStringify(CODEX_OUTPUT_SCHEMA), "utf8"),
             signal,
             () => this.#assertRunnable(),
           ));
         this.#assertRunnable();
-        const resultIdentity = await deadline.run(({ signal }) =>
+        const resultIdentity = await prepare((signal) =>
           writeNewFile(
             resultFile,
             Buffer.alloc(0),
@@ -2592,6 +2603,7 @@ export class SupervisedCliBrainProvider {
         let processResult = null;
         let completedCapture = null;
         try {
+          processAttempted = true;
           processResult = await this.#runProcess(invocation, deadline, recoveryDeadline, {
             executable: descriptor,
             args: codexArguments({
@@ -2710,9 +2722,11 @@ export class SupervisedCliBrainProvider {
     if (
       credentialLease !== null &&
       credentialStaged &&
-      processReaped &&
-      credentialCaptured &&
-      cleanupCompleted
+      cleanupCompleted &&
+      // Cleanup runs after every tracked preparation operation. With no process
+      // attempt, nothing could have refreshed credentials or produced a session
+      // requiring capture. Once a process was attempted, retain the full fence.
+      (!processAttempted || (processReaped && credentialCaptured))
     ) {
       onCredentialSettled();
     }
@@ -2952,10 +2966,19 @@ export class SupervisedCliBrainProvider {
 }
 
 export function createProductionSupervisedCliBrainProvider(options, grant) {
+  if (options?.credentialMode === "codex-native-login") {
+    if (!ProductionCliCompositionGrant.is(grant)) {
+      throw new TypeError("Production supervised CLI providers require a lexical composition grant");
+    }
+    return createNativeCodexBrainProvider(options, grant.consume(productionDependencies));
+  }
   return new SupervisedCliBrainProvider(options, grant);
 }
 
 export function createTestSupervisedCliBrainProvider(options, dependencies) {
+  if (options?.credentialMode === "codex-native-login") {
+    return createNativeCodexBrainProvider(options, providerDependencies(TEST_CONSTRUCTION_TOKEN, dependencies));
+  }
   return new SupervisedCliBrainProvider(
     options,
     TEST_CONSTRUCTION_TOKEN,

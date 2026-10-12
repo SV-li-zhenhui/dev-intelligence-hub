@@ -1298,6 +1298,7 @@ function brainProviderStatusProjection(value) {
     "fileLoginAvailable",
   ];
   const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (Object.hasOwn(descriptors, "credentialMode")) fields.push("credentialMode");
   if (
     Reflect.ownKeys(descriptors).length !== fields.length ||
     fields.some(
@@ -1314,6 +1315,7 @@ function brainProviderStatusProjection(value) {
   const capabilities = brainProviderStatusCapabilities.get(status.state);
   if (
     status.schemaVersion !== 1 ||
+    (Object.hasOwn(status, "credentialMode") && status.credentialMode !== "codex-native-login") ||
     !capabilities ||
     status.cliAvailable !== capabilities.cliAvailable ||
     status.fileLoginAvailable !== capabilities.fileLoginAvailable

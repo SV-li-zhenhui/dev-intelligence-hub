@@ -5,6 +5,7 @@ import {
 } from "./adapters/codex-login-credential-broker.js";
 import { DingTalkAdapter } from "./adapters/dingtalk-adapter.js";
 import { GitHubAdapter } from "./adapters/github-adapter.js";
+import { createProductionSupervisedCliBrainProvider } from "./adapters/supervised-cli-brain-provider.js";
 import { AutomaticReviewPublisher } from "./services/automatic-review-publisher.js";
 import { AutomaticOwnPrRepair } from "./services/automatic-own-pr-repair.js";
 import { ReviewRepairContextReader } from "./services/review-repair-context-reader.js";
@@ -842,6 +843,7 @@ export async function createApplication({
   codexLoginCredentialBrokerFactory =
     createProductionCodexLoginCredentialBroker,
   codexLoginLocationsFactory = productionCodexLoginLocations,
+  nativeCodexStatusProviderFactory = createProductionSupervisedCliBrainProvider,
   localSessionImporterFactory = (options) => new LocalSessionImporter(options),
   gitActivityImporterFactory = (options) => new GitActivityImporter(options),
   codeJobMemoryProjectorFactory = (options) =>
@@ -956,6 +958,9 @@ export async function createApplication({
   }
   if (typeof codexLoginLocationsFactory !== "function") {
     throw new TypeError("codexLoginLocationsFactory must be a function");
+  }
+  if (typeof nativeCodexStatusProviderFactory !== "function") {
+    throw new TypeError("nativeCodexStatusProviderFactory must be a function");
   }
   const scopedRuntimeGuardFactory = createProjectScopedGuardFactory({
     projectRoot,
@@ -1134,7 +1139,7 @@ export async function createApplication({
       ...cliProtectedRoots,
       ...credentialRoots,
     ]);
-    cliCompositionCapability = issueProductionCliCompositionGrant({
+    const cliRuntimeFacts = {
       protectedRoots: cliAndCredentialProtectedRoots,
       codexLoginCredentialBroker,
       ...(typeof privateRuntimeDirectory === "string" &&
@@ -1148,7 +1153,23 @@ export async function createApplication({
             ),
           }
         : {}),
-    });
+    };
+    cliCompositionCapability = issueProductionCliCompositionGrant(cliRuntimeFacts);
+    if (Object.values(config.brainProviders || {}).some(
+      (provider) => provider.kind === "codex-cli" && provider.credentialMode === "codex-native-login",
+    )) {
+      const nativeStatus = trackRuntime(frozenPort(
+        await nativeCodexStatusProviderFactory({
+          id: "codex-native-readiness",
+          cliKind: "codex-cli",
+          credentialMode: "codex-native-login",
+          timeoutMs: 30_000,
+        }, issueProductionCliCompositionGrant(cliRuntimeFacts)),
+        ["readStatus", "close"],
+        "nativeCodexStatusProvider",
+      ));
+      brainProviderStatus = frozenPort(nativeStatus, ["readStatus"], "brainProviderStatus");
+    }
     const controlledConflictPorts = conflictPreparationPorts(
       config.codeExecutor,
       codeExecutorRuntime,
