@@ -14,6 +14,7 @@ let appendFailuresRemaining = 1;
 let attentionFailuresRemaining = 0;
 let dashboardFailuresRemaining = 0;
 let externalConflictRemaining = 0;
+let externalFactRefreshRemaining = 0;
 let confirmationEnabled = false;
 let internalAttentionEnabled = false;
 let confirmationFixtureName = "active";
@@ -203,6 +204,24 @@ const confirmationFixtures = Object.freeze({
       type: "pull_request_merge",
       method: "squash",
       expectedHeadOid: "1".repeat(40),
+    }),
+  }),
+  code: Object.freeze({
+    kind: "local.code-job-create",
+    title: "Fixture 本地只读代码任务",
+    actionLabel: "确认并创建本地代码任务（不会立即执行）",
+    action: Object.freeze({
+      type: "create_code_job",
+      grant: Object.freeze({
+        repository: "fixture/repo",
+        workspaceId: "fixture-workspace",
+        operation: "inspect",
+        objective: "检查代码并输出依据",
+        acceptanceCriteria: ["给出可追溯的检查结果"],
+        writablePaths: [],
+        allowedActions: ["read_text", "complete"],
+        requiredProfiles: [],
+      }),
     }),
   }),
   unknown: Object.freeze({
@@ -467,6 +486,14 @@ function createFixtureServer() {
           path: url.pathname,
           body: JSON.parse(body),
         });
+        if (externalFactRefreshRemaining > 0) {
+          externalFactRefreshRemaining -= 1;
+          json(response, 503, {
+            code: "CONFIRMATION_FACTS_NOT_READY",
+            error: "fixture facts refreshing",
+          });
+          return;
+        }
         if (externalConflictRemaining > 0) {
           externalConflictRemaining -= 1;
           dashboardFailuresRemaining = 1;
@@ -799,12 +826,25 @@ try {
   assert.equal(await stableIdentity(page, liveRegion, "#confirmation-history-results"), true);
   assert.equal(await page.locator("#confirmation-history-status").inputValue(), "stale");
 
+  const refreshSubmissionStart = confirmationSubmissions.length;
+  externalFactRefreshRemaining = 1;
   await page.getByRole("button", { name: "确认发布并分配下一步" }).click();
+  await page.getByText("正在核对最新事实，确认请求将自动重试，请勿重复点击…", {
+    exact: true,
+  }).waitFor({ timeout: 3_000 });
+  assert.equal(await page.locator(".confirmation-actions").getAttribute("aria-busy"), "true");
+  assert.equal(await page.locator(".confirmation-close").isDisabled(), true);
+  assert.equal(await page.locator("#confirmation-dialog button:enabled").count(), 0);
+  assert.equal(historyMutation, 0);
   assert.equal(
     confirmationSubmissions.at(-1).path,
     "/api/confirmations/confirmation-active/approve",
   );
   await page.getByText(/GitHub 已确认发布成功/u).waitFor();
+  const refreshSubmissions = confirmationSubmissions.slice(refreshSubmissionStart);
+  assert.equal(refreshSubmissions.length, 2);
+  assert.deepEqual(refreshSubmissions[1], refreshSubmissions[0]);
+  assert.equal(historyMutation, 1);
   await page
     .locator(".confirmation-history-item strong")
     .filter({ hasText: "History mutation 1" })
@@ -873,11 +913,22 @@ try {
   await page.locator("#refresh-button").click();
   await page.locator("#confirmation-dialog[open]").waitFor();
   externalConflictRemaining = 1;
+  externalFactRefreshRemaining = 1;
+  const conflictSubmissionStart = confirmationSubmissions.length;
+  const mutationsBeforeConflict = historyMutation;
   await page.getByRole("button", { name: "确认发布并分配下一步" }).click();
   await page.getByText(/确认内容或目标状态已经变化.*其他页面数据会自动重试/u).waitFor();
   await page.locator("#confirmation-dialog[open]").waitFor();
+  const conflictSubmissions = confirmationSubmissions.slice(conflictSubmissionStart);
+  assert.equal(conflictSubmissions.length, 2);
+  assert.deepEqual(conflictSubmissions[1], conflictSubmissions[0]);
+  assert.equal(historyMutation, mutationsBeforeConflict);
   await page.getByRole("button", { name: "确认发布并分配下一步" }).click();
   await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });
+  assert.notEqual(
+    confirmationSubmissions.at(-1).body.requestId,
+    conflictSubmissions[0].body.requestId,
+  );
 
   for (const operation of ["answer", "reject"]) {
     await page.evaluate(() => fetch("/fixture/enable-internal", { method: "POST" }));
@@ -963,6 +1014,33 @@ try {
     /Fixture confirmation/u,
   );
   await racePage.close();
+
+  // Local code authorization shares the same submission path as GitHub
+  // actions. A fact refresh must not require another click or create two jobs.
+  confirmationEnabled = true;
+  confirmationFixtureName = "code";
+  const codePage = await browser.newPage();
+  codePage.on("pageerror", (error) => pageErrors.push(error.message));
+  await codePage.goto(`http://127.0.0.1:${address.port}`, { waitUntil: "networkidle" });
+  await codePage.locator("#confirmation-dialog[open] .code-job-confirmation").waitFor();
+  const codeSubmissionStart = confirmationSubmissions.length;
+  const mutationsBeforeCode = historyMutation;
+  externalFactRefreshRemaining = 2;
+  await codePage.getByRole("button", {
+    name: "确认并创建本地代码任务（不会立即执行）",
+    exact: true,
+  }).click();
+  await codePage.getByText("正在核对最新事实，确认请求将自动重试，请勿重复点击…", {
+    exact: true,
+  }).waitFor();
+  await codePage.locator("#confirmation-dialog").waitFor({ state: "hidden" });
+  const codeSubmissions = confirmationSubmissions.slice(codeSubmissionStart);
+  assert.equal(codeSubmissions.length, 3);
+  assert.ok(codeSubmissions.every((entry) => entry.path === "/api/confirmations/confirmation-code/approve"));
+  assert.deepEqual(codeSubmissions[1], codeSubmissions[0]);
+  assert.deepEqual(codeSubmissions[2], codeSubmissions[0]);
+  assert.equal(historyMutation, mutationsBeforeCode + 1);
+  await codePage.close();
   assert.equal(pageErrors.length, 0, pageErrors.join("\n"));
 } finally {
   await browser.close();

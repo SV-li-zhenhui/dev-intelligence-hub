@@ -372,7 +372,7 @@ test("GitHub confirmation results are reported before another dialog can replace
 test("later closes the popup without entering the mutation branch", async () => {
   const app = await readFile(path.join(root, "public", "app.js"), "utf8");
   const start = app.indexOf("async function handleExternalConfirmation");
-  const fetchStart = app.indexOf("const response = await fetch", start);
+  const fetchStart = app.indexOf("const response = await postAttentionDuringFactRefresh", start);
   const laterBranch = app.slice(start, fetchStart);
 
   assert.match(laterBranch, /if \(operation === "later"\)/);

@@ -4758,7 +4758,7 @@ async function handleExternalConfirmation(event) {
   const submissionOwner = beginExternalConfirmationSubmission(button, operation);
   if (submissionOwner === null) return;
   try {
-    const response = await fetch(
+    const response = await postAttentionDuringFactRefresh(
       `/api/confirmations/${encodeURIComponent(item.id)}/${operation}`,
       {
       method: "POST",
@@ -4784,7 +4784,15 @@ async function handleExternalConfirmation(event) {
           : {}),
       }),
       },
+      {
+        isCurrent: () => confirmationDialogOwnership.ownsSubmission(submissionOwner),
+        onWaiting: () => {
+          statusBanner.hidden = false;
+          statusBanner.textContent = "正在核对最新事实，确认请求将自动重试，请勿重复点击…";
+        },
+      },
     );
+    if (response === null) return;
     if (response.status === 409) {
       if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
       invalidateConfirmationQueueSnapshot();
