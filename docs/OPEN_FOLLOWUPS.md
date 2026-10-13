@@ -2,6 +2,26 @@
 
 This list records gaps identified in the September 2026 product and requirements review. It is a work queue, not a release acceptance report. Run-specific logs, credentials, account identities, and private runtime artifacts remain outside the repository. A finding is closed only when its acceptance check passes on the current source state.
 
+## P1 — Show real running tasks and support in-task adjustments
+
+The owner requested a clickable running-task list, supplemental instructions,
+priority changes, pause, resume and cancellation. The source audit of
+agent-feishu-bridge confirms that its live Codex steering uses the persistent
+app-server protocol and `turn/steer`, bound to a thread and expected turn.
+Our current native `exec` route can only continue at a later checkpoint; that
+compatibility behavior must not be presented as live steering.
+
+The [source review and integration design](research/2026-10-13-agent-feishu-bridge-source-review.md)
+records the transport, progress events, stale-turn protection and recovery
+limitations. A standalone checkpoint registry is being prepared; no running-list
+UI or app-server adapter is enabled by that module alone.
+
+**Acceptance:** demonstrate real task progress and turn-bound steering, reject
+late or duplicate controls, preserve instructions and holds across restart,
+confirm interruption before reporting a task stopped, and prevent stale output
+from reaching code execution or GitHub publication. Keep priority changes within
+the scheduler and preserve the existing task authorization and PR Head checks.
+
 ## P0 — Restore supervised CLI task execution
 
 The service can be healthy while a configured high-capability role cannot run because the Codex login broker reports `broker_blocked` and role cycles report `STRUCTURED_PROVIDER_CLEANUP_FAILED`. Diagnose the failed private mirror, process reap, or cleanup step without deleting retained sessions or changing the owner's login and configuration. Keep service readiness separate from role/provider execution readiness in the API and UI.
