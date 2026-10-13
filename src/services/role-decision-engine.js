@@ -31,6 +31,10 @@ const QUICK_PR_REVIEW_SKILL = readFileSync(
   new URL("../skills/quick-pr-review/SKILL.md", import.meta.url),
   "utf8",
 );
+const CONTROLLED_TESTING_SKILL = readFileSync(
+  new URL("../skills/controlled-testing/SKILL.md", import.meta.url),
+  "utf8",
+);
 const DIRECT_ACTION_ADMISSION = Object.freeze({
   run: (operation) => operation(),
 });
@@ -356,6 +360,9 @@ function systemPrompt(definition, permissions, reviewReading = false) {
           "Apply the bundled quick-pr-review skill below when proposing a GitHub Review:\n",
           QUICK_PR_REVIEW_SKILL,
         ]
+      : []),
+    ...(definition.id === "tester"
+      ? ["Apply the bundled controlled-testing skill below:\n", CONTROLLED_TESTING_SKILL]
       : []),
     `Role definition: ${JSON.stringify(definition)}.`,
     `Allowed intents: ${JSON.stringify(permissions.allowedIntents)}.`,

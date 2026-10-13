@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFile } from "node:fs/promises";
 import {
   CodeJobBrainDirectory,
   CodeJobBrainDirectoryError,
@@ -126,6 +127,23 @@ test("a role brain receives only bounded semantic code context", async () => {
     assert.equal(Object.hasOwn(userContext, forbidden), false);
     assert.equal(router.calls[0].messages[1].content.includes(`\"${forbidden}\"`), false);
   }
+});
+
+test("verify workers receive the reusable testing workflow without new execution permissions", async () => {
+  const router = fakeRouter();
+  const directory = new CodeJobBrainDirectory({ brainRouter: router.port, roles: roleBrain() });
+  const request = input();
+  request.task.operation = "verify";
+  request.capabilities.writablePaths = [];
+  request.capabilities.allowedActions = request.capabilities.allowedActions.filter((action) => action !== "write_text");
+  await directory.decide(request, authorized());
+  await directory.decide(input(), authorized());
+  const skill = await readFile(new URL("../src/skills/controlled-testing/SKILL.md", import.meta.url), "utf8");
+  assert.equal(router.calls[0].messages[0].content.includes(skill), true);
+  assert.equal(router.calls[1].messages[0].content.includes(skill), false);
+  const received = JSON.parse(router.calls[0].messages[1].content);
+  assert.deepEqual(received.capabilities, request.capabilities);
+  assert.equal(received.task.operation, "verify");
 });
 
 test("a code task forwards its stable GitHub entity session key", async () => {

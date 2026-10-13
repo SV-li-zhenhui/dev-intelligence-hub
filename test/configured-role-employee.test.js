@@ -374,6 +374,28 @@ test("Review Skill prompts pass provider input validation and preserve Markdown"
   assert.equal(request.messages[0].content.includes(skill), false);
 });
 
+test("tester receives the packaged testing workflow without changing its allowed intents", async () => {
+  const requests = [];
+  const router = {
+    async generate(value) {
+      requests.push(value);
+      normalizeStructuredBrainRequest({ model: value.brain.model, messages: value.messages, schema: value.schema }, { maxRequestBytes: 2 * 1024 * 1024 });
+      return JSON.stringify(completeDecision());
+    },
+    describe() { return { ...brain(), remote: false }; },
+  };
+  for (const roleId of ["tester", "developer"]) {
+    const engine = new RoleDecisionEngine({
+      definition: definition(roleId), permissions: permissions("complete"), brain: brain(), brainRouter: router,
+    });
+    await engine.decide({ item: {}, context: { requirements: {} } });
+  }
+  const skill = await readFile(new URL("../src/skills/controlled-testing/SKILL.md", import.meta.url), "utf8");
+  assert.equal(requests[0].messages[0].content.includes(skill), true);
+  assert.equal(requests[1].messages[0].content.includes(skill), false);
+  assert.deepEqual(requests[0].schema, requests[1].schema);
+});
+
 test("RoleDecisionEngine reuses one entity session across roles and event revisions", async () => {
   const sessionKeys = [];
   const router = {
