@@ -28,6 +28,12 @@ import { WorkProposalRunnerService } from "./work-proposal-runner.js";
 const FAILURE_CODE = /^[A-Z][A-Z0-9_]{0,127}$/;
 const REQUEST_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{6,126}[A-Za-z0-9])$/;
 const MAX_POLL_INTERVAL_MS = 24 * 60 * 60 * 1_000;
+const VERIFICATION_FAILURE_SUMMARIES = Object.freeze({
+  CODE_JOB_VERIFICATION_FAILED: "本地验证未通过；请查看测试记录，尚不能认定为产品代码缺陷",
+  CODE_JOB_VERIFICATION_TIMEOUT: "本地验证超时；请检查测试耗时和执行环境",
+  CODE_JOB_VERIFICATION_ENVIRONMENT_UNAVAILABLE: "本地验证环境不可用；请检查执行器及依赖",
+  CODE_JOB_VERIFICATION_UNKNOWN: "本地验证结果无法判断；请查看执行记录",
+});
 const CONFIRMATION_STATUSES = new Set([
   "pending",
   "executing",
@@ -811,9 +817,11 @@ export class CodeActionProposalHandler {
     if (job.status === "failed") {
       return terminal(
         "failed",
-        "本地代码任务执行失败",
+        VERIFICATION_FAILURE_SUMMARIES[job.verificationOutcome] ?? "本地代码任务执行失败",
         { id: confirmationId },
-        evidence,
+        job.verificationOutcome === undefined
+          ? evidence
+          : [...evidence, `verification-outcome:${job.verificationOutcome}`],
       );
     }
     if (job.status === "cancelled") {

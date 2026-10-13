@@ -19,6 +19,7 @@ import {
   projectArchivedCodeJobForBrowser,
 } from "../domain/code-job-browser-projection.js";
 import { codeJobTerminalLifecycleAt } from "../domain/code-job-terminal-time.js";
+import { isCodeJobVerificationOutcome } from "../domain/code-job-verification-outcome.js";
 import {
   digestValue,
   normalizeActionRequest,
@@ -2067,8 +2068,13 @@ function createArchiveTombstone(entry) {
       status: job.execution.observations.at(-1).status,
       recordedAt: job.execution.observations.at(-1).recordedAt,
   };
+  const resultCode = job.execution.result.detail?.code;
+  const verificationOutcome = job.status === "failed" &&
+    job.grant.operation === "verify" && isCodeJobVerificationOutcome(resultCode)
+    ? resultCode
+    : null;
   const content = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     previousArchiveDigest: entry.previousArchiveDigest,
     archiveDigest: entry.archiveDigest,
     sequence: job.sequence,
@@ -2091,6 +2097,7 @@ function createArchiveTombstone(entry) {
       },
       memoryProjection: job.execution.memoryProjection,
       changePackageDelivery: entry.changePackageDelivery,
+      verificationOutcome,
     },
   };
   if (
@@ -2130,7 +2137,7 @@ function normalizeArchiveTombstone(value) {
     ],
     error,
   );
-  if (![1, 2].includes(value.schemaVersion)) throw error;
+  if (![1, 2, 3].includes(value.schemaVersion)) throw error;
   const previousArchiveDigest = value.previousArchiveDigest === null
     ? null
     : normalizeSha256(value.previousArchiveDigest, error);
@@ -2152,7 +2159,12 @@ function normalizeArchiveTombstone(value) {
   const updatedAt = normalizeCodeJobTimestamp(value.updatedAt, error);
   const outcome = normalizeArchivedOutcome(
     value.outcome,
-    { schemaVersion: value.schemaVersion, updatedAt },
+    {
+      schemaVersion: value.schemaVersion,
+      status: value.status,
+      operation: request.grant.operation,
+      updatedAt,
+    },
     error,
   );
   const content = {
@@ -2215,6 +2227,7 @@ function normalizeArchiveTombstone(value) {
 
 function normalizeArchivedOutcome(value, tombstone, error) {
   const packageVersion = tombstone.schemaVersion >= 2;
+  const verificationVersion = tombstone.schemaVersion >= 3;
   assertExactKeys(
     value,
     [
@@ -2224,6 +2237,7 @@ function normalizeArchivedOutcome(value, tombstone, error) {
       "terminalResult",
       "memoryProjection",
       ...(packageVersion ? ["changePackageDelivery"] : []),
+      ...(verificationVersion ? ["verificationOutcome"] : []),
     ],
     error,
   );
@@ -2308,6 +2322,16 @@ function normalizeArchivedOutcome(value, tombstone, error) {
     value.changePackageDelivery === null
     ? null
     : normalizeDeliveredChangePackage(value.changePackageDelivery, error);
+  const verificationOutcome = verificationVersion
+    ? value.verificationOutcome
+    : null;
+  if (
+    verificationOutcome !== null &&
+    (tombstone.status !== "failed" || tombstone.operation !== "verify" ||
+      !isCodeJobVerificationOutcome(verificationOutcome))
+  ) {
+    throw error;
+  }
   return {
     turn,
     observationCount,
@@ -2315,6 +2339,7 @@ function normalizeArchivedOutcome(value, tombstone, error) {
     terminalResult,
     memoryProjection,
     ...(packageVersion ? { changePackageDelivery } : {}),
+    ...(verificationVersion ? { verificationOutcome } : {}),
   };
 }
 

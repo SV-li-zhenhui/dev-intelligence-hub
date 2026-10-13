@@ -30,6 +30,27 @@ confirm interruption before reporting a task stopped, and prevent stale output
 from reaching code execution or GitHub publication. Keep priority changes within
 the scheduler and preserve the existing task authorization and PR Head checks.
 
+## P1 — Complete the real testing and repair loop
+
+The tester role and verify code worker now load the portable bundled
+`controlled-testing` workflow. Verify failures must settle after their durable
+observation instead of repeating the same failed profile; retain bounded test
+counts and distinguish verification failure, timeout, unavailable environment
+and unknown cause. None of these classifications alone authorizes product-code
+repair or produces a completed test-report.
+
+The configured OCT/Picasso assets currently perform repository preflight only.
+The Docker Node runner cannot execute the local Windows Qt build and desktop
+workflow. Integrate a version-bound Windows test adapter, approved build/data
+inputs, authoritative failure evidence, a dedicated test-driven repair source,
+and separate developer/retest graph children with idempotent reconciliation.
+Do not reassign a test-report child to a developer or reuse old-Head results.
+
+**Acceptance:** a real scoped PR fails an executed test, a separate developer
+task repairs it, and a new-version retest passes with logs and evidence.
+Environment failures and hardware-pending checks remain distinct; repeated
+cycles/restarts cannot create duplicate repairs or tests. See [testing guide](TESTING.md).
+
 ## P0 — Restore supervised CLI task execution
 
 The service can be healthy while a configured high-capability role cannot run because the Codex login broker reports `broker_blocked` and role cycles report `STRUCTURED_PROVIDER_CLEANUP_FAILED`. Diagnose the failed private mirror, process reap, or cleanup step without deleting retained sessions or changing the owner's login and configuration. Keep service readiness separate from role/provider execution readiness in the API and UI.

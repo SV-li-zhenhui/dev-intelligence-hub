@@ -132,8 +132,8 @@ const OWNER_BASELINES = Object.freeze([
       discovery: "strict-scan",
     }),
     mode: "immutable-validate",
-    currentVersion: 2,
-    supportedVersions: frozenVersions(1, 2),
+    currentVersion: 3,
+    supportedVersions: frozenVersions(1, 2, 3),
     optional: true,
   }),
   Object.freeze({

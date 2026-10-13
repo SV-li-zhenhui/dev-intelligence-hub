@@ -29,6 +29,7 @@ import {
   successfulProfiles,
   terminalResult,
   trustedObservationAction,
+  verificationFailure,
   workerError,
 } from "./code-job-worker-policy.js";
 
@@ -530,6 +531,10 @@ export class CodeJobWorkerService {
       durableObservation.status === "succeeded"
     ) {
       return this.#completeObservedJob(job, durableObservation);
+    }
+    const failedVerification = verificationFailure(job);
+    if (failedVerification !== null) {
+      return this.#finishFailed(job, failedVerification);
     }
 
     await this.#verifyAuthority(job.grant);
@@ -1202,6 +1207,10 @@ export class CodeJobWorkerService {
         response.session.workspaceRevision,
       );
       return { jobId: job.jobId, status: "completed", actionType: "complete" };
+    }
+    const failedVerification = verificationFailure(job);
+    if (failedVerification !== null) {
+      return this.#finishFailed(job, failedVerification);
     }
     return {
       jobId: job.jobId,

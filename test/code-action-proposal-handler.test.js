@@ -115,8 +115,8 @@ function grantFor(value = proposal()) {
     evidence: value.payload.evidence,
     summary: value.payload.summary,
     reason: value.payload.reason,
-    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify],
-    writablePaths: ["src"],
+    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION[value.payload.operation]],
+    writablePaths: value.payload.operation === "modify" ? ["src"] : [],
     requiredProfiles: [
       { id: "node-tests", configDigest: "b".repeat(64) },
     ],
@@ -407,6 +407,36 @@ test("a terminal code job waits for verified memory before completing its propos
     "code-job-status:completed",
     `memory:memory-${"d".repeat(64)}`,
   ]);
+});
+
+test("failed verification retains its safe outcome when the proposal settles", async (t) => {
+  const labels = {
+    CODE_JOB_VERIFICATION_FAILED: "本地验证未通过；请查看测试记录，尚不能认定为产品代码缺陷",
+    CODE_JOB_VERIFICATION_TIMEOUT: "本地验证超时；请检查测试耗时和执行环境",
+    CODE_JOB_VERIFICATION_ENVIRONMENT_UNAVAILABLE: "本地验证环境不可用；请检查执行器及依赖",
+    CODE_JOB_VERIFICATION_UNKNOWN: "本地验证结果无法判断；请查看执行记录",
+  };
+  for (const [code, summary] of Object.entries(labels)) {
+    await t.test(code, async () => {
+      const { contentDigest: _digest, ...base } = proposal();
+      const value = normalizeBoundWorkProposal({ ...base, payload: { ...base.payload, operation: "verify" } });
+      const grant = grantFor(value);
+      const producer = new FakeConfirmationProducer();
+      const reader = new FakeCodeJobReader(queuedJob(grant));
+      const instance = handler(producer, reader, grant);
+      const waiting = await instance.value.handle(handlerInput({ proposal: value }));
+      producer.status = "completed";
+      reader.value = queuedJob(grant, {
+        status: "failed", revision: 5, verificationOutcome: code,
+        terminalResult: { kind: "failed", recordedAt: CREATED_AT },
+        memoryProjection: { recordId: `memory-${"d".repeat(64)}`, projectedAt: CREATED_AT },
+      });
+      const result = await instance.value.handle(handlerInput({ proposal: value, status: "running", downstreamRef: waiting.downstreamRef }));
+      assert.equal(result.status, "failed");
+      assert.equal(result.summary, summary);
+      assert.ok(result.evidence.includes(`verification-outcome:${code}`));
+    });
+  }
 });
 
 test("a cancelling job stays active and a projected cancellation becomes rejected", async () => {

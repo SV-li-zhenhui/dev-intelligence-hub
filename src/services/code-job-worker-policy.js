@@ -1,5 +1,6 @@
 import { digestValue } from "../domain/code-executor-contract.js";
 import { normalizeWorkspacePath } from "../domain/code-execution-policy.js";
+import { projectTestSummary } from "../domain/test-result-summary.js";
 import { requiresBrainOperatorPause } from "./brain-failure-policy.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -51,6 +52,13 @@ const OPERATOR_PAUSE_CODES = new Set([
   "CODE_BRAIN_WRITE_NOT_PERMITTED",
 ]);
 const INVALID_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
+const VERIFICATION_ENVIRONMENT_ERRORS = new Set([
+  "SANDBOX_UNAVAILABLE",
+  "SANDBOX_START_FAILED",
+  "SANDBOX_IMAGE_UNAVAILABLE",
+  "SANDBOX_PROFILE_NOT_FOUND",
+  "INVALID_SANDBOX_CONFIG",
+]);
 
 export class CodeJobWorkerError extends Error {
   constructor(code, message, options = {}) {
@@ -249,6 +257,7 @@ function compactExecutorResult(action, result) {
       timedOut: result?.timedOut === true,
       stdout: cleanText(result?.stdout, 16 * 1_024),
       stderr: cleanText(result?.stderr, 16 * 1_024),
+      ...projectTestSummary(result?.testSummary),
       error,
     };
   }
@@ -335,6 +344,7 @@ export function modelObservation(observation) {
       timedOut: result.timedOut === true,
       stdout: cleanText(result.stdout, 8 * 1_024),
       stderr: cleanText(result.stderr, 8 * 1_024),
+      ...projectTestSummary(result.testSummary),
       error: result.error ?? null,
     };
   } else {
@@ -394,6 +404,53 @@ export function successfulProfiles(job, session) {
     }
   }
   return result;
+}
+
+export function verificationFailure(job) {
+  if (job.grant.operation !== "verify") return null;
+  const latestProfiles = new Set();
+  let action;
+  const observation = job.execution.observations.findLast((entry) => {
+    if (entry.actionType !== "run_profile" ||
+        entry.workspaceRevision !== job.execution.workspaceRevision) return false;
+    const candidate = trustedObservationAction(entry);
+    if (latestProfiles.has(candidate.profileId)) return false;
+    latestProfiles.add(candidate.profileId);
+    if (entry.status !== "failed") return false;
+    action = candidate;
+    return true;
+  });
+  if (!observation) return null;
+  if (
+    action.expectedWorkspaceRevision !== observation.workspaceRevision ||
+    !job.grant.requiredProfiles.some(({ id }) => id === action.profileId)
+  ) {
+    throw workerError(
+      "CODE_JOB_EXECUTOR_RESULT_INVALID",
+      "Failed verification observation does not match its sealed profile and workspace",
+    );
+  }
+  const result = observation.detail?.result ?? {};
+  const errorCode = safeErrorCode(result.error, "ACTION_FAILED");
+  const reference = `测试配置 ${cleanText(action.profileId, 128)}（动作 ${action.actionId}，工作区 ${observation.workspaceRevision}）`;
+  if (result.timedOut === true || errorCode === "SANDBOX_TIMEOUT") {
+    return {
+      code: "CODE_JOB_VERIFICATION_TIMEOUT",
+      message: `${reference}执行超时。请检查执行日志、运行耗时和超时配置后重新发起验证。`,
+    };
+  }
+  if (VERIFICATION_ENVIRONMENT_ERRORS.has(errorCode)) {
+    return {
+      code: "CODE_JOB_VERIFICATION_ENVIRONMENT_UNAVAILABLE",
+      message: `${reference}的测试环境不可用（${errorCode}）。请恢复沙箱、镜像或测试配置后重新发起验证。`,
+    };
+  }
+  const verificationFailed = errorCode === "TESTS_FAILED" ||
+    (Number.isSafeInteger(result.exitCode) && result.exitCode !== 0);
+  return {
+    code: verificationFailed ? "CODE_JOB_VERIFICATION_FAILED" : "CODE_JOB_VERIFICATION_UNKNOWN",
+    message: `${reference}验证未通过（${errorCode}${Number.isSafeInteger(result.exitCode) ? `，退出码 ${result.exitCode}` : ""}），失败原因尚未确认。请检查测试日志、依赖和运行环境，处理后重新发起验证。`,
+  };
 }
 
 function incompleteReadError(path) {

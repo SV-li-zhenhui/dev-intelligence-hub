@@ -270,6 +270,14 @@ test("the production catalog and migration port expose the exact audited boundar
   assert.equal(typeof registry.migrate, "function");
 });
 
+test("the archive owner supports immutable tombstones through verification outcomes v3", () => {
+  const owner = allPersistedSchemaOwners().find(({ ownerId }) =>
+    ownerId === "code-job-archive-record"
+  );
+  assert.equal(owner.currentVersion, 3);
+  assert.deepEqual(owner.supportedVersions, [1, 2, 3]);
+});
+
 test("every omitted restore owner fails construction before restore starts", () => {
   for (const ownerId of PERSISTED_SCHEMA_OWNER_IDS) {
     expectCoverageFailure(() =>
@@ -962,4 +970,64 @@ test("immutable Code Job archive families validate byte-for-byte against live st
     ),
     stateBytes,
   );
+});
+
+function resealDigest(value, digestKey) {
+  const content = { ...value };
+  delete content[digestKey];
+  return { ...content, [digestKey]: digestValue(content) };
+}
+
+function archiveWithTombstoneVersion(archive, schemaVersion) {
+  const changed = new Map([...archive].map(([key, value]) => [key, structuredClone(value)]));
+  const state = changed.get("code-job-state");
+  const manifest = state.archiveIndex[0];
+  const recordKey = `code-job-tombstone-record-${manifest.jobId}`;
+  const record = changed.get(recordKey);
+  record.schemaVersion = schemaVersion;
+  if (schemaVersion === 2) delete record.outcome.verificationOutcome;
+  const sealedRecord = resealDigest(record, "tombstoneDigest");
+  changed.set(recordKey, sealedRecord);
+  const byteLength = (value) => Buffer.byteLength(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+  let storageBytes = byteLength(sealedRecord);
+  for (const [key, index] of changed) {
+    if (!key.startsWith("code-job-tombstone-index-")) continue;
+    const sealedIndex = resealDigest({
+      ...index,
+      tombstoneDigest: sealedRecord.tombstoneDigest,
+    }, "indexDigest");
+    changed.set(key, sealedIndex);
+    storageBytes += byteLength(sealedIndex);
+  }
+  const sealedManifest = resealDigest({
+    ...manifest,
+    tombstoneDigest: sealedRecord.tombstoneDigest,
+    storageBytes,
+  }, "manifestDigest");
+  state.archiveIndex = [sealedManifest];
+  state.archive = resealDigest({
+    ...state.archive,
+    storageBytes,
+    lastManifestDigest: sealedManifest.manifestDigest,
+  }, "checkpointDigest");
+  return changed;
+}
+
+test("restore accepts old v2 and new v3 tombstones without rewriting immutable bytes", async (t) => {
+  const archive = await createCodeJobArchiveFixture();
+  for (const schemaVersion of [2, 3]) {
+    await t.test(`schema v${schemaVersion}`, async (subtest) => {
+      const versioned = archiveWithTombstoneVersion(archive, schemaVersion);
+      const files = Object.fromEntries([...versioned].map(([key, value]) => [`${key}.json`, value]));
+      const fixture = await candidateDirectory(subtest, files);
+      const before = new Map(await Promise.all(Object.keys(files).map(async (name) => [
+        name,
+        await readFile(path.join(fixture.directory, name), "utf8"),
+      ])));
+      await createProductionRestoreMigrationRegistry().migrate(fixture);
+      for (const [name, bytes] of before) {
+        assert.equal(await readFile(path.join(fixture.directory, name), "utf8"), bytes);
+      }
+    });
+  }
 });

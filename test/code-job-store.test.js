@@ -16,6 +16,7 @@ import {
   memoryRecordForCodeJobEvent,
 } from "../src/domain/code-job-memory-event.js";
 import { normalizeMemoryRecord } from "../src/domain/memory-record.js";
+import { projectArchivedCodeJobForBrowser } from "../src/domain/code-job-browser-projection.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
 import {
   CODE_JOB_STATE_KEY,
@@ -3997,4 +3998,117 @@ test("explicit compaction archives only a terminal prefix, never paused work", a
   assert.equal(compacted.receipt.targetThroughSequence, 1);
   assert.equal((await jobs.list()).archive.throughSequence, 1);
   assert.equal((await jobs.list()).total, 0);
+});
+
+async function archivedVerificationFixture(code, {
+  operation = "verify",
+  terminalMethod = "fail",
+} = {}) {
+  const fixture = await readyStore();
+  const created = await fixture.jobs.createApprovedJob(approval({
+    grant: grant({
+      operation,
+      requestedBy: { roleId: "tester", workItemId: "work-1" },
+      allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION[operation]],
+    }),
+  }));
+  const failed = await fixture.jobs[terminalMethod]({
+    jobId: created.job.jobId,
+    expectedRevision: created.job.revision,
+    result: { code, summary: "Private detail C:\\private\\test-output.log" },
+  });
+  await fixture.jobs.markMemoryProjected(memoryProjection(failed.job));
+  const live = await fixture.jobs.get(created.job.jobId);
+  await fixture.jobs.compactTerminalPrefix(compactionRequest(fixture.store, {
+    targetThroughSequence: failed.job.sequence,
+  }));
+  const manifest = fixture.store.value.archiveIndex[0];
+  const storageKey = `code-job-tombstone-record-${manifest.jobId}`;
+  return {
+    ...fixture,
+    live,
+    manifest,
+    storageKey,
+    tombstone: await fixture.store.read(storageKey, null),
+  };
+}
+
+function resealArchiveFixture(tombstone, originalManifest) {
+  const { tombstoneDigest: ignoredTombstoneDigest, ...content } = tombstone;
+  const sealed = { ...content, tombstoneDigest: digestValue(content) };
+  const { manifestDigest: ignoredManifestDigest, ...manifestContent } = originalManifest;
+  const changedManifest = { ...manifestContent, tombstoneDigest: sealed.tombstoneDigest };
+  return {
+    tombstone: sealed,
+    manifest: { ...changedManifest, manifestDigest: digestValue(changedManifest) },
+  };
+}
+
+test("verification outcome survives compaction and restart without private terminal detail", async (t) => {
+  for (const code of [
+    "CODE_JOB_VERIFICATION_FAILED",
+    "CODE_JOB_VERIFICATION_TIMEOUT",
+    "CODE_JOB_VERIFICATION_ENVIRONMENT_UNAVAILABLE",
+    "CODE_JOB_VERIFICATION_UNKNOWN",
+  ]) {
+    await t.test(code, async () => {
+      const fixture = await archivedVerificationFixture(code);
+      assert.equal(fixture.live.verificationOutcome, code);
+      assert.equal(fixture.tombstone.schemaVersion, 3);
+      assert.equal(fixture.tombstone.outcome.verificationOutcome, code);
+      assert.doesNotMatch(JSON.stringify(fixture.tombstone), /Private detail|private\\\\test-output/);
+      assert.deepEqual(await fixture.jobs.get(fixture.live.jobId), fixture.live);
+      const recovered = await readyStore({ store: fixture.store });
+      assert.deepEqual(await recovered.jobs.get(fixture.live.jobId), fixture.live);
+    });
+  }
+});
+
+test("legacy tombstones remain readable without a verification outcome", async () => {
+  const fixture = await archivedVerificationFixture("CODE_JOB_VERIFICATION_FAILED");
+  for (const schemaVersion of [1, 2]) {
+    const legacy = structuredClone(fixture.tombstone);
+    legacy.schemaVersion = schemaVersion;
+    delete legacy.outcome.verificationOutcome;
+    if (schemaVersion === 1) delete legacy.outcome.changePackageDelivery;
+    const sealed = resealArchiveFixture(legacy, fixture.manifest);
+    const normalized = normalizeCodeJobArchiveTombstoneRecord(sealed.tombstone, {
+      storageKey: fixture.storageKey,
+      manifest: sealed.manifest,
+    });
+    assert.equal(Object.hasOwn(projectArchivedCodeJobForBrowser(normalized.tombstone), "verificationOutcome"), false);
+  }
+});
+
+test("archived verification outcome is digest-bound and restricted to failed verify jobs", async () => {
+  const fixture = await archivedVerificationFixture("CODE_JOB_VERIFICATION_FAILED");
+  const changed = structuredClone(fixture.tombstone);
+  changed.outcome.verificationOutcome = "CODE_JOB_VERIFICATION_TIMEOUT";
+  assert.throws(() => normalizeCodeJobArchiveTombstoneRecord(changed, {
+    storageKey: fixture.storageKey,
+    manifest: fixture.manifest,
+  }), { code: "CODE_JOB_ARCHIVE_CORRUPTED" });
+
+  for (const invalid of ["UNKNOWN_PRIVATE_CODE", { code: "CODE_JOB_VERIFICATION_FAILED" }]) {
+    const forged = structuredClone(fixture.tombstone);
+    forged.outcome.verificationOutcome = invalid;
+    const sealed = resealArchiveFixture(forged, fixture.manifest);
+    assert.throws(() => normalizeCodeJobArchiveTombstoneRecord(sealed.tombstone, {
+      storageKey: fixture.storageKey,
+      manifest: sealed.manifest,
+    }), { code: "CODE_JOB_ARCHIVE_CORRUPTED" });
+  }
+
+  for (const options of [{ operation: "inspect" }, { terminalMethod: "fence" }]) {
+    const other = await archivedVerificationFixture("CODE_JOB_VERIFICATION_FAILED", options);
+    assert.equal(other.tombstone.outcome.verificationOutcome, null);
+    assert.equal(Object.hasOwn(await other.jobs.get(other.live.jobId), "verificationOutcome"), false);
+    const forged = structuredClone(other.tombstone);
+    forged.outcome.verificationOutcome = "CODE_JOB_VERIFICATION_FAILED";
+    const sealed = resealArchiveFixture(forged, other.manifest);
+    assert.throws(() => normalizeCodeJobArchiveTombstoneRecord(sealed.tombstone, {
+      storageKey: other.storageKey,
+      manifest: sealed.manifest,
+    }), { code: "CODE_JOB_ARCHIVE_CORRUPTED" });
+  }
 });

@@ -1,4 +1,6 @@
 import { CODE_JOB_STATUSES } from "./code-job-vocabulary.js";
+import { projectTestSummary } from "./test-result-summary.js";
+import { isCodeJobVerificationOutcome } from "./code-job-verification-outcome.js";
 import {
   normalizeCodeExecutionSource,
   sameCodeExecutionSource,
@@ -345,6 +347,7 @@ function projectedObservationResult(observation) {
       signal: typeof source.signal === "string" ? source.signal : null,
       durationMs: Number.isFinite(source.durationMs) ? source.durationMs : 0,
       timedOut: source.timedOut === true,
+      ...projectTestSummary(source.testSummary),
       error,
     };
   }
@@ -693,6 +696,9 @@ function assertProjectionLifecycle(projection, progress, error) {
   } = progress;
   if (
     !CODE_JOB_STATUS_SET.has(projection.status) ||
+    (Object.hasOwn(projection, "verificationOutcome") &&
+      (projection.status !== "failed" || projection.operation !== "verify" ||
+        !isCodeJobVerificationOutcome(projection.verificationOutcome))) ||
     !Number.isSafeInteger(projection.revision) ||
     projection.revision < 1 ||
     Date.parse(updatedAt) < Date.parse(createdAt) ||
@@ -756,8 +762,12 @@ export function normalizeCodeJobBrowserProjection(
   error = invalidProjection(),
 ) {
   const suppliedKeys = dataEntries(value, error).map(([key]) => key);
-  const shape = projectionShape(suppliedKeys);
-  assertExactKeys(value, expectedProjectionKeys(shape), error);
+  const hasVerificationOutcome = suppliedKeys.includes("verificationOutcome");
+  const shape = projectionShape(suppliedKeys.filter((key) => key !== "verificationOutcome"));
+  assertExactKeys(value, [
+    ...expectedProjectionKeys(shape),
+    ...(hasVerificationOutcome ? ["verificationOutcome"] : []),
+  ], error);
   const projection = withLegacyProgress(value, shape, error);
   if (shape.startsWith("bound") && projection.inputBinding !== null) {
     let inputBinding;
@@ -852,8 +862,12 @@ function validateProjectedCodeJob(projection) {
 
 export function projectNormalizedCodeJobForBrowser(job) {
   const execution = job.execution;
+  const verificationOutcome = job.status === "failed" && job.grant.operation === "verify"
+    ? execution.result?.detail?.code
+    : null;
   return validateProjectedCodeJob(
     projectBrowserFields(job, {
+      ...(isCodeJobVerificationOutcome(verificationOutcome) ? { verificationOutcome } : {}),
       turn: execution.turn,
       pendingActionType: execution.pendingAction?.action.type ?? null,
       observationCount: execution.observations.length,
@@ -898,6 +912,9 @@ export function projectNormalizedCodeJobForBrowser(job) {
 export function projectArchivedCodeJobForBrowser(tombstone) {
   return validateProjectedCodeJob(
     projectBrowserFields(tombstone, {
+      ...(tombstone.outcome.verificationOutcome != null
+        ? { verificationOutcome: tombstone.outcome.verificationOutcome }
+        : {}),
       turn: tombstone.outcome.turn,
       pendingActionType: null,
       observationCount: tombstone.outcome.observationCount,

@@ -16,7 +16,7 @@ import { CodeJobBrainDirectory } from "../src/services/code-job-brain-directory.
 import { CodeJobWorkerService } from "../src/services/code-job-worker-service.js";
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { createTaskRunSettler } from '../src/services/work-ledger-run-control.js';
-import { modelObservation, observationDetail } from "../src/services/code-job-worker-policy.js";
+import { modelObservation, observationDetail, verificationFailure } from "../src/services/code-job-worker-policy.js";
 
 const REVISION_A = "a".repeat(64);
 const REVISION_B = "b".repeat(64);
@@ -2438,6 +2438,239 @@ test("the host selects fixed profiles and completes only after current-attempt p
   assert.equal(stored.execution.result.detail.manifest.modified[0].path, "src/app.js");
   assert.equal(store.completionRequests.length, 1);
   assert.equal(store.completionRequests[0].changePackageDelivery, true);
+});
+
+function failFirstProfileRun(executor, result) {
+  const perform = executor.perform.bind(executor);
+  let failed = false;
+  executor.perform = async (...args) => {
+    const response = await perform(...args);
+    if (response.action.type !== "run_profile" || failed) return response;
+    failed = true;
+    executor.last.action.status = "failed";
+    executor.last.action.error = result.error ?? null;
+    executor.last.result = structuredClone(result);
+    const index = executor.session.actions.findIndex(({ id }) => id === response.action.id);
+    executor.session.actions[index] = structuredClone(executor.last.action);
+    executor.last.session = structuredClone(executor.session);
+    return structuredClone(executor.last);
+  };
+}
+
+test("verify jobs settle a trusted failed profile once with an actionable reason", async (t) => {
+  const cases = [
+    {
+      name: "test failure does not assert a product defect",
+      result: {
+        exitCode: 1, timedOut: false, stdout: "TAP version 13\nnot ok 1 - module startup\n",
+        stderr: "ERR_MODULE_NOT_FOUND: missing dependency",
+        error: { code: "TESTS_FAILED", message: "测试未通过或缺少有效通过用例" },
+        testSummary: { total: 1, passed: 0, failed: 1, cancelled: 0, skipped: 0, todo: 0, executed: 1 },
+        profileId: "untrusted-profile", workspaceRevision: REVISION_B,
+      },
+      code: "CODE_JOB_VERIFICATION_FAILED",
+      reason: /原因.*未确认|未确认.*原因/,
+    },
+    {
+      name: "timed out process",
+      result: { exitCode: null, timedOut: true, error: { code: "SANDBOX_TIMEOUT", message: "interrupted" } },
+      code: "CODE_JOB_VERIFICATION_TIMEOUT",
+      reason: /超时/,
+    },
+    {
+      name: "sandbox unavailable",
+      result: { error: { code: "SANDBOX_UNAVAILABLE", message: "Docker sandbox is unavailable" } },
+      code: "CODE_JOB_VERIFICATION_ENVIRONMENT_UNAVAILABLE",
+      reason: /环境.*不可用|不可用.*环境/,
+    },
+    {
+      name: "sandbox process cannot start",
+      result: { error: { code: "SANDBOX_START_FAILED", message: "Docker process failed to start" } },
+      code: "CODE_JOB_VERIFICATION_ENVIRONMENT_UNAVAILABLE",
+      reason: /环境.*不可用|不可用.*环境/,
+    },
+    {
+      name: "unknown execution failure",
+      result: { error: { code: "UNRECOGNIZED_FAILURE", message: "unknown failure" } },
+      code: "CODE_JOB_VERIFICATION_UNKNOWN",
+      reason: /原因.*未确认|未确认.*原因/,
+    },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const initial = job({ grant: grant({ operation: "verify", allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.verify], writablePaths: [] }) });
+      const events = [];
+      const store = new FakeJobStore([initial], events);
+      const executor = new FakeExecutor(initial, events);
+      failFirstProfileRun(executor, scenario.result);
+      const brainCalls = [];
+      const worker = new CodeJobWorkerService({ jobStore: store, executor, brainDirectory: brain([{ type: "run_profile" }, { type: "run_profile" }], brainCalls), grantVerifier: verifier(events) });
+
+      const first = await worker.runCycle();
+      const second = await worker.runCycle();
+      const stored = await store.getForWorker(initial.jobId);
+
+      assert.equal(first.outcomes[0].status, "failed");
+      assert.equal(first.outcomes[0].code, scenario.code);
+      assert.equal(stored.execution.result.detail.code, scenario.code);
+      assert.match(stored.execution.result.detail.message, scenario.reason);
+      assert.match(stored.execution.result.detail.message, /node-tests/);
+      assert.match(stored.execution.result.detail.message, new RegExp(stored.execution.observations[0].actionId));
+      assert.equal(stored.execution.result.detail.message.includes("untrusted-profile"), false);
+      assert.equal(stored.execution.result.detail.message.includes("产品代码缺陷"), false);
+      assert.equal(stored.execution.observations.length, 1);
+      assert.equal(stored.execution.observations[0].status, "failed");
+      assert.equal(stored.execution.observations[0].workspaceRevision, REVISION_A);
+      assert.equal(events.indexOf("observe") < events.indexOf("failed"), true);
+      assert.equal(second.selected, 0);
+      assert.equal(brainCalls.length, 1);
+      assert.equal(executor.calls.filter(({ method }) => method === "perform").length, 1);
+      assert.equal(store.completionRequests.length, 0);
+    });
+  }
+});
+
+test("verify jobs recover a durable failed profile locally before asking the brain again", async () => {
+  const action = { type: "run_profile", actionId: "failed-profile-before-restart", expectedWorkspaceRevision: REVISION_A, profileId: "node-tests" };
+  const initial = job({
+    grant: grant({ operation: "verify", allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.verify], writablePaths: [] }),
+    status: "active", revision: 5,
+    execution: { ...job().execution, sessionId: job().jobId, workspaceRevision: REVISION_A, turn: 1, observations: [observation(action, { status: "failed", result: { exitCode: 1, error: { code: "TESTS_FAILED", message: "checks failed" } } })] },
+  });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial);
+  const brainCalls = [];
+  const worker = new CodeJobWorkerService({ jobStore: store, executor, brainDirectory: brain([{ type: "run_profile" }], brainCalls), grantVerifier: verifier([]) });
+
+  const result = await worker.runCycle();
+
+  assert.equal(result.outcomes[0].status, "failed");
+  assert.equal(result.outcomes[0].code, "CODE_JOB_VERIFICATION_FAILED");
+  assert.equal(brainCalls.length, 0);
+  assert.equal(executor.calls.length, 0);
+  assert.equal((await store.getForWorker(initial.jobId)).execution.observations.length, 1);
+});
+
+test("upgraded verify jobs keep a later passing retest instead of reviving an old failure", async () => {
+  const failed = { type: "run_profile", actionId: "legacy-failed-profile", expectedWorkspaceRevision: REVISION_A, profileId: "node-tests" };
+  const passed = { ...failed, actionId: "legacy-passed-retest" };
+  const initial = job({
+    grant: grant({ operation: "verify", allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.verify], writablePaths: [] }),
+    status: "active", revision: 6,
+    execution: { ...job().execution, sessionId: job().jobId, workspaceRevision: REVISION_A, turn: 2,
+      observations: [
+        observation(failed, { status: "failed", result: { exitCode: 1, error: { code: "TESTS_FAILED", message: "old failure" } } }),
+        { ...observation(passed, { result: { exitCode: 0 } }), turn: 2 },
+      ],
+    },
+  });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial);
+  const worker = new CodeJobWorkerService({ jobStore: store, executor, brainDirectory: brain([{ type: "complete" }]), grantVerifier: verifier([]) });
+  const result = await worker.runCycle();
+  assert.equal(result.outcomes[0].status, "completed");
+  assert.equal(executor.calls.filter(({ method }) => method === "perform").length, 1);
+  assert.equal((await store.getForWorker(initial.jobId)).execution.observations.length, 3);
+});
+
+test("recovered verification selects the latest result of each fixed profile at the current workspace", () => {
+  const initial = job({
+    grant: grant({ operation: "verify", requiredProfiles: [
+      { id: "node-tests", configDigest: PROFILE_DIGEST },
+      { id: "ui-tests", configDigest: PROFILE_DIGEST },
+    ] }),
+    execution: { ...job().execution, workspaceRevision: REVISION_B, observations: [] },
+  });
+  const add = (profileId, status, revision = REVISION_B) => {
+    const action = { type: "run_profile", actionId: `profile-${initial.execution.observations.length}`, expectedWorkspaceRevision: revision, profileId };
+    initial.execution.observations.push(observation(action, {
+      status, workspaceRevision: revision,
+      result: status === "failed" ? { exitCode: 1, error: { code: "TESTS_FAILED", message: "failed" } } : { exitCode: 0 },
+    }));
+  };
+  add("node-tests", "failed", REVISION_A);
+  add("ui-tests", "succeeded");
+  assert.equal(verificationFailure(initial), null, "a stale workspace failure does not fail current tests");
+  add("node-tests", "failed");
+  add("ui-tests", "succeeded");
+  assert.equal(verificationFailure(initial)?.code, "CODE_JOB_VERIFICATION_FAILED", "another profile passing does not hide the failure");
+  add("node-tests", "succeeded");
+  assert.equal(verificationFailure(initial), null, "a passing retest supersedes its earlier failure");
+  add("node-tests", "failed");
+  assert.equal(verificationFailure(initial)?.code, "CODE_JOB_VERIFICATION_FAILED", "the latest failure is authoritative");
+});
+
+test("verify jobs wait for audit reconciliation before settling a failed profile without replay", async () => {
+  const initial = job({
+    grant: grant({
+      operation: "verify",
+      allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.verify],
+      writablePaths: [],
+    }),
+  });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial);
+  failFirstProfileRun(executor, {
+    exitCode: 1,
+    error: { code: "TESTS_FAILED", message: "checks failed" },
+  });
+  executor.getActionResult = async () => {
+    throw Object.assign(new Error("audit unavailable"), { code: "AUDIT_BACKEND_UNAVAILABLE" });
+  };
+  const brainCalls = [];
+  const worker = new CodeJobWorkerService({
+    jobStore: store,
+    executor,
+    brainDirectory: brain([{ type: "run_profile" }], brainCalls),
+    grantVerifier: verifier([]),
+  });
+
+  const uncertain = await worker.runCycle();
+  assert.equal(uncertain.outcomes[0].status, "unknown");
+  assert.equal((await store.getForWorker(initial.jobId)).execution.observations.length, 0);
+  const reconciled = await worker.runCycle();
+
+  assert.equal(reconciled.outcomes[0].status, "failed");
+  assert.equal(reconciled.outcomes[0].code, "CODE_JOB_VERIFICATION_FAILED");
+  assert.equal((await store.getForWorker(initial.jobId)).execution.observations.length, 1);
+  assert.equal((await worker.runCycle()).selected, 0);
+  assert.equal(brainCalls.length, 1);
+  assert.equal(executor.calls.filter(({ method }) => method === "perform").length, 1);
+  assert.equal(executor.calls.filter(({ method }) => method === "reconcileAction").length, 1);
+});
+
+test("modify jobs can repair and retest after a trusted profile failure", async () => {
+  const initial = job();
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial);
+  failFirstProfileRun(executor, { exitCode: 1, error: { code: "TESTS_FAILED", message: "checks failed" } });
+  const worker = new CodeJobWorkerService({
+    jobStore: store, executor,
+    brainDirectory: brain([{ type: "run_profile" }, { type: "write_text", path: "src/new.js", content: "export const fixed = true;\n" }, { type: "run_profile" }, { type: "complete" }]),
+    grantVerifier: verifier([]),
+  });
+
+  assert.equal((await worker.runCycle()).outcomes[0].status, "active");
+  assert.equal((await worker.runCycle()).outcomes[0].status, "active");
+  assert.equal((await worker.runCycle()).outcomes[0].status, "active");
+  assert.equal((await worker.runCycle()).outcomes[0].status, "completed");
+  assert.deepEqual((await store.getForWorker(initial.jobId)).execution.observations.map(({ status }) => status), ["failed", "succeeded", "succeeded", "succeeded"]);
+});
+
+test("profile observations preserve only bounded validated test summary counts", () => {
+  const action = { type: "run_profile", actionId: "profile-summary", expectedWorkspaceRevision: REVISION_A, profileId: "node-tests" };
+  const summary = { total: 4, passed: 1, failed: 1, cancelled: 0, skipped: 1, todo: 1, executed: 2 };
+  const detail = observationDetail(action, { session: { status: "active", attempt: { number: 1 } }, action: { status: "failed", attemptNumber: 1 } }, { exitCode: 1, testSummary: { ...summary, testNames: ["x".repeat(100_000)] } });
+
+  assert.deepEqual(detail.result.testSummary, summary);
+  assert.deepEqual(JSON.parse(modelObservation(observation(action, { status: "failed", result: detail.result })).detail).testSummary, summary);
+  const invalid = observationDetail(action, { session: { status: "active", attempt: { number: 1 } }, action: { status: "failed", attemptNumber: 1 } }, { testSummary: { ...summary, executed: -1 } });
+  assert.equal(Object.hasOwn(invalid.result, "testSummary"), false);
+  for (const inconsistent of [ { ...summary, executed: 3 }, { ...summary, total: 5 } ]) {
+    const rejected = observationDetail(action, { session: { status: "active", attempt: { number: 1 } }, action: { status: "failed", attemptNumber: 1 } }, { testSummary: inconsistent });
+    assert.equal(Object.hasOwn(rejected.result, "testSummary"), false);
+    assert.equal(Object.hasOwn(JSON.parse(modelObservation(observation(action, { result: { testSummary: inconsistent } })).detail), "testSummary"), false);
+  }
 });
 
 test("a changed PR Head fences the job before brain or executor access", async () => {
