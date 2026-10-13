@@ -30,6 +30,22 @@ confirm interruption before reporting a task stopped, and prevent stale output
 from reaching code execution or GitHub publication. Keep priority changes within
 the scheduler and preserve the existing task authorization and PR Head checks.
 
+## P2 — Retire terminal task-control settings with authoritative evidence
+
+The running-task registry preserves controls across restarts, but currently never
+retires settings for finished tasks. After controls have been saved for 1,000
+distinct entities, new entities cannot save their first control. Increasing the
+limit or deleting the settings file would hide the lifecycle gap and could erase
+pause/cancel barriers and supplemental instructions.
+
+**Acceptance:** use fresh authoritative ledger/job terminal states to retire
+eligible settings, retain active runs, paused tasks and unresolved controls, and
+keep cancellation barriers until redispatch is impossible. Verify recovery from
+capacity after terminal records are retired, including unavailable/stale store
+evidence and restart. Preserve the current bounded-state validation. This is a
+long-term lifecycle follow-up, not evidence that the current deployment has
+reached capacity.
+
 ## P1 — Complete the real testing and repair loop
 
 The tester role and verify code worker now load the portable bundled

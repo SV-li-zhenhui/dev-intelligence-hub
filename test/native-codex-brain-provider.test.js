@@ -188,20 +188,24 @@ test("native FIFO is shared across providers and a cancelled queued request neve
   assert.ok(f.calls[1].input.toString().includes("SECOND"));
 });
 
-test("native timeout waits for supervised exit before the next queued provider launches", async (t) => {
+test("native timeout waits for supervised exit before the next queued provider launches", { timeout: 10_000 }, async (t) => {
   const f = await fixture(t);
-  const aborted = gate(); const reaped = gate();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const started = gate(); const aborted = gate(); const reaped = gate();
   const slow = f.create(async (call) => {
     call.signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+    started.resolve();
     await reaped.promise;
     return result(call);
   }, { timeoutMs: 35 });
   const fast = f.create();
   const first = slow.generate(request());
   const failure = assert.rejects(first, { code: "STRUCTURED_PROVIDER_TIMEOUT" });
+  await started.promise;
+  t.mock.timers.tick(35);
   await aborted.promise;
   const next = fast.generate(request());
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await new Promise(setImmediate);
   assert.equal(f.calls.length, 1);
   reaped.resolve(); await failure; await next;
   assert.equal(f.calls.length, 2);
