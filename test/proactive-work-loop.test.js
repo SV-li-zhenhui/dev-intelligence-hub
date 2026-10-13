@@ -1,6 +1,63 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
+import { createTaskRunSettler, planWorkItemRunControl } from '../src/services/work-ledger-run-control.js';
+
+for (const command of ['pause', 'cancel']) {
+  test(`accepted ${command} survives a decision deadline until process stop is confirmed`, { timeout: 10_000 }, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const time = controlledClock();
+    const ledger = new FakeLedger({ source: [workItem(1)], time });
+    ledger.readItemForReconciliation = async ({ itemId }) => clone(ledger.items.find((item) => item.itemId === itemId));
+    ledger.controlModelRun = async (input) => {
+      const plan = planWorkItemRunControl({ state: { items: ledger.items }, input, clock: time.clock });
+      ledger.items = plan.patch.items;
+      return clone(plan.result);
+    };
+    ledger.getSummary = async () => ({ revision: 1 });
+    ledger.cancelGraphTask = async (input) => {
+      const item = ledger.items.find((item) => item.itemId === input.itemId);
+      assert.equal(input.expectedRevision, item.revision);
+      assert.equal(item.status, 'paused');
+      Object.assign(item, { status: 'cancelled', revision: item.revision + 1 });
+    };
+    let state = null;
+    let stopped = false;
+    const registry = new TaskRunRegistry({
+      store: { read: async (_key, fallback) => state ?? fallback, write: async (_key, value) => { state = clone(value); } },
+      settleControl: createTaskRunSettler({ ledger }),
+      verifyStopped: async () => stopped,
+    });
+    const entered = deferred();
+    const directory = new FakeRoleDirectory({ 'pr-reviewer': worker({ decide: async ({ signal }) => {
+      entered.resolve();
+      await new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(Object.assign(new Error('process stop unconfirmed'), {
+          code: 'STRUCTURED_PROVIDER_REAP_FAILED',
+        })), { once: true });
+      });
+    } }) });
+    const cycle = createLoop({ ledger, directory, time, taskRuns: registry, decideTimeoutMs: 100 }).runCycle();
+    await entered.promise;
+    const view = (await registry.list()).items[0];
+    const claim = clone(ledger.items[0]);
+    await registry.control(view.kind, view.taskId, { runId: view.runId, expectedRevision: view.revision, command });
+    t.mock.timers.tick(100);
+    const result = await cycle;
+    assert.equal(result.outcomes[0].status, 'control_pending');
+    assert.equal(ledger.calls.scheduleRetry.length, 0);
+    assert.equal(ledger.calls.stageIntent.length, 0);
+    assert.deepEqual(ledger.items[0], claim, 'an unconfirmed stop must retain the original claim');
+    await registry.reconcile();
+    assert.equal((await registry.get(view.kind, view.taskId)).pendingCommand, command);
+    stopped = true;
+    await registry.reconcile();
+    const settled = await registry.get(view.kind, view.taskId);
+    assert.equal(settled.pendingCommand, null);
+    assert.equal(settled.phase, command === 'pause' ? 'paused' : 'cancelled');
+    assert.equal(ledger.items[0].status, settled.phase);
+  });
+}
 
 test('accepted pause followed by model failure cannot stage intent or schedule ordinary retry',async()=>{
   const time=controlledClock();const ledger=new FakeLedger({source:[workItem(1)],time});

@@ -570,6 +570,8 @@ async function withinAbortable(
     if (controller.signal.aborted) throw controller.signal.reason;
     return result;
   } catch (error) {
+    // A saved owner control must retain its claim while stop evidence is pending.
+    if (error instanceof TaskRunControlError) throw error;
     if (controller.signal.aborted) throw controller.signal.reason;
     throw error;
   } finally {
