@@ -156,7 +156,8 @@ test("the session deferral store safely falls back when storage is unavailable",
 test("all attention sources share one dialog and one unified next endpoint", async () => {
   const { html, app } = await sources();
 
-  assert.equal((html.match(/<dialog\b/g) || []).length, 2);
+  assert.equal((html.match(/<dialog id="confirmation-dialog"/g) || []).length, 1);
+  assert.equal((html.match(/<dialog id="task-run-dialog"/g) || []).length, 1);
   assert.match(
     html,
     /<dialog id="detail-dialog" aria-label="详情">/,

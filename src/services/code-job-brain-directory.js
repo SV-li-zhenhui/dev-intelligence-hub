@@ -8,6 +8,7 @@ import { normalizeSessionKey } from "../lib/session-key.js";
 import { normalizeBrainConfig } from "./brain-router.js";
 import { packCodeJobBrainContext } from "./code-job-context-packer.js";
 import { normalizeReviewRepairFeedbackContext, reviewRepairMessages } from "./review-repair-context-reader.js";
+import { taskInstructionMessages } from '../lib/task-execution-context.js';
 import { createConfiguredBrainRouter } from "./configured-workforce.js";
 
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
@@ -235,12 +236,14 @@ function normalizeDecisionInput(value) {
     typeof value === "object" &&
     Object.hasOwn(value, "sessionKey");
   const hasReviewRepairFeedback = value !== null && typeof value === "object" && Object.hasOwn(value, "reviewRepairFeedback");
+  const hasInstructions = value !== null && typeof value === 'object' && Object.hasOwn(value,'instructions');
   const input = exactData(
     value,
     [
       "roleId",
       ...(hasSessionKey ? ["sessionKey"] : []),
       ...(hasReviewRepairFeedback ? ["reviewRepairFeedback"] : []),
+      ...(hasInstructions ? ['instructions'] : []),
       "task",
       "capabilities",
       "turn",
@@ -263,6 +266,7 @@ function normalizeDecisionInput(value) {
   return {
     roleId: input.roleId,
     context,
+    instructions: hasInstructions ? value.instructions : undefined,
     ...(hasReviewRepairFeedback ? { reviewRepairFeedback: normalizeReviewRepairFeedbackContext(input.reviewRepairFeedback) } : {}),
     ...(hasSessionKey
       ? { sessionKey: normalizeSessionKey(input.sessionKey) }
@@ -362,7 +366,7 @@ export class CodeJobBrainDirectory {
 
   async decide(value, authorization) {
     this.#assertOpen();
-    const { roleId, context, sessionKey, reviewRepairFeedback } = normalizeDecisionInput(value);
+    const { roleId, context, sessionKey, reviewRepairFeedback, instructions } = normalizeDecisionInput(value);
     const { beforeGenerate, admitGenerate } =
       requireDecisionAuthorization(authorization);
     if (!this.#taskBrains.has(roleId)) {
@@ -384,6 +388,7 @@ export class CodeJobBrainDirectory {
       { role: "system", content: systemPrompt() },
       { role: "user", content: JSON.stringify(context) },
       ...reviewRepairMessages(reviewRepairFeedback),
+      ...taskInstructionMessages(instructions),
     ];
     const maximumAttempts = isSingleAttemptBrain(this.#router, brain) ? 1 : 2;
     for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {

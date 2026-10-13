@@ -104,6 +104,64 @@ push this private development history merely because the current tree passes.
 
 ## Managed lifecycle
 
+### Running-task controls and optional Codex app-server
+
+`GET /api/task-runs` projects actual in-process model turns and controlled code
+actions. Queued ledger items are not presented as running. The detail endpoint
+`GET /api/task-runs/{kind}/{taskId}` and origin-checked control endpoint
+`POST /api/task-runs/{kind}/{taskId}/control` use a run ID and settings revision
+to reject stale controls. Adjustment settings and holds live in the existing
+data directory as `task-run-settings.json`; preserve this file in backups.
+
+The native-login provider retains the exec/resume route by default. An app-server
+protocol adapter exists, but its production transport is **not enabled**:
+the installed CLI rejects the required `--ignore-user-config` / `--ignore-rules`
+options, and a contained bidirectional supervisor has not passed acceptance.
+`DIH_CODEX_NATIVE_TRANSPORT=app-server` therefore reports unavailable before
+starting a process; use unset or `exec`. Do not remove the isolation checks or
+substitute a direct-child exit for process-tree termination. This setting applies
+only to `codex-native-login`; it does not change legacy broker/API-key modes,
+authentication, selected models or reasoning effort. Preserve the original
+`CODEX_HOME`.
+
+The app-server route uses the verified installed CLI, explicit read-only turn
+policy, the pinned PR reader and existing entity session references. It accepts
+live `turn/steer` instructions only for the bound current turn in protocol tests.
+Before production activation, supply verified tree containment and demonstrate
+equivalent config/rule isolation on the installed CLI. The isolated real-CLI
+initialize handshake passed; it did not start a model turn and is not live-task
+acceptance. No CLI version string is hard-coded as a gate. Request acknowledgements
+do not prove semantic adoption of an instruction.
+
+Code actions are observed without replaying them when requirements change.
+Pause/cancel requests remain pending until the ledger or controlled executor
+confirms settlement. Scheduled coordination explicitly reconciles retained
+controls; pausing/cancelling/unknown code jobs remain eligible for recovery,
+even when new execution is held. Never clear a hold to bypass an uncertain
+executor result. `exec` instructions are applied at a later checkpoint.
+
+An accepted pause/cancel takes precedence over an ordinary model failure, so a
+retry cannot replace its original claim. `STRUCTURED_PROVIDER_REAP_FAILED`
+retains a durable stop-unconfirmed hold across restart. Coordination may settle
+it only after trusted native-provider readiness confirms recovery in a deployment
+where all configured CLI providers use the same native Codex home/fence. Mixed
+legacy/Claude CLI configurations cannot use that evidence; an absent in-memory
+run is not stop evidence. Other providers need maintenance evidence
+and must not have this hold cleared automatically. A code job already in a
+terminal state wins a late control and keeps its actual final status.
+An owner stop may settle that exact claim after its worker lease expires;
+revision, lease identity and active-intent checks still prevent changing a newer
+execution. This exception permits stopping, never worker execution.
+
+Post-deploy checks: open the global running list, verify that an actual task
+appears and a queued one does not, submit a harmless supplemental requirement,
+and inspect its receipt. Verify pause/resume uses the same item and that a
+cancelled code job remains pending until executor reconciliation. Watch stable
+`TASK_RUN_*` and `STRUCTURED_PROVIDER_*` diagnostics. On an unconfirmed process
+exit, preserve the invocation marker and native history; use the existing
+managed recovery procedure. A healthy web endpoint alone is not acceptance of
+real PR review or code execution.
+
 Run lifecycle commands from the project root. The manager serializes concurrent
 operations, authenticates the exact managed process, and does not force-kill a
 process whose shutdown outcome is unknown.

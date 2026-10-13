@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { taskInstructionMessages } from '../lib/task-execution-context.js';
 import {
   parseStructuredWorkDecision,
   WORK_DECISION_JSON_SCHEMA,
@@ -429,6 +430,7 @@ export class RoleDecisionEngine {
     trigger = "assigned",
     context: suppliedContext,
     reviewRepairFeedback,
+    instructions,
     signal: signalValue = null,
   } = {}) {
     const signal = normalizeAbortSignal(signalValue);
@@ -459,6 +461,7 @@ export class RoleDecisionEngine {
       },
       { role: "user", content: JSON.stringify(context) },
       ...feedbackMessages,
+      ...taskInstructionMessages(instructions),
     ];
     const request = {
       brain: this.#brain,

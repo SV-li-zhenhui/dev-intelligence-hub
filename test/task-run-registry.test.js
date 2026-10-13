@@ -12,6 +12,43 @@ import {
 
 const NOW = "2026-10-13T08:00:00.000Z";
 
+test('observing a controlled action never repeats the side effect for new instructions',async()=>{
+  const {registry}=fixture();const entered=deferred(),finish=deferred();let performed=0;
+  const operation=registry.run(task({kind:'code-job'}),async()=>{performed++;entered.resolve();await finish.promise;return 'executed';},{repeatOnInstruction:false});
+  await entered.promise;const view=await registry.get('code-job','work-1');
+  await registry.control(view.kind,view.taskId,control(view,'instruct',{instruction:'check error handling next'}));
+  finish.resolve();assert.equal(await operation,'executed');assert.equal(performed,1);
+});
+
+test('pending cancellation is reconciled only after the executor confirms terminal state',async()=>{
+  let confirmed=false;
+  const {registry}=fixture({settleControl:async()=>confirmed?undefined:{pending:true}});
+  const running=await start(registry);const rejected=assert.rejects(running.result,hasError('TASK_RUN_CONTROL_PENDING',409));
+  await registry.control('work-item','work-1',control(running.view,'cancel'));running.gate.resolve('old');await rejected;
+  assert.equal((await registry.list()).held[0].pendingCommand,'cancel');
+  await registry.reconcile();assert.equal((await registry.list()).held.length,1);
+  confirmed=true;await registry.reconcile();assert.equal((await registry.list()).held.length,0);
+  assert.equal((await registry.get('work-item','work-1')).phase,'cancelled');
+});
+
+test('held code jobs still admit cancellation and pause reconciliation',async()=>{
+  const {registry}=fixture({settleControl:async()=>({pending:true})});
+  const running=await start(registry,task({kind:'code-job'}));
+  const rejected=assert.rejects(running.result,hasError('TASK_RUN_CONTROL_PENDING',409));
+  await registry.control('code-job','work-1',control(running.view,'cancel'));running.gate.resolve('old');await rejected;
+  assert.equal((await registry.order([{id:'work-1',status:'cancelling'}],'code-job','id')).length,1);
+  assert.equal((await registry.order([{id:'work-1',status:'active'}],'code-job','id')).length,0);
+});
+
+test('a terminal action wins a late control and the completed task is not reported as paused',async()=>{
+  const {registry}=fixture({settleControl:async()=>({terminalStatus:'completed'})});
+  const running=await start(registry,task({kind:'code-job'}));
+  await registry.control('code-job','work-1',control(running.view,'pause'));
+  running.gate.resolve('completed');assert.equal(await running.result,'completed');
+  assert.equal((await registry.get('code-job','work-1')).phase,'completed');
+  assert.equal((await registry.list()).held.length,0);
+});
+
 class MemoryStore {
   value = null;
   writes = 0;
@@ -282,11 +319,11 @@ test("an acknowledged failure after a durable instruction still fences the old r
   assert.equal((await registry.get("work-item", "work-1")).revision, 1);
 });
 
-test("failed pause settlement propagates its error and retains a visible durable hold", async () => {
+test("failed pause settlement retains its cause without permitting ordinary retry", async () => {
   const failure = new Error("ledger settlement unavailable");
   const { registry, store } = fixture({ settleControl: async () => { throw failure; } });
   const running = await start(registry);
-  const rejected = assert.rejects(running.result, (error) => error === failure);
+  const rejected = assert.rejects(running.result, (error) => error.code === 'TASK_RUN_CONTROL_PENDING' && error.cause === failure);
   await registry.control("work-item", "work-1", control(running.view, "pause"));
   running.gate.resolve("obsolete");
   await rejected;
@@ -322,7 +359,7 @@ test("a failed checkpoint write retains the hold after the ledger was settled", 
     },
   });
   const running = await start(registry);
-  const rejected = assert.rejects(running.result, /disk unavailable/);
+  const rejected = assert.rejects(running.result, (error) => error.code === 'TASK_RUN_CONTROL_PENDING' && /disk unavailable/.test(error.cause?.message));
   await registry.control("work-item", "work-1", control(running.view, "pause"));
   running.gate.resolve("obsolete decision");
   await rejected;
@@ -353,18 +390,34 @@ test("resume never removes a durable hold when its final write fails", async () 
   assert.deepEqual(await recovered.order([{ id: "work-1" }], "work-item", "id"), []);
 });
 
-test("model failure with a pending pause leaves a failed hold without replaying the provider", async () => {
+test("model failure settles an accepted pause before ordinary retry can change its claim", async () => {
   const { registry, settlements } = fixture();
   const running = await start(registry);
   const failure = new Error("model process exited");
-  const rejected = assert.rejects(running.result, (error) => error === failure);
+  const rejected = assert.rejects(running.result, hasError('TASK_RUN_PAUSED',409));
   await registry.control("work-item", "work-1", control(running.view, "pause"));
   running.gate.reject(failure);
   await rejected;
   assert.equal(running.calls.length, 1);
-  assert.equal(settlements.length, 0);
-  assert.equal((await registry.list()).held[0].phase, "control_failed");
+  assert.equal(settlements.length, 1);
+  assert.equal((await registry.list()).held[0].phase, "paused");
   assert.deepEqual(await registry.order([{ id: "work-1" }], "work-item", "id"), []);
+});
+
+test('unconfirmed reap survives restart and cannot settle until trusted stop evidence arrives',async()=>{
+  let stopped=false;
+  const {registry,store,settlements}=fixture({verifyStopped:async()=>stopped});
+  const running=await start(registry);
+  const rejected=assert.rejects(running.result,hasError('TASK_RUN_CONTROL_PENDING',409));
+  await registry.control('work-item','work-1',control(running.view,'pause'));
+  running.gate.reject(Object.assign(new Error('stop unconfirmed'),{code:'STRUCTURED_PROVIDER_REAP_FAILED'}));
+  await rejected;assert.equal(settlements.length,0);
+  const recovered=fixture({store,verifyStopped:async()=>stopped});
+  await recovered.registry.reconcile();assert.equal(recovered.settlements.length,0);
+  assert.equal((await recovered.registry.list()).held[0].stopUnconfirmed,true);
+  stopped=true;await recovered.registry.reconcile();
+  assert.equal(recovered.settlements.length,1);
+  assert.equal((await recovered.registry.list()).held[0].phase,'paused');
 });
 
 test("repeated mid-round adjustments stop at five rounds and hold the original task", async () => {
@@ -380,6 +433,17 @@ test("repeated mid-round adjustments stop at five rounds and hold the original t
   assert.equal(calls, 5);
   assert.equal((await registry.list()).held[0].mode, "paused");
   assert.deepEqual(settlements, [{ task: task(), command: "pause" }]);
+});
+
+test('adjustment-limit pause settlement failure cannot escape as an ordinary provider retry',async()=>{
+  const failure=new Error('ledger unavailable');
+  const {registry}=fixture({settleControl:async()=>{throw failure;}});
+  const running=registry.run(task(),async()=>{
+    const view=await registry.get('work-item','work-1');
+    await registry.control(view.kind,view.taskId,control(view,'instruct',{instruction:'updated requirement'}));
+  });
+  await assert.rejects(running,error=>error.code==='TASK_RUN_CONTROL_PENDING' && error.cause===failure);
+  assert.equal((await registry.list()).held[0].pendingCommand,'pause');
 });
 
 test("controls validate exact bounded inputs without evaluating accessors", async () => {

@@ -6,6 +6,7 @@ import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { createApplication } from "../src/composition-root.js";
 import {
   createDashboardServer,
@@ -994,6 +995,7 @@ async function withServer(
     memoryImports,
     codeJobReader,
     codeJobControl,
+    taskRuns,
     changePackageReader,
     changePackageApplicationRequester,
     changePackageApplicationStatusReader,
@@ -1239,6 +1241,7 @@ async function withServer(
   if (memoryImports) application.memoryImports = memoryImports;
   if (codeJobReader) application.codeJobReader = codeJobReader;
   if (codeJobControl) application.codeJobControl = codeJobControl;
+  if (taskRuns) application.taskRuns = taskRuns;
   if (changePackageReader) application.changePackageReader = changePackageReader;
   if (changePackageApplicationRequester) {
     application.changePackageApplicationRequester =
@@ -1265,6 +1268,24 @@ async function withServer(
     await server.shutdown();
   }
 }
+
+test('task-run HTTP controls enforce origin and CAS through the real registry',async()=>{
+  let saved=null;const entered=deferred(),gate=deferred();let calls=0;
+  const registry=new TaskRunRegistry({store:{read:async(_k,f)=>saved??f,write:async(_k,v)=>{saved=structuredClone(v);}},settleControl:async()=>{}});
+  const execution=registry.run({kind:'work-item',taskId:'work-1',roleId:'reviewer',title:'Check',subject:'repo#1',revision:1},async()=>{calls++;entered.resolve();if(calls===1)await gate.promise;return calls;});
+  await entered.promise;
+  try{await withServer(async({server})=>{
+    const listed=await request(server,{path:'/api/task-runs'});assert.equal(listed.status,200);
+    const view=JSON.parse(listed.body).items[0];
+    const body=JSON.stringify({runId:view.runId,expectedRevision:view.revision,command:'instruct',instruction:'check locks'});
+    const rejected=await request(server,{method:'POST',path:'/api/task-runs/work-item/work-1/control',headers:{'content-type':'application/json',origin:'http://wrong.invalid'},body});
+    assert.equal(rejected.status,403);
+    const accepted=await request(server,{method:'POST',path:'/api/task-runs/work-item/work-1/control',headers:trustedConfigurationHeaders(),body});assert.equal(accepted.status,200);
+    const stale=await request(server,{method:'POST',path:'/api/task-runs/work-item/work-1/control',headers:trustedConfigurationHeaders(),body});assert.equal(stale.status,409);
+    assert.equal(JSON.parse(stale.body).code,'TASK_RUN_CONFLICT');
+  },{taskRuns:registry});}finally{gate.resolve();await execution;}
+  assert.equal(calls,2);
+});
 
 test("live and health freeze the startup runtime source identity", async () => {
   const runtimeSourceIdentity = {

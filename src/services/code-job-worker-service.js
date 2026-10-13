@@ -1,4 +1,6 @@
 import { OperationQueue } from "../lib/operation-queue.js";
+import { TaskRunControlError } from './task-run-registry.js';
+import { currentTaskExecution } from '../lib/task-execution-context.js';
 import { digestValue } from "../domain/code-executor-contract.js";
 import {
   canCreateCodeJobChangePackageEvent,
@@ -225,6 +227,7 @@ export class CodeJobWorkerService {
   #jobs;
   #executor;
   #brain;
+  #taskRuns;
   #reviewRepairContextReader;
   #verifyGrant;
   #actionAdmission;
@@ -242,6 +245,7 @@ export class CodeJobWorkerService {
     jobStore,
     executor,
     brainDirectory,
+    taskRuns = null,
     reviewRepairContextReader,
     grantVerifier,
     actionAdmissionGate = DIRECT_ACTION_ADMISSION,
@@ -289,6 +293,7 @@ export class CodeJobWorkerService {
       "controlled code executor",
     );
     this.#brain = requirePort(brainDirectory, ["decide"], "code job brain");
+    this.#taskRuns = taskRuns;
     this.#reviewRepairContextReader = reviewRepairContextReader === undefined
       ? null : requirePort(reviewRepairContextReader, ["read"], "review repair context reader");
     this.#verifyGrant = requirePort(
@@ -351,10 +356,11 @@ export class CodeJobWorkerService {
       ...query,
       afterSequence: this.#reconcilableCursor,
     });
-    const runnable = await this.#jobs.listRunnable({
+    const runnablePage = await this.#jobs.listRunnable({
       ...query,
       afterSequence: this.#runnableCursor,
     });
+    const runnable = this.#taskRuns ? {...runnablePage,items:await this.#taskRuns.order(runnablePage.items,'code-job','jobId')} : runnablePage;
     const selection = selectCycleCandidates(
       reconcilable.items,
       runnable.items,
@@ -581,11 +587,12 @@ export class CodeJobWorkerService {
           number: job.grant.subject.number,
         })
       : null;
-    const decision = await this.#brain.decide(
+    const decide = ({instructions} = {}) => this.#brain.decide(
       {
         roleId: job.grant.requestedBy.roleId,
         ...(sessionKey === null ? {} : { sessionKey }),
         ...brainContext,
+        ...(instructions === undefined ? {} : {instructions}),
         ...(reviewRepairFeedback === null ? {} : { reviewRepairFeedback }),
       },
       {
@@ -593,6 +600,9 @@ export class CodeJobWorkerService {
         brainDigest: job.grant.brainDigest,
       },
     );
+    const decision = this.#taskRuns ? await this.#taskRuns.run({kind:'code-job',taskId:job.jobId,
+      roleId:job.grant.requestedBy.roleId,title:job.grant.objective,
+      subject:job.grant.repository,revision:job.revision},decide) : await decide();
     if (reviewRepairFeedback !== null) {
       const currentFeedback = await this.#readReviewRepairFeedback(job);
       if (currentFeedback.reviewFeedbackDigest !== reviewRepairFeedback.reviewFeedbackDigest) throw workerError("CODE_REVIEW_REPAIR_CONTEXT_STALE", "Review feedback changed while the code brain was deciding");
@@ -975,7 +985,16 @@ export class CodeJobWorkerService {
     return { job: current, session };
   }
 
-  async #performPending(
+  async #performPending(...args) {
+    const [job] = args;
+    if (!this.#taskRuns || ['pausing','cancelling','unknown'].includes(job.status)) return this.#executePending(...args);
+    return this.#taskRuns.run({kind:'code-job',taskId:job.jobId,roleId:job.grant.requestedBy.roleId,
+      title:job.grant.objective,subject:job.grant.repository,revision:job.revision},
+      () => {currentTaskExecution()?.reportProgress(`正在执行受控动作：${job.execution.pendingAction?.action.type ?? '状态核对'}`);return this.#executePending(...args);},
+      {repeatOnInstruction:false});
+  }
+
+  async #executePending(
     job,
     session,
     {
@@ -1273,6 +1292,7 @@ export class CodeJobWorkerService {
         readCode: safeErrorCode(readError),
       };
     }
+    if (error instanceof TaskRunControlError) return {jobId,status:current?.status ?? 'unknown',actionType:null,code};
     if (current?.status === "unknown") {
       return {
         jobId,

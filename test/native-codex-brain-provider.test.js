@@ -8,6 +8,7 @@ import { createNativeCodexBrainProvider } from "../src/adapters/native-codex-bra
 import { nativeCodexDigest, nativeCodexHomeIdentity } from "../src/adapters/codex-native-session-store.js";
 import { createTestSupervisedProcessRunner } from "../src/lib/supervised-process-runner.js";
 import { BrainRouter } from "../src/services/brain-router.js";
+import { CodexAppServerRunner } from '../src/lib/codex-app-server-runner.js';
 
 const schema = { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false };
 const request = (overrides = {}) => ({ model: "gpt-6.1-sol", reasoningEffort: "high", messages: [{ role: "user", content: "PRIVATE_TASK_INPUT" }], schema, ...overrides });
@@ -15,6 +16,37 @@ const error = (code) => Object.assign(new Error("private diagnostic must not esc
 const options = { id: "native-test", cliKind: "codex-cli", credentialMode: "codex-native-login", timeoutMs: 3000 };
 const success = (stdout = "") => ({ exitCode: 0, signal: null, stdout, stderr: "", stdoutBytes: Buffer.from(stdout), stderrBytes: Buffer.alloc(0) });
 const gate = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
+
+test('opt-in app-server retains native config, rule and feature isolation before starting a model',async(t)=>{
+  const f=await fixture(t);const calls=[];
+  f.environment.DIH_CODEX_NATIVE_TRANSPORT='app-server';
+  const provider=f.create(()=>assert.fail('must not silently fall back to exec'),{}, {appServerRunner:{async run(call){
+    calls.push(call);await writeFile(path.join(call.cwd,'last-message.json'),JSON.stringify({result:JSON.stringify({ok:true})}));
+    return success(JSON.stringify({type:'thread.started',thread_id:'thread-42'}));
+  }}});
+  assert.deepEqual(JSON.parse(await provider.generate(request())),{ok:true});
+  for(const flag of ['--ignore-user-config','--ignore-rules','--strict-config'])assert.ok(calls[0].args.includes(flag),flag);
+  for(const feature of ['hooks','plugins','apps','multi_agent'])assert.ok(calls[0].args.some((value,index)=>value==='--disable' && calls[0].args[index+1]===feature),feature);
+  assert.equal(calls[0].env.CODEX_HOME,f.home);await provider.close();
+});
+
+test('unavailable production live transport leaves no unknown native session or active marker',async(t)=>{
+  const f=await fixture(t);f.environment.DIH_CODEX_NATIVE_TRANSPORT='app-server';
+  const provider=f.create(()=>assert.fail('must not fall back to exec'));
+  assert.equal((await provider.readStatus()).state,'cli_unavailable');
+  await assert.rejects(provider.generate(request({sessionKey:'pr:42'})),{code:'STRUCTURED_PROVIDER_UNAVAILABLE'});
+  assert.deepEqual(await readdir(path.join(f.runtime,'sessions')),[]);
+  assert.deepEqual(await readdir(f.runtime),['sessions']);await provider.close();
+});
+
+test('cancellation racing a certified unavailable live transport still clears a fresh session journal',async(t)=>{
+  const f=await fixture(t);f.environment.DIH_CODEX_NATIVE_TRANSPORT='app-server';const controller=new AbortController();
+  const provider=f.create(()=>assert.fail('must not fall back'),{}, {appServerRunner:{async run(){
+    try{return await new CodexAppServerRunner().run({});}catch(error){controller.abort();throw error;}
+  }}});
+  await assert.rejects(provider.generate(request({sessionKey:'pr:42',signal:controller.signal})),{code:'STRUCTURED_PROVIDER_CANCELLED'});
+  assert.deepEqual(await readdir(path.join(f.runtime,'sessions')),[]);await provider.close();
+});
 
 async function result(invocation, value = { ok: true }, threadId = "thread-42") {
   await writeFile(invocation.args[invocation.args.indexOf("--output-last-message") + 1], JSON.stringify({ result: JSON.stringify(value) }));

@@ -8,6 +8,7 @@ import { projectRoot } from "../lib/config.js";
 import { KnownCliLocator } from "../lib/known-cli-locator.js";
 import { PRODUCTION_PRIVATE_DIRECTORY_MANAGER } from "../lib/private-directory-manager.js";
 import { SupervisedProcessRunner, didSupervisedProcessNotStart, readReapedProcessFailureOutput } from "../lib/supervised-process-runner.js";
+import { CodexAppServerRunner, didAppServerNotStart, readAppServerFailureOutput } from '../lib/codex-app-server-runner.js';
 import { normalizeStructuredBrainRequest, readStructuredBrainGenerateInput } from "../lib/structured-brain-request.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { parseJsonWithUniqueKeys } from "../lib/strict-json.js";
@@ -140,6 +141,17 @@ function argumentsFor(request, directory, threadId, reader) {
   ];
 }
 
+function appServerArguments(args) {
+  const options=[];
+  for(let index=1;index<args.length;index++) {
+    if (['-c','--disable'].includes(args[index])) options.push(args[index],args[++index]);
+    else if (['--ignore-user-config','--ignore-rules','--strict-config'].includes(args[index])) options.push(args[index]);
+  }
+  // Unsupported isolation options must reject this opt-in transport before a turn,
+  // rather than inherit host MCP servers, hooks, plugins or custom rules.
+  return ['app-server',...options];
+}
+
 function threadFrom(result, previous = null) {
   let found = null;
   const bytes = result?.stdoutBytes ?? result?.stdout ?? "";
@@ -212,6 +224,9 @@ export class NativeCodexBrainProvider {
     };
     // Snapshot at construction: browser configuration can never choose a home.
     const environment = { ...(dependencies.environment ?? process.env) };
+    const transport = environment.DIH_CODEX_NATIVE_TRANSPORT ?? 'exec';
+    if (!['exec','app-server'].includes(transport)) throw new TypeError('Native Codex transport is invalid');
+    this.transport = transport;
     this.#nativeHome = absolute(environment.CODEX_HOME || path.join(homedir(), ".codex"));
     const temporaryRoot = absolute(dependencies.temporaryRoot ?? path.join(homedir(), ".mydashboard-supervised-cli-v1"));
     this.#root = `${temporaryRoot}-native`;
@@ -219,6 +234,7 @@ export class NativeCodexBrainProvider {
     if (protectedRoots.some((root) => overlaps(root, this.#root))) throw new TypeError("Native runtime directory overlaps a protected location");
     this.#dependencies = {
       processRunner: dependencies.processRunner ?? new SupervisedProcessRunner(),
+      appServerRunner: dependencies.appServerRunner ?? new CodexAppServerRunner(),
       commandLocator: dependencies.commandLocator ?? new KnownCliLocator(),
       rootDirectoryManager: dependencies.rootDirectoryManager ?? PRODUCTION_PRIVATE_DIRECTORY_MANAGER,
       reviewReaderFactory: dependencies.reviewReaderFactory ?? ((target, opts) => new GitHubReviewReader().open(target, opts)),
@@ -254,7 +270,7 @@ export class NativeCodexBrainProvider {
     return prepare;
   }
 
-  async #runProcess(options, signal, marker, onProcessAttempt = () => {}) {
+  async #runProcess(options, signal, marker, onProcessAttempt = () => {}, runner = this.#dependencies.processRunner) {
     signal.throwIfAborted();
     try {
       await writeFile(marker, JSON.stringify({ schemaVersion: 1, invocation: path.basename(options.cwd), createdAt: this.#dependencies.clock() }), { flag: "wx", mode: 0o600 });
@@ -266,7 +282,7 @@ export class NativeCodexBrainProvider {
     const processAttempt = Promise.resolve().then(() => {
       signal.throwIfAborted();
       onProcessAttempt();
-      return this.#dependencies.processRunner.run({ ...options, signal });
+      return runner.run({ ...options, signal });
     }).then((value) => ({ value }), (error) => ({ error }));
     let onAbort;
     const aborted = new Promise((resolve) => {
@@ -288,8 +304,8 @@ export class NativeCodexBrainProvider {
       }
       await unlink(marker);
       if (signal.aborted) {
-        if (didSupervisedProcessNotStart(outcome.error)) SETTLED_NOT_STARTED.add(signal.reason);
-        const output = outcome.value ?? readReapedProcessFailureOutput(outcome.error);
+        if (didSupervisedProcessNotStart(outcome.error) || didAppServerNotStart(outcome.error)) SETTLED_NOT_STARTED.add(signal.reason);
+        const output = outcome.value ?? readReapedProcessFailureOutput(outcome.error) ?? readAppServerFailureOutput(outcome.error);
         if (output) SETTLED_FAILURE_OUTPUT.set(signal.reason, output);
         throw signal.reason;
       }
@@ -369,17 +385,21 @@ export class NativeCodexBrainProvider {
         let processFailure;
         let processAttempted = false;
         try {
-          processResult = await this.#runProcess({ executable: descriptor, args: argumentsFor(request, directory, previous, reader), cwd: directory, env: this.#dependencies.environment,
-            input: Buffer.from(wireInput), timeoutMs: this.#options.timeoutMs, maxStdoutBytes: request.reviewTarget ? 64 * 1024 * 1024 : 1024 * 1024, maxStderrBytes: this.#options.maxResponseBytes }, operationSignal, this.#marker(), () => { processAttempted = true; });
+          const args = argumentsFor(request, directory, previous, reader);
+          const live = this.transport === 'app-server';
+          processResult = await this.#runProcess({ executable: descriptor, args: live ? appServerArguments(args) : args, cwd: directory, env: this.#dependencies.environment,
+            ...(live ? {appServer:{input:wireInput,model:request.model,effort:request.reasoningEffort,schema:ENVELOPE_SCHEMA,previous}} : {}),
+            input: Buffer.from(wireInput), timeoutMs: this.#options.timeoutMs, maxStdoutBytes: request.reviewTarget ? 64 * 1024 * 1024 : 1024 * 1024, maxStderrBytes: this.#options.maxResponseBytes }, operationSignal, this.#marker(), () => { processAttempted = true; }, live ? this.#dependencies.appServerRunner : this.#dependencies.processRunner);
           this.#state.lastStatus = status("available");
         } catch (failure) { processFailure = failure; }
         if (request.sessionKey && !this.#state.blocked) {
-          const threadId = threadFrom(processResult ?? SETTLED_FAILURE_OUTPUT.get(processFailure) ?? readReapedProcessFailureOutput(processFailure), previous);
+          const threadId = threadFrom(processResult ?? SETTLED_FAILURE_OUTPUT.get(processFailure) ?? readReapedProcessFailureOutput(processFailure) ?? readAppServerFailureOutput(processFailure), previous);
           if (threadId) await this.#sessions.save({ sessionKey: request.sessionKey, threadId });
-          else if (!processAttempted || didSupervisedProcessNotStart(processFailure) || SETTLED_NOT_STARTED.has(processFailure)) await this.#sessions.cancel?.({ sessionKey: request.sessionKey });
+          else if (!processAttempted || didSupervisedProcessNotStart(processFailure) || didAppServerNotStart(processFailure) || SETTLED_NOT_STARTED.has(processFailure)) await this.#sessions.cancel?.({ sessionKey: request.sessionKey });
           else throw failure("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
         }
         if (processFailure) throw processFailure;
+        if (processResult?.interrupted) throw failure('STRUCTURED_PROVIDER_CANCELLED');
         operationSignal.throwIfAborted();
         result = await readResult(path.join(directory, "last-message.json"), this.#options.maxResponseBytes);
         if (reader && JSON.parse(result).intent?.type === "propose_github_review") await reader.assertComplete();
@@ -400,6 +420,7 @@ export class NativeCodexBrainProvider {
     signal = normalizeAbortSignal(signal);
     if (signal?.aborted) throw failure("STRUCTURED_PROVIDER_CANCELLED");
     if (this.#closed) throw failure();
+    if (this.transport === 'app-server' && this.#dependencies.appServerRunner.supportsContainedExecution === false) return status('cli_unavailable');
     if (this.#state.blocked) return status("broker_blocked");
     if (this.#state.active && this.#state.lastStatus) return this.#state.lastStatus;
     try {

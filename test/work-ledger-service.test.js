@@ -1,6 +1,34 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
+import { TaskRunRegistry } from '../src/services/task-run-registry.js';
+import { createTaskRunSettler } from '../src/services/work-ledger-run-control.js';
+
+test('real ledger settles a pause after model failure, restores the same item, and cancels safely',async()=>{
+  const {service}=await createFixture({records:[issueAssignment(1)]});
+  await service.intake();
+  const item=(await service.listItems()).items[0];
+  let claimed=await service.claim({itemId:item.itemId,expectedRevision:item.revision,workerId:'employee-pr-reviewer',leaseDurationMs:60000});
+  let saved=null;
+  const registry=new TaskRunRegistry({store:{read:async(_k,f)=>saved??f,write:async(_k,v)=>{saved=structuredClone(v);}},settleControl:createTaskRunSettler({ledger:service})});
+  const task=()=>({kind:'work-item',taskId:claimed.itemId,roleId:'pr-reviewer',title:'Check',subject:'Issue',revision:claimed.revision,leaseId:claimed.leaseId});
+  const entered=deferred(), gate=deferred();
+  const execution=registry.run(task(),async()=>{entered.resolve();await gate.promise;throw new Error('model process failed');});
+  const rejected=assert.rejects(execution,e=>e.code==='TASK_RUN_PAUSED');await entered.promise;
+  let view=await registry.get('work-item',claimed.itemId);
+  await registry.control(view.kind,view.taskId,{runId:view.runId,expectedRevision:view.revision,command:'pause'});gate.resolve();await rejected;
+  assert.equal((await service.readItemForReconciliation({itemId:item.itemId})).status,'paused');
+  view=await registry.get(view.kind,view.taskId);
+  await registry.control(view.kind,view.taskId,{runId:view.runId,expectedRevision:view.revision,command:'resume'});
+  const resumed=await service.readItemForReconciliation({itemId:item.itemId});assert.equal(resumed.status,'queued');assert.equal(resumed.attempt,0);
+  claimed=await service.claim({itemId:item.itemId,expectedRevision:resumed.revision,workerId:'employee-pr-reviewer',leaseDurationMs:60000});
+  const started=deferred(), finish=deferred();
+  const cancelled=registry.run(task(),async()=>{started.resolve();await finish.promise;});
+  const cancelRejection=assert.rejects(cancelled,e=>e.code==='TASK_RUN_CANCELLED');await started.promise;
+  view=await registry.get('work-item',item.itemId);
+  await registry.control(view.kind,view.taskId,{runId:view.runId,expectedRevision:view.revision,command:'cancel'});finish.resolve();await cancelRejection;
+  assert.equal((await service.readItemForReconciliation({itemId:item.itemId})).status,'cancelled');
+});
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { normalizeAttentionRequest } from "../src/domain/attention-contract.js";
 import {

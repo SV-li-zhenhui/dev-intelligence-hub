@@ -13,9 +13,16 @@ compatibility behavior must not be presented as live steering.
 
 The [source review and integration design](research/2026-10-13-agent-feishu-bridge-source-review.md)
 records the transport, progress events, stale-turn protection and recovery
-limitations. A standalone checkpoint registry is prepared, with 24 focused
-registry/StateStore tests passing; it is not wired to the service or model
-execution. No running-list UI or app-server adapter is enabled by that module.
+limitations. The registry, global running-task UI, origin/CAS protected HTTP
+controls and role/code-worker integration are implemented. Focused checks cover
+real ledger settlement, fixture stdio communication and an isolated Chromium
+interaction. The app-server protocol adapter is tested but production activation
+is blocked: the installed CLI rejects required config/rule isolation flags, and
+equivalent bidirectional process-tree containment is not verified. The default
+runner rejects this mode before spawn rather than weaken either condition.
+Deployment and a live business-task acceptance check remain separate gates;
+this entry is not closed by fixture or initialization-only success. Existing
+runtime configuration is preserved.
 
 **Acceptance:** demonstrate real task progress and turn-bound steering, reject
 late or duplicate controls, preserve instructions and holds across restart,

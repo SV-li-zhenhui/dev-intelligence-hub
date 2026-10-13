@@ -199,6 +199,7 @@ export async function createCodeJobRuntime({
   grantVerifier,
   executor,
   brainDirectory,
+  taskRuns,
   reviewRepairContextReader,
   actionAdmissionGate,
   dataDirectory,
@@ -302,6 +303,7 @@ export async function createCodeJobRuntime({
           jobStore: jobs,
           executor,
           brainDirectory,
+          taskRuns,
           ...(reviewRepairContextReader === undefined ? {} : { reviewRepairContextReader }),
           grantVerifier,
           ...(actionAdmissionGate === undefined

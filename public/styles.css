@@ -354,6 +354,234 @@ h1 {
   line-height: 1.5;
 }
 
+.task-runs {
+  margin-bottom: 28px;
+  padding: 20px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.task-runs-heading {
+  margin-bottom: 10px;
+}
+
+.task-runs-heading h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.task-runs-hint,
+.task-runs-empty,
+.task-run-delivery,
+#task-run-permission {
+  margin: 8px 0 14px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.task-runs-groups {
+  display: grid;
+  gap: 18px;
+}
+
+.task-runs-groups h3 {
+  margin: 12px 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.task-runs-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.task-run-row {
+  display: grid;
+  gap: 7px;
+  width: 100%;
+  height: 100%;
+  padding: 12px;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.task-run-row:hover {
+  border-color: var(--green);
+}
+
+.task-run-row:focus-visible,
+.task-run-detail :is(button, textarea, select):focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 3px;
+}
+
+.task-run-row > span {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.task-run-row-title {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.task-run-row-title strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.task-run-row-title .status-pill {
+  line-height: 1.4;
+  white-space: normal;
+}
+
+.task-runs-held {
+  border-top: 1px solid var(--line);
+}
+
+.task-runs-error {
+  color: var(--red);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.task-run-detail {
+  overflow-wrap: anywhere;
+}
+
+.task-run-phase,
+.task-run-progress,
+.task-run-notice {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.task-run-notice {
+  color: var(--green);
+}
+
+.task-run-metadata {
+  margin: 16px 0;
+  font-size: 12px;
+}
+
+.task-run-metadata > div {
+  display: grid;
+  grid-template-columns: 100px minmax(0, 1fr);
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.task-run-metadata dt {
+  color: var(--muted);
+}
+
+.task-run-metadata dd {
+  margin: 0;
+}
+
+.task-run-delivery {
+  padding: 12px;
+  background: var(--blue-soft);
+  border-radius: 6px;
+}
+
+.task-run-instructions {
+  margin: 16px 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.task-run-instructions summary {
+  cursor: pointer;
+}
+
+.task-run-instructions p {
+  white-space: pre-wrap;
+}
+
+.task-run-instructions small {
+  color: var(--muted);
+}
+
+.task-run-detail form {
+  display: grid;
+  gap: 10px;
+  margin: 18px 0;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.task-run-detail label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.task-run-detail textarea,
+.task-run-detail select {
+  width: 100%;
+  min-width: 0;
+  padding: 10px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 13px;
+}
+
+.task-run-detail textarea {
+  resize: vertical;
+}
+
+.task-run-detail form button {
+  justify-self: start;
+}
+
+.task-run-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.task-run-cancel {
+  color: var(--red);
+}
+
+@media (max-width: 560px) {
+  .task-runs {
+    padding: 14px;
+  }
+
+  .task-run-detail {
+    padding: 24px 18px;
+  }
+
+  .task-run-metadata > div {
+    grid-template-columns: 78px minmax(0, 1fr);
+    gap: 8px;
+  }
+}
+
 .metrics {
   display: grid;
   grid-template-columns: repeat(4, 1fr);

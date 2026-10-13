@@ -44,6 +44,7 @@ import {
 } from "./review-handoff-routing.js";
 import { createWorkflowView } from "./workflow-view.js";
 import { createWorkView } from "./work-view.js";
+import { createTaskRunsView } from "./task-runs-view.js";
 import {
   createPrEmployeeRecoveryIntent,
   isPrEmployeeRecoveryIntentCurrent,
@@ -87,6 +88,10 @@ const confirmationCloseButton = confirmationDialog.querySelector(
 );
 const confirmationDialogOwnership = createConfirmationDialogOwnership();
 const pageTitle = document.querySelector("#page-title");
+const taskRunsView = createTaskRunsView({
+  container: document.querySelector("#task-runs"),
+  dialog: document.querySelector("#task-run-dialog"),
+});
 
 let dashboard = null;
 let employeeRoles = [];
@@ -5459,6 +5464,7 @@ async function load({ showConfirmation = true } = {}) {
 }
 
 async function refresh() {
+  void taskRunsView.refresh();
   refreshButton.disabled = true;
   refreshButton.classList.add("loading");
   if (isConfigurationBackedView()) {
@@ -5604,6 +5610,7 @@ confirmationDialog.addEventListener("close", () => {
   confirmationCloseButton.disabled = false;
 });
 document.addEventListener("keydown", (event) => {
+  if (document.querySelector("dialog[open]")) return;
   if (event.target.closest?.("input, textarea, select, [contenteditable=true]")) return;
   if (/^[1-9]$/.test(event.key)) {
     document.querySelectorAll(".nav-item")[Number(event.key) - 1]?.click();
@@ -5619,5 +5626,6 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
+void taskRunsView.start();
 await load();
 setInterval(load, 60_000);

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { types as utilTypes } from "node:util";
 import { OperationQueue } from "../lib/operation-queue.js";
+import { withTaskExecution } from '../lib/task-execution-context.js';
 
 export const TASK_RUN_STATE_KEY = "task-run-settings";
 const MAX_RECORDS = 1_000;
@@ -173,7 +174,9 @@ function normalizeControl(value) {
 function normalizeRecord(value) {
   const error = invalidState();
   exactKeys(value, ["task", "runId", "revision", "startedAt", "priority", "instructions",
-    "appliedRevision", "pendingCommand", "mode", "phase"], [], error);
+    "appliedRevision", "pendingCommand", "mode", "phase"], ["stopUnconfirmed","terminalStatus"], error);
+  if ("stopUnconfirmed" in value && (value.stopUnconfirmed !== true || value.pendingCommand === null)) throw error;
+  if ('terminalStatus' in value && (!['completed','failed','fenced','cancelled'].includes(value.terminalStatus) || value.pendingCommand !== null || value.mode !== 'active')) throw error;
   const task = normalizeTask(value.task, error, true);
   if (typeof value.runId !== "string" || !UUID.test(value.runId) ||
       !PRIORITIES.has(value.priority) || !MODES.has(value.mode) ||
@@ -248,13 +251,18 @@ function runView(record, run) {
     subject: task.subject,
     startedAt: run?.startedAt ?? record.startedAt,
     phase: run ? (waiting ? "waiting_checkpoint" : "running") :
-      (record.pendingCommand === null ? record.phase : "control_failed"),
+      (record.pendingCommand === null ? record.terminalStatus ?? record.phase : "control_failed"),
     priority: record.priority,
     instructions: record.instructions.map((entry) => ({ ...entry })),
     appliedRevision: run?.appliedRevision ?? record.appliedRevision,
     pendingCommand: record.pendingCommand,
     mode: run ? "active" : record.mode,
     active: Boolean(run),
+    live: Boolean(run?.liveControl),
+    progress: run?.progress ?? '',
+    lastActivityAt: run?.lastActivityAt ?? record.startedAt,
+    instructionReceipt: run?.instructionReceipt ?? (run?.liveControl ? 'ready' : 'checkpoint'),
+    stopUnconfirmed: record.stopUnconfirmed === true,
   };
 }
 
@@ -263,24 +271,48 @@ export class TaskRunRegistry {
   #active = new Map();
   #knownState = null;
 
-  constructor({ store, clock = () => new Date(), settleControl } = {}) {
+  constructor({ store, clock = () => new Date(), settleControl, verifyStopped = async () => false } = {}) {
     if (!store || typeof store.read !== "function" || typeof store.write !== "function" ||
-        typeof clock !== "function" || typeof settleControl !== "function") {
+        typeof clock !== "function" || typeof settleControl !== "function" || typeof verifyStopped !== 'function') {
       throw new TypeError("TaskRunRegistry dependencies are invalid");
     }
     this.store = store;
     this.clock = clock;
     this.settleControl = settleControl;
+    this.verifyStopped = verifyStopped;
   }
 
-  async run(input, operation) {
+  async run(input, operation, {repeatOnInstruction = true} = {}) {
     const task = normalizeTask(input);
     if (typeof operation !== "function") throw new TypeError("operation must be a function");
     const run = await this.#queue.enqueue(() => this.#register(task));
+    run.repeatOnInstruction = repeatOnInstruction;
     try {
       let instructions = run.instructions;
       for (let round = 1; ; round += 1) {
-        const result = await operation({ instructions: [...instructions] });
+        let result;
+        const context = {
+          reportProgress: (text) => { run.progress = displayText(text, 500, invalidInput()); run.lastActivityAt = this.#now(); },
+          registerLiveControl: (control) => {
+            if (typeof control?.steer !== 'function' || typeof control?.interrupt !== 'function') throw invalidInput();
+            run.liveControl = control;
+            return () => { if (run.liveControl === control) run.liveControl = null; };
+          },
+          confirmStopped: () => { run.stoppedConfirmed = true; },
+        };
+        try { result = await withTaskExecution(context, () => operation({ instructions: [...instructions] })); }
+        catch (error) {
+          await this.#queue.enqueue(async () => {
+            const state = await this.#readState();
+            const current = findRecord(state, run.key);
+            if (!current || current.mode === 'active') return;
+            if (error?.code === 'STRUCTURED_PROVIDER_REAP_FAILED' && !run.stoppedConfirmed) {
+              throw new TaskRunControlError('TASK_RUN_CONTROL_PENDING','停止尚未确认，等待维护核实',409,{cause:error});
+            }
+            await this.#checkpoint(run,round);
+          });
+          throw error;
+        }
         const checkpoint = await this.#queue.enqueue(() => this.#checkpoint(run, round));
         if (checkpoint.done) return result;
         instructions = checkpoint.instructions;
@@ -302,6 +334,18 @@ export class TaskRunRegistry {
         return !this.#active.has(key) && (record.mode === "paused" || record.pendingCommand !== null);
       }).map((record) => runView(record));
       return { enabled: true, items, held };
+    });
+  }
+
+  async reconcile() {
+    return this.#queue.enqueue(async () => {
+      let state = await this.#readState();
+      const pending = state.records.filter((entry) => entry.pendingCommand &&
+        !this.#active.has(identity(entry.task.kind,entry.task.taskId))).slice(0,20);
+      for (const record of pending) {
+        try { await this.#settleHeld(state,record); } catch { /* Keep unresolved holds available for maintenance. */ }
+        state = await this.#readState();
+      }
     });
   }
 
@@ -333,14 +377,15 @@ export class TaskRunRegistry {
   async order(items, kind, idKey) {
     if (!KINDS.has(kind) || typeof idKey !== "string" || !idKey ||
         ["__proto__", "constructor", "prototype"].includes(idKey)) throw invalidInput();
-    const candidates = denseArray(items, MAX_RECORDS, invalidInput()).map((item, index) => {
+    const candidates = denseArray(items, 10_000, invalidInput()).map((item, index) => {
       plainKeys(item, invalidInput());
       return { item, index, key: identity(kind, item[idKey]) };
     });
     return this.#queue.enqueue(async () => {
       const state = await this.#readState();
       const settings = new Map(state.records.map((entry) => [identity(entry.task.kind, entry.task.taskId), entry]));
-      return candidates.filter(({ key }) => (settings.get(key)?.mode ?? "active") === "active")
+      return candidates.filter(({ key,item }) => (settings.get(key)?.mode ?? "active") === "active" ||
+        (kind === 'code-job' && ['pausing','cancelling','unknown'].includes(item.status)))
         .sort((a, b) => PRIORITIES.get(settings.get(b.key)?.priority ?? "normal") -
           PRIORITIES.get(settings.get(a.key)?.priority ?? "normal") || a.index - b.index)
         .map(({ item }) => item);
@@ -394,8 +439,22 @@ export class TaskRunRegistry {
       candidate.mode = command === "pause" ? "paused" : "cancelled";
       candidate.pendingCommand = command;
       candidate.phase = "waiting_checkpoint";
+      if (run?.repeatOnInstruction) candidate.stopUnconfirmed = true;
     }
     const committed = await this.#writeRecord(state, candidate);
+    if (run?.liveControl && command === 'instruct') {
+      try {
+        await run.liveControl.steer(input.instruction, `${run.runId}:${candidate.revision}`);
+        run.instructionCount = candidate.instructions.length;
+        run.appliedRevision = candidate.revision;
+        run.instructionReceipt = 'submitted';
+      } catch (cause) {
+        run.instructionReceipt = 'failed';
+        throw new TaskRunControlError('TASK_RUN_STEER_FAILED','追加要求未确认送达；已保存，将在安全检查点续接',409,{cause});
+      }
+    } else if (run?.liveControl && ['pause','cancel'].includes(command)) {
+      await run.liveControl.interrupt();
+    }
     if (command === "cancel" && !run) {
       return runView(await this.#settleHeld(committed, candidate));
     }
@@ -404,6 +463,12 @@ export class TaskRunRegistry {
 
   async #resume(state, current, run) {
     if (run || current.mode !== "paused") throw conflict();
+    if (current.pendingCommand) {
+      current = await this.#settleHeld(state,current);
+      if (current.pendingCommand) throw registryError('TASK_RUN_CONTROL_PENDING','停止尚未确认，不能恢复');
+      if (current.terminalStatus) throw registryError('TASK_RUN_TERMINAL','原任务已结束，请刷新查看最终状态');
+      state = await this.#readState();
+    }
     await this.settleControl({ task: structuredClone(current.task), command: "resume" });
     const candidate = {
       ...current, revision: increment(current.revision), mode: "active",
@@ -417,11 +482,23 @@ export class TaskRunRegistry {
     let state = await this.#readState();
     let current = findRecord(state, run.key);
     if (current && current.mode !== "active") {
-      await this.#settleHeld(state, current);
+      let settled;
+      try {
+        if (current.stopUnconfirmed) {
+          const {stopUnconfirmed,...confirmed} = current;
+          state = await this.#writeRecord(state,confirmed);
+          current = confirmed;
+        }
+        settled = await this.#settleHeld(state, current);
+      } catch(cause) {
+        throw new TaskRunControlError('TASK_RUN_CONTROL_PENDING','控制已保存，等待台账核对',409,{cause});
+      }
       this.#active.delete(run.key);
+      if (settled.terminalStatus) return {done:true};
+      if (settled.pendingCommand) throw registryError('TASK_RUN_CONTROL_PENDING','停止请求已保存，等待执行器核对');
       throw heldError(current.mode);
     }
-    if (current && current.instructions.length !== run.instructionCount) {
+    if (run.repeatOnInstruction && current && current.instructions.length !== run.instructionCount) {
       if (round >= MAX_ROUNDS) {
         current = {
           ...current, revision: increment(current.revision), mode: "paused",
@@ -429,7 +506,13 @@ export class TaskRunRegistry {
           appliedRevision: run.appliedRevision,
         };
         state = await this.#writeRecord(state, current);
-        await this.#settleHeld(state, current);
+        try {
+          const settled = await this.#settleHeld(state, current);
+          if (settled.pendingCommand) throw registryError('TASK_RUN_CONTROL_PENDING','补充要求变化过于频繁，暂停仍等待核对');
+        } catch(cause) {
+          if (cause instanceof TaskRunControlError) throw cause;
+          throw new TaskRunControlError('TASK_RUN_CONTROL_PENDING','补充要求变化过于频繁，暂停仍等待核对',409,{cause});
+        }
         this.#active.delete(run.key);
         throw registryError("TASK_RUN_ADJUSTMENT_LIMIT", "任务补充要求变化过于频繁，已暂停等待恢复");
       }
@@ -445,9 +528,13 @@ export class TaskRunRegistry {
   }
 
   async #settleHeld(state, current) {
+    if (current.stopUnconfirmed && !(await this.verifyStopped(structuredClone(current.task)))) return current;
     const command = current.mode === "paused" ? "pause" : "cancel";
-    await this.settleControl({ task: structuredClone(current.task), command });
-    const settled = { ...current, pendingCommand: null, phase: current.mode };
+    const outcome = await this.settleControl({ task: structuredClone(current.task), command });
+    if (outcome?.pending) return current;
+    const {stopUnconfirmed,...record} = current;
+    const settled = outcome?.terminalStatus ? {...record,pendingCommand:null,phase:'idle',mode:'active',terminalStatus:outcome.terminalStatus} :
+      { ...record, pendingCommand: null, phase: current.mode };
     await this.#writeRecord(state, settled);
     return settled;
   }

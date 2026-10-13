@@ -1,4 +1,5 @@
 import { scheduler } from "node:timers/promises";
+import { planWorkItemRunControl } from './work-ledger-run-control.js';
 import { OperationQueue } from "../lib/operation-queue.js";
 import {
   isTrustedPullRequestScopeLifecycleAssignment,
@@ -1316,6 +1317,10 @@ export class WorkLedgerService {
 
   async transition(input = {}) {
     return this.#executeCommand(planWorkItemTransition, input);
+  }
+
+  async controlModelRun(input = {}) {
+    return this.#executeCommand(planWorkItemRunControl, input);
   }
 
   async scheduleRetry(input = {}) {

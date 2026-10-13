@@ -14,6 +14,8 @@ import { OperationQueue } from "../src/lib/operation-queue.js";
 import { CodeJobStore } from "../src/services/code-job-store.js";
 import { CodeJobBrainDirectory } from "../src/services/code-job-brain-directory.js";
 import { CodeJobWorkerService } from "../src/services/code-job-worker-service.js";
+import { TaskRunRegistry } from '../src/services/task-run-registry.js';
+import { createTaskRunSettler } from '../src/services/work-ledger-run-control.js';
 import { modelObservation, observationDetail } from "../src/services/code-job-worker-policy.js";
 
 const REVISION_A = "a".repeat(64);
@@ -2045,7 +2047,7 @@ test("pause during an admitted action stays pausing until result reconciliation"
   assert.equal(stored.execution.actionAdmission, null);
 });
 
-test("the real job store and worker preserve an in-flight pause across durable CAS", async () => {
+async function createRealApprovedJob() {
   const jobs = new CodeJobStore({
     store: new IntegrationMemoryStore(),
     exclusiveLease: { run: (operation) => operation() },
@@ -2091,6 +2093,53 @@ test("the real job store and worker preserve an in-flight pause across durable C
     grant: sealedGrant,
   });
   const durableJob = await jobs.getForWorker(created.job.jobId);
+  return {jobs,created,durableJob};
+}
+
+test('running controls retain a real code-job hold across interrupted action reconciliation and registry restart',async(t)=>{
+  for(const command of ['pause','cancel'])await t.test(command,async()=>{
+    const {jobs,created,durableJob}=await createRealApprovedJob();
+    const settings=new IntegrationMemoryStore();const entered=deferred(),release=deferred();
+    const executor=new FakeExecutor(durableJob);const perform=executor.perform.bind(executor);
+    const reconcile=executor.reconcileAction.bind(executor);let response;
+    executor.perform=async(value)=>{response=await perform(value);entered.resolve();await release.promise;
+      throw Object.assign(new Error('response interrupted after admission'),{code:'CODE_JOB_ACTION_INTERRUPTED'});};
+    executor.reconcileAction=async(value)=>({...await reconcile(value),result:response.result});
+    const cancelExecution=executor.reconcileCancellation.bind(executor);
+    executor.reconcileCancellation=async(value)=>{
+      const result=await cancelExecution(value);
+      const {proofDigest,...proof}=result.proof;
+      proof.settledAt='2026-08-02T08:00:00.000Z';
+      result.session.updatedAt=proof.settledAt;
+      executor.session.updatedAt=proof.settledAt;
+      result.proof={...proof,proofDigest:digestValue(proof)};
+      return result;
+    };
+    const control=Object.fromEntries(['pause','cancel','resume'].map(method=>[method,async(value)=>{
+      assert.equal(value.expectedRevision,(await jobs.getForWorker(value.jobId)).revision);
+      return jobs[method](value);
+    }]));
+    const settle=createTaskRunSettler({codeJobReader:{get:id=>jobs.getForWorker(id)},codeJobControl:control});
+    const registry=new TaskRunRegistry({store:settings,settleControl:settle});
+    const createWorker=taskRuns=>new CodeJobWorkerService({jobStore:jobs,executor,taskRuns,
+      brainDirectory:brain([{type:'read_text',path:'src/app.js'}]),grantVerifier:{verify:async value=>structuredClone(value)}});
+    const cycle=createWorker(registry).runCycle();await entered.promise;
+    const view=await registry.get('code-job',created.job.jobId);
+    await registry.control(view.kind,view.taskId,{runId:view.runId,expectedRevision:view.revision,command});
+    release.resolve();await cycle;
+    assert.equal((await registry.list()).held[0].pendingCommand,command);
+    const restarted=new TaskRunRegistry({store:settings,settleControl:settle});
+    await restarted.reconcile();assert.equal((await restarted.list()).held[0].pendingCommand,command);
+    const settledCycle=await createWorker(restarted).runCycle();await restarted.reconcile();
+    const final=await jobs.getForWorker(created.job.jobId);
+    assert.equal(final.status,command==='pause'?'paused':'cancelled',JSON.stringify(settledCycle.outcomes));
+    assert.equal(final.jobId,created.job.jobId);assert.equal((await restarted.get('code-job',final.jobId)).pendingCommand,null);
+    assert.equal(executor.calls.filter(call=>call.method==='perform').length,1);
+  });
+});
+
+test("the real job store and worker preserve an in-flight pause across durable CAS", async () => {
+  const {jobs,created,durableJob}=await createRealApprovedJob();
   const executor = new FakeExecutor(durableJob);
   const entered = deferred();
   const release = deferred();

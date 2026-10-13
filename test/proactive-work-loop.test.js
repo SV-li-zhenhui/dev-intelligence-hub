@@ -1,5 +1,41 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { TaskRunRegistry } from '../src/services/task-run-registry.js';
+
+test('accepted pause followed by model failure cannot stage intent or schedule ordinary retry',async()=>{
+  const time=controlledClock();const ledger=new FakeLedger({source:[workItem(1)],time});
+  const entered=deferred(),finish=deferred();let state=null;
+  const registry=new TaskRunRegistry({store:{read:async(_k,f)=>state??f,write:async(_k,v)=>{state=structuredClone(v);}},settleControl:async()=>{}});
+  const directory=new FakeRoleDirectory({'pr-reviewer':worker({decide:async()=>{entered.resolve();await finish.promise;throw new Error('provider failed');}})});
+  const cycle=createLoop({ledger,directory,time,taskRuns:registry}).runCycle();
+  await entered.promise;const view=(await registry.list()).items[0];
+  await registry.control(view.kind,view.taskId,{runId:view.runId,expectedRevision:view.revision,command:'pause'});
+  finish.resolve();const result=await cycle;
+  assert.equal(result.outcomes[0].status,'paused');assert.equal(ledger.calls.scheduleRetry.length,0);assert.equal(ledger.calls.stageIntent.length,0);
+});
+
+test('owner adjustment discards the old real role decision before staging', async () => {
+  const time = controlledClock();
+  const ledger = new FakeLedger({source:[workItem(1)],time});
+  let state = null;
+  const registry = new TaskRunRegistry({store:{read:async(_k,f)=>state??f,write:async(_k,v)=>{state=structuredClone(v);}},settleControl:async()=>{}});
+  const entered = deferred(); const gate = deferred(); const inputs=[];
+  const directory = new FakeRoleDirectory({'pr-reviewer':worker({decide:async(input)=>{
+    inputs.push(input); if(inputs.length===1){entered.resolve();await gate.promise;}
+    return completeDecision(inputs.length===1?'old':'new');
+  }})});
+  const cycle = createLoop({ledger,directory,time,taskRuns:registry}).runCycle();
+  await Promise.race([entered.promise,new Promise((_,r)=>setTimeout(()=>r(new Error('did not start')),1000))]);
+  const view=(await registry.list()).items[0];
+  if (!view) { gate.resolve(); await cycle; }
+  assert.ok(view,'real decision must appear in the running list');
+  await registry.control(view.kind,view.taskId,{runId:view.runId,expectedRevision:view.revision,command:'instruct',instruction:'check thread safety'});
+  gate.resolve(); await cycle;
+  assert.equal(inputs.length,2);
+  assert.deepEqual(inputs[1].instructions,['check thread safety']);
+  assert.equal(ledger.calls.stageIntent.length,1);
+  assert.equal(ledger.calls.stageIntent[0].intent.summary,'new');
+});
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
 import { RoleContextAssembler } from "../src/services/role-context-assembler.js";

@@ -66,6 +66,8 @@ import { AgentMemoryQueryService } from "./services/agent-memory-query-service.j
 import { LocalSessionImporter } from "./services/local-session-importer.js";
 import { GitActivityImporter } from "./services/git-activity-importer.js";
 import { ProactiveWorkLoop } from "./services/proactive-work-loop.js";
+import { TaskRunRegistry } from './services/task-run-registry.js';
+import { createTaskRunSettler,canUseNativeStopEvidence } from './services/work-ledger-run-control.js';
 import { OrchestratorService } from "./services/orchestrator-service.js";
 import { RoleContextAssembler } from "./services/role-context-assembler.js";
 import { ProactivePrEmployeeService } from "./services/proactive-pr-employee.js";
@@ -1050,6 +1052,13 @@ export async function createApplication({
   let inputAuthorityVerifier = null;
   let codeJobDeliveryEvidenceReader = null;
   let codeJobControl = null;
+  const taskRuns = new TaskRunRegistry({store,...(workCoordinationDependencies.clock ? {clock:workCoordinationDependencies.clock} : {}),
+    verifyStopped: async () => {
+      if (!canUseNativeStopEvidence(config.brainProviders)) return false;
+      const evidence = await brainProviderStatus?.readStatus();
+      return evidence?.credentialMode === 'codex-native-login' && evidence.state === 'available';
+    },
+    settleControl:(input) => createTaskRunSettler({ledger:workLedgerRuntime,codeJobReader,codeJobControl})(input)});
   let codeJobWorker = null;
   let codeJobMemoryProjector = null;
   let codeJobEvidenceReader = null;
@@ -1663,6 +1672,7 @@ export async function createApplication({
     if (coordinationEnabled && memoryRuntime) {
       codeJobRuntime = trackRuntime(
         await codeJobRuntimeFactory({
+          taskRuns,
           ...runtimeDependencies(codeJobRuntimeDependencies),
           store,
           ...(ordinaryActionAdmissionGate === null
@@ -2444,6 +2454,7 @@ export async function createApplication({
           : { actionAdmissionGate: ordinaryActionAdmissionGate }),
       });
       const workLoop = proactiveWorkLoopFactory({
+        taskRuns,
         ledger: workLedgerRuntime,
         roleDirectory,
         roleContextAssembler,
@@ -2578,7 +2589,11 @@ export async function createApplication({
         "attentionCoordinator",
       );
       workCoordination = frozenPort(
-        coordinationService,
+        {intake:(...args)=>coordinationService.intake(...args),runCycle:async(...args)=>{
+          const result = await coordinationService.runCycle(...args);
+          await taskRuns.reconcile();
+          return result;
+        }},
         ["intake", "runCycle"],
         "workCoordination",
       );
@@ -2748,6 +2763,8 @@ export async function createApplication({
       workflowRouting,
       codeJobReader,
       codeJobControl,
+      taskRuns: coordinationEnabled ? Object.freeze({list:()=>taskRuns.list(),get:(...args)=>taskRuns.get(...args),
+        control:(...args)=>ordinaryActionAdmissionGate ? ordinaryActionAdmissionGate.run(()=>taskRuns.control(...args)) : taskRuns.control(...args)}) : null,
       codeJobEvidenceReader,
       workLedgerView,
       dailyWorkLedgerView,

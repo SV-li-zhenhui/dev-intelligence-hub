@@ -1,0 +1,146 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { CodexAppServerRunner,didAppServerNotStart } from '../src/lib/codex-app-server-runner.js';
+import { ManagedProcess } from '../src/lib/managed-process.js';
+import { TaskRunRegistry } from '../src/services/task-run-registry.js';
+import { withTaskExecution } from '../src/lib/task-execution-context.js';
+const threadId='01973bca-3d8b-7000-a000-123456789abc';
+test('production app-server refuses a direct-child transport without tree containment before spawn',async()=>{
+  const runner=new CodexAppServerRunner({materialize:async()=>assert.fail('must not materialize or spawn')});
+  await assert.rejects(runner.run({}),error=>error.code==='STRUCTURED_PROVIDER_UNAVAILABLE' && didAppServerNotStart(error));
+});
+function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null}={}) {
+  let options; const calls=[]; let finish,interruptId,signalStopping;
+  const stopping=new Promise(resolve=>{signalStopping=resolve;});
+  const done = new Promise((r)=>{finish=r;});
+  const send=(value)=>options.onLine({stream:'stdout',line:JSON.stringify(value)});
+  const complete=()=>{send({method:'item/completed',params:{threadId,turnId:'turn-1',item:{type:'agentMessage',text:'{"result":"{\\"ok\\":true}"}'}}});send({method:'turn/completed',params:{threadId,turn:{id:'turn-1',status:failed?'failed':'completed'}}});};
+  const process={done,exited:false,start(value){options=value;},write(line){
+    const request=JSON.parse(line); if(!request.id)return;
+    calls.push(request); let result={};
+    if(request.method.startsWith('thread/'))result={thread:{id:threadId}};
+    if(request.method==='turn/start')result={turn:{id:'turn-1'}};
+    if(request.method==='turn/steer' && steerTurnId)result={turnId:steerTurnId};
+    if(request.method==='turn/interrupt' && manualInterrupt){interruptId=request.id;return;}
+    send({id:request.id,result});
+    if(request.method==='turn/start' && !hold)queueMicrotask(complete);
+    if(request.method==='turn/interrupt')queueMicrotask(()=>send({method:'turn/completed',params:{threadId,turn:{id:'turn-1',status:'interrupted'}}}));
+  },async stop(){signalStopping();await stopGate?.promise;if(stopFailure)throw new Error('not confirmed');this.exited=true;finish({code:0,signal:null});}};
+  return {runner:new CodexAppServerRunner({processFactory:()=>process,materialize:async()=>({command:'codex',prefixArgs:[]})}),calls,complete,send,stopping,
+    acknowledgeInterrupt:()=>send({id:interruptId,result:{}}),
+    interrupted:()=>send({method:'turn/completed',params:{threadId,turn:{id:'turn-1',status:'interrupted'}}})};
+}
+async function invocation(runner,execute=(run)=>run(),appServerOverrides={}) {
+  const directory=await mkdtemp(path.join(tmpdir(),'dih-app-server-'));
+  try{return await execute(()=>runner.run({executable:{},args:['app-server'],cwd:directory,env:{},timeoutMs:1000,
+    appServer:{input:'safe task',model:'test-model',schema:{type:'object'},previous:null,...appServerOverrides}}),directory);}
+  finally{await rm(directory,{recursive:true,force:true});}
+}
+test('app-server initializes, starts a bound turn, writes structured output and confirms exit',async()=>{
+  const f=fixture();
+  await invocation(f.runner,async(run,directory)=>{
+    const result=await run(); assert.equal(result.exitCode,0);
+    assert.match(result.stdoutBytes.toString(),/thread.started/);
+    assert.equal(JSON.parse(await readFile(path.join(directory,'last-message.json'),'utf8')).result,'{"ok":true}');
+  });
+  assert.deepEqual(f.calls.map(x=>x.method),['initialize','thread/start','turn/start']);
+  assert.equal(f.calls[2].params.approvalPolicy,'never');
+  assert.equal(f.calls[2].params.sandboxPolicy.type,'readOnly');
+});
+test('live steering goes to the same active turn without rerunning the operation',async()=>{
+  const f=fixture({hold:true}); let state=null;
+  const registry=new TaskRunRegistry({store:{read:async(_k,v)=>state??v,write:async(_k,v)=>{state=structuredClone(v);}},settleControl:async()=>{}});
+  await invocation(f.runner,async(run)=>{
+    const result=registry.run({kind:'work-item',taskId:'work-1',roleId:'reviewer',title:'Review',subject:'repo#1',revision:1},run);
+    let view; for(let i=0;i<100;i++){view=(await registry.list()).items[0];if(view?.live)break;await new Promise(r=>setImmediate(r));}
+    assert.equal(view.live,true);
+    await registry.control(view.kind,view.taskId,{runId:view.runId,expectedRevision:view.revision,command:'instruct',instruction:'check thread safety'});
+    f.complete(); await result;
+    assert.equal(f.calls.filter(x=>x.method==='turn/start').length,1);
+    assert.equal(f.calls.find(x=>x.method==='turn/steer').params.expectedTurnId,'turn-1');
+  });
+});
+test('failed turns never publish a structured result',async()=>{
+  await assert.rejects(invocation(fixture({failed:true}).runner),e=>e.code==='STRUCTURED_PROVIDER_PROCESS_FAILED');
+});
+test('unconfirmed process stop remains fenced',async()=>{
+  await assert.rejects(invocation(fixture({stopFailure:true}).runner),e=>e.code==='STRUCTURED_PROVIDER_REAP_FAILED');
+});
+
+test('the real managed stdio process exchanges RPC frames without closing its input early',async()=>{
+  const source=`import readline from 'node:readline';const send=x=>console.log(JSON.stringify(x));readline.createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line);if(r.id===undefined)return;let result={};if(r.method.startsWith('thread/'))result={thread:{id:'${threadId}'}};if(r.method==='turn/start')result={turn:{id:'turn-1'}};send({id:r.id,result});if(r.method==='turn/start'){send({method:'item/completed',params:{threadId:'${threadId}',turnId:'turn-1',item:{type:'agentMessage',text:JSON.stringify({result:JSON.stringify({ok:true})})}}});send({method:'turn/completed',params:{threadId:'${threadId}',turn:{id:'turn-1',status:'completed'}}});}});`;
+  const runner=new CodexAppServerRunner({processFactory:()=>new ManagedProcess(),materialize:async()=>({command:process.execPath,prefixArgs:['--input-type=module','-e',source]})});
+  const result=await invocation(runner);assert.equal(result.exitCode,0);
+});
+
+test('live pause waits for interrupted turn and confirmed process exit before settling',async()=>{
+  const f=fixture({hold:true});let state=null;const settlements=[];
+  const registry=new TaskRunRegistry({store:{read:async(_k,v)=>state??v,write:async(_k,v)=>{state=structuredClone(v);}},settleControl:async(input)=>settlements.push(input)});
+  await invocation(f.runner,async(run)=>{
+    const result=registry.run({kind:'work-item',taskId:'work-1',roleId:'reviewer',title:'Review',subject:'repo#1',revision:1},run);
+    const rejected=assert.rejects(result,e=>e.code==='TASK_RUN_PAUSED');
+    let view;for(let i=0;i<100;i++){view=(await registry.list()).items[0];if(view?.live)break;await new Promise(r=>setImmediate(r));}
+    await registry.control(view.kind,view.taskId,{runId:view.runId,expectedRevision:view.revision,command:'pause'});
+    await rejected;assert.equal(settlements[0].command,'pause');assert.equal((await registry.list()).held[0].phase,'paused');
+  });
+});
+
+test('interrupt acknowledgement and turn interruption do not settle pause before confirmed exit',async()=>{
+  let releaseStop;const stopGate={promise:new Promise(resolve=>{releaseStop=resolve;})};
+  const f=fixture({hold:true,manualInterrupt:true,stopGate});let saved=null;const settlements=[];
+  const registry=new TaskRunRegistry({store:{read:async(_k,v)=>saved??v,write:async(_k,v)=>{saved=structuredClone(v);}},settleControl:async value=>settlements.push(value)});
+  await invocation(f.runner,async(run)=>{
+    const running=registry.run({kind:'work-item',taskId:'work-1',roleId:'reviewer',title:'Review',subject:'repo#1',revision:1},run);
+    const stopped=assert.rejects(running,error=>error.code==='TASK_RUN_PAUSED');
+    let view;for(let i=0;i<100;i++){view=(await registry.list()).items[0];if(view?.live)break;await new Promise(resolve=>setImmediate(resolve));}
+    const control=registry.control(view.kind,view.taskId,{runId:view.runId,expectedRevision:view.revision,command:'pause'});
+    for(let i=0;i<100 && !f.calls.some(call=>call.method==='turn/interrupt');i++)await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(settlements.length,0);f.acknowledgeInterrupt();await control;
+    assert.equal((await registry.list()).items[0].pendingCommand,'pause');assert.equal(settlements.length,0);
+    f.interrupted();await f.stopping;assert.equal(settlements.length,0);
+    assert.equal((await registry.list()).items[0].pendingCommand,'pause');
+    releaseStop();await stopped;assert.equal(settlements.length,1);
+  });
+});
+
+test('a registry-bound reap failure remains stop-unconfirmed after interruption',async()=>{
+  const f=fixture({hold:true,stopFailure:true});let saved=null;let settlements=0;
+  const registry=new TaskRunRegistry({store:{read:async(_k,v)=>saved??v,write:async(_k,v)=>{saved=structuredClone(v);}},settleControl:async()=>{settlements++;}});
+  await invocation(f.runner,async(run)=>{
+    const running=registry.run({kind:'work-item',taskId:'work-1',roleId:'reviewer',title:'Review',subject:'repo#1',revision:1},run);
+    const stopped=assert.rejects(running,error=>error.code==='TASK_RUN_CONTROL_PENDING');
+    let view;for(let i=0;i<100;i++){view=(await registry.list()).items[0];if(view?.live)break;await new Promise(resolve=>setImmediate(resolve));}
+    await registry.control(view.kind,view.taskId,{runId:view.runId,expectedRevision:view.revision,command:'pause'});
+    await stopped;await registry.reconcile();assert.equal(settlements,0);
+    assert.equal((await registry.list()).held[0].stopUnconfirmed,true);
+  });
+});
+
+test('another thread or turn cannot complete the active response',async()=>{
+  const f=fixture({hold:true});
+  await invocation(f.runner,async(run)=>{
+    let finished=false;const running=run().then(value=>{finished=true;return value;});
+    for(let i=0;i<100 && !f.calls.some(call=>call.method==='turn/start');i++)await new Promise(resolve=>setImmediate(resolve));
+    for(const [target,turn] of [[threadId,'old-turn'],['another-thread','turn-1']])f.send({method:'turn/completed',params:{threadId:target,turn:{id:turn,status:'completed'}}});
+    await new Promise(resolve=>setImmediate(resolve));assert.equal(finished,false);f.complete();await running;
+  });
+});
+
+test('a steer acknowledgement for a different turn is rejected',async()=>{
+  const f=fixture({hold:true,steerTurnId:'different-turn'});
+  await invocation(f.runner,async(run)=>{
+    let live;const running=withTaskExecution({reportProgress(){},registerLiveControl:value=>{live=value;return()=>{};}},run);
+    for(let i=0;i<100 && !live;i++)await new Promise(resolve=>setImmediate(resolve));
+    await assert.rejects(live.steer('check races','message-1'),error=>error.code==='STRUCTURED_PROVIDER_RESPONSE_INVALID');
+    f.complete();await running;
+  });
+});
+
+test('resuming a different native thread fails before a model turn starts',async()=>{
+  const f=fixture();
+  await assert.rejects(invocation(f.runner,run=>run(),{previous:'01973bca-3d8b-7000-a000-987654321abc'}),error=>error.code==='STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED');
+  assert.equal(f.calls.some(call=>call.method==='turn/start'),false);
+});

@@ -1,4 +1,5 @@
 import { normalizeWorkDecision } from "../domain/work-intent.js";
+import { TaskRunControlError } from './task-run-registry.js';
 import { automaticReviewEligibility } from "../domain/automatic-review-policy.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { brainFailureOwnerAttention } from "./brain-failure-policy.js";
@@ -651,7 +652,9 @@ export class ProactiveWorkLoop {
     automaticReviewPolicy = null,
     automaticOwnPrRepair = null,
     reviewRepairContextReader = null,
+    taskRuns = null,
   } = {}) {
+    this.taskRuns = taskRuns;
     this.automaticReviewPolicy = automaticReviewPolicy;
     this.automaticOwnPrRepair = automaticOwnPrRepair;
     this.readReviewRepairContext = optionalPortMethod(reviewRepairContextReader,
@@ -841,7 +844,9 @@ export class ProactiveWorkLoop {
     );
     const claimAttemptLimit = Math.max(availabilityCheckLimit * 8, 32);
 
-    for (const item of prioritizeWorkItems(items, candidateWindow.facts)) {
+    const prioritized = prioritizeWorkItems(items, candidateWindow.facts);
+    const scheduled = this.taskRuns ? await this.taskRuns.order(prioritized, 'work-item', 'itemId') : prioritized;
+    for (const item of scheduled) {
       throwIfLoopAborted(options.signal);
       if (workAttempts >= options.workLimit) break;
       if (availabilityBudgetUsed >= availabilityCheckLimit) break;
@@ -1236,10 +1241,15 @@ export class ProactiveWorkLoop {
     const inputBinding = needsFeedback ? currentWorkItemExecutionBinding(item) : null;
     const feedback = needsFeedback ? await this.readReviewRepairContext({ inputBinding }) : null;
     throwIfLoopAborted(signal);
-    const decision = await worker.decide({ item: workerItemDto(item), trigger,
+    const decide = ({instructions} = {}) => worker.decide({ item: workerItemDto(item), trigger,
       ...(context === undefined ? {} : { context }), signal,
+      ...(instructions === undefined ? {} : {instructions}),
       ...(feedback === null ? {} : { reviewRepairFeedback: feedback }),
     });
+    const decision = this.taskRuns ? await this.taskRuns.run({kind:'work-item',taskId:item.itemId,
+      roleId:worker.roleId, title:event.payload?.title ?? event.subject?.id ?? item.itemId,
+      subject:event.subject?.repository ? `${event.subject.repository} #${event.subject.number ?? ''}` : item.itemId,
+      revision:item.revision,...(item.leaseId ? {leaseId:item.leaseId} : {})}, decide) : await decide();
     if (needsFeedback) {
       const current = await this.readReviewRepairContext({ inputBinding });
       if (current.reviewFeedbackDigest !== feedback.reviewFeedbackDigest) {
@@ -1422,6 +1432,8 @@ export class ProactiveWorkLoop {
       ));
     } catch (error) {
       throwIfLoopAborted(options.signal);
+      if (error instanceof TaskRunControlError) return {claimAttempted:false,claimed:false,
+        outcome:{status:error.code === 'TASK_RUN_CANCELLED' ? 'cancelled' : error.code === 'TASK_RUN_CONTROL_PENDING' ? 'control_pending' : 'paused',workerId:worker.workerId,code:error.code}};
       const terminalState = terminalPullRequestState(error);
       if (terminalState !== null) {
         const claim = await this.#claim(item, worker, options);
@@ -1762,6 +1774,7 @@ export class ProactiveWorkLoop {
     reasons = DECISION_FAILURE_REASONS,
   ) {
     throwIfLoopAborted(options.signal);
+    if (error instanceof TaskRunControlError) return {status:error.code === 'TASK_RUN_CANCELLED' ? 'cancelled' : error.code === 'TASK_RUN_CONTROL_PENDING' ? 'control_pending' : 'paused',workerId:actorId,code:error.code};
     const code = stableFailureCode(error);
     const contention = isContextContention(error);
     const input = {

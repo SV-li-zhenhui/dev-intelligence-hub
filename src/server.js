@@ -3299,6 +3299,30 @@ export function createDashboardServer(
         sendJson(response, 200, result);
         return;
       }
+      if (request.method === 'GET' && url.pathname === '/api/task-runs') {
+        requireNoQuery(url);
+        sendJson(response,200,application.taskRuns ? await application.taskRuns.list() : {enabled:false,items:[],held:[]});
+        return;
+      }
+      const taskRunRoute = url.pathname.match(/^\/api\/task-runs\/(work-item|code-job)\/([^/]+)(\/control)?$/);
+      if (taskRunRoute && ['GET','POST'].includes(request.method)) {
+        requireNoQuery(url);
+        const port = requireApplicationPort(application,'taskRuns',['get','control'],'运行任务控制未启用');
+        const [,kind,encodedId,controlPath] = taskRunRoute;
+        let taskId;
+        try { taskId = decodeURIComponent(encodedId); } catch { throw httpError(400,'任务标识编码无效'); }
+        if (request.method === 'GET' && !controlPath) {
+          sendJson(response,200,await port.get(kind,taskId)); return;
+        }
+        if (request.method === 'POST' && controlPath) {
+          assertTrustedMutation(request,expectedOrigin,{json:true});
+          const result = await port.control(kind,taskId,await readJsonBody(request));
+          sendJson(response,200,result);
+          signalBackgroundAgency(backgroundWork,{trigger:'owner_task_control'},reportError);
+          return;
+        }
+        throw httpError(405,'运行任务请求方法无效');
+      }
       if (
         request.method === "GET" &&
         url.pathname === "/api/work/daily/items"
@@ -3880,7 +3904,7 @@ export function createDashboardServer(
         error: ownerIntakeBlocked
           ? "请求已保存并路由，但尚未进入工作台账。请重试原请求，不要重复创建。"
           : status >= 500 ? internalServerErrorMessage : error.message,
-        ...(ownerIntakeBlocked || confirmationFactsPending
+        ...(ownerIntakeBlocked || confirmationFactsPending || (typeof error.code === 'string' && /^TASK_RUN_[A-Z_]+$/.test(error.code))
           ? { code: error.code }
           : {}),
       });

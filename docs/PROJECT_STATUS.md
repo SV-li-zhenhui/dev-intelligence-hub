@@ -11,6 +11,8 @@ schemas, and documentation may change before the first stable release.
 | Local dashboard and source aggregation | Implemented | Safe example configuration keeps all real sources disabled. |
 | Versioned routing and durable work ledger | Implemented | Routing assigns work but cannot grant model, executor, or GitHub authority. |
 | Orchestrator and specialist roles | Implemented | Roles start paused and require explicit configuration and provider availability. |
+| Running tasks and owner adjustments | Implemented, deployment acceptance pending | Real model/action observations; instructions and pause/cancel settle at checkpoints; existing authority remains required. |
+| Native Codex live steering | Protocol tested; production unavailable | Requires equivalent config/rule isolation and contained bidirectional process supervision; exec remains default. |
 | Cited local memory | Implemented | Remote use remains subject to explicit requirements, code, and memory data grants. |
 | Controlled code jobs and change packages | Implemented | Execution occurs in an isolated copy; applying a package requires a separate confirmation. |
 | GitHub reviews and PR actions | Implemented behind confirmation | Every write is bound to an account, repository, PR, and exact Head. |

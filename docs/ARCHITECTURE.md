@@ -137,6 +137,29 @@ request, binds its workflow assignment, and then binds the corresponding ledger
 item. Each transition is content-addressed and restart recovery reconciles a
 lost routing or ledger response instead of creating a second root task.
 
+### Running tasks and owner adjustments
+
+`TaskRunRegistry` observes role model calls and controlled code actions through
+process-private async context. Its HTTP projection separates actual active
+operations from queued work. Controls bind both a run UUID and a durable settings
+revision; settings cannot grant executor or GitHub authority. Supplemental user
+messages are supplied on the same task's next model turn. A changed instruction
+discards an old decision at its checkpoint; an already performed code action is
+never repeated merely because requirements changed.
+
+Pause/cancel holds precede retry dispatch and survive restart. Ledger settlement
+uses the original claim, existing code-job controls and graph cancellation.
+Unconfirmed native process stops require positive recovery evidence; code-job
+terminal states win late controls. Scheduled coordination performs reconciliation,
+whereas list/detail reads do not mutate the task ledger.
+
+The app-server protocol implementation binds steering and interruption to an
+exact native thread/turn, but the production runner currently rejects it before
+spawn. Required config/rule isolation and bidirectional process-tree containment
+are not yet available together on the installed CLI. Protocol fixtures and an
+initialize-only probe do not authorize production activation. See
+[operations](OPERATIONS.md#running-task-controls-and-optional-codex-app-server).
+
 ## Confirmation and side effects
 
 Human-only operations enter one durable confirmation queue. A request is bound
