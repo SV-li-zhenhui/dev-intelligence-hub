@@ -13,8 +13,9 @@ compatibility behavior must not be presented as live steering.
 
 The [source review and integration design](research/2026-10-13-agent-feishu-bridge-source-review.md)
 records the transport, progress events, stale-turn protection and recovery
-limitations. A standalone checkpoint registry is being prepared; no running-list
-UI or app-server adapter is enabled by that module alone.
+limitations. A standalone checkpoint registry is prepared, with 24 focused
+registry/StateStore tests passing; it is not wired to the service or model
+execution. No running-list UI or app-server adapter is enabled by that module.
 
 **Acceptance:** demonstrate real task progress and turn-bound steering, reject
 late or duplicate controls, preserve instructions and holds across restart,
