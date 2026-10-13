@@ -27,6 +27,7 @@ or a claim that the entire system runs without blockers.
 | Final registry/loop regression suite | 144 passed, 0 failed | Includes a witnessed red/green check that automatic pause settlement failure cannot become ordinary retry |
 | Final native/protocol regression suite | 40 passed, 0 failed | Includes cancellation racing certified no-spawn transport rejection without leaving an unknown session journal |
 | Final stop-evidence guard | 28 passed, 0 failed | Native readiness cannot certify legacy or Claude CLI termination in a mixed configuration |
+| Committed-tree distribution checks at `365e49132e` | 19 tests: 16 passed, 3 reported failed | Two ACL setup failures; the nested lifecycle failure also fails its parent test |
 | Final controls suite | 176 passed, 0 failed | Registry, real code-job store/worker/settler, protocol, HTTP-attention contract and Chromium fixture |
 | Bounded application shutdown cases | 2 passed, 0 failed in an isolated rerun | Both had hit causal poll bounds under the full concurrent workload |
 | Full main test command | 4,290 tests: 4,260 passed, 20 failed, 10 skipped | Started before final fixes; not a passing final-tree full-suite receipt |
@@ -41,6 +42,13 @@ dialog; two bounded shutdown cases passed on isolated rerun; 17 Windows cases
 failed while preparing ACL fixtures (`SetAccessControl`, unauthorized operation),
 before their intended behavior could be exercised. Production checks were not
 weakened to accommodate fixture permissions.
+
+After the local implementation commit, committed-input provenance, npm package
+contents and both distributable/whole-tree privacy scans passed. A clean payload
+installed and loaded its safe bootstrap without private `config.json`; packed
+manager and clean-payload managed lifecycle acceptance remained blocked at two
+Windows ACL preparation sites. The three reported failures include a nested
+lifecycle test and its parent. The distribution suite is not claimed green.
 
 The real code-job integration covers both pause and cancel after an admitted
 action's response is interrupted, a fresh registry loaded from durable settings,
@@ -71,7 +79,10 @@ whose terminal receipt is degraded, rather than a claim that no local review
 occurred. A final manual diff scan checked control authority, stale run/revision
 fences, original-claim settlement, non-replay and private-state exclusions.
 After the receipt, that scan added the conservative mixed-CLI stop-evidence
-guard and its scoped regression. Original findings and snapshots remain in the
+guard and its scoped regression. Independent addendum
+`closure-addendum-native-stop-evidence.json` completed with no findings, one
+targeted test passed, and composition syntax checked; parent review status stays
+degraded. Original findings and snapshots remain in the
 local review artifacts; this document contains no credentials or runtime logs.
 
 Simplification: reuse, quality and efficiency prompts were applied inline after
