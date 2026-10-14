@@ -776,6 +776,7 @@ function planCrossRootPullRequestSourceReconciliation({
   if (
     activation.blockers.some(
       (blocker) =>
+        blocker.status !== "cancelled" &&
         crossRootPullRequestCutoverPendingId(blocker) !== root.itemId,
     )
   ) {

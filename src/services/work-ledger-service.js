@@ -1665,6 +1665,29 @@ export class WorkLedgerService {
         deduplicated += 1;
         continue;
       }
+      const cancelledSourceDescriptor = pullRequestWorkDescriptor(envelope);
+      const cancelledSourceRoot = cancelledSourceDescriptor === null ? null :
+        rootByWorkKey.get(cancelledSourceDescriptor.workKey);
+      if (cancelledSourceRoot?.status === "cancelled") {
+        // Keep owner cancellation final without rejecting the rest of the batch.
+        knownAssignments.set(assignmentItem.assignmentId, {
+          inputDigest: assignmentItem.inputDigest,
+          sourceSequence: assignmentItem.sourceSequence,
+        });
+        received += 1;
+        timelineEvents.push({
+          itemId: cancelledSourceRoot.itemId,
+          type: "pr_source_ignored",
+          at: now,
+          actorId: "work-ledger-system",
+          details: {
+            workKey: cancelledSourceRoot.source.workKey,
+            sourceSequence: envelope.sequence,
+            disposition: "ignored_cancelled_source",
+          },
+        });
+        continue;
+      }
       const trustedScopeLifecycle =
         isTrustedPullRequestScopeLifecycleAssignment(
           envelope.assignment,
@@ -1954,6 +1977,7 @@ export class WorkLedgerService {
             rootCandidate.statusReason =
               crossRootPullRequestCutoverPendingReason(predecessor.itemId);
             for (const blocker of activation.blockers) {
+              if (blocker.status === "cancelled") continue;
               const marked = {
                 ...blocker,
                 revision:
@@ -2082,6 +2106,7 @@ export class WorkLedgerService {
               ),
             };
             for (const blocker of activation.blockers) {
+              if (blocker.status === "cancelled") continue;
               const marked = {
                 ...blocker,
                 revision:
@@ -2198,6 +2223,7 @@ export class WorkLedgerService {
                 ),
               };
               for (const blocker of activation.blockers) {
+                if (blocker.status === "cancelled") continue;
                 const marked = {
                   ...blocker,
                   revision:

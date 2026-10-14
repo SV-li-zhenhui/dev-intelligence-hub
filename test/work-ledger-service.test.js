@@ -4,6 +4,52 @@ import test from "node:test";
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { createTaskRunSettler } from '../src/services/work-ledger-run-control.js';
 
+test('a cancelled PR predecessor stays unchanged without rejecting unrelated intake', async () => {
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  await fixture.service.intake();
+  const root = (await fixture.service.listItems()).items[0];
+  await fixture.service.cancelGraphTask({
+    itemId: root.itemId, expectedRevision: root.revision,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    actorId: 'employee-orchestrator', reason: 'owner-took-manual-repair',
+  });
+  const cancelled = (await fixture.service.listItems()).items[0];
+  fixture.source.records.push(prAssignment(2, {
+    sourceScopeId: 'github-secondary', occurredAt: '2026-08-02T01:05:00.000Z',
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }), issueAssignment(3));
+  fixture.source.highWatermark = 3;
+  const intake = await fixture.service.intake();
+  assert.equal(intake.error, undefined);
+  assert.equal(intake.cursor, 3);
+  const items = (await fixture.service.listItems()).items;
+  assert.deepEqual(items.find(item => item.itemId === root.itemId), cancelled);
+  const pending = items.find(item => item.source?.identity?.scopeId === 'github-secondary');
+  assert.equal(pending.status, 'blocked');
+  assert.equal(items.find(item => item.event.subject.id.startsWith('github:issue:')).status, 'queued');
+  const result = await fixture.service.reconcilePullRequestSource({
+    itemId: pending.itemId, expectedRevision: pending.revision,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    expectedPendingRevision: pending.source.activeRevision,
+  });
+  assert.equal(result.applied, false);
+  assert.equal(result.blockers[0].itemId, root.itemId);
+  assert.equal(result.blockers[0].status, 'cancelled');
+  fixture.source.records.push(prAssignment(4, {
+    occurredAt: '2026-08-02T01:10:00.000Z', gitFacts: prGitFacts(PR_HEAD_A),
+  }));
+  fixture.source.highWatermark = 4;
+  assert.equal((await fixture.service.intake()).error, undefined);
+  assert.deepEqual((await fixture.service.listItems()).items.find(item => item.itemId === root.itemId), cancelled);
+  fixture.source.records.push(prScopeLifecycleAssignment(5, prAssignment(5, {
+    eventType: 'pull_request.left_scope', occurredAt: '2026-08-02T01:15:00.000Z',
+    gitFacts: prGitFacts(PR_HEAD_A),
+  }).event));
+  fixture.source.highWatermark = 5;
+  assert.equal((await fixture.service.intake()).error, undefined);
+  assert.deepEqual((await fixture.service.listItems()).items.find(item => item.itemId === root.itemId), cancelled);
+});
+
 test('real ledger settles a pause after model failure, restores the same item, and cancels safely',async()=>{
   const {service}=await createFixture({records:[issueAssignment(1)]});
   await service.intake();

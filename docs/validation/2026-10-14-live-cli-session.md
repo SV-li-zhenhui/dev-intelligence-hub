@@ -70,3 +70,7 @@ Code review: skipped (ce-code-review unavailable)。本会话此前正式 CE 流
 - 执行仓库缺少目标提交 `413be939195eeee05d38c2ee02549c6673f5c137`；已通过不写 FETCH_HEAD、不更新引用的 fetch 补齐，并通过 `cat-file -t` 确认为 commit。旧失败收据保留。重试验证请求为 `e1fd4f38-0fd1-4340-94ec-f37962d6c798`；尚不能称为验证通过。
 - 发现历史 #24723 PR 工程师任务也在运行后，通过当前 run/revision 控制取消；根任务已为 `cancelled / owner_task_run_cancel`。原 #24723 自动代码任务仍为 cancelled。
 - 本轮启动至备用任务进入模型约 13 分钟，存在明显的刷新和队列等待。已验证真实模型分析及提案派发，尚未验证完整编译、真实病例或无阻碍的开发测试闭环。
+
+### 取消任务导致整批入账失败
+
+重试请求返回 `OWNER_WORK_REQUEST_LEDGER_REJECTED`。纯内存重放真实台账及分配流，确认来源切换尝试把已取消的 #24723 任务 revision 11 改为 12，终态校验因此拒绝整批事件，连带阻挡 #24232。修复保持已取消任务不变：跨来源只保留阻塞，同来源后续观测记为 `pr_source_ignored / ignored_cancelled_source`。不放宽终态校验、不把取消视为允许重新执行。新增回归先失败后通过；切换、生命周期等相关测试 47/47，真实批次内存重放已成功推进游标并创建 #24232 的 queued 重试任务。生产部署结果另行核验。
