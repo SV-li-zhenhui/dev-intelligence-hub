@@ -555,6 +555,24 @@ async function createFixture({
   return { service, source, store, lease, time };
 }
 
+test("task timeline filtering preserves an older recovery record amid unrelated activity", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  await fixture.service.intake();
+  const item = (await fixture.service.listItems()).items[0];
+  const original = (await fixture.service.listTimeline()).items.find((entry) => entry.itemId === item.itemId);
+  fixture.source.records.push(...Array.from({ length: 105 }, (_, index) => assignment(index + 2)));
+  fixture.source.highWatermark = 106;
+  await fixture.service.intake({ limit: 100 });
+  await fixture.service.intake({ limit: 100 });
+  assert.equal((await fixture.service.listTimeline({ limit: 100, order: "newest" })).items
+    .some((entry) => entry.itemId === item.itemId), false);
+  const scoped = await fixture.service.listTimeline({ itemId: item.itemId, limit: 1, order: "newest" });
+  assert.deepEqual(scoped.items, [original]);
+  assert.equal(scoped.nextCursor, null);
+  await assert.rejects(fixture.service.listTimeline({ itemId: "" }));
+  await assert.rejects(fixture.service.listTimeline({ itemId: item.itemId, unsupported: true }));
+});
+
 async function createLedgerMemoryPipeline(service, options = {}) {
   const store = options.store ?? new MemoryStore();
   const journal = new LocalMemoryJournal({

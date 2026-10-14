@@ -761,6 +761,11 @@ export class WorkLedgerService {
 
   async listTimeline(options = {}) {
     this.#assertReady();
+    if (isPlainLedgerObject(options) && Object.hasOwn(options, "itemId")) {
+      const { itemId: suppliedItemId, ...pageOptions } = options;
+      const itemId = boundedLedgerString(suppliedItemId, "itemId", 192);
+      return queryPage(this.state.timeline.filter((entry) => entry.itemId === itemId), "timelineId", pageOptions);
+    }
     return queryPage(this.state.timeline, "timelineId", options);
   }
 

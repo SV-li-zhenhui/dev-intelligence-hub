@@ -377,6 +377,9 @@ async function assemble(fixture, options = {}) {
     ...(options.evidenceCatalog
       ? { evidenceCatalog: options.evidenceCatalog }
       : {}),
+    ...(options.failedCodeJobContextReader
+      ? { failedCodeJobContextReader: options.failedCodeJobContextReader }
+      : {}),
   });
   const roleId = options.roleId ?? "developer";
   return assembler.assemble({
@@ -2145,6 +2148,37 @@ test("classifies proposal decision context as code instead of requirements", asy
     packet.context.code.decisionContext.value.summary,
     "CODE-ONLY-PROPOSAL-RESULT",
   );
+});
+
+test("a failed PR repair includes its execution failure and explicit retry context", async () => {
+  const fixture = graphFixture({ pullRequest: true });
+  const event = pullRequestEvent("a".repeat(40), "2026-08-03T04:00:00.000Z");
+  const { source } = createPullRequestWorkSource(pullRequestAssignment(1, event));
+  fixture.item = {
+    ...fixture.item, event, source, inputDigest: source.current.inputDigest,
+    decisionContext: {
+      source: "proposal", outcome: "failed", referenceId: "proposal-failed",
+      value: { kind: "code_action_proposal", evidence: ["code-job:previous-job"] },
+      observedAt: "2026-08-03T04:30:00.000Z", contentDigest: DIGEST_A,
+    },
+  };
+  const failedExecution = {
+    jobId: "previous-job", failureCode: "GIT_SNAPSHOT_TIMEOUT",
+    ownerRetry: { at: "2026-08-03T04:45:00.000Z", note: "Snapshot repair verified; retry." },
+  };
+  const calls = [];
+  const packet = await assemble(fixture, {
+    failedCodeJobContextReader: { async read(input) {
+      calls.push(input);
+      return failedExecution;
+    } },
+  });
+  assert.deepEqual(packet.context.code.failedExecution, failedExecution);
+  assert.equal(packet.context.requirements.failedExecution, undefined);
+  assert.equal(calls[0].inputBinding.headRefOid, "a".repeat(40));
+  assert.equal(calls[0].itemId, fixture.item.itemId);
+  failedExecution.failureCode = "MUTATED";
+  assert.equal(packet.context.code.failedExecution.failureCode, "GIT_SNAPSHOT_TIMEOUT");
 });
 
 test("rejects a context larger than 128 KiB without truncating it", async () => {

@@ -70,6 +70,7 @@ import { TaskRunRegistry } from './services/task-run-registry.js';
 import { createTaskRunSettler,canUseNativeStopEvidence } from './services/work-ledger-run-control.js';
 import { OrchestratorService } from "./services/orchestrator-service.js";
 import { RoleContextAssembler } from "./services/role-context-assembler.js";
+import { FailedCodeJobContextReader } from "./services/failed-code-job-context-reader.js";
 import { ProactivePrEmployeeService } from "./services/proactive-pr-employee.js";
 import { PrEngineerService } from "./services/pr-engineer-service.js";
 import { RefreshService } from "./services/refresh-service.js";
@@ -2418,6 +2419,9 @@ export async function createApplication({
         ),
         factSource,
         pullRequestContextReader,
+        ...(codeJobReader === null ? {} : {
+          failedCodeJobContextReader: new FailedCodeJobContextReader({ codeJobReader, ledger: workLedgerRuntime }),
+        }),
         evidenceCatalog: deliveryEvidence,
         ...(agentMemoryQueries === null
           ? {}

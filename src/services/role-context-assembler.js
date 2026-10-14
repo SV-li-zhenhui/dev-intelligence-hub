@@ -305,6 +305,20 @@ function optionalMemoryQueryReader(value) {
   });
 }
 
+async function readFailedCodeJobContext(reader, item, signal) {
+  if (!reader || item.sourceBinding === null ||
+      item.decisionContext?.source !== "proposal" || item.decisionContext.outcome !== "failed" ||
+      item.decisionContext.value?.kind !== "code_action_proposal") return null;
+  const result = await reader.read({
+    itemId: item.taskId,
+    inputBinding: createPullRequestExecutionBinding({ sourceBinding: item.sourceBinding, event: item.event }),
+    decisionContext: item.decisionContext,
+    ...(signal === undefined ? {} : { signal }),
+  });
+  signal?.throwIfAborted();
+  return result === null ? null : canonicalValue(result);
+}
+
 function normalizeTarget(value, name) {
   const fields = exactData(value, ["type", "id"], name);
   const type = fields.get("type");
@@ -1213,6 +1227,7 @@ export class RoleContextAssembler {
   #pullRequestContextReader;
   #memoryQueryReader;
   #evidenceCatalogAdapter;
+  #failedCodeJobContextReader;
 
   constructor({
     graphReader,
@@ -1220,6 +1235,7 @@ export class RoleContextAssembler {
     pullRequestContextReader,
     memoryQueryReader,
     evidenceCatalog,
+    failedCodeJobContextReader,
   } = {}) {
     this.#graphReader = requireGraphReader(graphReader);
     this.#factSource = optionalFactSource(factSource);
@@ -1227,6 +1243,9 @@ export class RoleContextAssembler {
       pullRequestContextReader,
     );
     this.#memoryQueryReader = optionalMemoryQueryReader(memoryQueryReader);
+    this.#failedCodeJobContextReader = failedCodeJobContextReader == null ? null : Object.freeze({
+      read: bindPortMethod(failedCodeJobContextReader, "read", "failedCodeJobContextReader"),
+    });
     this.#evidenceCatalogAdapter =
       createRoleContextEvidenceCatalogAdapter(evidenceCatalog);
     Object.freeze(this);
@@ -1301,7 +1320,7 @@ export class RoleContextAssembler {
       currentTask,
       deliveryState,
     );
-    const [facts, authoritativeEvidence, pullRequest, memoryQuery] = await Promise.all([
+    const [facts, authoritativeEvidence, pullRequest, memoryQuery, failedExecution] = await Promise.all([
       readFacts(this.#factSource, item.event, signal),
       this.#evidenceCatalogAdapter.read({
         roleId,
@@ -1311,6 +1330,7 @@ export class RoleContextAssembler {
       }),
       readPullRequestContext(this.#pullRequestContextReader, item, signal),
       readMemoryQueryContext(this.#memoryQueryReader, roleId, item, signal),
+      readFailedCodeJobContext(this.#failedCodeJobContextReader, item, signal),
     ]);
     signal?.throwIfAborted();
     const isPullRequest = item.eventType.startsWith("pull_request.");
@@ -1390,6 +1410,7 @@ export class RoleContextAssembler {
         ...(proposalDecisionContext === null
           ? {}
           : { decisionContext: proposalDecisionContext }),
+        ...(failedExecution === null ? {} : { failedExecution }),
         ...(currentTaskRejection?.dataClass === "code"
           ? { currentTaskRejection: currentTaskRejection.value }
           : {}),

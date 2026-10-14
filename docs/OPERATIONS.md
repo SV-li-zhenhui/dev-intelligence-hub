@@ -415,6 +415,16 @@ the repair. Inspect success alone is not evidence of code changes or publication
 Object preparation accepts validated mirror branch refs containing `#`; a missing
 bound Head must be fetched by the trusted object synchronizer before creating the
 code snapshot. Keep the failed job and audit trail when retrying the original task.
+
+For a failed PR code proposal, the next role decision receives `code.failedExecution`
+from the exact bound job and memory receipt: its safe failure code, visible action
+statuses, and whether the observation history is complete. A matching local-owner
+transition back to `queued` after that failure is included as `ownerRetry`, with a
+bounded recovery note. This lets a developer distinguish a repaired preparation
+fault from an unresolved code problem. A retry note grants no new permissions and
+does not prove that code was changed or published. Old jobs, sessions and settled
+proposal results remain intact; stale job or Head bindings are rejected.
+
 When automatic own-PR repair is enabled, legacy PR patrol leaves authored
 `address_review` items to the canonical developer route and supersedes its old
 competing patrol jobs. Already emitted triage owner requests require separate
