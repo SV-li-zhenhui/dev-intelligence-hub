@@ -47,6 +47,7 @@ const SAFE_GIT_PREFIX = Object.freeze([
 const MAX_PACK_DATABASE_ENTRIES = 100_000;
 const MAX_LOOSE_OBJECT_ENTRIES = 100_000;
 const MAX_GIT_EXECUTABLE_BYTES = 256 * 1024 * 1024;
+const MAX_BLOBS_PER_BATCH = 128;
 const DEFAULT_LIMITS = Object.freeze({
   maxFiles: 5_000,
   maxFileBytes: 1_000_000,
@@ -824,25 +825,30 @@ export class GitObjectSnapshotter {
         shouldInclude: (relativePath) => !policy.isExcluded(relativePath),
       });
       const oids = [...new Set(entries.map((entry) => entry.oid))];
-      const batchInput = Buffer.from(oids.map((oid) => `${oid}\n`).join(""));
-      const maxBlobOutput = Math.min(
-        Number.MAX_SAFE_INTEGER,
-        this.#limits.maxTotalBytes + oids.length * 160 + 1,
-      );
-      const blobOutput = oids.length === 0
-        ? Buffer.alloc(0)
-        : await this.#gitBytes(
-            ["cat-file", "--batch"],
-            sourceRoot,
-            batchInput,
-            maxBlobOutput,
-          );
-      const blobs = parseBlobs(
-        blobOutput,
-        oids,
-        this.#limits,
-        boundary.objectFormat,
-      );
+      const blobs = new Map();
+      let uniqueBlobBytes = 0;
+      // A whole repository can exceed one command's deadline. Keep each read
+      // bounded while validating the complete object set before writing files.
+      for (let offset = 0; offset < oids.length; offset += MAX_BLOBS_PER_BATCH) {
+        const batchOids = oids.slice(offset, offset + MAX_BLOBS_PER_BATCH);
+        const remainingBytes = this.#limits.maxTotalBytes - uniqueBlobBytes;
+        const blobOutput = await this.#gitBytes(
+          ["cat-file", "--batch"],
+          sourceRoot,
+          Buffer.from(batchOids.map((oid) => `${oid}\n`).join("")),
+          Math.min(Number.MAX_SAFE_INTEGER, remainingBytes + batchOids.length * 160 + 1),
+        );
+        const batchBlobs = parseBlobs(
+          blobOutput,
+          batchOids,
+          { ...this.#limits, maxTotalBytes: remainingBytes },
+          boundary.objectFormat,
+        );
+        for (const [oid, content] of batchBlobs) {
+          blobs.set(oid, content);
+          uniqueBlobBytes += content.length;
+        }
+      }
       const totalBytes = entries.reduce((sum, entry) => {
         const content = blobs.get(entry.oid);
         if (!Buffer.isBuffer(content)) {

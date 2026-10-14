@@ -448,6 +448,15 @@ with the ordinary 30-second minimum and a cap below the normalized lease. It use
 that matching lease so the result can still be persisted. Ordinary code proposals
 retain their existing handler defaults. This changes waiting time, not authority.
 
+Fixed-Head materialization reads Git blobs in batches of at most 128 unique
+object IDs. Each command retains its configured timeout; all batches share the
+total byte budget, and every object and protocol response is verified before
+files are written. A measured #24723 recovery failure was a single 4,926-object
+command timing out, not an output limit. Its same-Head probe passed after batching.
+Keep the failed session and job as audit records; retry the original automatic
+developer task only after verifying the fixed snapshot, current input binding,
+absence of another active repair and an exclusive application writer lease.
+
 The following capture and cleanup rules describe compatibility invocation
 profiles. Native mode keeps conversations in the fixed Codex home and only
 cleans its task-owned input/output workspace after verified process exit.
