@@ -3,6 +3,7 @@ import { types as utilTypes } from "node:util";
 import { normalizeSessionKey } from "./session-key.js";
 import { normalizeReviewReadTarget } from "../domain/review-read-target.js";
 import { isCodeReadContext } from "./code-read-context.js";
+import { isCodeExecutionContext } from "./code-execution-context.js";
 
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_MESSAGES = 16;
@@ -91,9 +92,9 @@ export function readStructuredBrainGenerateInput(rawRequest) {
     required.some((key) => !keys.includes(key)) ||
     keys.some((key) =>
       typeof key !== "string" ||
-      ![...required, "reasoningEffort", "sessionKey", "signal", "reviewTarget", "codeReadContext"].includes(key)
+      ![...required, "reasoningEffort", "sessionKey", "signal", "reviewTarget", "codeReadContext", "codeExecutionContext"].includes(key)
     ) ||
-    keys.length > required.length + 5
+    keys.length > required.length + 6
   ) {
     throw new TypeError("structured request is invalid");
   }
@@ -114,6 +115,7 @@ export function readStructuredBrainGenerateInput(rawRequest) {
     signal: result.signal ?? null,
     reviewTarget: result.reviewTarget ?? null,
     codeReadContext: result.codeReadContext ?? null,
+    codeExecutionContext: result.codeExecutionContext ?? null,
   });
 }
 
@@ -325,6 +327,7 @@ export function normalizeStructuredBrainRequest(rawRequest, options) {
   const hasSessionKey = hasOwnPlainDataField("sessionKey");
   const hasReviewTarget = hasOwnPlainDataField("reviewTarget");
   const hasCodeReadContext = hasOwnPlainDataField("codeReadContext");
+  const hasCodeExecutionContext = hasOwnPlainDataField("codeExecutionContext");
   const request = exactDataObject(
     rawRequest,
     [
@@ -333,6 +336,7 @@ export function normalizeStructuredBrainRequest(rawRequest, options) {
       ...(hasSessionKey ? ["sessionKey"] : []),
       ...(hasReviewTarget ? ["reviewTarget"] : []),
       ...(hasCodeReadContext ? ["codeReadContext"] : []),
+      ...(hasCodeExecutionContext ? ["codeExecutionContext"] : []),
       "messages",
       "schema",
     ],
@@ -347,6 +351,9 @@ export function normalizeStructuredBrainRequest(rawRequest, options) {
   if (hasCodeReadContext && (!isCodeReadContext(request.codeReadContext) || hasReviewTarget)) {
     throw new TypeError("codeReadContext is invalid");
   }
+  if (hasCodeExecutionContext && (!isCodeExecutionContext(request.codeExecutionContext) || hasReviewTarget || hasCodeReadContext)) {
+    throw new TypeError("codeExecutionContext is invalid");
+  }
   const normalized = {
     model: safeText(request.model, "model", MAX_MODEL_BYTES),
     ...(hasReasoningEffort
@@ -358,6 +365,7 @@ export function normalizeStructuredBrainRequest(rawRequest, options) {
     messages: normalizeMessages(request.messages),
     ...(hasReviewTarget ? { reviewTarget: normalizeReviewReadTarget(request.reviewTarget) } : {}),
     ...(hasCodeReadContext ? { codeReadContext: request.codeReadContext } : {}),
+    ...(hasCodeExecutionContext ? { codeExecutionContext: request.codeExecutionContext } : {}),
     schema: normalizeSchema(request.schema),
   };
   if (

@@ -6,14 +6,16 @@ import { currentTaskExecution } from './task-execution-context.js';
 import { isNativeCodexThreadId } from '../adapters/codex-native-session-store.js';
 import { ContainedStdioProcess } from './contained-stdio-process.js';
 import { randomBytes } from 'node:crypto';
-import { threadConfiguration, assertEffectiveAppServerPolicy, NATIVE_CHANNEL_INSTRUCTIONS } from './codex-app-server-policy.js';
+import { threadConfiguration, assertEffectiveAppServerPolicy, NATIVE_CHANNEL_INSTRUCTIONS, CODE_EXECUTION_CHANNEL_INSTRUCTIONS, CODE_EXECUTION_TOOLS } from './codex-app-server-policy.js';
 
 const FAILURE_OUTPUT = new WeakMap();
 const NOT_STARTED = new WeakSet();
 const NO_MODEL_TURN = new WeakSet();
+const REAPED_FAILURES = new WeakSet();
 export const readAppServerFailureOutput = (error) => FAILURE_OUTPUT.get(error) ?? null;
 export const didAppServerNotStart = (error) => NOT_STARTED.has(error);
 export const didAppServerNotStartModel = (error) => NO_MODEL_TURN.has(error);
+export const didAppServerReap = (error) => REAPED_FAILURES.has(error);
 function failure(code='STRUCTURED_PROVIDER_PROCESS_FAILED') {
   return Object.assign(new Error(code),{code,statusCode:code==='STRUCTURED_PROVIDER_TIMEOUT'?504:502});
 }
@@ -36,7 +38,10 @@ export class CodexAppServerRunner {
     // Protocol fixtures can inject a process. Production needs a contained,
     // bidirectional supervisor: a direct child's exit is not tree-reap proof.
     if ((!this.processFactory && !this.supportsContainedExecution) || !appServer ||
-        !Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+        !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 ||
+        (appServer.isolation?.channel === 'code-job' &&
+          (!appServer.isolation.execution || typeof appServer.isolation.execution.url !== 'string' ||
+            typeof appServer.isolation.execution.revoke !== 'function' || appServer.isolation.reader || appServer.isolation.skill))) {
       const error=failure('STRUCTURED_PROVIDER_UNAVAILABLE');NOT_STARTED.add(error);throw error;
     }
     let descriptor;
@@ -46,6 +51,8 @@ export class CodexAppServerRunner {
     const process=this.processFactory ? this.processFactory() : new ContainedStdioProcess(this.processRunner);
     const completed=deferred(); const pending=new Map();
     const context=currentTaskExecution(); let threadId=appServer.previous,turnId=null,text=null;
+    const codeExecution = appServer.isolation?.channel === 'code-job';
+    const revokeTools = () => appServer.isolation?.execution?.revoke();
     let sequence=0,started=false,initialized=false,terminal=false,interrupted=false,detach,output,error,turnAttempted=false;
     const earlyEvents=[];const streamedItems=new Set();let earlyBytes=0;
     const request=(method,params)=>{
@@ -57,6 +64,7 @@ export class CodexAppServerRunner {
       return waiting.promise;
     };
     const fail=(cause)=>{
+      revokeTools();
       const problem=cause?.code?.startsWith('STRUCTURED_PROVIDER_') ? cause : failure(initialized ? 'STRUCTURED_PROVIDER_PROCESS_FAILED' : 'STRUCTURED_PROVIDER_UNAVAILABLE');
       completed.reject(problem);
       for(const waiting of pending.values()){clearTimeout(waiting.timer);waiting.reject(problem);}
@@ -68,7 +76,7 @@ export class CodexAppServerRunner {
         const message=parseJsonWithUniqueKeys(line);
         if(!message || typeof message!=='object' || Array.isArray(message))throw failure('STRUCTURED_PROVIDER_RESPONSE_INVALID');
         if(message.method && message.id!==undefined){
-          process.write(`${JSON.stringify({id:message.id,error:{code:-32601,message:'Interactive server requests are not authorized in this read-only decision channel'}})}\n`);
+          process.write(`${JSON.stringify({id:message.id,error:{code:-32601,message:'Interactive server requests are not authorized in this controlled channel'}})}\n`);
           return;
         }
         if(message.id!==undefined){
@@ -107,13 +115,13 @@ export class CodexAppServerRunner {
         const progress={
           'turn/started':'正在分析任务', 'item/started':'正在读取或检查代码',
           'item/completed':'检查步骤已完成', 'item/commandExecution/outputDelta':'代码检查有新输出',
-          'item/mcpToolCall/progress':'正在读取 PR 材料', 'turn/plan/updated':'执行计划已更新',
+          'item/mcpToolCall/progress':codeExecution?'正在执行受控代码动作':'正在读取 PR 材料', 'turn/plan/updated':'执行计划已更新',
           'item/agentMessage/delta':'正在生成判断',
         }[message.method];
         if(progress)context?.reportProgress(progress);
         if(message.method==='turn/completed'){
           if(!['completed','failed','interrupted'].includes(params.turn?.status))throw failure('STRUCTURED_PROVIDER_RESPONSE_INVALID');
-          terminal=true;turnId=params.turn?.id??turnId;
+          revokeTools();terminal=true;turnId=params.turn?.id??turnId;
           interrupted=params.turn?.status==='interrupted';
           context?.reportSession?.({transport:'app-server',threadId,turnId,status:interrupted?'interrupted':params.turn?.status==='failed'?'failed':'completed'});
           if(params.turn?.status==='failed')completed.reject(failure());
@@ -137,13 +145,13 @@ export class CodexAppServerRunner {
       let config,namespace;
       if(appServer.isolation) {
         const effective=await request('config/read',{includeLayers:false,cwd});
-        assertEffectiveAppServerPolicy(effective?.config);
-        namespace=`dih_pr_review_${randomBytes(8).toString('hex')}`;
+        assertEffectiveAppServerPolicy(effective?.config,{channel:codeExecution?'code-job':'review'});
+        namespace=`${codeExecution?'dih_code_job':'dih_pr_review'}_${randomBytes(8).toString('hex')}`;
         config=threadConfiguration(effective?.config,{...appServer.isolation,namespace});
       }
       const resumed=await request(threadId?'thread/resume':'thread/start',{
         ...(threadId?{threadId}:{}),cwd,model:appServer.model,approvalPolicy:'never',sandbox:'read-only',
-        ...(appServer.isolation?{config,modelProvider:'openai',baseInstructions:NATIVE_CHANNEL_INSTRUCTIONS,developerInstructions:NATIVE_CHANNEL_INSTRUCTIONS,
+        ...(appServer.isolation?{config,modelProvider:'openai',baseInstructions:codeExecution?CODE_EXECUTION_CHANNEL_INSTRUCTIONS:NATIVE_CHANNEL_INSTRUCTIONS,developerInstructions:codeExecution?CODE_EXECUTION_CHANNEL_INSTRUCTIONS:NATIVE_CHANNEL_INSTRUCTIONS,
           runtimeWorkspaceRoots:[cwd],...(threadId?{excludeTurns:true}:{ephemeral:appServer.isolation.ephemeral,historyMode:'legacy'})}:{}),
       });
       const actual=resumed?.thread?.id;
@@ -158,7 +166,8 @@ export class CodexAppServerRunner {
           for(const server of servers.data) {
             const tools=Object.keys(server.tools??{});
             if(server.name===namespace) {
-              if(tools.length!==3 || !['read_document','read_source','list_directory'].every(tool=>tools.includes(tool)))throw failure('STRUCTURED_PROVIDER_UNAVAILABLE');
+              const expectedTools=codeExecution?CODE_EXECUTION_TOOLS:['read_document','read_source','list_directory'];
+              if(tools.length!==expectedTools.length || !expectedTools.every(tool=>tools.includes(tool)))throw failure('STRUCTURED_PROVIDER_UNAVAILABLE');
               seenReader=true;
             } else if(tools.length)throw failure('STRUCTURED_PROVIDER_UNAVAILABLE');
           }
@@ -166,11 +175,12 @@ export class CodexAppServerRunner {
           if(cursor && (cursors.has(cursor) || cursors.size>=3))throw failure('STRUCTURED_PROVIDER_UNAVAILABLE');
           if(cursor)cursors.add(cursor);
         }while(cursor);
-        if(appServer.isolation.reader && !seenReader)throw failure('STRUCTURED_PROVIDER_UNAVAILABLE');
+        if((appServer.isolation.reader || appServer.isolation.execution) && !seenReader)throw failure('STRUCTURED_PROVIDER_UNAVAILABLE');
       }
       context?.reportSession?.({transport:'app-server',threadId,turnId:null,status:'starting'});
       const skill=appServer.isolation?.skill;
-      const input=namespace && appServer.isolation.reader ? `For this invocation, references to pr_review in task and skill instructions mean the read-only MCP server ${namespace}.\n${appServer.input}` : appServer.input;
+      const input=codeExecution ? `For this invocation, references to the code-job MCP server mean ${namespace}.\n${appServer.input}`
+        : namespace && appServer.isolation.reader ? `For this invocation, references to pr_review in task and skill instructions mean the read-only MCP server ${namespace}.\n${appServer.input}` : appServer.input;
       turnAttempted=true;
       const begun=await request('turn/start',{threadId,cwd,model:appServer.model,
         ...(appServer.effort?{effort:appServer.effort}:{}),
@@ -186,7 +196,13 @@ export class CodexAppServerRunner {
           const accepted=await request('turn/steer',{threadId,expectedTurnId:turnId,input:[{type:'text',text:instruction,text_elements:[]}],clientUserMessageId});
           if(accepted?.turnId!==turnId)throw failure('STRUCTURED_PROVIDER_RESPONSE_INVALID');
         },
-        interrupt:()=>request('turn/interrupt',{threadId,turnId}),
+        interrupt:()=>{
+          revokeTools();
+          // A captured live-control callback can arrive while process teardown
+          // drains. The terminal event already proves no active native turn;
+          // do not create an RPC waiter after finally cleared pending requests.
+          return terminal ? Promise.resolve({}) : request('turn/interrupt',{threadId,turnId});
+        },
       });
       await completed.promise;
       if(!interrupted){
@@ -197,6 +213,7 @@ export class CodexAppServerRunner {
       output={exitCode:0,signal:null,stdoutBytes:Buffer.from(JSON.stringify({type:'thread.started',thread_id:threadId})+'\n'),interrupted};
     }catch(cause){error=cause;}
     finally {
+      revokeTools();
       clearTimeout(deadline);signal?.removeEventListener('abort',abort);detach?.();
       for(const waiting of pending.values()){clearTimeout(waiting.timer);waiting.reject(error??failure());}pending.clear();
       if(started){
@@ -206,9 +223,12 @@ export class CodexAppServerRunner {
           else error??=cause;
         }
       }
-      if(interrupted && !error)context?.confirmStopped();
+      // A code job can still own an admitted host action after native exit.
+      // Its provider certifies stop only after the execution MCP drains too.
+      if(interrupted && !error && !codeExecution)context?.confirmStopped();
     }
     if(error){
+      if(started && process.exited && error.code!=='STRUCTURED_PROVIDER_REAP_FAILED')REAPED_FAILURES.add(error);
       if(threadId && (appServer.previous || turnAttempted))FAILURE_OUTPUT.set(error,{stdoutBytes:Buffer.from(JSON.stringify({type:'thread.started',thread_id:threadId})+'\n')});
       if(!started || process.notStarted)NOT_STARTED.add(error);
       if(!turnAttempted && process.exited)NO_MODEL_TURN.add(error);

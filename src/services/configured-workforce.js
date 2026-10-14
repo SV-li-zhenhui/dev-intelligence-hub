@@ -324,6 +324,10 @@ function providerWithBoundary(provider, remote, lifecycle, sessionIsolationKey =
   );
   const nativeReviewSkillsDescriptor = Object.getOwnPropertyDescriptor(provider, "supportsNativeReviewSkills");
   const codeReadingDescriptor = Object.getOwnPropertyDescriptor(provider, "supportsCodeReading");
+  const codeExecutionDescriptor = Object.getOwnPropertyDescriptor(provider, "supportsCodeExecution");
+  if (codeExecutionDescriptor && (!("value" in codeExecutionDescriptor) || typeof codeExecutionDescriptor.value !== "boolean")) {
+    throw new TypeError("brain provider code execution support is invalid");
+  }
   if (codeReadingDescriptor && (!("value" in codeReadingDescriptor) || typeof codeReadingDescriptor.value !== "boolean")) {
     throw new TypeError("brain provider code reading support is invalid");
   }
@@ -367,6 +371,7 @@ function providerWithBoundary(provider, remote, lifecycle, sessionIsolationKey =
       : {}),
     ...(nativeReviewSkillsDescriptor?.value === true ? { supportsNativeReviewSkills: true } : {}),
     ...(codeReadingDescriptor?.value === true ? { supportsCodeReading: true } : {}),
+    ...(codeExecutionDescriptor?.value === true ? { supportsCodeExecution: true } : {}),
     generate: provider.generate.bind(provider),
     ...(availability
       ? { checkAvailability: availability.bind(provider) }

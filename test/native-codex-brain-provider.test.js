@@ -12,6 +12,8 @@ import { BrainRouter } from "../src/services/brain-router.js";
 import { CodexAppServerRunner } from '../src/lib/codex-app-server-runner.js';
 import { createCodeReadContext, hasCompleteCodeRead } from "../src/lib/code-read-context.js";
 import { createCodeJobArtifactReader } from "../src/adapters/code-job-artifact-reader.js";
+import { createCodeExecutionContext } from "../src/lib/code-execution-context.js";
+import { withTaskExecution } from "../src/lib/task-execution-context.js";
 
 const schema = { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false };
 const request = (overrides = {}) => ({ model: "gpt-6.1-sol", reasoningEffort: "high", messages: [{ role: "user", content: "PRIVATE_TASK_INPUT" }], schema, ...overrides });
@@ -46,6 +48,140 @@ async function readAuditedPages(url, path, { firstPageOnly = false } = {}) {
 }
 
 const codeDecision = (action) => ({ schemaVersion: 1, confidence: 90, summary: "检查当前代码", reason: "使用完整受控读取", action });
+
+async function executionTool(url, id, name, args = {}) {
+  const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }) });
+  assert.equal(response.status, 200);
+  const message = await response.json();
+  assert.notEqual(message.result.isError, true);
+  return JSON.parse(message.result.content[0].text);
+}
+
+test("native continuous execution keeps several host actions inside one invocation and a distinct tool channel", async (t) => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = "app-server";
+  const actions = []; let remaining = 1, closed = 0, invocations = 0;
+  const context = createCodeExecutionContext({
+    async performAction({ decision }) { actions.push(decision.action.type); if (decision.action.type === "run_profile") remaining--; return { status: "succeeded" }; },
+    readSource: () => ({ text: "full audited content", nextOffset: null, sourceVersion: "version-1" }),
+    getState: () => ({ requiredProfilesRemaining: remaining }), close: () => { closed++; return { settled: true }; },
+  });
+  const provider = f.create(() => assert.fail("continuous execution cannot use exec fallback"), {}, { appServerRunner: { async run(call) {
+    invocations++;
+    assert.equal(call.timeoutMs, 900_000);
+    assert.equal(call.appServer.isolation.channel, "code-job");
+    assert.equal(call.appServer.isolation.reader, null);
+    assert.match(await readFile(path.join(call.cwd, "model-instructions.txt"), "utf8"), /one continuous controlled code job/);
+    const url = call.appServer.isolation.execution.url;
+    assert.equal((await executionTool(url, 1, "get_state")).requiredProfilesRemaining, 1);
+    await executionTool(url, 2, "perform_action", { decision: codeDecision({ type: "read_text", path: "src/app.cpp" }) });
+    assert.equal((await executionTool(url, 3, "read_source", { path: "src/app.cpp", offset: 0 })).nextOffset, null);
+    await executionTool(url, 4, "perform_action", { decision: codeDecision({ type: "write_text", path: "src/app.cpp", content: "fixed" }) });
+    await executionTool(url, 5, "perform_action", { decision: codeDecision({ type: "run_profile" }) });
+    assert.equal((await executionTool(url, 6, "get_state")).requiredProfilesRemaining, 0);
+    await writeFile(path.join(call.cwd, "last-message.json"), JSON.stringify({ result: JSON.stringify(codeDecision({ type: "complete", outcome: "done", evidence: [] })) }));
+    return success();
+  } } });
+  assert.equal(provider.supportsCodeExecution, true);
+  assert.equal(JSON.parse(await provider.generate(request({ codeExecutionContext: context }))).action.type, "complete");
+  assert.deepEqual(actions, ["read_text", "write_text", "run_profile"]);
+  assert.equal(invocations, 1); assert.equal(closed, 1);
+  assert.equal(await readFile(path.join(f.home, "auth.json"), "utf8"), "private-native-auth");
+  assert.equal(await readFile(path.join(f.home, "config.toml"), "utf8"), 'model = "user-preferred-model"\n');
+  await provider.close();
+});
+
+test("continuous stop confirmation waits for an admitted host action and its trusted drain receipt", async (t) => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = "app-server";
+  const entered = gate(), release = gate(), nativeExited = gate(); let confirmed = 0, closed = 0, fetched;
+  const context = createCodeExecutionContext({
+    async performAction() { entered.resolve(); await release.promise; return { status: "succeeded" }; },
+    readSource() {}, getState() {}, close() { closed++; return { settled: true }; },
+  });
+  const provider = f.create(result, {}, { appServerRunner: { async run(call) {
+    fetched = executionTool(call.appServer.isolation.execution.url, 1, "perform_action", { decision: codeDecision({ type: "run_profile" }) });
+    await entered.promise;
+    call.appServer.isolation.execution.revoke();
+    nativeExited.resolve();
+    return { ...success(), interrupted: true };
+  } } });
+  const running = withTaskExecution({ confirmStopped() { confirmed++; } }, () => provider.generate(request({ codeExecutionContext: context })));
+  const stopped = assert.rejects(running, { code: "STRUCTURED_PROVIDER_CANCELLED" });
+  await nativeExited.promise; await new Promise(resolve => setImmediate(resolve));
+  assert.equal(confirmed, 0); assert.equal(closed, 0);
+  release.resolve(); await stopped; await fetched;
+  assert.equal(confirmed, 1); assert.equal(closed, 1);
+  await provider.close();
+});
+
+test("an unknown host action result never certifies a continuous stop", async (t) => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = "app-server"; let confirmed = 0;
+  const context = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {}, close: () => ({ settled: false }) });
+  const provider = f.create(result, {}, { appServerRunner: { async run() { return { ...success(), interrupted: true }; } } });
+  await assert.rejects(withTaskExecution({ confirmStopped() { confirmed++; } }, () => provider.generate(request({ codeExecutionContext: context }))), { code: "STRUCTURED_PROVIDER_CANCELLED" });
+  assert.equal(confirmed, 0); await provider.close();
+});
+
+test("a completed native turn certifies a late stop only after its host drain settles", async (t) => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = "app-server";
+  const closing = gate(), release = gate(); let confirmed = 0;
+  const context = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {}, async close() {
+    closing.resolve(); await release.promise; return { settled: true };
+  } });
+  const provider = f.create(result, {}, { appServerRunner: { async run(call) {
+    await writeFile(path.join(call.cwd, "last-message.json"), JSON.stringify({ result: JSON.stringify(codeDecision({ type: "complete", outcome: "done", evidence: [] })) }));
+    return success();
+  } } });
+  const running = withTaskExecution({ confirmStopped() { confirmed++; } }, () => provider.generate(request({ codeExecutionContext: context })));
+  await closing.promise; assert.equal(confirmed, 0);
+  release.resolve(); await running; assert.equal(confirmed, 1);
+  await provider.close();
+});
+
+test("a native failure without a verified process result cannot certify stop from a drained host alone", async (t) => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = "app-server"; let confirmed = 0;
+  const context = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {}, close: () => ({ settled: true }) });
+  const provider = f.create(result, {}, { appServerRunner: { async run() { throw error("STRUCTURED_PROVIDER_TIMEOUT"); } } });
+  await assert.rejects(withTaskExecution({ confirmStopped() { confirmed++; } }, () => provider.generate(request({ codeExecutionContext: context }))), { code: "STRUCTURED_PROVIDER_TIMEOUT" });
+  assert.equal(confirmed, 0); await provider.close();
+});
+
+test("caller cancellation preserves explicit native reap proof through abort remapping before certifying stop", async (t) => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = "app-server";
+  const entered = gate(), controller = new AbortController(); let confirmed = 0, processOptions;
+  const threadId = "01973bca-3d8b-7000-a000-123456789abc";
+  const process = { exited: false, start(value) { processOptions = value; }, write(line) {
+    const message = JSON.parse(line); if (!message.id) return;
+    const result = message.method.startsWith("thread/") ? { thread: { id: threadId } }
+      : message.method === "turn/start" ? { turn: { id: "turn-1" } } : {};
+    processOptions.onLine({ stream: "stdout", line: JSON.stringify({ id: message.id, result }) });
+    if (message.method === "turn/start") entered.resolve();
+  }, async stop() { this.exited = true; } };
+  const runner = new CodexAppServerRunner({ processFactory: () => process, materialize: async () => ({ command: "fixture", prefixArgs: [] }) });
+  const context = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {}, close: () => ({ settled: true }) });
+  const provider = f.create(result, {}, { appServerRunner: { run(call) {
+    // Policy isolation is tested separately; this fixture isolates the actual
+    // runner's reap certificate and provider abort-reason translation.
+    return runner.run({ ...call, appServer: { ...call.appServer, isolation: undefined } });
+  } } });
+  const running = withTaskExecution({ confirmStopped() { confirmed++; } }, () => provider.generate(request({ codeExecutionContext: context, signal: controller.signal })));
+  const stopped = assert.rejects(running, { code: "STRUCTURED_PROVIDER_CANCELLED" });
+  await entered.promise; controller.abort(); await stopped;
+  assert.equal(process.exited, true); assert.equal(confirmed, 1);
+  await provider.close();
+});
+
+test("execution capability is not serialized, combined with readers, or accepted by exec transport", async (t) => {
+  const f = await fixture(t); let starts = 0;
+  const provider = f.create(() => { starts++; return success(); });
+  const context = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {} });
+  assert.equal(provider.supportsCodeExecution, false);
+  await assert.rejects(provider.generate(request({ codeExecutionContext: context })), { code: "CODE_EXECUTION_UNAVAILABLE" });
+  await assert.rejects(provider.generate(request({ codeExecutionContext: structuredClone(context) })), /codeExecutionContext is invalid/);
+  await assert.rejects(provider.generate(request({ codeExecutionContext: context, codeReadContext: auditedCode().context })), /codeExecutionContext is invalid/);
+  await assert.rejects(provider.generate(request({ codeExecutionContext: context, reviewTarget: {} })), /codeExecutionContext is invalid/);
+  assert.equal(starts, 0); await provider.close();
+});
 
 test("native code reader reaches the full audited BOM source tail and preserves exact write proof", async (t) => {
   const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = "app-server";

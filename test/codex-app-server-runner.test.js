@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { CodexAppServerRunner,didAppServerNotStart,didAppServerNotStartModel } from '../src/lib/codex-app-server-runner.js';
+import { CodexAppServerRunner,didAppServerNotStart,didAppServerNotStartModel,didAppServerReap } from '../src/lib/codex-app-server-runner.js';
 import { ManagedProcess } from '../src/lib/managed-process.js';
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { withTaskExecution } from '../src/lib/task-execution-context.js';
@@ -13,7 +13,7 @@ test('production app-server certifies invalid invocations as not started',async(
   const runner=new CodexAppServerRunner({materialize:async()=>assert.fail('must not materialize or spawn')});
   await assert.rejects(runner.run({}),error=>error.code==='STRUCTURED_PROVIDER_UNAVAILABLE' && didAppServerNotStart(error));
 });
-function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null,initializationFailure=false}={}) {
+function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null,initializationFailure=false,codeJob=false,toolInventory=null,onInterrupt=null}={}) {
   let options; const calls=[]; let finish,interruptId,signalStopping;
   const stopping=new Promise(resolve=>{signalStopping=resolve;});
   const done = new Promise((r)=>{finish=r;});
@@ -23,9 +23,19 @@ function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=fals
     const request=JSON.parse(line); if(!request.id)return;
     calls.push(request); let result={};
     if(request.method==='initialize' && initializationFailure){send({id:request.id,error:{code:-32600,message:'fixture startup refused'}});return;}
+    if(request.method==='config/read') result={config:{
+      features:{...Object.fromEntries(['shell_tool','apps','browser_use','computer_use','image_generation','hooks','plugins','remote_plugin','plugin_sharing','skill_search','skill_mcp_dependency_install','goals','memories','workspace_dependencies','multi_agent_v2','code_mode','multi_agent'].map(name=>[name,false])),skip_host_skill_discovery:true,code_mode_host:true},
+      agents:{enabled:false},web_search:'disabled',approval_policy:'never',sandbox_mode:'read-only',model_provider:'openai',notify:[],mcp_servers:{old:{url:'private'}},
+    }};
     if(request.method.startsWith('thread/'))result={thread:{id:threadId}};
+    if(request.method.startsWith('thread/') && codeJob)Object.assign(result,{approvalPolicy:'never',sandbox:{type:'readOnly',networkAccess:false}});
+    if(request.method==='mcpServerStatus/list') {
+      const namespace=Object.keys(calls.find(call=>call.method.startsWith('thread/')).params.config.mcp_servers).find(name=>name.startsWith('dih_code_job_'));
+      result={data:[{name:namespace,tools:Object.fromEntries((toolInventory??['perform_action','read_source','get_state']).map(name=>[name,{}]))}],nextCursor:null};
+    }
     if(request.method==='turn/start')result={turn:{id:'turn-1'}};
     if(request.method==='turn/steer')result=steerTurnId===false?{}:{turnId:steerTurnId??'turn-1'};
+    if(request.method==='turn/interrupt')onInterrupt?.();
     if(request.method==='turn/interrupt' && manualInterrupt){interruptId=request.id;return;}
     send({id:request.id,result});
     if(request.method==='turn/start' && !hold)queueMicrotask(complete);
@@ -66,7 +76,7 @@ test('live steering goes to the same active turn without rerunning the operation
   });
 });
 test('failed turns never publish a structured result',async()=>{
-  await assert.rejects(invocation(fixture({failed:true}).runner),e=>e.code==='STRUCTURED_PROVIDER_PROCESS_FAILED');
+  await assert.rejects(invocation(fixture({failed:true}).runner),e=>e.code==='STRUCTURED_PROVIDER_PROCESS_FAILED' && didAppServerReap(e));
 });
 
 test('a reaped initialization failure certifies no model turn without claiming no process spawned',async()=>{
@@ -84,7 +94,7 @@ test('unknown terminal status is not accepted as a completed response',async()=>
   }),{code:'STRUCTURED_PROVIDER_RESPONSE_INVALID'});
 });
 test('unconfirmed process stop remains fenced',async()=>{
-  await assert.rejects(invocation(fixture({stopFailure:true}).runner),e=>e.code==='STRUCTURED_PROVIDER_REAP_FAILED');
+  await assert.rejects(invocation(fixture({stopFailure:true}).runner),e=>e.code==='STRUCTURED_PROVIDER_REAP_FAILED' && !didAppServerReap(e));
 });
 
 test('the real managed stdio process exchanges RPC frames without closing its input early',async()=>{
@@ -205,4 +215,52 @@ test('resuming a different native thread fails before a model turn starts',async
   const f=fixture();
   await assert.rejects(invocation(f.runner,run=>run(),{previous:'01973bca-3d8b-7000-a000-987654321abc'}),error=>error.code==='STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED');
   assert.equal(f.calls.some(call=>call.method==='turn/start'),false);
+});
+
+test('a continuous code channel verifies exact host tools and revokes admission at native completion',async()=>{
+  const f=fixture({codeJob:true});let revoked=false,confirmed=0;
+  await invocation(f.runner,run=>withTaskExecution({reportProgress(){},confirmStopped(){confirmed++;}},run),{
+    isolation:{channel:'code-job',execution:{url:'http://127.0.0.1:1234/code-execution/token',revoke(){revoked=true;}},agentConfigPath:'private.toml',ephemeral:true},
+  });
+  assert.equal(revoked,true);assert.equal(confirmed,0);
+  const thread=f.calls.find(call=>call.method==='thread/start');
+  assert.match(thread.params.baseInstructions,/one continuous controlled code job/);
+  assert.equal(thread.params.config.mcp_servers.old.enabled,false);
+  const input=f.calls.find(call=>call.method==='turn/start').params.input[0].text;
+  assert.match(input,/dih_code_job_[a-f0-9]{16}/);
+});
+
+test('continuous pause revokes tools before interrupt and defers stop certification to the host drain',async()=>{
+  let revoked=false,confirmed=0,live;
+  const f=fixture({hold:true,codeJob:true,onInterrupt(){assert.equal(revoked,true);}});
+  await invocation(f.runner,async run=>{
+    const running=withTaskExecution({reportProgress(){},confirmStopped(){confirmed++;},registerLiveControl(value){live=value;return()=>{};}},run);
+    for(let i=0;i<100&&!live;i++)await new Promise(resolve=>setImmediate(resolve));
+    await live.interrupt();
+    const result=await running;
+    assert.equal(result.interrupted,true);assert.equal(confirmed,0);
+  },{isolation:{channel:'code-job',execution:{url:'http://127.0.0.1:1234/code-execution/token',revoke(){revoked=true;}},agentConfigPath:'private.toml',ephemeral:true}});
+});
+
+test('review tools and extra tools cannot enter a continuous code turn',async()=>{
+  for(const toolInventory of [['read_document','read_source','list_directory'],['perform_action','read_source','get_state','shell']]) {
+    const f=fixture({codeJob:true,toolInventory});let revoked=false;
+    await assert.rejects(invocation(f.runner,run=>run(),{isolation:{channel:'code-job',execution:{url:'http://127.0.0.1:1234/code-execution/token',revoke(){revoked=true;}},agentConfigPath:'private.toml',ephemeral:true}}),{code:'STRUCTURED_PROVIDER_UNAVAILABLE'});
+    assert.equal(revoked,true);assert.equal(f.calls.some(call=>call.method==='turn/start'),false);
+  }
+});
+
+test('a captured late interrupt after terminal completion does not send an RPC during process teardown',async()=>{
+  let releaseStop,live;
+  const stopGate={promise:new Promise(resolve=>{releaseStop=resolve;})};
+  const f=fixture({hold:true,codeJob:true,stopGate});let revoked=false;
+  await invocation(f.runner,async run=>{
+    const running=withTaskExecution({reportProgress(){},registerLiveControl(value){live=value;return()=>{};}},run);
+    for(let i=0;i<100&&!live;i++)await new Promise(resolve=>setImmediate(resolve));
+    f.complete();await f.stopping;
+    await live.interrupt();
+    assert.equal(revoked,true);
+    assert.equal(f.calls.some(call=>call.method==='turn/interrupt'),false);
+    releaseStop();await running;
+  },{isolation:{channel:'code-job',execution:{url:'http://127.0.0.1:1234/code-execution/token',revoke(){revoked=true;}},agentConfigPath:'private.toml',ephemeral:true}});
 });

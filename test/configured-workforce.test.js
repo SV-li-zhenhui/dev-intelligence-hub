@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import test from "node:test";
 import * as configuredWorkforceApi from "../src/services/configured-workforce.js";
+import { createCodeExecutionContext } from "../src/lib/code-execution-context.js";
 import {
   createConfiguredBrainRouter,
   createConfiguredWorkforce,
@@ -321,6 +322,32 @@ test("configured supervised CLIs stay remote and declare one process attempt", a
       (error) => error?.code === "REMOTE_DATA_NOT_AUTHORIZED",
     );
   }
+});
+
+test("configured routing carries explicit continuous execution support and opaque identity", async () => {
+  const context = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {} });
+  let received;
+  const router = createOwnedTestConfiguredBrainRouter({ brainProviders: { cli: { kind: "codex-cli" } } }, {
+    supervisedCliProviderFactory(options) {
+      return { id: options.id, remote: true, supportsCodeExecution: true,
+        async generate(value) { received = value; return '{"ok":true}'; } };
+    },
+  });
+  const brain = { provider: "cli", model: "gpt-6.1-sol", remoteData: { requirements: true, code: true, memory: false } };
+  assert.equal(router.describe(brain).supportsCodeExecution, true);
+  await router.generate({ brain, messages: MESSAGES, schema: SCHEMA, dataClasses: ["code"], codeExecutionContext: context });
+  assert.equal(received.codeExecutionContext, context);
+  await router.close();
+});
+
+test("configured routing rejects execution-support accessors without invoking them", () => {
+  let reads = 0;
+  assert.throws(() => createOwnedTestConfiguredBrainRouter({ brainProviders: { cli: { kind: "codex-cli" } } }, {
+    supervisedCliProviderFactory(options) {
+      return { id: options.id, remote: true, get supportsCodeExecution() { reads++; return true; }, async generate() {} };
+    },
+  }), /code execution support is invalid/);
+  assert.equal(reads, 0);
 });
 
 test("configured routing forwards credential mode and provider availability", async () => {

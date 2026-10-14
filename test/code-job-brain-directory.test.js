@@ -9,6 +9,7 @@ import {
 import { BrainRouter } from "../src/services/brain-router.js";
 import { createHash } from "node:crypto";
 import { createCodeReadContext, beginCodeReadSession, hasCompleteCodeRead } from "../src/lib/code-read-context.js";
+import { createCodeExecutionContext, beginCodeExecutionSession } from "../src/lib/code-execution-context.js";
 
 function roleBrain(remoteData = {
   requirements: false,
@@ -94,6 +95,53 @@ function fakeRouter(responses = [decision()]) {
 function authorized(callback = async () => {}) {
   return { beforeGenerate: callback };
 }
+
+test("continuous directory returns only final complete and leaves fresh readiness to the host", async () => {
+  const execution = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {} });
+  let calls = 0;
+  const directory = new CodeJobBrainDirectory({ roles: roleBrain(), brainRouter: {
+    describe: () => ({ supportsCodeExecution: true }),
+    async generate(value) {
+      calls++;
+      assert.equal(value.codeExecutionContext, execution);
+      assert.match(value.messages[0].content, /get_state first/);
+      assert.match(value.messages[0].content, /initial observations and profile counts can become stale/);
+      return decision({ type: "complete", outcome: "done", evidence: [] });
+    },
+  } });
+  // The initial count is one. Required checks can pass within this single turn;
+  // the worker validates their fresh audit state before it executes complete.
+  const result = await directory.decide(input({ codeExecutionContext: execution }), authorized());
+  assert.equal(result.action.type, "complete");
+  assert.equal(calls, 1);
+});
+
+test("a continuous nonterminal result is rejected without replaying earlier tool actions", async () => {
+  const execution = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {} });
+  let calls = 0;
+  const directory = new CodeJobBrainDirectory({ roles: roleBrain(), brainRouter: {
+    describe: () => ({ supportsCodeExecution: true }), generate: async () => { calls++; return decision(); },
+  } });
+  await assert.rejects(directory.decide(input({ codeExecutionContext: execution }), authorized()), { code: "CODE_BRAIN_RESPONSE_INVALID" });
+  assert.equal(calls, 1);
+  assert.throws(() => beginCodeExecutionSession(execution), { code: "CODE_EXECUTION_SESSION_REVOKED" });
+});
+
+test("continuous cancellation signal crosses trusted authorization without entering model messages", async () => {
+  const execution = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {} });
+  const controller = new AbortController(); let received;
+  const directory = new CodeJobBrainDirectory({ roles: roleBrain(), brainRouter: {
+    describe: () => ({ supportsCodeExecution: true }), async generate(value) {
+      received = value;
+      assert.equal(value.signal, controller.signal);
+      assert.equal(JSON.stringify(value.messages).includes('"signal"'), false);
+      return decision({ type: "complete", outcome: "done", evidence: [] });
+    },
+  } });
+  await directory.decide(input({ codeExecutionContext: execution }), { ...authorized(), signal: controller.signal });
+  assert.ok(received);
+  await assert.rejects(directory.decide(input({ codeExecutionContext: execution }), { ...authorized(), signal: {} }), /signal is invalid/);
+});
 
 test("directory forwards opaque audit access and revokes proofs when its business permission validation fails", async () => {
   const content = "\uFEFF中文" + "x".repeat(70 * 1024) + "TAIL";

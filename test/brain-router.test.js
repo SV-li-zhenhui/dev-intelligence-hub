@@ -7,6 +7,7 @@ import test from "node:test";
 import { CodexCliSessionStore } from "../src/adapters/codex-cli-session-store.js";
 import { BrainRouter } from "../src/services/brain-router.js";
 import { createCodeReadContext } from "../src/lib/code-read-context.js";
+import { createCodeExecutionContext } from "../src/lib/code-execution-context.js";
 
 const BRAIN = Object.freeze({
   provider: "codex",
@@ -298,4 +299,25 @@ test("opaque controlled code reading preserves authorization, capability identit
   await router.generate({ ...request, dataClasses: ["code"] });
   assert.equal(calls[0].codeReadContext, context);
   assert.equal(router.describe(BRAIN).supportsCodeReading, true);
+});
+
+test("continuous code execution preserves opaque authority and never leaks into review or unsupported providers", async () => {
+  const context = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {} });
+  const calls = [];
+  const router = new BrainRouter({ providers: [provider({ supportsCodeExecution: true,
+    async generate(value) { calls.push(value); return '{"ok":true}'; } })] });
+  const request = { brain: BRAIN, messages: [], schema: { type: "object" }, codeExecutionContext: context };
+  for (const overrides of [
+    { dataClasses: ["requirements"] },
+    { dataClasses: ["code"], codeExecutionContext: structuredClone(context) },
+    { dataClasses: ["code"], reviewTarget: { pullRequestNumber: 42 } },
+    { dataClasses: ["code"], codeReadContext: createCodeReadContext({ jobId: "job", workspaceRevision: "a".repeat(64), documents: [] }) },
+  ]) await assert.rejects(router.generate({ ...request, ...overrides }), { code: "REMOTE_DATA_CLASSIFICATION_REQUIRED" });
+  await assert.rejects(router.generate({ ...request, dataClasses: ["code"], brain: { ...BRAIN, remoteData: { ...BRAIN.remoteData, code: false } } }), { code: "REMOTE_DATA_NOT_AUTHORIZED" });
+  await assert.rejects(new BrainRouter({ providers: [provider()] }).generate({ ...request, dataClasses: ["code"] }), { code: "CODE_EXECUTION_UNAVAILABLE" });
+  assert.equal(calls.length, 0);
+  await router.generate({ ...request, dataClasses: ["code"] });
+  assert.equal(calls[0].codeExecutionContext, context);
+  assert.equal(router.describe(BRAIN).supportsCodeExecution, true);
+  assert.equal(Object.hasOwn(calls[0], "reviewTarget"), false);
 });

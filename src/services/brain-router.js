@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { normalizeSessionKey } from "../lib/session-key.js";
 import { isCodeReadContext } from "../lib/code-read-context.js";
+import { isCodeExecutionContext } from "../lib/code-execution-context.js";
 
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
@@ -179,6 +180,7 @@ function normalizeProvider(value) {
     supportsEntitySessions: value.supportsEntitySessions === true,
     supportsReviewReading: value.supportsReviewReading === true,
     supportsCodeReading: value.supportsCodeReading === true,
+    supportsCodeExecution: value.supportsCodeExecution === true,
     supportsNativeReviewSkills: value.supportsNativeReviewSkills === true,
     ...(value.supportsEntitySessions === true
       ? { sessionIsolationKey: value.sessionIsolationKey }
@@ -219,6 +221,7 @@ function frozenDescription(provider, brain) {
     ...(provider.singleAttempt ? { singleAttempt: true } : {}),
     ...(provider.supportsReviewReading ? { supportsReviewReading: true } : {}),
     ...(provider.supportsCodeReading ? { supportsCodeReading: true } : {}),
+    ...(provider.supportsCodeExecution ? { supportsCodeExecution: true } : {}),
     ...(provider.supportsNativeReviewSkills ? { supportsNativeReviewSkills: true } : {}),
   });
 }
@@ -253,6 +256,7 @@ export class BrainRouter {
     signal = null,
     reviewTarget = null,
     codeReadContext = null,
+    codeExecutionContext = null,
   } = {}) {
     const brain = normalizeBrainConfig(brainValue);
     const provider = this.#provider(brain.provider);
@@ -264,8 +268,15 @@ export class BrainRouter {
         (!isCodeReadContext(codeReadContext) || !classes.includes("code"))) {
       throw routerError("REMOTE_DATA_CLASSIFICATION_REQUIRED", "Code reading requires trusted code classification", 403);
     }
+    if (codeExecutionContext !== null &&
+        (!isCodeExecutionContext(codeExecutionContext) || !classes.includes("code") || reviewTarget !== null || codeReadContext !== null)) {
+      throw routerError("REMOTE_DATA_CLASSIFICATION_REQUIRED", "Code execution requires a trusted isolated code context", 403);
+    }
     if (codeReadContext !== null && !provider.supportsCodeReading) {
       throw routerError("CODE_READING_UNAVAILABLE", "Brain does not support controlled code reading", 503);
+    }
+    if (codeExecutionContext !== null && !provider.supportsCodeExecution) {
+      throw routerError("CODE_EXECUTION_UNAVAILABLE", "Brain does not support continuous controlled code execution", 503);
     }
     const requestSignal = normalizeAbortSignal(signal);
     if (requestSignal?.aborted) {
@@ -301,6 +312,7 @@ export class BrainRouter {
       schema,
       ...(reviewTarget !== null && provider.supportsReviewReading ? { reviewTarget } : {}),
       ...(codeReadContext === null ? {} : { codeReadContext }),
+      ...(codeExecutionContext === null ? {} : { codeExecutionContext }),
       ...(sessionKeyValue === null || !provider.supportsEntitySessions
         ? {}
         : { sessionKey: authorizedSessionKey(sessionKeyValue, provider, brain, classes) }),
