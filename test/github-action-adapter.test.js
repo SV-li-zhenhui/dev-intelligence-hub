@@ -216,6 +216,15 @@ class FakeRunner {
     let response = this.responses.shift();
     if (typeof response === "function") response = await response(input);
     if (response instanceof Error) throw response;
+    if (input.args.includes("graphql") && response?.number !== undefined) {
+      const repo = new URL(response.url).pathname.split("/").slice(1, 3).join("/");
+      const headRepo = response.headRepository?.nameWithOwner;
+      response = { data: { repository: { nameWithOwner: repo, pullRequest: {
+        ...response, author: { login: "contributor" }, changedFiles: 1,
+        baseRef: { name: response.baseRefName, repository: { nameWithOwner: repo }, target: { oid: response.liveBaseOid ?? response.baseRefOid } },
+        headRef: { name: response.headRefName, repository: { nameWithOwner: headRepo }, target: { oid: response.headRefOid } },
+      } } } };
+    }
     const stdout = response?.__jsonLines
       ? response.__jsonLines.map((value) => JSON.stringify(value)).join("\n")
       : JSON.stringify(response);
@@ -491,7 +500,8 @@ test("work proposal reviews verify the full sealed Git target at execution time"
     url: "https://github.com/acme/command-center/pull/42",
     state: "OPEN",
     baseRefName: "main",
-    baseRefOid: BASE_HEAD,
+    baseRefOid: "d".repeat(40),
+    liveBaseOid: BASE_HEAD,
     headRefName: "fix/conflict",
     headRefOid: HEAD,
     headRepository: { nameWithOwner: "contributor/command-center" },
@@ -505,15 +515,13 @@ test("work proposal reviews verify the full sealed Git target at execution time"
     { status: "absent", code: "GITHUB_MARKER_ABSENT" },
   );
   assert.equal(matchingVerifier.calls.length, 1);
-  assert.equal(
-    matching.calls[2].args.at(-1),
-    "number,url,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepository",
-  );
+  assert.equal(matching.calls[2].args.includes("graphql"), true);
+  assert.match(matching.calls[2].args.find((arg) => arg.startsWith("query=")), /baseRef \{ name repository \{ nameWithOwner \} target/);
 
   const changedBase = new FakeRunner([
     actor(),
     pages([]),
-    { ...currentTarget, baseRefOid: "e".repeat(40) },
+    { ...currentTarget, liveBaseOid: "e".repeat(40) },
   ]);
   assert.deepEqual(
     await createAdapter(changedBase, {
@@ -558,7 +566,7 @@ test("work proposal execution rechecks ledger authority and the full target befo
     pages([]),
     currentTarget,
     actor(),
-    { ...currentTarget, baseRefOid: "e".repeat(40) },
+    { ...currentTarget, liveBaseOid: "e".repeat(40) },
   ]);
   const stale = await createAdapter(changedBase, {
     inputAuthorityVerifier: acceptingInputAuthorityVerifier(),

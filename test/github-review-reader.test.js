@@ -8,7 +8,7 @@ const TARGET = { pullRequestNumber: 42, gitTarget: {
   headRepository: "contributor/repo", headRefName: "feature", headRefOid: "b".repeat(40),
 } };
 
-function fixture({ changed = 117, moved = false, missingFile = false, missingDiff = false } = {}) {
+function fixture({ changed = 117, moved = false, movedBase = false, missingFile = false, missingDiff = false, liveBase = TARGET.gitTarget.baseRefOid } = {}) {
   const calls = [];
   const files = Array.from({ length: changed }, (_, i) => ({ filename: `src/${i}.js`, status: "modified", additions: 2, deletions: 1 }));
   const diff = files.slice(0, missingDiff ? -1 : undefined).map((file) => `diff --git a/${file.filename} b/${file.filename}\n--- a/${file.filename}\n+++ b/${file.filename}\n@@ -1 +1 @@\n-old\n+${"new ".repeat(180)}\n`).join("");
@@ -17,11 +17,15 @@ function fixture({ changed = 117, moved = false, missingFile = false, missingDif
     assert.equal(command, "gh");
     calls.push(args);
     const endpoint = args[3];
+    if (endpoint === "graphql") { metadataCalls += 1; const headOid = moved && metadataCalls > 1 ? "c".repeat(40) : TARGET.gitTarget.headRefOid; return { data: { repository: { nameWithOwner: "acme/repo", pullRequest: {
+      number: 42, url: "https://github.com/acme/repo/pull/42", state: "OPEN", author: { login: "contributor" }, changedFiles: changed,
+      baseRefName: "main", baseRefOid: TARGET.gitTarget.baseRefOid,
+      baseRef: { name: "main", repository: { nameWithOwner: "acme/repo" }, target: { oid: movedBase && metadataCalls > 1 ? "d".repeat(40) : liveBase } },
+      headRefName: "feature", headRefOid: headOid,
+      headRef: { name: "feature", repository: { nameWithOwner: "contributor/repo" }, target: { oid: headOid } },
+      headRepository: { nameWithOwner: "contributor/repo" },
+    } } } }; }
     if (endpoint === "user") return { login: "reviewer" };
-    if (endpoint === "repos/acme/repo/pulls/42") {
-      metadataCalls += 1;
-      return { changed_files: changed, head: { sha: moved && metadataCalls > 1 ? "c".repeat(40) : TARGET.gitTarget.headRefOid, repo: { full_name: "contributor/repo" } }, base: { sha: TARGET.gitTarget.baseRefOid, repo: { full_name: "acme/repo" } } };
-    }
     if (endpoint === "repos/acme/repo/pulls/42/files?per_page=100") {
       assert.ok(args.includes("--paginate"));
       return [files.slice(0, 100), files.slice(100, missingFile ? -1 : undefined)];
@@ -40,6 +44,30 @@ function fixture({ changed = 117, moved = false, missingFile = false, missingDif
   };
   return { reader: new GitHubReviewReader({ run, runText }), files, diff, calls };
 }
+
+test("historical PR base SHA cannot authorize a reader against a moved live base", async () => {
+  const { reader } = fixture({ changed: 1, liveBase: "d".repeat(40) });
+  let session;
+  try {
+    await assert.rejects(async () => { session = await reader.open(TARGET); }, { code: "PR_REVIEW_READ_HEAD_CHANGED" });
+  } finally { await session?.close(); }
+});
+
+test("a live base movement after the diff read rejects mixed evidence despite an unchanged historical scalar", async () => {
+  await assert.rejects(fixture({ changed: 1, movedBase: true }).reader.open(TARGET), { code: "PR_REVIEW_READ_HEAD_CHANGED" });
+});
+
+test("an account change after reading the diff cannot produce a review session", async () => {
+  const { reader } = fixture({ changed: 1 });
+  const run = reader.run;
+  let accountReads = 0;
+  reader.run = async (command, args, options) => {
+    if (args[3] === "user" && ++accountReads === 2) return { login: "other-account" };
+    return run(command, args, options);
+  };
+  await assert.rejects(reader.open(TARGET), { code: "PR_REVIEW_READ_ACCOUNT_CHANGED" });
+  assert.equal(accountReads, 2);
+});
 
 async function rpc(session, method, params = {}) {
   const response = await fetch(session.url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });

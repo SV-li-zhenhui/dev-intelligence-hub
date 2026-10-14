@@ -82,11 +82,20 @@ test("bounded timeline without a matching event cannot invent a receipt time", (
 test("reviewer-only PRs are discovered and enriched once even if also assigned", async () => {
   let details = 0;
   const record = { number: 1, title: "fix", url: "https://github.com/acme/repo/pull/1", repository: { nameWithOwner: "acme/repo" }, author: { login: "dev" }, state: "open" };
+  const target = { number: 1, url: record.url, state: "OPEN", author: record.author, changedFiles: 1,
+    baseRefName: "main", baseRefOid: "a".repeat(40), headRefName: "fix/review", headRefOid: "b".repeat(40),
+    headRepository: { nameWithOwner: "acme/repo" } };
   const adapter = new GitHubAdapter({ run: async (_command, args) => {
+    if (args.some((value) => value.startsWith("query=") && value.includes("MyDashboardCurrentPullRequestTargets {"))) {
+      return { data: { r0: { nameWithOwner: "acme/repo", pullRequest: { ...target,
+        baseRef: { name: target.baseRefName, repository: record.repository, target: { oid: target.baseRefOid } },
+        headRef: { name: target.headRefName, repository: target.headRepository, target: { oid: target.headRefOid } },
+      } } } };
+    }
     if (args[0] === "api") return { login: "me" };
     if (args[0] === "search") return args.includes("--review-requested=@me") ? [record] : [];
     details++;
-    return { number: 1, url: record.url, reviews: [], labels: [], assignees: [], statusCheckRollup: [] };
+    return { ...target, reviews: [], labels: [], assignees: [], statusCheckRollup: [] };
   } });
   const [pr] = await adapter.searchRelevantPullRequests();
   assert.equal(pr.relation, "review_requested");

@@ -7,6 +7,7 @@ import {
   samePullRequestExecutionBinding,
 } from "../domain/pull-request-execution-binding.js";
 import { samePullRequestGitTarget } from "../domain/git-tool-contract.js";
+import { currentPullRequestTargetArgs, projectGitHubCurrentPullRequestTarget } from "./github-current-pull-request-target.js";
 import {
   GitHubCredentialSourceError,
 } from "../lib/github-credential-source.js";
@@ -952,15 +953,28 @@ class GitHubActionAdapter {
 
   async #currentTarget(envelope, childEnvironment, operation = null) {
     const targetAware = Boolean(envelope.action.inputBinding);
+    if (targetAware) {
+      const identity = { repository: envelope.target.repo, number: envelope.target.number, sourceAccountId: envelope.actor.accountId };
+      try {
+        const observed = projectGitHubCurrentPullRequestTarget(
+          await this.#runJson(["api", ...currentPullRequestTargetArgs(identity).slice(3)], { childEnvironment, operation }), identity);
+        if (observed.state !== "OPEN") return { matches: false, actualVersion: observed.headRefOid };
+        return {
+          matches: samePullRequestGitTarget(envelope.action.inputBinding.gitTarget, observed.gitTarget),
+          actualVersion: observed.headRefOid,
+        };
+      } catch (error) {
+        if (error.code !== "GITHUB_CURRENT_PR_TARGET_INVALID") throw error;
+        throw actionError("GITHUB_PROTOCOL");
+      }
+    }
     const value = await this.#runJson(
       [
         "pr",
         "view",
         `https://github.com/${envelope.target.repo}/pull/${envelope.target.number}`,
         "--json",
-        targetAware
-          ? "number,url,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepository"
-          : "headRefOid",
+        "headRefOid",
       ],
       { childEnvironment, operation },
     );
@@ -971,40 +985,8 @@ class GitHubActionAdapter {
     ) {
       throw actionError("GITHUB_PROTOCOL");
     }
-    if (!targetAware) {
-      return {
-        matches: value.headRefOid === envelope.target.version,
-        actualVersion: value.headRefOid,
-      };
-    }
-    const expected = envelope.action.inputBinding.gitTarget;
-    const expectedUrl =
-      `https://github.com/${envelope.target.repo}/pull/${envelope.target.number}`;
-    if (
-      value.number !== envelope.target.number ||
-      typeof value.url !== "string" ||
-      value.url.toLowerCase() !== expectedUrl.toLowerCase() ||
-      value.state !== "OPEN" ||
-      typeof value.baseRefName !== "string" ||
-      typeof value.baseRefOid !== "string" ||
-      typeof value.headRefName !== "string" ||
-      typeof value.headRepository?.nameWithOwner !== "string"
-    ) {
-      return { matches: false, actualVersion: value.headRefOid };
-    }
-    const observed = {
-      schemaVersion: 1,
-      provider: "github",
-      sourceAccountId: envelope.actor.accountId,
-      baseRepository: envelope.target.repo,
-      baseRefName: value.baseRefName,
-      baseRefOid: value.baseRefOid,
-      headRepository: value.headRepository.nameWithOwner,
-      headRefName: value.headRefName,
-      headRefOid: value.headRefOid,
-    };
     return {
-      matches: samePullRequestGitTarget(expected, observed),
+      matches: value.headRefOid === envelope.target.version,
       actualVersion: value.headRefOid,
     };
   }

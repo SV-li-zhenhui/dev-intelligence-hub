@@ -8,6 +8,52 @@ import {
   summarizeReviewFacts,
 } from "../src/adapters/github-adapter.js";
 
+function currentTargetPr(overrides = {}) {
+  const target = {
+    number: 42,
+    url: "https://github.com/acme/repo/pull/42",
+    state: "OPEN",
+    author: { login: "contributor" },
+    changedFiles: 1,
+    baseRefName: "main",
+    baseRefOid: "a".repeat(40),
+    headRefName: "fix/conflict",
+    headRefOid: "b".repeat(40),
+    headRepository: { nameWithOwner: "contributor/repo" },
+    ...overrides,
+  };
+  return {
+    ...target,
+    baseRef: Object.hasOwn(overrides, "baseRef") ? overrides.baseRef : {
+      name: target.baseRefName, repository: { nameWithOwner: "acme/repo" }, target: { oid: target.baseRefOid },
+    },
+    headRef: Object.hasOwn(overrides, "headRef") ? overrides.headRef : {
+      name: target.headRefName, repository: target.headRepository, target: { oid: target.headRefOid },
+    },
+  };
+}
+
+function currentTargetResponse(overrides = {}) {
+  return { data: { repository: { nameWithOwner: "acme/repo", pullRequest: currentTargetPr(overrides) } } };
+}
+
+function isCurrentTargetCall(args) {
+  return args.some((value) => value.startsWith("query=") && value.includes("MyDashboardCurrentPullRequestTarget("));
+}
+
+function isCurrentTargetBatchCall(args) {
+  return args.some((value) => value.startsWith("query=") && value.includes("MyDashboardCurrentPullRequestTargets {"));
+}
+
+function currentTargetBatchResponse(args, target = (number) => ({ number, url: `https://github.com/acme/repo/pull/${number}` })) {
+  const query = args.find((value) => value.startsWith("query="));
+  const aliases = [...query.matchAll(/(r\d+):repository\(owner:"([^"]+)",name:"([^"]+)"\)\s*\{\s*nameWithOwner pullRequest\(number:(\d+)\)/gu)];
+  assert.ok(aliases.length > 0, "current-target batch must have aliased repository selections");
+  return { data: Object.fromEntries(aliases.map(([, alias, owner, name, number]) => [alias, {
+    nameWithOwner: `${owner}/${name}`, pullRequest: currentTargetPr(target(Number(number))),
+  }])) };
+}
+
 test("a pull request assigned to me by another author means review", () => {
   assert.equal(
     classifyPullRequestRelation("assigned", "local-owner", "other-user"),
@@ -482,6 +528,7 @@ test("relevant PR search uses the active account, returns every result, and fetc
   };
   const run = async (_command, args) => {
     calls.push(args);
+    if (isCurrentTargetBatchCall(args)) return currentTargetBatchResponse(args, (number) => ({ number, url: `https://github.com/acme/repo/pull/${number}`, headRefName: `feature-${number}`, headRefOid: `${number}`.repeat(40), headRepository: { nameWithOwner: "acme/repo" } }));
     if (args[0] === "api") return { login: "runtime-user" };
     if (args[0] === "search" && args.includes("--assignee=@me")) {
       return [own, assigned];
@@ -542,7 +589,7 @@ test("relevant PR search uses the active account, returns every result, and fetc
   assert.ok(items.every((item) => item.reviewFactsAvailable));
 });
 
-test("relevant PR search produces a complete atomic Git target from real CLI JSON", async () => {
+test("relevant PR search uses the live base Ref instead of historical CLI and PR scalars", async () => {
   const record = {
     number: 42,
     title: "Resolve conflict",
@@ -553,6 +600,11 @@ test("relevant PR search produces a complete atomic Git target from real CLI JSO
   };
   const adapter = new GitHubAdapter({
     run: async (_command, args) => {
+      if (isCurrentTargetBatchCall(args)) return currentTargetBatchResponse(args, (number) => ({
+        number, url: `https://github.com/acme/repo/pull/${number}`,
+        baseRefOid: "d".repeat(40),
+        baseRef: { name: "main", repository: { nameWithOwner: "acme/repo" }, target: { oid: "a".repeat(40) } },
+      }));
       if (args[0] === "api") return { login: "runtime-user" };
       if (args[0] === "search" && args.includes("--assignee=@me")) {
         return [record];
@@ -570,7 +622,7 @@ test("relevant PR search produces a complete atomic Git target from real CLI JSO
           assignees: [],
           milestone: null,
           baseRefName: "main",
-          baseRefOid: "a".repeat(40),
+          baseRefOid: "d".repeat(40),
           headRefName: "fix/conflict",
           headRefOid: "b".repeat(40),
           headRepository: { id: "R_kgDOExample", name: "repo" },
@@ -602,6 +654,44 @@ test("relevant PR search produces a complete atomic Git target from real CLI JSO
   });
 });
 
+test("discovery reads current PR targets in bounded batches of 25", async () => {
+  const records = Array.from({ length: 101 }, (_, index) => ({
+    number: index + 1,
+    title: `PR ${index + 1}`,
+    url: `https://github.com/acme/repo/pull/${index + 1}`,
+    repository: { nameWithOwner: "acme/repo" },
+    author: { login: "contributor" },
+    state: "open",
+  }));
+  const batchSizes = [];
+  let detailCalls = 0;
+  const adapter = new GitHubAdapter({ run: async (_command, args) => {
+    if (isCurrentTargetBatchCall(args)) {
+      const response = currentTargetBatchResponse(args);
+      batchSizes.push(Object.keys(response.data).length);
+      return response;
+    }
+    if (args[0] === "api") return { login: "runtime-user" };
+    if (args[0] === "search") return args.includes("--assignee=@me") ? records : [];
+    if (args[0] === "pr") {
+      detailCalls += 1;
+      const number = Number(args[2].split("/").at(-1));
+      return { ...currentTargetPr({ number, url: `https://github.com/acme/repo/pull/${number}` }),
+        headRepository: { name: "repo" }, headRepositoryOwner: { login: "contributor" },
+        reviews: [], assignees: [], labels: [], statusCheckRollup: [],
+      };
+    }
+    assert.fail(`Unexpected command: ${args.join(" ")}`);
+  } });
+
+  const items = await adapter.searchRelevantPullRequests();
+
+  assert.equal(items.length, 101);
+  assert.deepEqual(batchSizes, [25, 25, 25, 25, 1]);
+  assert.equal(detailCalls, 101);
+  assert.ok(items.every((item) => item.gitTargetAvailable && item.gitTarget.baseRefOid === "a".repeat(40)));
+});
+
 test("a partial PR detail failure makes the source stale instead of returning mixed facts", async () => {
   const record = {
     number: 8,
@@ -613,6 +703,7 @@ test("a partial PR detail failure makes the source stale instead of returning mi
   };
   const adapter = new GitHubAdapter({
     run: async (_command, args) => {
+      if (isCurrentTargetBatchCall(args)) return currentTargetBatchResponse(args);
       if (args[0] === "api") return { login: "runtime-user" };
       if (args[0] === "search" && args.includes("--assignee=@me")) {
         return [record];
@@ -629,7 +720,7 @@ test("a partial PR detail failure makes the source stale instead of returning mi
   );
 });
 
-test("an incomplete live Git target is explicit and cannot masquerade as legacy facts", async () => {
+test("a deleted live Ref disables only that PR while healthy discovery keeps its current target", async () => {
   const record = {
     number: 8,
     title: "Deleted fork PR",
@@ -640,20 +731,25 @@ test("an incomplete live Git target is explicit and cannot masquerade as legacy 
   };
   const adapter = new GitHubAdapter({
     run: async (_command, args) => {
+      if (isCurrentTargetBatchCall(args)) return currentTargetBatchResponse(args, (number) => ({
+        number, url: `https://github.com/acme/repo/pull/${number}`,
+        ...(number === 8 ? { headRef: null, headRepository: null } : {}),
+      }));
       if (args[0] === "api") return { login: "runtime-user" };
       if (args[0] === "search" && args.includes("--assignee=@me")) {
-        return [record];
+        return [record, { ...record, number: 9, url: "https://github.com/acme/repo/pull/9" }];
       }
       if (args[0] === "search") return [];
+      const number = Number(args[2].split("/").at(-1));
       return {
-        number: 8,
-        url: "https://github.com/acme/repo/pull/8",
+        number,
+        url: `https://github.com/acme/repo/pull/${number}`,
         baseRefName: "main",
         baseRefOid: "a".repeat(40),
         headRefName: "fix/conflict",
         headRefOid: "b".repeat(40),
-        headRepository: null,
-        headRepositoryOwner: null,
+        headRepository: number === 8 ? null : { name: "repo", nameWithOwner: "contributor/repo" },
+        headRepositoryOwner: number === 8 ? null : { login: "contributor" },
         reviews: [],
         assignees: [],
         labels: [],
@@ -662,12 +758,35 @@ test("an incomplete live Git target is explicit and cannot masquerade as legacy 
     },
   });
 
-  const [item] = await adapter.searchRelevantPullRequests();
+  const [unavailable, healthy] = await adapter.searchRelevantPullRequests();
+  assert.equal(unavailable.number, 8);
+  assert.equal(unavailable.gitTargetAvailable, false);
+  assert.equal(Object.hasOwn(unavailable, "gitTarget"), false);
+  assert.equal(healthy.number, 9);
+  assert.equal(healthy.gitTargetAvailable, true);
+  assert.equal(healthy.gitTarget.baseRefOid, "a".repeat(40));
+  await assert.rejects(adapter.loadReviewContext(unavailable), { code: "PR_CONTEXT_STALE" });
+});
 
-  assert.equal(item.gitTargetAvailable, false);
-  assert.equal(Object.hasOwn(item, "gitTarget"), false);
-  assert.equal(Object.hasOwn(item, "headRepository"), false);
-  assert.equal(item.headRefOid, "b".repeat(40));
+test("stale open search results enrich terminal PRs with deleted refs without executable targets", async () => {
+  for (const state of ["CLOSED", "MERGED"]) {
+    const record = { number: 42, title: "Finished PR", url: "https://github.com/acme/repo/pull/42",
+      repository: { nameWithOwner: "acme/repo" }, author: { login: "contributor" }, state: "open" };
+    const adapter = new GitHubAdapter({ run: async (_command, args) => {
+      if (isCurrentTargetBatchCall(args)) return currentTargetBatchResponse(args, () => ({
+        state, baseRef: null, headRef: null, headRepository: null,
+      }));
+      if (args[0] === "api") return { login: "runtime-user" };
+      if (args[0] === "search") return args.includes("--assignee=@me") ? [record] : [];
+      if (args[0] === "pr") return { number: 42, url: record.url, headRefOid: "b".repeat(40),
+        headRepository: null, reviews: [], assignees: [], labels: [], statusCheckRollup: [] };
+      assert.fail("unexpected terminal enrichment request");
+    } });
+    const [item] = await adapter.searchRelevantPullRequests();
+    assert.equal(item.state, state.toLowerCase());
+    assert.equal(item.gitTargetAvailable, false);
+    assert.equal(Object.hasOwn(item, "gitTarget"), false);
+  }
 });
 
 test("an account switch during discovery invalidates the entire PR batch", async () => {
@@ -765,8 +884,10 @@ test("review context reports a head change instead of returning mixed evidence",
 test("review context drops a patch when the base target changes under the same Head", async () => {
   const headRefOid = "b".repeat(40);
   let viewCount = 0;
+  let targetCalls = 0;
   const adapter = new GitHubAdapter({
     run: async (_command, args) => {
+      if (isCurrentTargetCall(args)) return currentTargetResponse({ baseRefOid: (++targetCalls === 1 ? "a" : "c").repeat(40) });
       if (args[0] === "api") return { login: "runtime-user" };
       viewCount += 1;
       return viewCount === 1
@@ -848,6 +969,7 @@ test("review context drops a patch when the observing GitHub account changes", a
   };
   const adapter = new GitHubAdapter({
     run: async (_command, args) => {
+      if (isCurrentTargetCall(args)) return currentTargetResponse();
       if (args[0] === "api") {
         accountCalls += 1;
         return { login: accountCalls === 1 ? "runtime-user" : "other-user" };
@@ -901,13 +1023,14 @@ test("target-aware review context reads an immutable compare by the sealed OIDs"
   const textCalls = [];
   const adapter = new GitHubAdapter({
     run: async (_command, args) => {
+      if (isCurrentTargetCall(args)) return currentTargetResponse({ baseRefOid: "d".repeat(40), baseRef: { name: "main", repository: { nameWithOwner: "acme/repo" }, target: { oid: baseRefOid } } });
       if (args[0] === "api") return { login: "runtime-user" };
       return {
         number: 42,
         url: "https://github.com/acme/repo/pull/42",
         title: "Resolve conflict",
         baseRefName: "main",
-        baseRefOid,
+        baseRefOid: "d".repeat(40),
         headRefName: "fix/conflict",
         headRefOid,
         headRepository: { id: "R_kgDOExample", name: "repo" },
@@ -945,6 +1068,40 @@ test("target-aware review context reads an immutable compare by the sealed OIDs"
   ]);
 });
 
+test("a base Ref that moved before context loading prevents the sealed patch read", async () => {
+  const adapter = new GitHubAdapter({
+    run: async (_command, args) => {
+      if (isCurrentTargetCall(args)) return currentTargetResponse({
+        baseRef: { name: "main", repository: { nameWithOwner: "acme/repo" }, target: { oid: "c".repeat(40) } },
+      });
+      if (args[0] === "api") return { login: "runtime-user" };
+      return { ...currentTargetPr(), files: [] };
+    },
+    runText: async () => assert.fail("a moved live base must not download the old patch"),
+  });
+  await assert.rejects(adapter.loadReviewContext({
+    repo: "acme/repo", number: 42, url: "https://github.com/acme/repo/pull/42",
+    gitTargetAvailable: true,
+    gitTarget: { schemaVersion: 1, provider: "github", sourceAccountId: "runtime-user",
+      baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "a".repeat(40),
+      headRepository: "contributor/repo", headRefName: "fix/conflict", headRefOid: "b".repeat(40),
+    },
+  }), (error) => error.code === "PR_CONTEXT_STALE");
+});
+
+test("discovery cannot mix current Ref observations with changed detail identity", async () => {
+  const record = { number: 42, title: "Changed Head", url: "https://github.com/acme/repo/pull/42",
+    repository: { nameWithOwner: "acme/repo" }, author: { login: "contributor" }, state: "open" };
+  const adapter = new GitHubAdapter({ run: async (_command, args) => {
+    if (isCurrentTargetBatchCall(args)) return currentTargetBatchResponse(args);
+    if (args[0] === "api") return { login: "runtime-user" };
+    if (args[0] === "search") return args.includes("--assignee=@me") ? [record] : [];
+    return { ...currentTargetPr({ headRefOid: "c".repeat(40) }), reviews: [], labels: [], assignees: [], statusCheckRollup: [] };
+  } });
+  await assert.rejects(adapter.searchRelevantPullRequests(),
+    (error) => error.code === "GITHUB_CURRENT_PR_TARGET_INVALID");
+});
+
 test("an explicitly unavailable live target cannot fall back to legacy patch review", async () => {
   const adapter = new GitHubAdapter({
     run: async () => assert.fail("unavailable target must fail before I/O"),
@@ -969,8 +1126,13 @@ test("target-aware no-patch context verifies the target and account twice", asyn
   const headRefOid = "b".repeat(40);
   let accountCalls = 0;
   let viewCalls = 0;
+  let targetCalls = 0;
   const adapter = new GitHubAdapter({
     run: async (_command, args) => {
+      if (isCurrentTargetCall(args)) {
+        targetCalls += 1;
+        return currentTargetResponse({ headRefName: "fix/ci", headRepository: { nameWithOwner: "acme/repo" } });
+      }
       if (args[0] === "api") {
         accountCalls += 1;
         return { login: "runtime-user" };
@@ -1022,7 +1184,8 @@ test("target-aware no-patch context verifies the target and account twice", asyn
 
   assert.equal(result.patch, "");
   assert.equal(accountCalls, 2);
-  assert.equal(viewCalls, 2);
+  assert.equal(viewCalls, 1);
+  assert.equal(targetCalls, 2);
 });
 
 test("a canonical base repository change invalidates target-aware context", async () => {
@@ -1030,6 +1193,7 @@ test("a canonical base repository change invalidates target-aware context", asyn
   const headRefOid = "b".repeat(40);
   const adapter = new GitHubAdapter({
     run: async (_command, args) => {
+      if (isCurrentTargetCall(args)) return currentTargetResponse();
       if (args[0] === "api") return { login: "runtime-user" };
       return {
         number: 42,
@@ -1110,8 +1274,10 @@ test("an owner-selected PR target is resolved twice against one GitHub account",
   const headRefOid = "a".repeat(40);
   const baseRefOid = "b".repeat(40);
   let viewCalls = 0;
+  let targetCalls = 0;
   const adapter = new GitHubAdapter({
     run: async (_command, args) => {
+      if (isCurrentTargetCall(args)) { targetCalls += 1; return currentTargetResponse({ baseRefOid: "d".repeat(40), baseRef: { name: "main", repository: { nameWithOwner: "acme/repo" }, target: { oid: baseRefOid } }, headRefOid, headRefName: "fix/ci" }); }
       if (args[0] === "api") return { login: "Runtime-User" };
       viewCalls += 1;
       return {
@@ -1121,7 +1287,7 @@ test("an owner-selected PR target is resolved twice against one GitHub account",
         title: "Fix CI",
         body: "Repair the failing check",
         baseRefName: "main",
-        baseRefOid,
+        baseRefOid: "d".repeat(40),
         headRefName: "fix/ci",
         headRefOid,
         headRepository: { name: "repo" },
@@ -1136,7 +1302,8 @@ test("an owner-selected PR target is resolved twice against one GitHub account",
     number: 42,
   });
 
-  assert.equal(viewCalls, 2);
+  assert.equal(viewCalls, 1);
+  assert.equal(targetCalls, 2);
   assert.equal(result.title, "Fix CI");
   assert.equal(result.state, "open");
   assert.deepEqual(result.gitTarget, {
@@ -1154,8 +1321,10 @@ test("an owner-selected PR target is resolved twice against one GitHub account",
 
 test("an owner-selected PR target fails closed when its Head changes during resolution", async () => {
   let viewCalls = 0;
+  let targetCalls = 0;
   const adapter = new GitHubAdapter({
     run: async (_command, args) => {
+      if (isCurrentTargetCall(args)) return currentTargetResponse({ baseRefOid: "b".repeat(40), headRefName: "fix/ci", headRefOid: (++targetCalls === 1 ? "a" : "c").repeat(40) });
       if (args[0] === "api") return { login: "runtime-user" };
       viewCalls += 1;
       return {
@@ -1184,6 +1353,7 @@ for (const state of ["CLOSED", "MERGED"]) {
   test(`an owner-selected ${state.toLowerCase()} PR fails closed`, async () => {
     const adapter = new GitHubAdapter({
       run: async (_command, args) => {
+        if (isCurrentTargetCall(args)) return currentTargetResponse({ state, baseRefOid: "b".repeat(40), headRefName: "fix/inactive", headRefOid: "a".repeat(40) });
         if (args[0] === "api") return { login: "runtime-user" };
         return {
           number: 42,
@@ -1210,8 +1380,10 @@ for (const state of ["CLOSED", "MERGED"]) {
 
 test("an owner-selected PR fails closed when it closes during resolution", async () => {
   let viewCalls = 0;
+  let targetCalls = 0;
   const adapter = new GitHubAdapter({
     run: async (_command, args) => {
+      if (isCurrentTargetCall(args)) return currentTargetResponse({ state: ++targetCalls === 1 ? "OPEN" : "CLOSED", baseRefOid: "b".repeat(40), headRefName: "fix/closing", headRefOid: "a".repeat(40) });
       if (args[0] === "api") return { login: "runtime-user" };
       viewCalls += 1;
       return {
@@ -1234,7 +1406,8 @@ test("an owner-selected PR fails closed when it closes during resolution", async
     adapter.resolvePullRequestTarget({ repository: "acme/repo", number: 42 }),
     (error) => error.code === "PR_CONTEXT_STALE",
   );
-  assert.equal(viewCalls, 2);
+  assert.equal(viewCalls, 1);
+  assert.equal(targetCalls, 2);
 });
 
 test("versions paginate milestones and retain the most recently active work", async () => {

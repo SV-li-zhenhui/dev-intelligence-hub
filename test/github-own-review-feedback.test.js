@@ -111,10 +111,18 @@ test("live feedback rejects changed heads, foreign authors, and incomplete pagin
 });
 
 test("discovery exposes own feedback identity without persisting comment bodies or lists into routing facts", async () => {
+  const target = pullRequest({ changedFiles: 1, baseRefName: "main", baseRefOid: "b".repeat(40),
+    headRefName: "fix/feedback", headRepository: { nameWithOwner: "acme/repo" } });
   const run = async (_command, args) => {
     if (args.at(-1) === "user") return { login: ACCOUNT };
+    if (args.some((value) => value.startsWith("query=") && value.includes("MyDashboardCurrentPullRequestTargets {"))) {
+      return { data: { r0: { nameWithOwner: "acme/repo", pullRequest: { ...target,
+        baseRef: { name: target.baseRefName, repository: { nameWithOwner: "acme/repo" }, target: { oid: target.baseRefOid } },
+        headRef: { name: target.headRefName, repository: target.headRepository, target: { oid: target.headRefOid } },
+      } } } };
+    }
     if (args[0] === "search") return args.includes("--author=@me") ? [{ ...pullRequest(), repository: { nameWithOwner: "acme/repo" }, state: "open", updatedAt: AT, createdAt: AT, title: "Own PR" }] : [];
-    if (args[0] === "pr") return { number: 42, url: "https://github.com/acme/repo/pull/42", headRefOid: HEAD, reviews: [], assignees: [], labels: [], statusCheckRollup: [] };
+    if (args[0] === "pr") return { ...target, reviews: [], assignees: [], labels: [], statusCheckRollup: [] };
     return { data: { repository: { pullRequest: pullRequest({ reviews: page([]), reviewThreads: page([thread({ comments: page([comment()]) })]) }) } } };
   };
   const [item] = await new GitHubAdapter({ run }).searchRelevantPullRequests();

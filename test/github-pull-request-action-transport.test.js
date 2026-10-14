@@ -130,7 +130,19 @@ class FakeRunner {
     }
     const next = this.responses.shift();
     if (next instanceof Error) throw next;
-    const value = typeof next === "function" ? await next(options) : next;
+    let value = typeof next === "function" ? await next(options) : next;
+    if (options.args.includes("graphql") && value?.number !== undefined) value = {
+      data: { repository: { nameWithOwner: value.base?.repo?.full_name, pullRequest: {
+        number: value.number, url: value.html_url, state: value.merged_at ? "MERGED" : String(value.state).toUpperCase(),
+        author: value.user, changedFiles: 1, mergedAt: value.merged_at,
+        mergeCommit: value.merge_commit_sha ? { oid: value.merge_commit_sha } : null, mergedBy: value.merged_by,
+        baseRefName: value.base?.ref, baseRefOid: value.base?.sha,
+        baseRef: { name: value.base?.ref, repository: { nameWithOwner: value.base?.repo?.full_name }, target: { oid: value.base?.liveSha ?? value.base?.sha } },
+        headRefName: value.head?.ref, headRefOid: value.head?.sha,
+        headRef: value.headRefDeleted === true ? null : { name: value.head?.ref, repository: { nameWithOwner: value.head?.repo?.full_name }, target: { oid: value.head?.sha } },
+        headRepository: { nameWithOwner: value.head?.repo?.full_name },
+      } } },
+    };
     if (value?.processResult === true) return value.value;
     return {
       exitCode: 0,
@@ -521,7 +533,7 @@ test("rejects self approval and change requests before mutation while allowing C
     );
     assert.equal(runner.calls.length, 2);
     assert.equal(
-      runner.calls.some((call) => call.args.includes("POST")),
+      runner.calls.some((call) => call.args.includes("POST") && !call.args.includes("graphql")),
       false,
     );
   }
@@ -910,6 +922,28 @@ test("actor and Head mismatches stop before every external mutation", async () =
   assert.equal(staleRunner.calls.length, 2);
 });
 
+test("a historical base SHA cannot permit a mutation after its live base moved", async () => {
+  const input = transportInput("comment");
+  const pr = pullRequestRecord(input);
+  pr.base.liveSha = externalActionOid("9");
+  const runner = new FakeRunner([actorRecord(input), pr]);
+  await assert.rejects(actionTransport(runner).perform(input), assertTransportError("GITHUB_TARGET_STALE", "absent"));
+  assert.equal(runner.calls.some((call) => call.args.includes("POST") && !call.args.includes("graphql")), false);
+});
+
+test("terminal receipt reconciliation survives a deleted head without permitting another mutation", async () => {
+  const input = transportInput("merge");
+  const mergeCommitOid = externalActionOid("8");
+  const pr = { ...pullRequestRecord(input, { state: "merged", mergeCommitOid }), headRefDeleted: true };
+  const proof = markerRecord(input, { kind: "comment", id: 303, body: mergeProofBody(input, mergeCommitOid) });
+  const observation = await actionTransport(new FakeRunner([actorRecord(input), pr, [proof]])).observe(input);
+  assert.equal(observation.state, "merged");
+  assert.equal(observation.actionEvidence.merge.receipt.id, mergeCommitOid);
+  const runner = new FakeRunner([actorRecord(input), pr]);
+  await assert.rejects(actionTransport(runner).perform(input), assertTransportError("GITHUB_TARGET_STALE", "absent"));
+  assert.equal(runner.calls.some((call) => call.args.includes("POST") && !call.args.includes("graphql")), false);
+});
+
 test("fails closed at the fixed pagination bound", async () => {
   const input = transportInput("comment");
   const fullPage = Array.from({ length: 100 }, (_, index) => ({
@@ -1030,7 +1064,7 @@ test("a merge with a lost proof comment stays unknown after restart", async () =
   });
   assert.equal(recoveryRunner.calls.length, 3);
   assert.equal(
-    recoveryRunner.calls.some((call) => call.args.includes("POST")),
+    recoveryRunner.calls.some((call) => call.args.includes("POST") && !call.args.includes("graphql")),
     false,
   );
 });

@@ -2,6 +2,8 @@ import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 import { runCommand, runJson } from "../lib/command-runner.js";
 import { normalizeReviewReadTarget } from "../domain/review-read-target.js";
+import { samePullRequestGitTarget } from "../domain/git-tool-contract.js";
+import { readGitHubCurrentPullRequestTarget } from "./github-current-pull-request-target.js";
 
 function failure(code) {
   return Object.assign(new Error(code), { code });
@@ -62,13 +64,19 @@ export class GitHubReviewReader {
     const api = (endpoint, extra = []) => ["api", "--hostname", "github.com", endpoint, ...extra];
     const prEndpoint = `repos/${git.baseRepository}/pulls/${target.pullRequestNumber}`;
     const checkTarget = async () => {
-      const pr = await this.run("gh", api(prEndpoint), options);
-      if (pr.head?.sha !== git.headRefOid || pr.base?.sha !== git.baseRefOid ||
-          pr.head?.repo?.full_name?.toLowerCase() !== git.headRepository.toLowerCase() ||
-          pr.base?.repo?.full_name?.toLowerCase() !== git.baseRepository.toLowerCase()) {
+      let current;
+      try {
+        current = await readGitHubCurrentPullRequestTarget(this.run, {
+          repository: git.baseRepository, number: target.pullRequestNumber, sourceAccountId: git.sourceAccountId,
+        }, options);
+      } catch (error) {
+        if (error.code !== "GITHUB_CURRENT_PR_TARGET_INVALID") throw error;
         throw failure("PR_REVIEW_READ_HEAD_CHANGED");
       }
-      return pr;
+      if (current.state !== "OPEN" || !samePullRequestGitTarget(current.gitTarget, git)) {
+        throw failure("PR_REVIEW_READ_HEAD_CHANGED");
+      }
+      return { changed_files: current.changedFiles };
     };
     const account = await this.run("gh", api("user"), options);
     if (account.login?.toLowerCase() !== git.sourceAccountId) throw failure("PR_REVIEW_READ_ACCOUNT_CHANGED");
@@ -94,6 +102,8 @@ export class GitHubReviewReader {
       throw failure("PR_REVIEW_READ_DIFF_INCOMPLETE");
     }
     await checkTarget();
+    const finalAccount = await this.run("gh", api("user"), options);
+    if (finalAccount.login?.toLowerCase() !== git.sourceAccountId) throw failure("PR_REVIEW_READ_ACCOUNT_CHANGED");
     const manifestText = JSON.stringify({ repository: git.baseRepository, pullRequestNumber: target.pullRequestNumber, base: git.baseRefOid, head: git.headRefOid, changedFiles: files.length, files }, null, 2);
     const documents = { "review-manifest.json": manifestText, "review.diff": diffText, ...Object.fromEntries(skills) };
     const requiredDocuments = ["review-manifest.json", "review.diff", ...skills.filter(([name]) => ["review-skill/SKILL.md", "review-skill/manifest.json"].includes(name)).map(([name]) => name)];

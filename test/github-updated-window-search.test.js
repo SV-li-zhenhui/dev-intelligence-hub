@@ -36,6 +36,30 @@ function detailFor(url) {
   };
 }
 
+function isCurrentTargetBatchCall(args) {
+  return args.some((value) => value.startsWith("query=") && value.includes("MyDashboardCurrentPullRequestTargets {"));
+}
+
+function currentTargetBatchResponse(args) {
+  const query = args.find((value) => value.startsWith("query="));
+  const aliases = [...query.matchAll(/(r\d+):repository\(owner:"([^"]+)",name:"([^"]+)"\)\s*\{\s*nameWithOwner pullRequest\(number:(\d+)\)/gu)];
+  assert.ok(aliases.length > 0, "current-target batch must have aliased repository selections");
+  return { data: Object.fromEntries(aliases.map(([, alias, owner, name, value]) => {
+    const number = Number(value);
+    const repository = { nameWithOwner: `${owner}/${name}` };
+    const detail = detailFor(`https://github.com/${owner}/${name}/pull/${number}`);
+    return [alias, { ...repository, pullRequest: {
+      ...detail,
+      state: "OPEN",
+      author: { login: number % 2 === 0 ? "runtime-user" : "contributor" },
+      changedFiles: 1,
+      headRepository: repository,
+      baseRef: { name: detail.baseRefName, repository, target: { oid: detail.baseRefOid } },
+      headRef: { name: detail.headRefName, repository, target: { oid: detail.headRefOid } },
+    } }];
+  })) };
+}
+
 function updatedArgument(args) {
   const index = args.indexOf("--updated");
   return index === -1 ? null : args[index + 1];
@@ -70,6 +94,7 @@ test("finite PR search uses official updated sorting and filters locally before 
     searchRecord(3, "2026-08-12T15:59:59.999Z"),
   ];
   const run = async (_command, args) => {
+    if (isCurrentTargetBatchCall(args)) return currentTargetBatchResponse(args);
     if (args[0] === "api") return { login: "runtime-user" };
     if (args[0] === "search") {
       searchCalls.push(args);
@@ -118,6 +143,7 @@ test("a saturated PR search splits inclusive ranges and deduplicates the overlap
   );
   const overlap = searchRecord(42, "2026-08-02T00:00:00Z");
   const run = async (_command, args) => {
+    if (isCurrentTargetBatchCall(args)) return currentTargetBatchResponse(args);
     if (args[0] === "api") return { login: "runtime-user" };
     if (args[0] === "search") {
       const relation = args.includes("--assignee=@me") ? "assigned" : args.includes("--author=@me") ? "authored" : "requested";
@@ -170,6 +196,7 @@ test("rolling PR windows include the exact millisecond lower bound and no earlie
   ];
   const ranges = [];
   const run = async (_command, args) => {
+    if (isCurrentTargetBatchCall(args)) return currentTargetBatchResponse(args);
     if (args[0] === "api") return { login: "runtime-user" };
     if (args[0] === "search") {
       ranges.push(updatedArgument(args));
