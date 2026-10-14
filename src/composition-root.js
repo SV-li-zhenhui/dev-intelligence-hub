@@ -2109,8 +2109,21 @@ export async function createApplication({
           confirmationProducer: confirmationRuntime.producerQueue,
           codeJobReader,
           grantFactory,
-          ...(automaticOwnPrRepair === null ? {} : { automaticOwnPrRepair }),
-          leaseDurationMs: coordinationConfig.leaseDurationMs,
+          ...(automaticOwnPrRepair === null ? {} : {
+            automaticOwnPrRepair,
+            // Two current-fact checks bracket globally bounded Git preparation.
+            // Leave a margin for persisting the result before the lease expires.
+            handlerTimeoutMs: Math.min(
+              Math.max(30_000,
+                2 * (configuredGithubActions.timeoutMs ?? 60_000) +
+                  (config.codeExecutor.gitTimeoutMs ?? 30_000) +
+                  coordinationTiming.resolveTimeoutMs),
+              coordinationTiming.leaseDurationMs - coordinationTiming.evidenceMutationMarginMs,
+            ),
+          }),
+          leaseDurationMs: automaticOwnPrRepair === null
+            ? coordinationConfig.leaseDurationMs
+            : coordinationTiming.leaseDurationMs,
           retryBaseMs: coordinationConfig.retryBaseMs,
           retryMaxMs: coordinationConfig.retryMaxMs,
           defaultBatchLimit: coordinationConfig.proposalLimit,

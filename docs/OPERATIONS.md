@@ -428,6 +428,26 @@ The public routing input takes only event content (`schemaVersion`, `eventType`,
 `occurredAt`, `source`, `subject`, `payload`) and recomputes its ID/digest; omit the
 stored event's `eventId` and `contentDigest` when using `dryRun`/`ingest`.
 
+With both GitHub actions and automatic own-PR repair enabled, developer role
+cycles use the independent employee scheduler, as incoming Reviews do. They wait
+for the latest successful fact refresh and retain maintenance admission,
+cancellation and shutdown drain, without waiting for legacy patrol or optional
+memory projection. Manual and scheduled requests for the same independent role
+coalesce. Proposal execution, code jobs and publication still use their existing
+controlled stages; a staged modify proposal is not evidence that code has run.
+
+Intent dispatch uses the active configuration's `workCoordination.leaseDurationMs`.
+This differs from the role decision timeout and the proposal handler deadline.
+If a proposal handler times out, inspect its downstream confirmation and code-job
+receipt before diagnosing a failed repair: an idempotent in-flight handler may
+complete after the retry was recorded. Do not create a second manual repair for
+the same feedback solely because the outer wait timed out.
+Automatic own-PR code preparation uses a handler budget derived from two
+GitHub fact checks, one globally bounded Git preparation and the resolve budget,
+with the ordinary 30-second minimum and a cap below the normalized lease. It uses
+that matching lease so the result can still be persisted. Ordinary code proposals
+retain their existing handler defaults. This changes waiting time, not authority.
+
 The following capture and cleanup rules describe compatibility invocation
 profiles. Native mode keeps conversations in the fixed Codex home and only
 cleans its task-owned input/output workspace after verified process exit.

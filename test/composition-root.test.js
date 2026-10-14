@@ -30,6 +30,10 @@ import {
   createPrTriageHandoff,
 } from "../src/composition-root.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
+import {
+  CodeActionProposalHandler,
+  createCodeActionProposalRunnerService,
+} from "../src/services/code-action-proposal-handler.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { createWorkLedgerRuntime } from "../src/work-ledger-runtime.js";
 import { createLocalWorkLedgerCandidateProcessor } from
@@ -4227,14 +4231,41 @@ test("an explicit empty PR action allow-list remains inert and never reads trans
 });
 
 test("automatic own PR repair composes internal push with ownership guards and complete feedback readers", async (t) => {
-  for (const explicitPush of [false, true]) {
-    await t.test(explicitPush ? "generic push enabled" : "generic push disabled", async () => {
+  const scenarios = [
+    { name: "generic push disabled", explicitPush: false, expectedBudget: 119_000 },
+    { name: "generic push enabled", explicitPush: true, expectedBudget: 119_000 },
+    {
+      name: "automatic preparation can finish after the ordinary handler deadline",
+      leaseDurationMs: 1_080_000, resolveTimeoutMs: 30_000, decisionTimeoutMs: 60_000,
+      githubTimeoutMs: 60_000, gitTimeoutMs: 30_000, expectedBudget: 180_000,
+      elapsedMs: 75_000, expectedStatus: "succeeded",
+    },
+    {
+      name: "automatic preparation still times out before its lease expires",
+      leaseDurationMs: 90_000, resolveTimeoutMs: 5_000, decisionTimeoutMs: 10_000,
+      githubTimeoutMs: 60_000, gitTimeoutMs: 30_000, expectedBudget: 89_000,
+      elapsedMs: 89_000, expectedStatus: "waiting_retry",
+    },
+    {
+      name: "short preparation stages retain the ordinary 30 second minimum",
+      leaseDurationMs: 120_000, resolveTimeoutMs: 5_000, decisionTimeoutMs: 10_000,
+      githubTimeoutMs: 5_000, gitTimeoutMs: 2_000, expectedBudget: 30_000,
+    },
+  ];
+  for (const scenario of scenarios) {
+    const explicitPush = scenario.explicitPush === true;
+    await t.test(scenario.name, async (t) => {
       const config = structuredClone(defaultCodeJobConfiguration());
       config.githubActions = {
         enabled: true, actorAccountId: "review-account", tokenEnv: "TEST_GITHUB_TOKEN",
         ghCommand: process.execPath, automaticOwnPrRepair: true,
         enabledActions: explicitPush ? ["push"] : [],
       };
+      for (const field of ["leaseDurationMs", "resolveTimeoutMs", "decisionTimeoutMs"]) {
+        if (scenario[field] !== undefined) config.workCoordination[field] = scenario[field];
+      }
+      if (scenario.githubTimeoutMs !== undefined) config.githubActions.timeoutMs = scenario.githubTimeoutMs;
+      if (scenario.gitTimeoutMs !== undefined) config.codeExecutor.gitTimeoutMs = scenario.gitTimeoutMs;
       config.changePackages = { enabled: true, gitCommand: "C:\\Program Files\\Git\\cmd\\git.exe" };
       config.workCoordination.policy.configurationChangeRoles = [];
       const calls = {};
@@ -4307,8 +4338,68 @@ test("automatic own PR repair composes internal push with ownership guards and c
         },
         pullRequestExternalActionProposalRunnerFactory: () => ({ async runCycle() {} }),
         githubReviewProposalRunnerFactory: () => ({ async runCycle() {} }),
+        codeActionProposalRunnerFactory(options) {
+          calls.codeRunner = options;
+          return createCodeActionProposalRunnerService(options);
+        },
       });
       try {
+        assert.equal(calls.codeRunner.handlerTimeoutMs, scenario.expectedBudget);
+        assert.equal(calls.codeRunner.leaseDurationMs, scenario.leaseDurationMs ?? 120_000);
+        assert.ok(calls.codeRunner.handlerTimeoutMs < calls.codeRunner.leaseDurationMs);
+        if (scenario.elapsedMs !== undefined) {
+          const proposal = normalizeBoundWorkProposal({
+            proposalId: "automatic-code-preparation-budget", policyVersion: 1,
+            kind: "code_action_proposal", requestedBy: { roleId: "developer", workItemId: "work-budget" },
+            source: { assignmentId: "assignment-budget", eventId: "event-budget" },
+            binding: { repository: "acme/repo" }, payload: { operation: "modify" },
+          });
+          let claimed = false;
+          let start;
+          let release;
+          const started = new Promise((resolve) => { start = resolve; });
+          const preparing = new Promise((resolve) => { release = resolve; });
+          const advances = [];
+          t.mock.method(CodeActionProposalHandler.prototype, "handle", async () => {
+            start();
+            await preparing;
+            return { status: "succeeded", summary: "Automatic preparation completed", evidence: [] };
+          });
+          const runner = createCodeActionProposalRunnerService({
+            ...calls.codeRunner,
+            runner: {
+              async claim({ leaseDurationMs }) {
+                assert.equal(leaseDurationMs, scenario.leaseDurationMs);
+                if (claimed) return null;
+                claimed = true;
+                return {
+                  proposal, status: "pending_delivery", revision: 1, attempt: 1, downstreamRef: null,
+                  lease: { runnerId: "code-action-runner", leaseId: "lease-budget", leaseUntil: "2026-10-14T04:30:00.000Z" },
+                };
+              },
+              async advance(value) { advances.push(value); },
+            },
+          });
+          t.mock.timers.enable({ apis: ["setTimeout"] });
+          try {
+            const execution = runner.runCycle({ limit: 1 });
+            await started;
+            t.mock.timers.tick(30_001);
+            await Promise.resolve();
+            assert.equal(advances.length, 0, "automatic preparation must not time out at the ordinary deadline");
+            t.mock.timers.tick(scenario.elapsedMs - 30_001);
+            if (scenario.expectedStatus === "succeeded") release();
+            const result = await execution;
+            assert.equal(result.outcomes[0].status, scenario.expectedStatus);
+            if (scenario.expectedStatus === "waiting_retry") {
+              assert.equal(advances[0].transition.reason, "WORK_PROPOSAL_HANDLER_TIMEOUT");
+            }
+          } finally {
+            release();
+            t.mock.timers.reset();
+            t.mock.restoreAll();
+          }
+        }
         assert.equal(application.prEmployee.config.automaticOwnPrRepair, true);
         assert.deepEqual(calls.externalExecutor.enabledActions, ["push"]);
         assert.deepEqual(config.githubActions.enabledActions, explicitPush ? ["push"] : []);
@@ -6323,6 +6414,7 @@ test("local code composition keeps CLI authority private from injected factories
     },
   ]);
   assert.strictEqual(calls.codeJobRuntime.store, application.store);
+  assert.equal(Object.hasOwn(calls.codeRunner, "handlerTimeoutMs"), false);
   assert.equal(Object.isFrozen(calls.codeJobRuntime.executor), true);
   assert.deepEqual(Object.keys(calls.codeJobRuntime.executor).sort(), [
     "getActionResult",
