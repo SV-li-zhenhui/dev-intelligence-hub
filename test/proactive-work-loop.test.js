@@ -95,7 +95,8 @@ test('owner adjustment discards the old real role decision before staging', asyn
 });
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
-import { RoleContextAssembler } from "../src/services/role-context-assembler.js";
+import { RoleContextAssembler, RoleContextAssemblerError } from "../src/services/role-context-assembler.js";
+import { PrEngineerServiceError } from "../src/services/pr-engineer-service.js";
 import { OrchestratorServiceError } from "../src/services/orchestrator-service.js";
 import { assertExpectedWorkGraphRevision } from "../src/services/work-ledger-graph-command-support.js";
 
@@ -2736,6 +2737,171 @@ function terminalPullRequestFailure(state = "MERGED") {
     { code: "ROLE_CONTEXT_PR_FACT_UNAVAILABLE" },
   );
 }
+
+function stalePullRequestFactsFailure() {
+  const stale = Object.assign(new Error("PR execution identity changed"), {
+    name: "GitHubReadError", code: "PR_FACTS_STALE", statusCode: 409,
+  });
+  const refresh = new PrEngineerServiceError(
+    "PR_FACT_REFRESH_FAILED", "Unable to refresh bounded PR facts", 503,
+    { cause: stale },
+  );
+  return new RoleContextAssemblerError(
+    "ROLE_CONTEXT_PR_FACT_UNAVAILABLE", "Unable to read bounded PR task facts", 503,
+    { cause: refresh },
+  );
+}
+
+function staleFactsRootLoop({ failures, time = controlledClock(), signal = null }) {
+  const sources = Array.from({ length: failures.length + 1 }, (_, index) =>
+    workItem(901 + index, { type: "role", id: "orchestrator" }));
+  const cancelled = workItem(24723, { type: "role", id: "orchestrator" });
+  Object.assign(cancelled, { status: "cancelled", revision: 11 });
+  const ledger = new FakeLedger({ source: [...sources, cancelled], time });
+  const assemblies = [];
+  const executions = [];
+  const loop = createLoop({
+    ledger, time,
+    directory: new FakeRoleDirectory({
+      orchestrator: worker({ roleId: "orchestrator", workerId: "employee-orchestrator",
+        decide: async ({ item }) => orchestrationDecision(item) }),
+    }),
+    roleContextAssembler: { async assemble({ roleId, item }) {
+      assemblies.push(item.itemId);
+      const failure = failures[item.event.payload.number - 901];
+      if (failure) {
+        if (signal) signal.abort(new Error("owner cancelled cycle"));
+        throw failure;
+      }
+      return contextPacket(item, roleId);
+    } },
+    orchestratorService: { async execute({ item }) {
+      executions.push(item.itemId);
+      return { applied: true };
+    } },
+  });
+  return { loop, ledger, sources, cancelled, assemblies, executions };
+}
+
+test("stale PR facts defer only their root before claim and preserve the healthy work budget", async () => {
+  const { loop, ledger, sources, cancelled, executions } = staleFactsRootLoop({
+    failures: [stalePullRequestFactsFailure(), stalePullRequestFactsFailure()],
+  });
+  for (let iteration = 0; iteration < 3; iteration += 1) {
+    const result = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+    assert.equal(result.orchestrated, 1);
+    assert.equal(result.workAttempts, 1);
+    assert.equal(result.claimed, 0);
+    assert.ok(result.outcomes.every(({ status, code }) =>
+      status === "orchestrated" || (status === "decision_deferred" && code === "PR_FACTS_STALE")));
+  }
+  assert.deepEqual(executions, Array(3).fill(sources[2].itemId));
+  assert.deepEqual(ledger.items, [...sources, cancelled]);
+  assert.equal(ledger.calls.claim.length, 0);
+  assert.equal(ledger.calls.stageIntent.length, 0);
+  assert.equal(ledger.calls.scheduleRetry.length, 0);
+});
+
+test("stale PR facts respect each cycle read budget and eventually reach a healthy root beyond two windows", async () => {
+  const failures = Array.from({ length: 13 }, () => stalePullRequestFactsFailure());
+  const { loop, ledger, sources, cancelled, assemblies, executions } = staleFactsRootLoop({ failures });
+  let cycles = 0;
+  while (executions.length === 0 && cycles < 5) {
+    const priorReads = assemblies.length;
+    const result = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+    cycles += 1;
+    assert.ok(assemblies.length - priorReads <= 4, "workLimit 1 permits at most four availability/context reads");
+    assert.equal(result.claimed, 0);
+    assert.ok(result.workAttempts <= 1);
+  }
+  assert.equal(cycles, 4);
+  assert.deepEqual(executions, [sources[13].itemId]);
+  assert.equal(new Set(assemblies).size, 14);
+  assert.equal(assemblies.length, 14, "a partial sweep must not re-read unchanged stale roots");
+  assert.deepEqual(ledger.items, [...sources, cancelled]);
+  assert.equal(ledger.calls.claim.length, 0);
+  assert.equal(ledger.calls.scheduleRetry.length, 0);
+});
+
+test("a revised root is eligible immediately during a partial stale-fact sweep", async () => {
+  const failures = Array.from({ length: 5 }, () => stalePullRequestFactsFailure());
+  const { loop, ledger, sources, assemblies, executions } = staleFactsRootLoop({ failures });
+  await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+  assert.equal(assemblies.length, 4);
+  ledger.items[0].revision += 1;
+  failures[0] = null;
+  await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+  assert.deepEqual(executions, [sources[0].itemId]);
+  assert.equal(assemblies[4], sources[0].itemId);
+});
+
+test("terminal PR retirement and stale PR deferral both permit the following healthy root", async () => {
+  const { loop, ledger, sources, executions } = staleFactsRootLoop({
+    failures: [terminalPullRequestFailure(), stalePullRequestFactsFailure()],
+  });
+  const result = await loop.runCycle({ roleId: "orchestrator", workLimit: 2 });
+  assert.deepEqual(result.outcomes.map(({ status }) => status),
+    ["blocked", "decision_deferred", "orchestrated"]);
+  assert.deepEqual(executions, [sources[2].itemId]);
+  assert.equal(ledger.items[0].statusReason, "pr_source_terminal");
+  assert.deepEqual(ledger.calls.claim.map(({ itemId }) => itemId), [sources[0].itemId]);
+  assert.equal(ledger.items[1].attempt, 0);
+});
+
+test("untrusted or unrelated nested root failures still stop the work cycle", async (t) => {
+  const variants = [
+    ["plain outer error", () => {
+      const original = stalePullRequestFactsFailure();
+      return Object.assign(new Error(original.message, { cause: original.cause }),
+        { code: original.code, statusCode: original.statusCode });
+    }],
+    ["wrong refresh wrapper", () => {
+      const failure = stalePullRequestFactsFailure();
+      failure.cause.code = "PR_REVIEW_CONTEXT_REFRESH_FAILED";
+      return failure;
+    }],
+    ["unknown nested failure", () => {
+      const failure = stalePullRequestFactsFailure();
+      failure.cause.cause.code = "WORK_LEDGER_STATE_WRITE_FAILED";
+      return failure;
+    }],
+    ["wrong leaf type", () => {
+      const failure = stalePullRequestFactsFailure();
+      failure.cause.cause.name = "Error";
+      return failure;
+    }],
+    ["wrong leaf status", () => {
+      const failure = stalePullRequestFactsFailure();
+      failure.cause.cause.statusCode = 503;
+      return failure;
+    }],
+    ["nested admission failure", () => {
+      const failure = stalePullRequestFactsFailure();
+      failure.cause.cause = Object.assign(new Error("restart required"), { code: "RUNTIME_RESTART_REQUIRED" });
+      return failure;
+    }],
+  ];
+  for (const [name, createFailure] of variants) {
+    await t.test(name, async () => {
+      const failure = createFailure();
+      const { loop, ledger, executions } = staleFactsRootLoop({ failures: [failure] });
+      await assert.rejects(loop.runCycle({ roleId: "orchestrator" }), (error) => error === failure);
+      assert.deepEqual(executions, []);
+      assert.equal(ledger.calls.claim.length, 0);
+    });
+  }
+});
+
+test("cycle cancellation takes precedence over a wrapped stale PR fact", async () => {
+  const controller = new AbortController();
+  const { loop, ledger, executions } = staleFactsRootLoop({
+    failures: [stalePullRequestFactsFailure()], signal: controller,
+  });
+  await assert.rejects(loop.runCycle({ roleId: "orchestrator", signal: controller.signal }),
+    (error) => error === controller.signal.reason);
+  assert.deepEqual(executions, []);
+  assert.equal(ledger.calls.claim.length, 0);
+});
 
 function assertSafeOwnerAttention({ ledger, roleId, code, remediation }) {
   assert.equal(ledger.outbox.length, 1);

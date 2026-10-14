@@ -4,6 +4,8 @@ import { automaticReviewEligibility } from "../domain/automatic-review-policy.js
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { brainFailureOwnerAttention } from "./brain-failure-policy.js";
 import { OrchestratorServiceError } from "./orchestrator-service.js";
+import { RoleContextAssemblerError } from "./role-context-error.js";
+import { PrEngineerServiceError } from "./pr-engineer-service.js";
 import {
   normalizeWorkCoordinationTiming,
   WORK_COORDINATION_EVIDENCE_MUTATION_MARGIN_MS,
@@ -504,10 +506,50 @@ function claimFailureConsumesWorkBudget(claim) {
   return !NON_BUDGET_CLAIM_FAILURE_CODES.has(claim.code);
 }
 
+function isUnclaimedStalePrFact(result) {
+  return (
+    !result.claimAttempted &&
+    result.outcome.status === "decision_deferred" &&
+    result.outcome.code === "PR_FACTS_STALE"
+  );
+}
+
 function configuredResultConsumesWorkBudget(result) {
+  if (isUnclaimedStalePrFact(result)) return false;
   return result.claimed ||
     !result.claimAttempted ||
     claimFailureConsumesWorkBudget(result.outcome);
+}
+
+function ownErrorData(error, name) {
+  const descriptor = Object.getOwnPropertyDescriptor(error, name);
+  return descriptor && "value" in descriptor ? descriptor.value : undefined;
+}
+
+function isStalePullRequestFactContext(error) {
+  // Only a GitHub target mismatch may defer an unclaimed root. Other context
+  // failures retain their existing admission, durability, or failure behavior.
+  try {
+    if (
+      !(error instanceof RoleContextAssemblerError) ||
+      ownErrorData(error, "code") !== "ROLE_CONTEXT_PR_FACT_UNAVAILABLE" ||
+      ownErrorData(error, "statusCode") !== 503
+    ) return false;
+    const refresh = ownErrorData(error, "cause");
+    if (
+      !(refresh instanceof PrEngineerServiceError) ||
+      ownErrorData(refresh, "code") !== "PR_FACT_REFRESH_FAILED" ||
+      ownErrorData(refresh, "statusCode") !== 503
+    ) return false;
+    const stale = ownErrorData(refresh, "cause");
+    return stale instanceof Error &&
+      ownErrorData(stale, "name") === "GitHubReadError" &&
+      ownErrorData(stale, "code") === "PR_FACTS_STALE" &&
+      ownErrorData(stale, "statusCode") === 409 &&
+      ownErrorData(stale, "cause") === undefined;
+  } catch {
+    return false;
+  }
 }
 
 function ownerBrainAttentionDecision(error, roleId) {
@@ -773,6 +815,7 @@ export class ProactiveWorkLoop {
     this.lastIssueRetirementKey = null;
     this.issueRetirementSweep = null;
     this.fencedClaimDeferrals = new Map();
+    this.stalePrFactSweeps = new Map();
     this.claimCycleSequence = 0;
   }
 
@@ -818,6 +861,12 @@ export class ProactiveWorkLoop {
     const itemRevisions = new Map(
       items.map((item) => [item.itemId, item.revision]),
     );
+    const scope = options.roleId ?? "*";
+    const stalePrFactSweep = this.stalePrFactSweeps.get(scope) ?? new Map();
+    this.stalePrFactSweeps.set(scope, stalePrFactSweep);
+    for (const [itemId, revision] of stalePrFactSweep) {
+      if (itemRevisions.get(itemId) !== revision) stalePrFactSweep.delete(itemId);
+    }
     for (const [itemId, deferral] of this.fencedClaimDeferrals) {
       if (
         (
@@ -848,11 +897,18 @@ export class ProactiveWorkLoop {
 
     const prioritized = prioritizeWorkItems(items, candidateWindow.facts);
     const scheduled = this.taskRuns ? await this.taskRuns.order(prioritized, 'work-item', 'itemId') : prioritized;
+    let completedCandidateSweep = true;
     for (const item of scheduled) {
       throwIfLoopAborted(options.signal);
-      if (workAttempts >= options.workLimit) break;
-      if (availabilityBudgetUsed >= availabilityCheckLimit) break;
-      if (claimAttempts >= claimAttemptLimit) break;
+      if (
+        workAttempts >= options.workLimit ||
+        availabilityBudgetUsed >= availabilityCheckLimit ||
+        claimAttempts >= claimAttemptLimit
+      ) {
+        completedCandidateSweep = false;
+        break;
+      }
+      if (stalePrFactSweep.get(item.itemId) === item.revision) continue;
       const fencedDeferral = this.fencedClaimDeferrals.get(item.itemId);
       if (
         fencedDeferral?.revision === item.revision &&
@@ -998,9 +1054,11 @@ export class ProactiveWorkLoop {
             options,
             graphBlocked: isGraphBlocked,
           });
+          const stalePrFact = isUnclaimedStalePrFact(processed);
+          if (stalePrFact) stalePrFactSweep.set(item.itemId, item.revision);
           if (configuredResultConsumesWorkBudget(processed)) {
             workAttempts += 1;
-          } else {
+          } else if (!stalePrFact) {
             availabilityBudgetUsed -= 1;
             this.fencedClaimDeferrals.set(item.itemId, {
               revision: item.revision,
@@ -1053,6 +1111,9 @@ export class ProactiveWorkLoop {
       }
     }
 
+    // Continue a bounded stale-fact sweep across cycles without moving new or
+    // urgent candidates behind old work. A changed revision is never skipped.
+    if (completedCandidateSweep) this.stalePrFactSweeps.delete(scope);
     throwIfLoopAborted(options.signal);
     return {
       trigger: options.trigger,
@@ -1459,6 +1520,17 @@ export class ProactiveWorkLoop {
       }
       if (RUNTIME_ADMISSION_ERROR_CODES.has(stableFailureCode(error))) {
         throw error;
+      }
+      if (isStalePullRequestFactContext(error)) {
+        return {
+          claimAttempted: false,
+          claimed: false,
+          outcome: {
+            status: "decision_deferred",
+            workerId: worker.workerId,
+            code: "PR_FACTS_STALE",
+          },
+        };
       }
       const code = stableFailureCode(error);
       if (ROOT_DECISION_DEFERRED_ERROR_CODES.has(code) || isContextContention(error)) {
