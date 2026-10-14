@@ -8,7 +8,7 @@ import { createNativeCodexBrainProvider } from "../src/adapters/native-codex-bra
 import { createTestConfiguredBrainRouter } from "../src/services/configured-workforce.js";
 import { RoleDecisionEngine } from "../src/services/role-decision-engine.js";
 
-test("configured native PR role requires complete reading of the immutable review target", async (t) => {
+async function assertConfiguredNativeReviewReading(t, patch) {
   const root = await mkdtemp(path.join(tmpdir(), "configured-native-review-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const home = path.join(root, "codex-home");
@@ -96,7 +96,7 @@ test("configured native PR role requires complete reading of the immutable revie
       requirements: {},
       code: {
         sourceEvent: { subject: { number: 42 } },
-        pullRequest: { reviewMaterial: { gitTarget, patchTruncated: true, filesTruncated: true } },
+        pullRequest: { reviewMaterial: { gitTarget, patch, patchTruncated: true, filesTruncated: true } },
       },
     },
   }), { code: "PR_REVIEW_READ_INCOMPLETE" });
@@ -112,4 +112,14 @@ test("configured native PR role requires complete reading of the immutable revie
   assert.equal(call.maxStdoutBytes, 64 * 1024 * 1024);
   const input = JSON.parse(call.input.toString("utf8"));
   assert.match(input.messages[0].content, /Use the pr_review read-only tools/u);
-});
+  assert.equal(JSON.parse(input.messages[1].content).code.pullRequest.reviewMaterial.patch, patch);
+}
+
+for (const [scenario, patch] of [
+  ["small preview", ""],
+  ["UTF-8 preview above 64 KiB", "变".repeat(22_000)],
+]) {
+  test(`configured native PR role requires complete reading of the immutable review target: ${scenario}`, async (t) => {
+    await assertConfiguredNativeReviewReading(t, patch);
+  });
+}

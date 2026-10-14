@@ -165,7 +165,7 @@ function canonicalContextValue(value, depth = 0) {
   if (typeof value === "string") {
     if (
       INVALID_TEXT_CONTROL.test(value) ||
-      Buffer.byteLength(value, "utf8") > 64 * 1024
+      Buffer.byteLength(value, "utf8") > MAXIMUM_CONTEXT_BYTES
     ) {
       throw new TypeError("role context contains invalid text");
     }

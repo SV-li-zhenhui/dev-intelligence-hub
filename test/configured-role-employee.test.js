@@ -520,6 +520,35 @@ test("RoleDecisionEngine uses supplied trusted context without invoking its lega
   );
 });
 
+test("RoleDecisionEngine admits a bounded UTF-8 review preview while retaining total size and text checks", async () => {
+  const requests = [];
+  const engine = new RoleDecisionEngine({
+    definition: definition("pr-engineer"),
+    permissions: permissions("complete"),
+    brain: brain(),
+    brainRouter: {
+      describe() { return { ...brain(), remote: false }; },
+      async generate(request) {
+        requests.push(request);
+        return JSON.stringify(completeDecision());
+      },
+    },
+  });
+  const patch = "变".repeat(22_000);
+  const context = { requirements: {}, code: { pullRequest: { reviewMaterial: { patch } } } };
+  await engine.decide({ context });
+  assert.equal(JSON.parse(requests[0].messages[1].content).code.pullRequest.reviewMaterial.patch, patch);
+  await assert.rejects(
+    engine.decide({ context: { requirements: {}, code: { patch, otherText: patch } } }),
+    { code: "ROLE_CONTEXT_TOO_LARGE" },
+  );
+  await assert.rejects(
+    engine.decide({ context: { requirements: {}, code: { patch: "invalid\u0000text" } } }),
+    /role context contains invalid text/u,
+  );
+  assert.equal(requests.length, 1, "invalid contexts must never reach the model");
+});
+
 test("RoleDecisionEngine rejects intents outside the independent role permissions", async () => {
   const forbidden = completeDecision({
     intent: {
