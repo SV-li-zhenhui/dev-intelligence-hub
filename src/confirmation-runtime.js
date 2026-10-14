@@ -549,6 +549,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
           ...MEMORY_PROJECTION_SOURCE_METHODS,
           ...RECOVERY_STATUS_READER_METHODS,
           ...REVIEW_HANDOFF_METHODS,
+          "readSettlement",
         ]),
       ],
       "queue",
@@ -590,6 +591,9 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
         queue,
         RECOVERY_STATUS_READER_METHODS,
       ),
+      confirmationSettlementReader: Object.freeze({
+        read: (input) => queue.readSettlement(input),
+      }),
       close,
     });
   } catch (error) {

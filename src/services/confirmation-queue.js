@@ -782,6 +782,23 @@ export class ConfirmationQueue {
     return this.#projectItem(item);
   }
 
+  // Internal proof reader: the user projection intentionally omits execution.
+  async readSettlement(input) {
+    this.#assertReady();
+    const invalid = queueError("INVALID_CONFIRMATION_REQUEST", "确认 ID 无效", 400);
+    exactDataFields(input, ["confirmationId"], invalid);
+    if (typeof input.confirmationId !== "string" ||
+        !HISTORY_ITEM_ID.test(input.confirmationId)) throw invalid;
+    return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
+      await this.#reload();
+      const item = this.#find(input.confirmationId);
+      return item === null ? null : deepFreeze({
+        queueRevision: this.state.revision,
+        item: clone(item),
+      });
+    }));
+  }
+
   async list(options) {
     this.#assertReady();
     const query = normalizeHistoryQuery(options);

@@ -1,5 +1,9 @@
 import { scheduler } from "node:timers/promises";
 import { planWorkItemRunControl } from './work-ledger-run-control.js';
+import {
+  createRevokedCodeConfirmationSettlement,
+  isRevokedCodeConfirmationDecision,
+} from "./work-ledger-code-confirmation-settlement.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 import {
   isTrustedPullRequestScopeLifecycleAssignment,
@@ -72,6 +76,7 @@ import {
   applyPullRequestScopeLifecycle,
   appendPullRequestWorkSource,
   currentWorkItemEvent,
+  currentWorkItemInputBinding,
   pullRequestHeadAdmission,
   pullRequestWorkDescriptor,
   pullRequestTrustedPredecessor,
@@ -91,6 +96,7 @@ import {
   crossRootPullRequestCutoverPendingReason,
   crossRootPullRequestCutoverPredecessorId,
   inspectPullRequestSourceCutover,
+  normalizePullRequestSourceReconciliationCommand,
   planPullRequestSourceReconciliation,
   retireCrossRootPullRequestPredecessor,
 } from "./work-ledger-pr-cutover-commands.js";
@@ -560,6 +566,7 @@ export class WorkLedgerService {
     limits,
     postCommitYield = DEFAULT_POST_COMMIT_YIELD,
     candidateProcessor = createLocalWorkLedgerCandidateProcessor(),
+    confirmationSettlementReader = null,
   } = {}) {
     if (
       !store ||
@@ -586,6 +593,10 @@ export class WorkLedgerService {
     if (typeof postCommitYield !== "function") {
       throw new TypeError("postCommitYield must be a function");
     }
+    if (confirmationSettlementReader !== null &&
+      typeof confirmationSettlementReader?.read !== "function") {
+      throw new TypeError("confirmationSettlementReader must provide read");
+    }
     if (
       !candidateProcessor ||
       typeof candidateProcessor.prepare !== "function" ||
@@ -605,6 +616,7 @@ export class WorkLedgerService {
     this.idFactory = idFactory;
     this.postCommitYield = postCommitYield;
     this.candidateProcessor = candidateProcessor;
+    this.confirmationSettlementReader = confirmationSettlementReader;
     this.limits = normalizeWorkLedgerLimits(limits);
     this.state = emptyWorkLedgerState();
     this.durableContentVersion = undefined;
@@ -1242,7 +1254,12 @@ export class WorkLedgerService {
   }
 
   async reconcilePullRequestSource(input = {}) {
-    return this.#executeCommand(planPullRequestSourceReconciliation, input);
+    this.#assertReady();
+    const command = normalizePullRequestSourceReconciliationCommand(input);
+    const confirmationSettlements = await this.#readConfirmationSettlements([command.itemId]);
+    return this.#executeCommand((options) => planPullRequestSourceReconciliation({
+      ...options, confirmationSettlements,
+    }), command);
   }
 
   async reconcilePullRequestSourceBatch(input = {}) {
@@ -1267,6 +1284,7 @@ export class WorkLedgerService {
         "PR 来源批量对账请求无效",
       );
     }
+    const confirmationSettlements = await this.#readConfirmationSettlements(input.items.map(({ itemId }) => itemId));
     return this.#writeTransaction(async () => {
       if (this.state.revision !== input.expectedGraphRevision) {
         throw workLedgerError(
@@ -1287,6 +1305,7 @@ export class WorkLedgerService {
             },
             clock: () => this.#now(),
             timelineLimit: this.limits.timelineLimit,
+            confirmationSettlements,
           });
         } catch (error) {
           if (
@@ -1312,6 +1331,53 @@ export class WorkLedgerService {
       }
       return cloneLedgerValue({ outcomes, stoppedAfterWrite: false });
     });
+  }
+
+  async #readConfirmationSettlements(itemIds) {
+    if (this.confirmationSettlementReader === null) return null;
+    if (!this.state.items.some((item) => item.status === "blocked" &&
+      item.activeIntentId === null && isRevokedCodeConfirmationDecision(item.decisionContext))) return null;
+    // Never hold the ledger lease while entering the confirmation queue: its
+    // executor can call back into this ledger when verifying code authority.
+    const snapshot = await this.#writeTransaction(() => {
+      const itemsById = new Map(this.state.items.map((item) => [item.itemId, item]));
+      const candidates = new Map();
+      const eligible = this.state.items.filter((item) => item.status === "blocked" &&
+        item.activeIntentId === null && isRevokedCodeConfirmationDecision(item.decisionContext))
+        .map((item) => ({ item, binding: currentWorkItemInputBinding(item) }));
+      for (const itemId of itemIds) {
+        const root = itemsById.get(itemId);
+        if (root?.source?.kind !== "pull_request") continue;
+        const predecessorId = crossRootPullRequestCutoverPredecessorId(root);
+        const participantRoot = predecessorId === null ? root : itemsById.get(predecessorId);
+        if (participantRoot === undefined) continue;
+        const active = currentWorkItemInputBinding(participantRoot);
+        for (const { item, binding } of eligible) {
+          if ((item.itemId === participantRoot.itemId ||
+              (binding?.rootItemId === participantRoot.itemId &&
+                binding.headRevision === active?.headRevision))) candidates.set(item.itemId, item);
+        }
+      }
+      return {
+        candidates: cloneLedgerValue([...candidates.values()].slice(0, MAX_WORK_LEDGER_QUERY_PAGE)),
+        outbox: cloneLedgerValue(this.state.outbox.filter(({ itemId }) => candidates.has(itemId))),
+      };
+    });
+    const outboxById = new Map(snapshot.outbox.map((entry) => [entry.intentId, entry]));
+    const proofs = new Map();
+    for (const item of snapshot.candidates) {
+      const confirmation = await this.confirmationSettlementReader.read({
+        confirmationId: item.decisionContext.value.downstreamRef,
+      });
+      const proof = createRevokedCodeConfirmationSettlement(item, outboxById, confirmation);
+      if (proof !== null) proofs.set(item.itemId, proof);
+    }
+    // A normalized authorization-revoked stale confirmation is terminal: the
+    // queue cannot approve/retry it. Its explicit no-execution proof remains
+    // valid while we reacquire the ledger lease for the normal CAS transaction.
+    // The planner re-reads durable state and checks its normal graph/item CAS;
+    // each opaque proof additionally binds the captured item and outbox versions.
+    return proofs;
   }
 
   async claim(input = {}) {

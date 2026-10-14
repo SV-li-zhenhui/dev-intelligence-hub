@@ -46,6 +46,9 @@ function queuePort(events = []) {
     get(id) {
       return ["get", id];
     },
+    readSettlement(input) {
+      return ["readSettlement", input];
+    },
     approve(id, input) {
       return ["approve", id, input];
     },
@@ -305,6 +308,7 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
     "applicationResultSource",
     "memoryProjectionSource",
     "recoveryStatusReader",
+    "confirmationSettlementReader",
     "close",
   ]);
   assert.equal(Object.isFrozen(runtime.queue), true);
@@ -314,6 +318,11 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
   assert.equal(Object.isFrozen(runtime.applicationResultSource), true);
   assert.equal(Object.isFrozen(runtime.memoryProjectionSource), true);
   assert.equal(Object.isFrozen(runtime.recoveryStatusReader), true);
+  assert.equal(Object.isFrozen(runtime.confirmationSettlementReader), true);
+  assert.deepEqual(runtime.confirmationSettlementReader.read({ confirmationId: "item-1" }),
+    ["readSettlement", { confirmationId: "item-1" }]);
+  assert.equal("readSettlement" in runtime.queue, false);
+  assert.equal("readSettlement" in runtime.producerQueue, false);
   assert.notEqual(runtime.queue, rawQueue);
   assert.notEqual(runtime.historyReader, rawQueue);
   assert.notEqual(runtime.producerQueue, rawQueue);

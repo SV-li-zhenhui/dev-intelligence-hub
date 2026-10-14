@@ -117,6 +117,10 @@ import { MemoryAnswerService } from "../src/services/memory-answer-service.js";
 import { MemoryContextRetriever } from "../src/services/memory-context-retriever.js";
 import { MemoryProjector } from "../src/services/memory-projector.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
+import { createCodeJobGrant, CODE_JOB_ACTIONS_BY_OPERATION } from "../src/domain/code-job-contract.js";
+import { createCodeActionProposalConfirmationPlan } from "../src/domain/code-action-proposal-confirmation.js";
+import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
+import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
 import {
   createLocalWorkLedgerCandidateProcessor,
   createWorkerWorkLedgerCandidateProcessor,
@@ -144,7 +148,10 @@ import {
 import {
   crossRootPullRequestCutoverBlockerReason,
   crossRootPullRequestCutoverCandidate,
+  createPullRequestCutoverTimelineIndex,
+  inspectPullRequestSourceCutover,
 } from "../src/services/work-ledger-pr-cutover-commands.js";
+import { createRevokedCodeConfirmationSettlement } from "../src/services/work-ledger-code-confirmation-settlement.js";
 import {
   appendWorkLedgerTimeline,
   createAssignmentWorkItem,
@@ -585,6 +592,7 @@ async function createFixture({
   actionAdmissionGate,
   postCommitYield,
   candidateProcessor,
+  confirmationSettlementReader,
 } = {}) {
   const service = new WorkLedgerService({
     store,
@@ -596,6 +604,7 @@ async function createFixture({
     ...(limits ? { limits } : {}),
     ...(postCommitYield === undefined ? {} : { postCommitYield }),
     ...(candidateProcessor === undefined ? {} : { candidateProcessor }),
+    ...(confirmationSettlementReader === undefined ? {} : { confirmationSettlementReader }),
   });
   await service.recover();
   return { service, source, store, lease, time };
@@ -2967,6 +2976,248 @@ test("same-root cutover releases durably rejected attention", async () => {
   assert.equal(root.status, "queued");
   assert.equal(root.source.current.headRefOid, PR_HEAD_B);
   assert.equal(root.source.pendingRevision, null);
+});
+
+async function revokedCodeConfirmationFixture({ executed = false } = {}) {
+  let overrideSnapshot;
+  let confirmationQueue;
+  const reads = [];
+  const confirmationSettlementReader = {
+    read: async (input) => {
+      reads.push(input);
+      // A real callback into the ledger would deadlock if the service held its
+      // ledger queue/lease while asking the confirmation queue for settlement.
+      await fixture.service.readItemForReconciliation({ itemId: plan.requestedBy.workItemId });
+      return overrideSnapshot === undefined
+        ? confirmationQueue.readSettlement(input) : clone(overrideSnapshot);
+    },
+  };
+  const record = authoredReviewRepairAssignment(1);
+  record.assignment.target = { type: "role", id: "developer" };
+  const fixture = await createFixture({
+    records: [record],
+    confirmationSettlementReader,
+  });
+  await fixture.service.intake();
+  let item = (await fixture.service.listItems()).items[0];
+  item = await fixture.service.claim({
+    itemId: item.itemId, expectedRevision: item.revision,
+    workerId: "employee-developer", leaseDurationMs: 30_000,
+  });
+  const intent = codeActionIntent();
+  const staged = await fixture.service.stageIntent({
+    itemId: item.itemId, expectedRevision: item.revision, leaseId: item.leaseId,
+    actorId: "employee-developer", roleId: "developer", intent,
+  });
+  const content = {
+    policyVersion: 1, kind: "code_action_proposal",
+    requestedBy: { roleId: "developer", workItemId: item.itemId },
+    source: { assignmentId: item.assignmentId, eventId: item.event.eventId },
+    binding: {
+      eventId: item.event.eventId, subject: item.event.subject,
+      repository: "acme/repo", workspaceId: "dashboard", inputBinding: prExecutionBinding(item),
+    },
+    payload: Object.fromEntries(["operation", "objective", "acceptanceCriteria", "evidence", "summary", "reason"]
+      .map((key) => [key, intent[key]])),
+  };
+  const proposal = normalizeBoundWorkProposal({
+    proposalId: `work-intent-${workProposalDigest(content)}`, ...content,
+  });
+  let outbox = await fixture.service.claimIntent({
+    intentId: staged.outbox.intentId, expectedRevision: staged.outbox.revision,
+    dispatcherId: "work-intent-dispatcher", leaseDurationMs: 30_000,
+  });
+  outbox = await fixture.service.bindIntent({
+    intentId: outbox.intentId, expectedRevision: outbox.revision,
+    itemExpectedRevision: staged.item.revision, dispatcherId: outbox.dispatcherId,
+    dispatchLeaseId: outbox.dispatchLeaseId,
+    boundIntent: { intentId: proposal.proposalId, ...content },
+  });
+  await fixture.service.ackIntent({
+    intentId: outbox.intentId, expectedRevision: outbox.revision,
+    itemExpectedRevision: staged.item.revision, dispatchLeaseId: outbox.dispatchLeaseId,
+    actorId: "work-intent-dispatcher", outcome: "delivered", nextStatus: "waiting_external",
+    details: { downstreamRef: proposal.proposalId, proposalDigest: proposal.contentDigest },
+  });
+  const grant = createCodeJobGrant({
+    schemaVersion: 2, proposalId: proposal.proposalId, contentDigest: proposal.contentDigest,
+    policyVersion: proposal.policyVersion, requestedBy: proposal.requestedBy, source: proposal.source,
+    subject: proposal.binding.subject, repository: proposal.binding.repository,
+    workspaceId: proposal.binding.workspaceId, inputBinding: proposal.binding.inputBinding,
+    workspaceAuthorityDigest: "9".repeat(64), ...proposal.payload,
+    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify], writablePaths: ["src"],
+    requiredProfiles: [{ id: "node-tests", configDigest: "b".repeat(64) }], brainDigest: "c".repeat(64),
+  });
+  const plan = normalizeConfirmationPlan(createCodeActionProposalConfirmationPlan(proposal, {
+    grant, allowedOperationsByRole: { developer: ["modify"] },
+  }));
+  confirmationQueue = new ConfirmationQueue({
+    store: fixture.store, exclusiveLease: new ExclusiveLease(), clock: () => new Date(fixture.time.clock()),
+    executor: { execute: async () => ({ status: "stale" }), reconcile: async () => ({ status: "unknown" }) },
+  });
+  await confirmationQueue.recover();
+  const { displayedPayloadDigest: _display, approvalBindingDigest: _binding, ...queuePlan } = plan;
+  const queued = await confirmationQueue.enqueue(queuePlan);
+  if (executed) {
+    await confirmationQueue.approve(queued.id, {
+      requestId: "request-executed-stale", expectedQueueRevision: queued.queueRevision,
+      expectedItemRevision: queued.itemRevision, displayedPayloadDigest: queued.displayedPayloadDigest,
+      approvalBindingDigest: queued.approvalBindingDigest,
+    });
+  } else {
+    await confirmationQueue.invalidate(queued.id, {
+      requestedBy: queued.requestedBy, approvalBindingDigest: queued.approvalBindingDigest,
+      reason: "authorization_changed",
+    });
+  }
+  const snapshot = await confirmationQueue.readSettlement({ confirmationId: queued.id });
+  const result = createWorkProposalResult({
+    proposal, sequence: 1, at: fixture.time.clock(), downstreamRef: plan.id,
+    transition: { status: "stale", summary: "旧确认已安全撤销", evidence: [
+      `confirmation:${plan.id}`, "authorization_changed", "old_confirmation_status:stale",
+    ] },
+  });
+  await fixture.service.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1,
+    oldestAvailableSequence: 1 });
+  const update = authoredReviewRepairAssignment(2, {
+    occurredAt: "2026-08-02T01:15:00.000Z", ciStatus: "SUCCESS", title: "Updated PR facts",
+  });
+  update.assignment.target = record.assignment.target;
+  fixture.source.records.push(update);
+  fixture.source.highWatermark = 2;
+  assert.equal((await fixture.service.intake()).error, undefined);
+  item = (await fixture.service.listItems()).items[0];
+  assert.equal(item.status, "blocked");
+  assert.notEqual(item.source.pendingRevision, null);
+  // Reproduce the retained state from earlier source intake: only the reason
+  // was replaced; the proposal decision and its latest result remain intact.
+  const durable = fixture.store.stored();
+  durable.items.find(({ itemId }) => itemId === item.itemId).statusReason = "pr_source_revised";
+  fixture.store.replaceStored(durable);
+  fixture.service = new WorkLedgerService({
+    store: fixture.store, assignmentSource: fixture.source, exclusiveLease: fixture.lease,
+    clock: fixture.time.clock, idFactory: incrementingIds(), confirmationSettlementReader,
+  });
+  await fixture.service.recover();
+  item = (await fixture.service.listItems()).items[0];
+  return { ...fixture, item, proposal, plan, snapshot, reads, confirmationQueue,
+    replaceSnapshot: (next) => { overrideSnapshot = next; },
+    command: {
+      itemId: item.itemId, expectedRevision: item.revision,
+      expectedPendingRevision: item.source.pendingRevision,
+      expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    },
+  };
+}
+
+test("PR source reconciliation settles an unstarted revoked code confirmation after source revision replaced its reason", async () => {
+  const fixture = await revokedCodeConfirmationFixture();
+  const result = await fixture.service.reconcilePullRequestSource(fixture.command);
+  assert.equal(result.applied, true);
+  const next = await fixture.service.readItemForReconciliation({ itemId: fixture.item.itemId });
+  assert.equal(next.status, "queued");
+  assert.equal(next.source.pendingRevision, null);
+  assert.deepEqual(fixture.reads, [{ confirmationId: fixture.plan.id }]);
+});
+
+test("PR source reconciliation does not mistake an executed stale confirmation for an unstarted revocation", async () => {
+  const fixture = await revokedCodeConfirmationFixture({ executed: true });
+  assert.equal(fixture.snapshot.item.execution.outcome, "stale");
+  assert.equal(fixture.snapshot.item.invalidation, null);
+  const result = await fixture.service.reconcilePullRequestSource(fixture.command);
+  assert.equal(result.applied, false);
+  assert.equal(result.blockers[0].itemId, fixture.item.itemId);
+});
+
+test("PR source batch reconciliation uses the same trusted revoked-confirmation settlement", async () => {
+  const fixture = await revokedCodeConfirmationFixture();
+  const { expectedGraphRevision, ...item } = fixture.command;
+  const result = await fixture.service.reconcilePullRequestSourceBatch({ expectedGraphRevision, items: [item] });
+  assert.deepEqual(result, { outcomes: [{ itemId: item.itemId, status: "applied" }], stoppedAfterWrite: true });
+});
+
+test("PR source reconciliation rejects absent, executed or mismatched confirmation proof", async (t) => {
+  const variants = [
+    ["missing confirmation", () => null],
+    ["omitted execution field", (value) => { delete value.item.execution; return value; }],
+    ["executed absent outcome", (value) => {
+      value.item.execution = { requestId: "request-proved-absent", attempt: 1,
+        startedAt: value.item.createdAt, outcome: "absent" }; return value;
+    }],
+    ["receipt present", (value) => { value.item.receipt = { id: "created-job" }; return value; }],
+    ["different invalidation", (value) => { value.item.invalidation.reason = "work_item_superseded"; return value; }],
+    ["different proposer", (value) => { value.item.requestedBy.workItemId = "work-other"; return value; }],
+    ["different proposal", (value) => { value.item.action.grant.proposalId = `work-intent-${"f".repeat(64)}`; return value; }],
+    ["impossible queue revision", (value) => { value.queueRevision = 0; return value; }],
+  ];
+  for (const [name, change] of variants) await t.test(name, async () => {
+    const fixture = await revokedCodeConfirmationFixture();
+    fixture.replaceSnapshot(change(clone(fixture.snapshot)));
+    const result = await fixture.service.reconcilePullRequestSource(fixture.command);
+    assert.equal(result.applied, false);
+    assert.equal(result.blockers[0].itemId, fixture.item.itemId);
+  });
+});
+
+test("revoked-confirmation settlement preserves active-intent, decision, outbox and retained-timeline fences", async () => {
+  const fixture = await revokedCodeConfirmationFixture();
+  const state = fixture.store.stored();
+  const item = state.items.find(({ itemId }) => itemId === fixture.item.itemId);
+  const outbox = new Map(state.outbox.map((entry) => [entry.intentId, entry]));
+  const proof = createRevokedCodeConfirmationSettlement(item, outbox, fixture.snapshot);
+  assert.notEqual(proof, null);
+  const inspect = (candidate = item, { timeline = state.timeline, proofs = new Map([[item.itemId, proof]]), entries = outbox } = {}) =>
+    inspectPullRequestSourceCutover(candidate, [candidate], entries, {
+      timelineIndex: createPullRequestCutoverTimelineIndex(timeline), confirmationSettlements: proofs,
+    }).blockers;
+  assert.deepEqual(inspect(), []);
+  assert.equal(inspect({ ...item, activeIntentId: "intent-current" }).length, 1);
+  assert.equal(inspect({ ...item, revision: item.revision + 1 }).length, 1);
+  assert.equal(inspect({ ...item, decisionContext: { ...item.decisionContext, contentDigest: "e".repeat(64) } }).length, 1);
+  assert.equal(inspect(item, { proofs: new Map([[item.itemId, {}]]) }).length, 1);
+  assert.equal(inspect(item, { timeline: [] }).length, 1);
+  assert.equal(inspect(item, { timeline: [...state.timeline, { itemId: item.itemId, type: "transitioned" }] }).length, 1);
+  const delivered = [...outbox.values()].find((entry) => entry.itemId === item.itemId);
+  assert.equal(inspect(item, { entries: new Map([[delivered.intentId, { ...delivered, revision: delivered.revision + 1 }]]) }).length, 1);
+  const retained = state.timeline.find((entry) => entry.type === "proposal_result_applied");
+  assert.equal(inspect(item, { timeline: [{ ...retained, details: { ...retained.details,
+    decision: { ...retained.details.decision, contentDigest: "b".repeat(64) } } }] }).length, 1);
+  const result = inspectPullRequestSourceCutover(item, [item], outbox, {
+    timelineIndex: createPullRequestCutoverTimelineIndex([...state.timeline, { itemId: "other", type: "assignment_intaken" }], 1),
+    confirmationSettlements: new Map([[item.itemId, proof]]),
+  });
+  assert.equal(result.blockers.length, 1);
+});
+
+test("PR source reconciliation keeps command fields exact and rejects graph changes during confirmation read", async () => {
+  const fixture = await revokedCodeConfirmationFixture();
+  await assert.rejects(fixture.service.reconcilePullRequestSource({ ...fixture.command, confirmedUnstarted: true }),
+    (error) => error.code === "WORK_LEDGER_PR_SOURCE_RECONCILIATION_INVALID");
+  assert.equal(fixture.reads.length, 0);
+  fixture.service.confirmationSettlementReader = {
+    read: async (input) => {
+      fixture.source.records.push(issueAssignment(3));
+      fixture.source.highWatermark = 3;
+      await fixture.service.intake();
+      return fixture.confirmationQueue.readSettlement(input);
+    },
+  };
+  await assert.rejects(fixture.service.reconcilePullRequestSource(fixture.command),
+    (error) => error.code === "WORK_LEDGER_STATE_REVISION_CONFLICT");
+  const current = await fixture.service.readItemForReconciliation({ itemId: fixture.item.itemId });
+  assert.equal(current.status, "blocked");
+  assert.equal(current.source.pendingRevision, fixture.item.source.pendingRevision);
+});
+
+test("PR source reconciliation remains blocked without its trusted reader and fails closed when the queue cannot be read", async () => {
+  const fixture = await revokedCodeConfirmationFixture();
+  fixture.service.confirmationSettlementReader = null;
+  assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, false);
+  fixture.service.confirmationSettlementReader = { read: async () => { throw new Error("settlement unavailable"); } };
+  await assert.rejects(fixture.service.reconcilePullRequestSource(fixture.command), /settlement unavailable/);
+  const current = await fixture.service.readItemForReconciliation({ itemId: fixture.item.itemId });
+  assert.equal(current.status, "blocked");
+  assert.equal(current.source.pendingRevision, fixture.item.source.pendingRevision);
 });
 
 for (const nextStatus of ["blocked", "retry_wait"]) {

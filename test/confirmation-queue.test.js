@@ -348,6 +348,45 @@ function producerInvalidation(item, overrides = {}) {
   };
 }
 
+test("internal settlement reads durable full records without exposing them in user projections", async () => {
+  const store = new MemoryStore();
+  const queue = await readyQueue({ store });
+  const item = await queue.enqueue(actionPlan());
+  assert.equal("execution" in item, false);
+  const otherQueue = await readyQueue({ store });
+  await otherQueue.invalidate(item.id, producerInvalidation(item, {
+    reason: "authorization_changed",
+  }));
+  const snapshot = await queue.readSettlement({ confirmationId: item.id });
+  assert.equal(snapshot.queueRevision, store.value.revision);
+  assert.equal(snapshot.item.status, "stale");
+  assert.equal(snapshot.item.invalidation.reason, "authorization_changed");
+  for (const field of ["execution", "receipt", "failure"]) {
+    assert.equal(snapshot.item[field], null);
+  }
+  assert.deepEqual(snapshot.item.action, store.value.items[0].action);
+  assert.equal(Object.isFrozen(snapshot), true);
+  assert.equal(Object.isFrozen(snapshot.item.action), true);
+  assert.equal(await queue.readSettlement({ confirmationId: "missing-item" }), null);
+  await assert.rejects(queue.readSettlement({ confirmationId: item.id, extra: true }),
+    (error) => error.code === "INVALID_CONFIRMATION_REQUEST");
+  store.failReadAt = store.readCount + 1;
+  await assert.rejects(queue.readSettlement({ confirmationId: item.id }), /disk read unavailable/);
+});
+
+test("internal settlement preserves evidence that an executed stale confirmation was started", async () => {
+  const queue = await readyQueue({ actionExecutor: executor({
+    async execute() { return { status: "stale" }; },
+  }) });
+  await queue.enqueue(actionPlan());
+  const next = await queue.next();
+  await queue.approve(next.item.id, approvalRequest(next));
+  const snapshot = await queue.readSettlement({ confirmationId: next.item.id });
+  assert.equal(snapshot.item.status, "stale");
+  assert.equal(snapshot.item.execution.outcome, "stale");
+  assert.equal(snapshot.item.invalidation, null);
+});
+
 test("the queue stays closed until durable recovery succeeds", async () => {
   const queue = new ConfirmationQueue({
     store: new MemoryStore(),

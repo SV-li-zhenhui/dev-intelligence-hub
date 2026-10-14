@@ -1532,6 +1532,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     workLedgerRuntimeFactory: async (options) => {
       runtimeOrder.push("ledger");
       calls.ledger = options;
+      assert.equal(await options.confirmationSettlementReader.read({ confirmationId: "before-runtime" }), null);
       return ledgerRuntime;
     },
     dailyWorkLedgerViewFactory: ({ ledger, activeWindowDays }) => {
@@ -1582,6 +1583,9 @@ test("enabled work coordination composes private runtimes into frozen applicatio
       return {
         queue: confirmationQueue,
         producerQueue: confirmationProducerPort(),
+        confirmationSettlementReader: {
+          async read(input) { return { source: "private-confirmation", input }; },
+        },
         async close() {
           closeCalls.push("confirmation");
         },
@@ -1703,6 +1707,11 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   ]);
   assert.strictEqual(calls.ledger.store, store);
   assert.strictEqual(calls.ledger.assignmentSource, workflowRouting);
+  assert.deepEqual(await calls.ledger.confirmationSettlementReader.read({ confirmationId: "after-runtime" }), {
+    source: "private-confirmation", input: { confirmationId: "after-runtime" },
+  });
+  assert.equal(Object.isFrozen(calls.ledger.confirmationSettlementReader), true);
+  assert.equal("confirmationSettlementReader" in application, false);
   assert.notStrictEqual(calls.ownerWorkRetry.ledger, ledgerRuntime);
   assert.deepEqual(Object.keys(calls.ownerWorkRetry.ledger).sort(), [
     "readItemForReconciliation",

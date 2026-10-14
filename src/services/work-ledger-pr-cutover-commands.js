@@ -1,4 +1,5 @@
 import { assertExpectedWorkGraphRevision } from "./work-ledger-graph-command-support.js";
+import { hasRevokedCodeConfirmationSettlement } from "./work-ledger-code-confirmation-settlement.js";
 import { requireWorkLedgerItem } from "./work-ledger-item-commands.js";
 import {
   activatePendingPullRequestWorkSource,
@@ -222,7 +223,7 @@ function normalizeItemId(value) {
   }
 }
 
-function normalizeCommand(value) {
+export function normalizePullRequestSourceReconciliationCommand(value) {
   if (
     !hasExactLedgerKeys(value, [
       "itemId",
@@ -279,12 +280,13 @@ function isCodeProposalStoppedBeforeConfirmation(decision) {
     value.evidence[1] === `proposal:${decision.referenceId}`;
 }
 
-function latestSettledProposalProof(item, timelineIndex) {
+function latestSettledProposalProof(item, timelineIndex, revokedConfirmationSettled) {
   if (
     item.decisionContext?.source !== "proposal" ||
     (item.decisionContext?.outcome !== "rejected" &&
       !isExpiredCodeConfirmation(item.decisionContext) &&
-      !isCodeProposalStoppedBeforeConfirmation(item.decisionContext)) ||
+      !isCodeProposalStoppedBeforeConfirmation(item.decisionContext) &&
+      !revokedConfirmationSettled) ||
     typeof item.decisionContext.contentDigest !== "string"
   ) {
     return null;
@@ -300,7 +302,7 @@ function latestSettledProposalProof(item, timelineIndex) {
     : null;
 }
 
-function definitiveBlockedSettlement(item, outboxById, timelineIndex) {
+function definitiveBlockedSettlement(item, outboxById, timelineIndex, confirmationSettlements) {
   if (item.status !== "blocked" || item.activeIntentId !== null) return null;
   if ([
     "pr_source_left_scope",
@@ -327,10 +329,14 @@ function definitiveBlockedSettlement(item, outboxById, timelineIndex) {
   ) {
     return { proposalProof: null };
   }
-  const proposalProof = latestSettledProposalProof(item, timelineIndex);
+  const revokedConfirmationSettled = hasRevokedCodeConfirmationSettlement(
+    item, outboxById, confirmationSettlements?.get(item.itemId),
+  );
+  const proposalProof = latestSettledProposalProof(item, timelineIndex, revokedConfirmationSettled);
   if (
     proposalProof !== null &&
     (item.statusReason === `proposal_${item.decisionContext.outcome}` ||
+      (item.statusReason === "pr_source_revised" && revokedConfirmationSettled) ||
       crossRootPullRequestCutoverPendingId(item) !== null)
   ) {
     return { proposalProof };
@@ -378,7 +384,7 @@ export function inspectPullRequestSourceCutover(
   root,
   items,
   outboxById,
-  { forceHeadChanged = false, timelineIndex = null } = {},
+  { forceHeadChanged = false, timelineIndex = null, confirmationSettlements = null } = {},
 ) {
   const headChanged = forceHeadChanged || pendingHeadChanged(root.source);
   const participants = [
@@ -396,6 +402,7 @@ export function inspectPullRequestSourceCutover(
       item,
       outboxById,
       timelineIndex,
+      confirmationSettlements,
     );
     if (settlement !== null) {
       if (settlement.proposalProof !== null) {
@@ -713,6 +720,7 @@ function planCrossRootPullRequestSourceReconciliation({
   predecessorItemId,
   clock,
   timelineLimit,
+  confirmationSettlements,
 }) {
   if (root.status !== "blocked") {
     throw conflict("跨来源 PR cutover 状态无效");
@@ -767,6 +775,7 @@ function planCrossRootPullRequestSourceReconciliation({
     outboxById,
     {
       forceHeadChanged: true,
+      confirmationSettlements,
       timelineIndex: createPullRequestCutoverTimelineIndex(
         state.timeline,
         timelineLimit,
@@ -918,8 +927,9 @@ export function planPullRequestSourceReconciliation({
   input,
   clock,
   timelineLimit,
+  confirmationSettlements = null,
 }) {
-  const command = normalizeCommand(input);
+  const command = normalizePullRequestSourceReconciliationCommand(input);
   const root = requireWorkLedgerItem(state, command.itemId);
   if (root.kind !== "source_root" || root.source?.kind !== "pull_request") {
     throw conflict("工作项不是 PR 来源根");
@@ -933,6 +943,7 @@ export function planPullRequestSourceReconciliation({
       predecessorItemId,
       clock,
       timelineLimit,
+      confirmationSettlements,
     });
   }
   if (
@@ -966,6 +977,7 @@ export function planPullRequestSourceReconciliation({
     state.items,
     outboxById,
     {
+      confirmationSettlements,
       timelineIndex: createPullRequestCutoverTimelineIndex(
         state.timeline,
         timelineLimit,
