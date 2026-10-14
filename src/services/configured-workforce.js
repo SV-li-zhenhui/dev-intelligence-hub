@@ -322,6 +322,10 @@ function providerWithBoundary(provider, remote, lifecycle, sessionIsolationKey =
     provider,
     "supportsReviewReading",
   );
+  const nativeReviewSkillsDescriptor = Object.getOwnPropertyDescriptor(provider, "supportsNativeReviewSkills");
+  if (nativeReviewSkillsDescriptor && (!("value" in nativeReviewSkillsDescriptor) || typeof nativeReviewSkillsDescriptor.value !== "boolean")) {
+    throw new TypeError("brain provider native review skill support is invalid");
+  }
   const availability = provider.checkAvailability;
   if (
     attemptDescriptor &&
@@ -357,6 +361,7 @@ function providerWithBoundary(provider, remote, lifecycle, sessionIsolationKey =
     ...(reviewReadingDescriptor?.value === true
       ? { supportsReviewReading: true }
       : {}),
+    ...(nativeReviewSkillsDescriptor?.value === true ? { supportsNativeReviewSkills: true } : {}),
     generate: provider.generate.bind(provider),
     ...(availability
       ? { checkAvailability: availability.bind(provider) }

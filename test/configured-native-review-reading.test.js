@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -26,6 +26,8 @@ async function assertConfiguredNativeReviewReading(t, patch) {
   };
   const targets = [];
   const calls = [];
+  const skillDocuments = [];
+  const registeredSkills = [];
   let completenessChecks = 0;
   let readerCloses = 0;
   const router = createTestConfiguredBrainRouter({
@@ -44,15 +46,16 @@ async function assertConfiguredNativeReviewReading(t, patch) {
           async prepare({ directory, validateLocation, signal }) {
             signal?.throwIfAborted();
             await validateLocation();
-            await mkdir(directory, { recursive: true });
+            await mkdir(directory).catch((error) => { if (error.code !== "EEXIST") throw error; });
             const stat = await lstat(directory, { bigint: true });
             return { path: await realpath(directory), device: String(stat.dev), inode: String(stat.ino) };
           },
         },
-        async reviewReaderFactory(target) {
+        async reviewReaderFactory(target, options) {
           assert.equal(Object.isFrozen(target), true);
           assert.equal(Object.isFrozen(target.gitTarget), true);
           targets.push(target);
+          skillDocuments.push(options.skillDocuments);
           return {
             url: "http://127.0.0.1:12345/scoped-reader",
             diffText: "complete immutable diff",
@@ -67,6 +70,7 @@ async function assertConfiguredNativeReviewReading(t, patch) {
         processRunner: {
           async run(call) {
             calls.push(call);
+            registeredSkills.push(await readFile(path.join(call.cwd, ".agents/skills/dih-pr-review/SKILL.md"), "utf8"));
             await writeFile(call.args[call.args.indexOf("--output-last-message") + 1], JSON.stringify({
               result: JSON.stringify({ intent: { type: "propose_github_review" } }),
             }));
@@ -105,12 +109,22 @@ async function assertConfiguredNativeReviewReading(t, patch) {
   assert.equal(calls.length, 1);
   assert.equal(completenessChecks, 1);
   assert.equal(readerCloses, 1);
+  assert.equal(skillDocuments.length, 1);
+  assert.equal(registeredSkills[0], skillDocuments[0]["review-skill/SKILL.md"]);
+  assert.match(registeredSkills[0], /name: dih-pr-review/u);
   const [call] = calls;
   assert.ok(call.args.includes("mcp_servers.pr_review.required=true"));
   assert.ok(call.args.includes('mcp_servers.pr_review.url="http://127.0.0.1:12345/scoped-reader"'));
   assert.ok(call.args.includes('mcp_servers.pr_review.enabled_tools=["read_document","read_source","list_directory"]'));
   assert.equal(call.maxStdoutBytes, 64 * 1024 * 1024);
+  assert.ok(call.args.some((entry, index) => entry === "--enable" && call.args[index + 1] === "multi_agent"));
+  assert.ok(call.args.includes("skills.include_instructions=false"));
+  assert.ok(call.args.includes("skills.bundled.enabled=false"));
+  assert.equal(call.args[call.args.indexOf("--sandbox") + 1], "read-only");
   const input = JSON.parse(call.input.toString("utf8"));
+  assert.match(input.instruction, /Use \$dih-pr-review/u);
+  assert.match(input.messages[0].content, /native \$dih-pr-review/u);
+  assert.doesNotMatch(input.messages[0].content, /Apply the bundled quick-pr-review skill below/u);
   assert.match(input.messages[0].content, /Use the pr_review read-only tools/u);
   assert.equal(JSON.parse(input.messages[1].content).code.pullRequest.reviewMaterial.patch, patch);
 }

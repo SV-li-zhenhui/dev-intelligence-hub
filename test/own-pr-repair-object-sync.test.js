@@ -196,6 +196,50 @@ test("fetches only the store missing the bound commit, including an explicitly c
   assert.equal(s.calls.filter(({ args }) => args.includes("fetch")).length, 2);
 });
 
+for (const headStorage of ["loose", "packed", "detached"]) {
+  test(`prepares exact Head with a valid hash-containing mirror ref (${headStorage})`, realGit, async (t) => {
+    const s = await fixture(t);
+    const baseOid = (await git(s.mirrorRoot, ["rev-parse", "HEAD"])).stdout.trim();
+    if (headStorage === "detached") {
+      await writeFile(path.join(s.mirrorRoot, "HEAD"), `${baseOid}\n`);
+    } else {
+      const ref = "refs/heads/S#desc/fda-protocol-search-sql-layer";
+      await git(s.mirrorRoot, ["update-ref", ref, baseOid]);
+      await git(s.mirrorRoot, ["symbolic-ref", "HEAD", ref]);
+      if (headStorage === "packed") await git(s.mirrorRoot, ["pack-refs", "--all", "--prune"]);
+    }
+    const before = await preservedState(s);
+    const sync = new OwnPrRepairObjectSync(s);
+    assert.deepEqual((await sync.prepare(s)).fetchedRoots, [s.sourceRoot, s.mirrorRoot]);
+    assert.deepEqual(await preservedState(s), before);
+    for (const cwd of [s.sourceRoot, s.mirrorRoot]) {
+      assert.equal((await git(cwd, ["cat-file", "-t", s.headOid])).stdout.trim(), "commit");
+    }
+  });
+}
+
+test("rejects malformed and escaping mirror HEAD refs before credentials or fetch", realGit, async (t) => {
+  const s = await fixture(t);
+  const sync = new OwnPrRepairObjectSync(s);
+  for (const ref of [
+    "refs/heads/S#desc/../main",
+    "refs/heads//main",
+    "refs/heads/.hidden",
+    "refs/heads/main.lock",
+    "refs/heads/main\\escape",
+    "refs/heads/main\0suffix",
+    "refs/heads/main\nref: refs/heads/other",
+    "/refs/heads/main",
+  ]) {
+    const head = `ref: ${ref}\n`;
+    await writeFile(path.join(s.mirrorRoot, "HEAD"), head);
+    await assert.rejects(sync.prepare(s), { code: "OWN_PR_REPAIR_OBJECT_PREFLIGHT_FAILED" });
+    assert.equal(await readFile(path.join(s.mirrorRoot, "HEAD"), "utf8"), head);
+  }
+  assert.equal(s.calls.some(({ args }) => args.includes("fetch")), false);
+  assert.equal(s.acquired.length, 0);
+});
+
 test("rejects malformed bindings, mismatched actors, unconfigured repositories and invalid paths before Git or credentials", realGit, async (t) => {
   const s = await fixture(t);
   const mutations = [

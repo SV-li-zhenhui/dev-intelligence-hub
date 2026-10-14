@@ -108,6 +108,14 @@ task documents. Inline previews are bounded; complete change-set reading is a
 separate enforced evidence condition. Neither native mode nor the MCP reader
 grants direct GitHub publishing authority.
 
+Native exec reviews advertise `supportsNativeReviewSkills`; the role engine
+references the registered skill instead of embedding the legacy quick-review body.
+The provider stages a fixed `dih-pr-review` entry, explicitly invokes it, and serves
+its content-fingerprinted references through the scoped reader. Native agent tools
+are enabled only for these Review calls. Its tiered background procedure reuses
+available installed routing/persona documents, preserves the business decision
+schema, and records actual coverage; it is not the unmodified CE workflow.
+
 The native read-only sandbox restricts writes, not read confidentiality across
 the service account's filesystem. Native mode therefore trusts Codex's local
 read capability for that account. Automation ignores host Codex user config,

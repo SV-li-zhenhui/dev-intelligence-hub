@@ -177,6 +177,7 @@ function normalizeProvider(value) {
     singleAttempt: attemptDescriptor?.value === true,
     supportsEntitySessions: value.supportsEntitySessions === true,
     supportsReviewReading: value.supportsReviewReading === true,
+    supportsNativeReviewSkills: value.supportsNativeReviewSkills === true,
     ...(value.supportsEntitySessions === true
       ? { sessionIsolationKey: value.sessionIsolationKey }
       : {}),
@@ -215,6 +216,7 @@ function frozenDescription(provider, brain) {
     remoteData: Object.freeze({ ...brain.remoteData }),
     ...(provider.singleAttempt ? { singleAttempt: true } : {}),
     ...(provider.supportsReviewReading ? { supportsReviewReading: true } : {}),
+    ...(provider.supportsNativeReviewSkills ? { supportsNativeReviewSkills: true } : {}),
   });
 }
 

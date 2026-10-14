@@ -387,6 +387,35 @@ rollout files, and blocks fresh invocation with
 error: preserve the only copy of task history and investigate capture recovery.
 MyDashboard also keeps durable task context in its own ledger and memory.
 
+Native exec Review calls register the bundled `dih-pr-review` under the private
+invocation's `.agents/skills` directory and invoke it explicitly with `$dih-pr-review`.
+Automatic skill catalog instructions and bundled host skills are disabled for
+that call; plugins, hooks and host MCP remain disabled. Only Review calls enable
+native subagents, with the skill limiting independent reviewers to three and
+requiring their results before completion. Non-Review calls keep subagents disabled.
+Skill references are served by the existing read-only MCP, not host shell commands.
+Complete reads of the native skill entry and its manifest are required alongside
+the PR manifest/diff before a Review proposal can pass.
+
+The package may read the installed `pr-review-tiering` policy and CE persona
+documents from the service user's standard skill/plugin folders. It records content
+hashes and missing optional resources in `review-skill/manifest.json`, without
+pinning a plugin release or editing personal skills. The background adaptation
+does not run CE's full Git/CLI/script/cross-model pipeline. Missing independent
+results must appear as coverage limits, not a claim of completed deep review.
+No skill receives publishing authority. Known staged skill files and their empty
+parent directories are removed only after confirmed process exit; unknown residue
+and native history remain preserved under the existing recovery rules.
+
+For automatic own-PR review repair, a successful sealed `inspect` result on the
+current bound Head is intermediate work: the original developer task is queued
+again with its attested result. Ordinary/manual inspection keeps its existing
+completion semantics. Failed, stale, unknown or superseded results do not advance
+the repair. Inspect success alone is not evidence of code changes or publication.
+Object preparation accepts validated mirror branch refs containing `#`; a missing
+bound Head must be fetched by the trusted object synchronizer before creating the
+code snapshot. Keep the failed job and audit trail when retrying the original task.
+
 The following capture and cleanup rules describe compatibility invocation
 profiles. Native mode keeps conversations in the fixed Codex home and only
 cleans its task-owned input/output workspace after verified process exit.

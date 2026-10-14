@@ -161,7 +161,7 @@ async function mirrorHead(mirrorRoot) {
   for (let depth = 0; depth < 8; depth += 1) {
     const value = content.trimEnd();
     if (OID.test(value)) return value;
-    const match = /^ref: (refs\/[A-Za-z0-9_./-]+)$/u.exec(value);
+    const match = /^ref: (refs\/[A-Za-z0-9_#./-]+)$/u.exec(value);
     const ref = match?.[1];
     if (!ref || ref.includes("..") || ref.split("/").some((segment) => !segment || segment.startsWith(".") || segment.endsWith(".lock")) || visited.has(ref)) break;
     visited.add(ref);

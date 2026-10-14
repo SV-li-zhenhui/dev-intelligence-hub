@@ -53,6 +53,24 @@ async function tool(session, name, args) {
   return JSON.parse(result.content[0].text);
 }
 
+test("native skill resources are scoped to this reader and must be read before a review completes", async (t) => {
+  const skillDocuments = { "review-skill/SKILL.md": "Follow the native review procedure.", "review-skill/manifest.json": "{}", "review-skill/references/correctness.md": "Trace boundary conditions." };
+  const session = await fixture({ changed: 1 }).reader.open(TARGET, { skillDocuments });
+  t.after(() => session.close());
+  for (const document of ["review-manifest.json", "review.diff"]) {
+    await tool(session, "read_document", { document, offset: 0, length: 48_000 });
+  }
+  await assert.rejects(session.assertComplete(), { code: "PR_REVIEW_READ_INCOMPLETE" });
+  const registered = (await rpc(session, "tools/list")).tools.find((entry) => entry.name === "read_document");
+  assert.ok(registered.inputSchema.properties.document.enum.includes("review-skill/SKILL.md"));
+  assert.equal((await tool(session, "read_document", { document: "review-skill/SKILL.md", offset: 0 })).text, skillDocuments["review-skill/SKILL.md"]);
+  await assert.rejects(session.assertComplete(), { code: "PR_REVIEW_READ_INCOMPLETE" });
+  await tool(session, "read_document", { document: "review-skill/manifest.json", offset: 0 });
+  await session.assertComplete();
+  assert.equal((await tool(session, "read_document", { document: "review-skill/references/correctness.md", offset: 0 })).text, skillDocuments["review-skill/references/correctness.md"]);
+  await assert.rejects(tool(session, "read_document", { document: "review-skill/../../auth.json", offset: 0 }), { code: "PR_REVIEW_READ_DOCUMENT_INVALID" });
+});
+
 test("CLI can page through all 117 files and a diff beyond the old prompt budget", async (t) => {
   const f = fixture();
   const session = await f.reader.open(TARGET);

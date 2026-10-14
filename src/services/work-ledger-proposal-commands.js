@@ -2,6 +2,7 @@ import { normalizeWorkProposalResult } from "../domain/work-proposal-contract.js
 import { normalizeDeliveryEvidenceTarget } from "../domain/delivery-evidence-contract.js";
 import {
   normalizePullRequestExecutionBinding,
+  samePullRequestExecutionBinding,
 } from "../domain/pull-request-execution-binding.js";
 import {
   isWorkItemInLegacyPullRequestCutover,
@@ -13,6 +14,7 @@ import {
 } from "./work-ledger-state.js";
 import {
   currentWorkItemExecutionBinding,
+  currentWorkItemEvent,
   LEGACY_PR_SOURCE_CUTOVER_REASON,
   LEGACY_PR_SOURCE_QUARANTINE_KIND,
 } from "./work-ledger-pr-source.js";
@@ -52,6 +54,38 @@ const PULL_REQUEST_BINDING_FIELDS = Object.freeze([
 function samePullRequestSourceBinding(left, right) {
   return left !== null && right !== null &&
     PULL_REQUEST_BINDING_FIELDS.every((field) => left?.[field] === right?.[field]);
+}
+
+function continuesOwnPullRequestRepairInspection(item, outbox, result) {
+  const boundIntent = outbox.dispatchBinding?.boundIntent;
+  const event = currentWorkItemEvent(item);
+  if (
+    result.kind !== "code_action_proposal" ||
+    result.requestedBy.roleId !== "developer" ||
+    outbox.intent.operation !== "inspect" ||
+    boundIntent?.payload?.operation !== "inspect" ||
+    item.source?.kind !== "pull_request" ||
+    item.source.scope.active !== true ||
+    item.source.scope.kind !== "automatic" ||
+    item.source.pendingRevision !== null ||
+    item.source.identity.targetRoleId !== "developer" ||
+    event.source.provider !== "github" ||
+    event.payload.relation !== "authored" ||
+    event.payload.actionState !== "action_now" ||
+    event.payload.nextAction !== "address_review"
+  ) {
+    return false;
+  }
+  const current = currentWorkItemExecutionBinding(item);
+  if (!samePullRequestSourceBinding(current, outbox.sourceBinding)) return false;
+  try {
+    return samePullRequestExecutionBinding(
+      current,
+      boundIntent.binding.inputBinding,
+    );
+  } catch {
+    return false;
+  }
 }
 
 function proposalTimelineInputBinding(state, item, outbox) {
@@ -393,7 +427,11 @@ export function planProposalBatchApplication({ state, input, clock }) {
       "intentId",
       outboxResult,
     );
-    const continueForEvidence = succeeded && evidenceTarget !== null;
+    const continueForEvidence = succeeded && (
+      evidenceTarget !== null ||
+      // Inspection must return to the developer's repair decision.
+      continuesOwnPullRequestRepairInspection(item, outbox, result)
+    );
     let nextStatus = "blocked";
     if (succeeded) {
       nextStatus = continueForEvidence ? "queued" : "completed";

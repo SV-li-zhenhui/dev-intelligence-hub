@@ -12759,6 +12759,7 @@ async function prepareProposalResult(
     downstreamRef,
     proposalDigest,
     authoritativeEvidence = false,
+    sealSource = false,
     intentOverrides = {},
     roleId: configuredRoleId,
     workerId: configuredWorkerId,
@@ -12852,6 +12853,9 @@ async function prepareProposalResult(
       ? {
           repository: "acme/repo",
           workspaceId: "dashboard",
+          ...(sealSource
+            ? { inputBinding: prExecutionBinding(staged.item) }
+            : {}),
           ...(evidenceTarget === undefined ? {} : { evidenceTarget }),
         }
       : {
@@ -12861,7 +12865,7 @@ async function prepareProposalResult(
         },
     payload: codeProposal
       ? {
-          operation: "modify",
+          operation: intentOverrides.operation ?? "modify",
           objective: "修复并发覆盖",
           acceptanceCriteria: ["回归测试通过"],
         }
@@ -12870,7 +12874,7 @@ async function prepareProposalResult(
         : { verdict: "approve", body: "本地审查通过。" },
   };
   const proposal = normalizeBoundWorkProposal({
-    proposalId: authoritativeEvidence
+    proposalId: authoritativeEvidence || sealSource
       ? `work-intent-${workProposalDigest(proposalContent)}`
       : `work-intent-${
           codeProposal
@@ -12887,7 +12891,7 @@ async function prepareProposalResult(
     dispatcherId: "work-intent-dispatcher",
     leaseDurationMs: 30_000,
   });
-  if (evidenceTarget !== undefined) {
+  if (evidenceTarget !== undefined || sealSource) {
     claimed = await fixture.service.bindIntent({
       intentId: claimed.intentId,
       expectedRevision: claimed.revision,
@@ -13460,6 +13464,190 @@ test("a bound code proposal id distinct from its staged intent completes work", 
   assert.equal(applied.applied, 1);
   assert.equal(item.status, "completed");
   assert.equal(item.statusReason, "proposal_succeeded");
+});
+
+function authoredReviewRepairAssignment(sequence, overrides = {}) {
+  const record = prAssignment(sequence, {
+    gitFacts: {
+      ...prGitFacts(overrides.headRefOid ?? PR_HEAD_A),
+      relation: "authored",
+      actionState: "action_now",
+      nextAction: "address_review",
+      reviewDecision: "CHANGES_REQUESTED",
+      reviewFeedbackCount: 1,
+    },
+    ...overrides,
+  });
+  record.assignment.target = { type: "role", id: "developer" };
+  record.assignment.ruleId = AUTHORED_PR_SELF_FIX_RULE_ID;
+  record.assignment.reason = "authored-pr-self-fix";
+  return record;
+}
+
+test("own PR review repair continues after successful inspection without a graph evidence target", async () => {
+  const fixture = await createFixture({
+    records: [authoredReviewRepairAssignment(1)],
+  });
+  const result = await prepareProposalResult(fixture, {
+    kind: "code_action_proposal",
+    sealSource: true,
+    intentOverrides: { operation: "inspect" },
+  });
+  const original = (await fixture.service.listItems()).items[0];
+  assert.equal(original.source.kind, "pull_request");
+  assert.equal(
+    fixture.store.stored().outbox[0].dispatchBinding.boundIntent.binding
+      .evidenceTarget,
+    undefined,
+  );
+
+  await fixture.service.applyProposalBatch({
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  const queued = (await fixture.service.listItems()).items[0];
+  assert.equal(queued.itemId, original.itemId);
+  assert.equal(queued.status, "queued");
+  assert.equal(queued.statusReason, "proposal_evidence_ready");
+  assert.equal(queued.activeIntentId, null);
+  assert.equal(queued.decisionContext.referenceId, result.proposalId);
+  assert.equal(queued.decisionContext.value.resultDigest, result.contentDigest);
+  assert.deepEqual(queued.decisionContext.value.evidence, result.evidence);
+
+  const restarted = await createFixture({
+    records: fixture.source.records,
+    store: fixture.store,
+  });
+  const nextTurn = await restarted.service.claim({
+    itemId: queued.itemId,
+    expectedRevision: queued.revision,
+    workerId: "employee-developer",
+    leaseDurationMs: 30_000,
+  });
+  assert.deepEqual(nextTurn.decisionContext, queued.decisionContext);
+  const modification = await restarted.service.stageIntent({
+    itemId: nextTurn.itemId,
+    expectedRevision: nextTurn.revision,
+    leaseId: nextTurn.leaseId,
+    actorId: "employee-developer",
+    roleId: "developer",
+    intent: codeActionIntent(),
+  });
+  assert.notEqual(modification.outbox.intentId, original.activeIntentId);
+});
+
+test("own PR review repair inspection failures and stale outcomes stay blocked", async (t) => {
+  for (const outcome of ["failed", "stale", "unknown", "rejected"]) {
+    await t.test(outcome, async () => {
+      const fixture = await createFixture({
+        records: [authoredReviewRepairAssignment(1)],
+      });
+      const result = await prepareProposalResult(fixture, {
+        kind: "code_action_proposal",
+        sealSource: true,
+        intentOverrides: { operation: "inspect" },
+        outcome,
+      });
+      await fixture.service.applyProposalBatch({
+        items: [result],
+        nextSequence: 1,
+        highWatermark: 1,
+        oldestAvailableSequence: 1,
+      });
+      const item = (await fixture.service.listItems()).items[0];
+      assert.equal(item.status, "blocked");
+      assert.equal(item.statusReason, `proposal_${outcome}`);
+      assert.equal(item.decisionContext.outcome, outcome);
+    });
+  }
+});
+
+test("own PR inspection does not continue repair against a pending newer Head", async () => {
+  const fixture = await createFixture({
+    records: [authoredReviewRepairAssignment(1)],
+  });
+  const result = await prepareProposalResult(fixture, {
+    kind: "code_action_proposal",
+    sealSource: true,
+    intentOverrides: { operation: "inspect" },
+  });
+  fixture.source.records.push(authoredReviewRepairAssignment(2, {
+    occurredAt: "2026-08-02T01:05:00.000Z",
+    headRefOid: PR_HEAD_B,
+    previousHeadRefOid: PR_HEAD_A,
+    changedFields: ["headRefOid"],
+  }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  const waiting = (await fixture.service.listItems()).items[0];
+  assert.notEqual(waiting.source.pendingRevision, null);
+  assert.equal(waiting.source.current.headRefOid, PR_HEAD_A);
+
+  await fixture.service.applyProposalBatch({
+    items: [result],
+    nextSequence: 1,
+    highWatermark: 1,
+    oldestAvailableSequence: 1,
+  });
+  const settled = (await fixture.service.listItems()).items[0];
+  assert.equal(settled.status, "completed");
+  assert.equal(settled.statusReason, "proposal_succeeded");
+  assert.equal(settled.source.current.headRefOid, PR_HEAD_A);
+  assert.notEqual(settled.source.pendingRevision, null);
+});
+
+test("successful inspection alone still completes ordinary analysis and final code operations", async (t) => {
+  const cases = [
+    {
+      name: "ordinary Issue inspection",
+      record: assignment(1, { type: "role", id: "developer" }),
+      operation: "inspect",
+      sealSource: false,
+    },
+    {
+      name: "owner requested PR inspection",
+      record: (() => {
+        const record = ownerRequestedPrAssignment(1);
+        record.assignment.target = { type: "role", id: "developer" };
+        return record;
+      })(),
+      operation: "inspect",
+      sealSource: true,
+    },
+    {
+      name: "unsealed own PR inspection",
+      record: authoredReviewRepairAssignment(1),
+      operation: "inspect",
+      sealSource: false,
+    },
+    ...["modify", "verify"].map((operation) => ({
+      name: `own PR ${operation}`,
+      record: authoredReviewRepairAssignment(1),
+      operation,
+      sealSource: true,
+    })),
+  ];
+  for (const { name, record, operation, sealSource } of cases) {
+    await t.test(name, async () => {
+      const fixture = await createFixture({ records: [record] });
+      const result = await prepareProposalResult(fixture, {
+        kind: "code_action_proposal",
+        sealSource,
+        intentOverrides: { operation },
+      });
+      await fixture.service.applyProposalBatch({
+        items: [result],
+        nextSequence: 1,
+        highWatermark: 1,
+        oldestAvailableSequence: 1,
+      });
+      const item = (await fixture.service.listItems()).items[0];
+      assert.equal(item.status, "completed");
+      assert.equal(item.statusReason, "proposal_succeeded");
+    });
+  }
 });
 
 test("a PR external action result settles only its trusted external-action intent", async () => {

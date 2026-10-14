@@ -50,7 +50,10 @@ export class GitHubReviewReader {
     this.runText = runText;
   }
 
-  async open(rawTarget, { signal = null } = {}) {
+  async open(rawTarget, { signal = null, skillDocuments = {} } = {}) {
+    const skills = Object.entries(skillDocuments);
+    if (skills.some(([name, value]) => !/^review-skill\/(?:SKILL\.md|manifest\.json|references\/[a-z-]+\.md)$/.test(name) ||
+      typeof value !== "string" || Buffer.byteLength(value) > 128 * 1024)) throw failure("PR_REVIEW_READ_DOCUMENT_INVALID");
     const target = normalizeReviewReadTarget(rawTarget);
     const git = target.gitTarget;
     const controller = new AbortController();
@@ -92,8 +95,13 @@ export class GitHubReviewReader {
     }
     await checkTarget();
     const manifestText = JSON.stringify({ repository: git.baseRepository, pullRequestNumber: target.pullRequestNumber, base: git.baseRefOid, head: git.headRefOid, changedFiles: files.length, files }, null, 2);
-    const documents = { "review-manifest.json": manifestText, "review.diff": diffText };
-    const reads = { "review-manifest.json": [], "review.diff": [] };
+    const documents = { "review-manifest.json": manifestText, "review.diff": diffText, ...Object.fromEntries(skills) };
+    const requiredDocuments = ["review-manifest.json", "review.diff", ...skills.filter(([name]) => ["review-skill/SKILL.md", "review-skill/manifest.json"].includes(name)).map(([name]) => name)];
+    const reads = Object.fromEntries(Object.keys(documents).map((name) => [name, []]));
+    const tools = TOOLS.map((tool) => tool.name === "read_document" ? {
+      ...tool, description: "Read a PR or trusted skill document in successive pages, following nextOffset until null.",
+      inputSchema: { ...tool.inputSchema, properties: { ...tool.inputSchema.properties, document: { type: "string", enum: Object.keys(documents) } } },
+    } : tool);
     const contentsCache = new Map();
     const sourceCache = new Map();
     const contents = async (filePath, revision, directory = false) => {
@@ -169,7 +177,7 @@ export class GitHubReviewReader {
         let result;
         if (message.method === "initialize") result = { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "mydashboard-pr-review", version: "1.0.0" } };
         else if (message.method === "ping") result = {};
-        else if (message.method === "tools/list") result = { tools: TOOLS };
+        else if (message.method === "tools/list") result = { tools };
         else if (message.method === "tools/call") {
           try {
             const value = await callTool(message.params?.name, message.params?.arguments);
@@ -199,7 +207,7 @@ export class GitHubReviewReader {
       url: `http://127.0.0.1:${server.address().port}${endpointPath}`,
       diffText, manifestText,
       async assertComplete() {
-        if (Object.entries(documents).some(([name, value]) => !coversAll(reads[name], value.length))) {
+        if (requiredDocuments.some((name) => !coversAll(reads[name], documents[name].length))) {
           throw failure("PR_REVIEW_READ_INCOMPLETE");
         }
         await checkTarget();
