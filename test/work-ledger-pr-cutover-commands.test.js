@@ -213,6 +213,44 @@ test("cutover releases an expired code confirmation from durable proof after its
   }
 });
 
+test("cutover releases authorization expiry before code confirmation only with matching durable proof", () => {
+  const decision = {
+    source: "proposal", outcome: "stale", contentDigest: "a".repeat(64),
+    referenceId: "work-intent-unstarted-code",
+    value: {
+      kind: "code_action_proposal", downstreamRef: null,
+      evidence: ["authorization_changed", "proposal:work-intent-unstarted-code"],
+    },
+  };
+  const persisted = root({
+    revision: 7, decisionContext: decision,
+    statusReason: "pr_source_cross_root_cutover_blocker:root-b",
+  });
+  const proof = {
+    itemId: persisted.itemId, type: "proposal_result_applied", sequence: 10,
+    details: { outcome: "stale", workItemRevision: 6, decision },
+  };
+  const inspect = (item = persisted, timeline = [proof]) => blockersFor(item, [], { timeline });
+  assert.deepEqual(inspect(), []);
+  assert.deepEqual(inspect({ ...persisted, statusReason: "proposal_stale" }), []);
+  assert.equal(inspect(persisted, []).length, 1);
+  assert.equal(inspect(persisted, [proof, { itemId: persisted.itemId, type: "transitioned" }]).length, 1);
+  assert.equal(inspect({ ...persisted, activeIntentId: "still-running" }).length, 1);
+  assert.equal(inspect({ ...persisted, decisionContext: { ...decision, contentDigest: "b".repeat(64) } }).length, 1);
+  for (const value of [
+    { ...decision.value, kind: "github_review_proposal" },
+    { ...decision.value, downstreamRef: "confirmation-code-job-existing" },
+    { ...decision.value, evidence: ["authorization_changed", "proposal:another-proposal"] },
+    { ...decision.value, evidence: ["authorization_changed"] },
+    { ...decision.value, evidence: [...decision.value.evidence, "code-job:possibly-running"] },
+  ]) {
+    const changedDecision = { ...decision, value };
+    assert.equal(inspect({ ...persisted, decisionContext: changedDecision }, [{
+      ...proof, details: { ...proof.details, decision: changedDecision },
+    }]).length, 1);
+  }
+});
+
 test("cutover proof expires when unrelated same-batch events rotate it out", () => {
   const decisionDigest = "f".repeat(64);
   const rejected = root({

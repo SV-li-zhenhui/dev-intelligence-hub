@@ -266,11 +266,25 @@ function isExpiredCodeConfirmation(decision) {
     value.evidence[0] === `confirmation:${value.downstreamRef}`;
 }
 
+function isCodeProposalStoppedBeforeConfirmation(decision) {
+  const value = decision?.value;
+  // This handler result is emitted only before enqueueing a confirmation.
+  // Other stale results can represent an executing or quarantined code job.
+  return decision?.outcome === "stale" &&
+    value?.kind === "code_action_proposal" &&
+    value.downstreamRef === null &&
+    typeof decision.referenceId === "string" &&
+    Array.isArray(value.evidence) && value.evidence.length === 2 &&
+    value.evidence[0] === "authorization_changed" &&
+    value.evidence[1] === `proposal:${decision.referenceId}`;
+}
+
 function latestSettledProposalProof(item, timelineIndex) {
   if (
     item.decisionContext?.source !== "proposal" ||
     (item.decisionContext?.outcome !== "rejected" &&
-      !isExpiredCodeConfirmation(item.decisionContext)) ||
+      !isExpiredCodeConfirmation(item.decisionContext) &&
+      !isCodeProposalStoppedBeforeConfirmation(item.decisionContext)) ||
     typeof item.decisionContext.contentDigest !== "string"
   ) {
     return null;

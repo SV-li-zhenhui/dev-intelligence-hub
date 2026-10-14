@@ -45,3 +45,18 @@ Code review: skipped (ce-code-review unavailable)。本会话此前正式 CE 流
 没有配置 lint/typecheck 命令；执行语法及 diff 检查。T3、多机远程桌面及真实 OCT 编译/界面测试不在上述模型通道验收结果内。
 
 用户已接手 #24723 的修复，系统提交了取消该代码作业的请求；不以它继续测试，也不恢复其自动写入。后续使用另一条 PR 核验业务链路，通道验收不等于真实 PR 修复已完成。
+
+## 部署核验（2026-10-14）
+
+- 15:17:51（北京时间）受管服务启动，源码提交 `371ff5699e`，PID 19356，端口 4173。第一次停止因临时未取得匹配 liveness 被拒绝；重新核实身份后正常停止和启动，未强杀或恢复失败快照。
+- 系统就绪、维护模式 open；`/api/task-runs` 返回 200，包含后台作业组。配置版本仍为 39，`config.json` SHA256 仍为 `D1654D61C39622430ECBB7BB7B5C5436B20C9EBF09D5AFAA0A25EDAA9C46A225`。
+- 15:29 观察到生产任务 `requirements-analyst` 的真实会话：`live:true`、transport `app-server`、绑定当前 thread/turn，正在生成判断。
+- 额外真实模型中断验收通过：`app-server-interrupt-bfa3ef1b-9a16-45c5-abc7-4aa205037c2d/receipt.json`。暂停后收到 interrupted 回合、受管进程清理完成、Registry 进入 paused，私有运行目录只保留 sessions。
+- #24723 的代码作业已进入 cancelled，根任务为 blocked / proposal_rejected；未产生本轮修复提交。
+- 改用 #24232 测试，所有者请求 `e2508afc-625c-439f-81f3-099df2be8264` 已持久入账到开发岗位。HTTP 客户端 45 秒等待超时，但请求最终 intaken；未重复提交。该 PR 的旧任务交接仍被 `pr_source_cross_root_cutover_pending` 阻塞，不能将入账称为已执行或已修复。
+
+## 备用 PR 的交接修复
+
+- #24232 旧代码提案在进入确认队列前因授权变化失效，结果保留了精确的未启动证据；来源切换漏认此分支，导致新开发请求被旧根挡住。
+- 仅认可 `code_action_proposal`、`downstreamRef:null` 和精确的 `authorization_changed` / 对应 proposal 证据，同时保留最新持久事件、摘要、版本及无活动意图检查。已有确认、可能运行的作业及不完整证据继续阻塞。
+- 聚焦验证：切换单元及来源测试 36/36，通过来源切换相关服务集成测试 27/27。只读真实状态规划从有 blocker 变为可应用；该规划未写入生产状态。部署后的真实推进结果另行记录。
