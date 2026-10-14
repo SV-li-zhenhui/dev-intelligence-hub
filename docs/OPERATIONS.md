@@ -424,6 +424,9 @@ routing and ledger intake, after verifying the same current Head, feedback, acto
 generated-triage provenance and absence of live children/intents. Preserve the
 original snapshot timestamp and audit history; ordinary manual owner requests are
 not candidates for this repair.
+The public routing input takes only event content (`schemaVersion`, `eventType`,
+`occurredAt`, `source`, `subject`, `payload`) and recomputes its ID/digest; omit the
+stored event's `eventId` and `contentDigest` when using `dryRun`/`ingest`.
 
 The following capture and cleanup rules describe compatibility invocation
 profiles. Native mode keeps conversations in the fixed Codex home and only
