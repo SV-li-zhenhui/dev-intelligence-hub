@@ -264,3 +264,18 @@ export function sameCodeExecutionSource(left, right) {
 export function codeExecutionSourceWritablePaths(value) {
   return [...normalizeCodeExecutionSource(value).writeScope.paths];
 }
+
+export function codeExecutionSourceAllowsWrite(value, path) {
+  const { writeScope } = normalizeCodeExecutionSource(value);
+  const relativePath = normalizeWorkspacePath(path);
+  if (writeScope.mode === "exact_files") {
+    return writeScope.paths.includes(relativePath);
+  }
+  const policy = new CodeExecutionPolicy({ writablePaths: writeScope.paths });
+  try {
+    policy.assertWritable(relativePath);
+    return true;
+  } catch {
+    return false;
+  }
+}

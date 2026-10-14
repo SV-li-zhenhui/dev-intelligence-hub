@@ -2047,7 +2047,7 @@ test("pause during an admitted action stays pausing until result reconciliation"
   assert.equal(stored.execution.actionAdmission, null);
 });
 
-async function createRealApprovedJob() {
+async function createRealApprovedJob(grantOverrides = {}) {
   const jobs = new CodeJobStore({
     store: new IntegrationMemoryStore(),
     exclusiveLease: { run: (operation) => operation() },
@@ -2084,6 +2084,7 @@ async function createRealApprovedJob() {
     writablePaths: [],
     requiredProfiles: [{ id: "node-tests", configDigest: PROFILE_DIGEST }],
     brainDigest: "3".repeat(64),
+    ...grantOverrides,
   });
   const created = await jobs.createApprovedJob({
     confirmationId: "confirmation-integration-pause",
@@ -2095,6 +2096,138 @@ async function createRealApprovedJob() {
   const durableJob = await jobs.getForWorker(created.job.jobId);
   return {jobs,created,durableJob};
 }
+
+async function createRealReviewRepairJob() {
+  const fixture = reviewRepairFixture();
+  const inputBinding = fixture.initial.grant.inputBinding;
+  const writablePaths = ["Source", "Test"];
+  const executionSource = createReviewRepairCodeExecutionSource({ inputBinding, writablePaths });
+  const approved = await createRealApprovedJob({
+    ...fixture.initial.grant,
+    executionSource,
+    writablePaths,
+    source: { assignmentId: "integration-assignment", eventId: inputBinding.eventId },
+    subject: { id: "github:acme/dashboard:pull-request:42", repository: "acme/dashboard", number: 42 },
+  });
+  return { ...approved, reader: fixture.reader };
+}
+
+test("durable review repair admission permits configured descendants and keeps the sealed scope", async () => {
+  const { jobs, durableJob } = await createRealReviewRepairJob();
+  const starting = await jobs.claimStarting({ jobId: durableJob.jobId, expectedRevision: durableJob.revision });
+  const active = await jobs.activate({ jobId: durableJob.jobId, expectedRevision: starting.job.revision, workspaceRevision: REVISION_A });
+  const action = {
+    type: "write_text", path: "Source/Systems/Analysis/AnalysisFAZSystem.cpp", content: "fixed\n",
+    actionId: "review-repair-write", expectedWorkspaceRevision: REVISION_A, expectedSha256: FILE_SHA,
+  };
+  for (const path of ["Sources/AnalysisFAZSystem.cpp", "Other/AnalysisFAZSystem.cpp", "Source/.git/config"]) {
+    await assert.rejects(jobs.prepareAction({ jobId: durableJob.jobId, expectedRevision: active.job.revision,
+      action: { ...action, path } }), (error) => error.code === "INVALID_CODE_JOB");
+  }
+  const prepared = await jobs.prepareAction({ jobId: durableJob.jobId, expectedRevision: active.job.revision, action });
+  assert.deepEqual(prepared.job.execution.pendingAction.action, action);
+  assert.deepEqual(prepared.job.grant, durableJob.grant);
+  assert.deepEqual((await jobs.getForWorker(durableJob.jobId)).execution.pendingAction.action, action);
+});
+
+test("review repair grant normalization rejects changed source kinds, modes, paths and input bindings", async () => {
+  const { durableJob } = await createRealReviewRepairJob();
+  const { grantDigest, ...content } = durableJob.grant;
+  for (const tamper of [
+    (value) => { value.executionSource.kind = "conflict_preparation"; },
+    (value) => { value.executionSource.writeScope.mode = "exact_files"; },
+    (value) => { value.writablePaths = ["Source"]; },
+    (value) => { value.executionSource.inputBinding.eventId = "foreign-source-event"; },
+  ]) {
+    const changed = structuredClone(content);
+    tamper(changed);
+    assert.throws(() => createCodeJobGrant(changed), (error) => error.code === "INVALID_CODE_JOB_GRANT");
+  }
+  assert.equal(createCodeJobGrant(content).grantDigest, grantDigest);
+});
+
+test("review repair worker writes existing and new configured descendants through the real durable store", async (t) => {
+  for (const existing of [true, false]) await t.test(existing ? "trusted existing file hash" : "new file", async () => {
+    const { jobs, durableJob, reader } = await createRealReviewRepairJob();
+    const executor = new FakeExecutor(durableJob);
+    const path = existing ? "Source/Systems/Analysis/AnalysisFAZSystem.cpp" : "Test/ReviewRepair.test.cpp";
+    const actions = [
+      ...(existing ? [{ type: "read_text", path }] : []),
+      { type: "write_text", path, content: "fixed\n" },
+    ];
+    const worker = new CodeJobWorkerService({ jobStore: jobs, executor,
+      brainDirectory: brain(actions), grantVerifier: verifier([]), reviewRepairContextReader: reader });
+    if (existing) assert.equal((await worker.runCycle({ limit: 1 })).outcomes[0].actionType, "read_text");
+    const outcome = (await worker.runCycle({ limit: 1 })).outcomes[0];
+    assert.equal(outcome.status, "active", outcome.code);
+    assert.equal(outcome.actionType, "write_text");
+    const write = executor.calls.find(({ method, value }) => method === "perform" && value.action.type === "write_text").value.action;
+    assert.equal(write.path, path);
+    assert.equal(write.expectedSha256, existing ? FILE_SHA : null);
+    const stored = await jobs.getForWorker(durableJob.jobId);
+    assert.equal(stored.execution.observations.at(-1).actionType, "write_text");
+    assert.equal(stored.execution.observations.at(-1).status, "succeeded");
+    assert.deepEqual(stored.grant, durableJob.grant);
+  });
+});
+
+test("write admission keeps legacy configured prefixes and conflict exact files distinct", async (t) => {
+  const inputBinding = conflictInputBinding();
+  const conflictSource = conflictExecutionSource(inputBinding);
+  for (const schemaVersion of [undefined, 2, 3]) await t.test(`grant ${schemaVersion ?? "legacy"}`, async () => {
+    const { jobs, durableJob } = await createRealApprovedJob({
+      ...(schemaVersion === undefined ? {} : { schemaVersion }),
+      ...(schemaVersion === 3 ? {
+        inputBinding, executionSource: conflictSource,
+        source: { assignmentId: "integration-assignment", eventId: inputBinding.eventId },
+        subject: { id: "github:acme/dashboard:pull-request:42", repository: "acme/dashboard", number: 42 },
+      } : schemaVersion === 2 ? { inputBinding: null } : {}),
+      operation: "modify", allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify],
+      writablePaths: ["src/app.js"],
+    });
+    const starting = await jobs.claimStarting({ jobId: durableJob.jobId, expectedRevision: durableJob.revision });
+    const active = await jobs.activate({ jobId: durableJob.jobId, expectedRevision: starting.job.revision, workspaceRevision: REVISION_A });
+    const action = { type: "write_text", actionId: "scope-write", expectedWorkspaceRevision: REVISION_A,
+      path: "src/app.js/child.js", content: "candidate\n", expectedSha256: null };
+    if (schemaVersion === 3) {
+      await assert.rejects(jobs.prepareAction({ jobId: durableJob.jobId, expectedRevision: active.job.revision, action }),
+        (error) => error.code === "INVALID_CODE_JOB");
+    } else {
+      const prepared = await jobs.prepareAction({ jobId: durableJob.jobId, expectedRevision: active.job.revision, action });
+      assert.equal(prepared.job.execution.pendingAction.action.path, action.path);
+    }
+  });
+});
+
+test("conflict worker still rejects descendants of sealed exact files", async () => {
+  const inputBinding = conflictInputBinding();
+  const initial = job({ grant: grant({ schemaVersion: 3, inputBinding,
+    executionSource: conflictExecutionSource(inputBinding), writablePaths: ["src/app.js"] }) });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial);
+  const worker = new CodeJobWorkerService({ jobStore: store, executor,
+    brainDirectory: brain([{ type: "write_text", path: "src/app.js/child.js", content: "forbidden" }]),
+    grantVerifier: verifier([]) });
+  const outcome = (await worker.runCycle({ limit: 1 })).outcomes[0];
+  assert.equal(outcome.status, "paused");
+  assert.equal(outcome.code, "CODE_BRAIN_WRITE_NOT_PERMITTED");
+  assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
+});
+
+test("review repair worker rejects sibling and outside paths before durable admission", async (t) => {
+  for (const path of ["Sources/AnalysisFAZSystem.cpp", "Other/AnalysisFAZSystem.cpp", "Source/.git/config"]) await t.test(path, async () => {
+    const { jobs, durableJob, reader } = await createRealReviewRepairJob();
+    const executor = new FakeExecutor(durableJob);
+    const worker = new CodeJobWorkerService({ jobStore: jobs, executor,
+      brainDirectory: brain([{ type: "write_text", path, content: "forbidden\n" }]),
+      grantVerifier: verifier([]), reviewRepairContextReader: reader });
+    const outcome = (await worker.runCycle({ limit: 1 })).outcomes[0];
+    assert.equal(outcome.status, "paused");
+    assert.equal(outcome.code, "CODE_BRAIN_WRITE_NOT_PERMITTED");
+    assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
+    assert.equal((await jobs.getForWorker(durableJob.jobId)).execution.pendingAction, null);
+  });
+});
 
 test('running controls retain a real code-job hold across interrupted action reconciliation and registry restart',async(t)=>{
   for(const command of ['pause','cancel'])await t.test(command,async()=>{

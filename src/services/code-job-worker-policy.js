@@ -1,5 +1,6 @@
 import { digestValue } from "../domain/code-executor-contract.js";
 import { normalizeWorkspacePath } from "../domain/code-execution-policy.js";
+import { codeExecutionSourceAllowsWrite } from "../domain/code-execution-source.js";
 import { projectTestSummary } from "../domain/test-result-summary.js";
 import { requiresBrainOperatorPause } from "./brain-failure-policy.js";
 
@@ -543,7 +544,7 @@ export function bindTrustedAction(job, session, semanticAction, remainingProfile
   if (semanticAction.type === "write_text") {
     const path = normalizeSemanticPath(semanticAction.path);
     const writable = job.grant.schemaVersion === 3
-      ? job.grant.writablePaths.includes(path)
+      ? codeExecutionSourceAllowsWrite(job.grant.executionSource, path)
       : job.grant.writablePaths.some(
           (candidate) => path === candidate || path.startsWith(`${candidate}/`),
         );

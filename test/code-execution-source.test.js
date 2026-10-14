@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import {
+  codeExecutionSourceAllowsWrite,
   codeExecutionSourceWritablePaths,
   createConflictCodeExecutionSource,
   createReviewRepairCodeExecutionSource,
@@ -25,6 +26,30 @@ test("review repair binds the exact PR input and configured prefixes without con
   assert.throws(() => createReviewRepairCodeExecutionSource({ inputBinding: inputBinding(), writablePaths: paths }),
     (error) => error.code === "INVALID_CODE_EXECUTION_SOURCE");
   assert.throws(() => normalizeCodeExecutionSource({ ...source, preparationBinding: preparationBinding() }));
+  assert.throws(() => normalizeCodeExecutionSource({ ...source,
+    writeScope: { ...source.writeScope, mode: "exact_files" } }));
+  assert.throws(() => normalizeCodeExecutionSource({ ...source, kind: "conflict_preparation" }));
+});
+
+test("source write checks preserve configured prefix boundaries and exact conflict files", () => {
+  const reviewSource = createReviewRepairCodeExecutionSource({ inputBinding: inputBinding(), writablePaths: ["Source", "Test"] });
+  for (const path of ["Source/Systems/Analysis/AnalysisFAZSystem.cpp", "Test/new.test.cpp"]) {
+    assert.equal(codeExecutionSourceAllowsWrite(reviewSource, path), true);
+  }
+  for (const path of ["Sources/a.cpp", "Other/a.cpp", "Source/.git/config", "Source/.env"]) {
+    assert.equal(codeExecutionSourceAllowsWrite(reviewSource, path), false);
+  }
+  assert.throws(() => codeExecutionSourceAllowsWrite(reviewSource, "Source/../Other/a.cpp"));
+  assert.throws(() => codeExecutionSourceAllowsWrite({ ...reviewSource,
+    writeScope: { ...reviewSource.writeScope, mode: "exact_files" } }, "Source/a.cpp"));
+
+  const conflictSource = createConflictCodeExecutionSource({ inputBinding: inputBinding(), preparationBinding: preparationBinding() });
+  assert.equal(codeExecutionSourceAllowsWrite(conflictSource, "src/first.js"), true);
+  for (const path of ["src/first.js/child.js", "src/third.js", "src/First.js"]) {
+    assert.equal(codeExecutionSourceAllowsWrite(conflictSource, path), false);
+  }
+  assert.throws(() => codeExecutionSourceAllowsWrite({ ...conflictSource,
+    writeScope: { ...conflictSource.writeScope, mode: "configured_paths" } }, "src/first.js/child.js"));
 });
 
 function gitTarget(overrides = {}) {
@@ -132,6 +157,8 @@ test("normalization rejects changed provenance, scope, shape, and legacy PR iden
       },
     },
     { ...source, extra: true },
+    { ...source, writeScope: { ...source.writeScope, mode: "configured_paths" } },
+    { ...source, kind: "review_repair" },
     {
       ...source,
       preparationBinding: preparationBinding(

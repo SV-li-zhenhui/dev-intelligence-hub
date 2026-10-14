@@ -4,6 +4,7 @@ import {
 } from "./code-executor-contract.js";
 import { normalizeWorkspacePath } from "./code-execution-policy.js";
 import {
+  codeExecutionSourceAllowsWrite,
   codeExecutionSourceWritablePaths,
   normalizeCodeExecutionSource,
   sameCodeExecutionSource,
@@ -801,7 +802,7 @@ function assertActionAllowedByGrant(action, grant, error) {
       throw error;
     }
     const writable = grant.schemaVersion === 3
-      ? grant.writablePaths.includes(relativePath)
+      ? codeExecutionSourceAllowsWrite(grant.executionSource, relativePath)
       : grant.writablePaths.some(
           (writablePath) =>
             relativePath === writablePath ||
