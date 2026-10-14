@@ -361,6 +361,20 @@ export class TaskRunRegistry {
             if (!current()) throw registryError("TASK_RUN_NOT_ACTIVE", "任务运行已结束");
             if (run.stopRequested) throw heldError(run.stopRequested);
           },
+          hasPendingInstructions: () => current() && run.savedInstructionCount !== run.instructionCount,
+          beginCompletion: () => this.#queue.enqueue(async () => {
+            const state = await this.#readState();
+            if (!current()) throw registryError("TASK_RUN_NOT_ACTIVE", "任务运行已结束");
+            if (run.stopRequested) throw heldError(run.stopRequested);
+            const record = findRecord(state, run.key);
+            if (record && record.mode !== "active") throw heldError(record.mode);
+            // A store acknowledgement can fail after the instruction was persisted.
+            run.savedInstructionCount = record?.instructions.length ?? 0;
+            if (run.savedInstructionCount !== run.instructionCount) return false;
+            // Close instruction acceptance before any asynchronous final action begins.
+            run.instructionsClosed = true;
+            return true;
+          }),
         };
         try {
           try { result = await withTaskExecution(context, () => operation({ instructions: [...instructions] })); }
@@ -467,6 +481,7 @@ export class TaskRunRegistry {
       key, task, runId: randomUUID(), startedAt: this.#now(),
       appliedRevision: current?.revision ?? 0,
       instructionCount: current?.instructions.length ?? 0,
+      savedInstructionCount: current?.instructions.length ?? 0,
       instructions: current?.instructions.map(({ text }) => text) ?? [],
       session: null, events: [], eventSequence: 0,
     };
@@ -482,6 +497,9 @@ export class TaskRunRegistry {
 
   async #applyControl(state, current, run, input) {
     const { command } = input;
+    if (command === "instruct" && run?.instructionsClosed) {
+      throw registryError("TASK_RUN_INSTRUCTIONS_CLOSED", "任务正在完成，无法接收追加要求");
+    }
     if ((["instruct", "pause"].includes(command) && !run) ||
         (command === "cancel" && !run && current.mode === "active")) {
       throw registryError("TASK_RUN_NOT_ACTIVE", "任务当前没有正在运行的模型回合");
@@ -508,6 +526,7 @@ export class TaskRunRegistry {
       if (run?.repeatOnInstruction || run?.requireStopConfirmation) candidate.stopUnconfirmed = true;
     }
     const committed = await this.#writeRecord(state, candidate);
+    if (run && command === "instruct") run.savedInstructionCount = candidate.instructions.length;
     if (run && ['pause','cancel'].includes(command)) run.stopRequested = candidate.mode;
     if (run?.liveControl && command === 'instruct') {
       try {

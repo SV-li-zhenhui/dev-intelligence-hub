@@ -881,6 +881,41 @@ test("continuous execution records an uncertain admitted action and never admits
   assert.equal(fixture.executor.calls.filter(({ method }) => method === "perform").length, 1);
 });
 
+test("continuous authority revocation after one action durably fences later tools and completion", async () => {
+  const { jobs, durableJob } = await createRealApprovedJob();
+  const executor = new FakeExecutor(durableJob);
+  let revoked = false, decisions = 0;
+  const worker = new CodeJobWorkerService({ jobStore: jobs, executor,
+    grantVerifier: { async verify(value) {
+      if (revoked) throw Object.assign(new Error('authority revoked during continuous turn'), { code: 'INVALID_CODE_JOB_AUTHORITY' });
+      return structuredClone(value);
+    } },
+    brainDirectory: { describe: () => ({ supportsCodeExecution: true, supportsCodeReading: true }),
+      async decide({ codeExecutionContext }) {
+        decisions++;
+        const tools = beginCodeExecutionSession(codeExecutionContext);
+        await tools.invoke('perform_action', { decision: continuousDecision({ type: 'run_profile' }) });
+        revoked = true;
+        await assert.rejects(tools.invoke('perform_action', { decision: continuousDecision({ type: 'list_files', path: '' }) }),
+          { code: 'INVALID_CODE_JOB_AUTHORITY' });
+        await tools.close();
+        return continuousDecision({ type: 'complete', outcome: 'must not complete after revocation', evidence: [] });
+      } } });
+  const result = await worker.runCycle();
+  assert.equal(result.outcomes[0].status, 'fenced');
+  assert.equal(result.outcomes[0].code, 'INVALID_CODE_JOB_AUTHORITY');
+  const current = await jobs.getForWorker(durableJob.jobId);
+  assert.equal(current.status, 'fenced');
+  assert.equal(current.execution.pendingAction, null);
+  assert.equal(current.execution.actionAdmission, null);
+  assert.equal(current.execution.observations.at(-1).actionType, 'run_profile');
+  assert.equal(current.execution.observations.at(-1).status, 'succeeded');
+  assert.deepEqual(executor.calls.filter(({ method }) => method === 'perform').map(({ value }) => value.action.type), ['run_profile']);
+  await worker.runCycle();
+  assert.equal(decisions, 1);
+  assert.equal(executor.calls.filter(({ method }) => method === 'perform').length, 1);
+});
+
 test("continuous model failure after a settled write preserves audit and resumes without replaying it", async () => {
   let tools;
   const fixture = continuousFixture(async ({ codeExecutionContext }) => {
@@ -958,6 +993,96 @@ test("continuous cancellation aborts reasoning without an active executor action
   assert.equal((await cycle).outcomes[0].status, 'cancelling');
   assert.equal(worker.requestCancellation(current.jobId), false);
   assert.equal(executor.calls.some(({ method }) => method === 'perform'), false);
+});
+
+test("continuous completion waits for undelivered owner instructions without replaying actions", async () => {
+  const { jobs, durableJob } = await createRealApprovedJob();
+  const executor = new FakeExecutor(durableJob);
+  const entered = deferred(), finish = deferred();
+  const registry = new TaskRunRegistry({ store: new IntegrationMemoryStore(), settleControl: async () => {} });
+  let calls = 0;
+  const worker = new CodeJobWorkerService({ jobStore: jobs, executor, taskRuns: registry,
+    grantVerifier: { verify: async value => structuredClone(value) },
+    brainDirectory: { describe: () => ({ supportsCodeExecution: true, supportsCodeReading: true }),
+      async decide({ codeExecutionContext, instructions }) {
+        calls++;
+        if (calls === 1) {
+          const tools = beginCodeExecutionSession(codeExecutionContext);
+          await tools.invoke('perform_action', { decision: continuousDecision({ type: 'run_profile' }) });
+          await tools.close(); entered.resolve(); await finish.promise;
+        } else assert.deepEqual(instructions, ['Check the additional acceptance requirement']);
+        return continuousDecision({ type: 'complete', outcome: 'done', evidence: [] });
+      } } });
+  const first = worker.runCycle(); await entered.promise;
+  const view = await registry.get('code-job', durableJob.jobId);
+  await registry.control(view.kind, view.taskId, { runId: view.runId, expectedRevision: view.revision,
+    command: 'instruct', instruction: 'Check the additional acceptance requirement' });
+  finish.resolve();
+  assert.equal((await first).outcomes[0].status, 'active');
+  assert.equal(executor.calls.some(({ method, value }) => method === 'perform' && value.action.type === 'complete'), false);
+  assert.equal((await worker.runCycle()).outcomes[0].status, 'completed');
+  assert.equal(calls, 2);
+  assert.equal(executor.calls.filter(({ method, value }) => method === 'perform' && value.action.type === 'run_profile').length, 1);
+});
+
+test("continuous pause winning during authority verification blocks action admission", async () => {
+  const { jobs, durableJob } = await createRealApprovedJob();
+  const executor = new FakeExecutor(durableJob);
+  const verifying = deferred(), release = deferred();
+  const settle = createTaskRunSettler({ codeJobReader: { get: id => jobs.getForWorker(id) },
+    codeJobControl: Object.fromEntries(['pause','cancel','resume'].map(name => [name, value => jobs[name](value)])) });
+  const registry = new TaskRunRegistry({ store: new IntegrationMemoryStore(), settleControl: settle });
+  const worker = new CodeJobWorkerService({ jobStore: jobs, executor, taskRuns: registry,
+    grantVerifier: { async verify(value) {
+      const current = await jobs.getForWorker(durableJob.jobId);
+      if (current.execution.pendingAction && current.execution.actionAdmission === null) { verifying.resolve(); await release.promise; }
+      return structuredClone(value);
+    } },
+    brainDirectory: { describe: () => ({ supportsCodeExecution: true, supportsCodeReading: true }),
+      async decide({ codeExecutionContext }) {
+        const tools = beginCodeExecutionSession(codeExecutionContext);
+        currentTaskExecution().registerLiveControl({ steer: async () => {}, interrupt: async () => tools.revoke() });
+        await assert.rejects(tools.invoke('perform_action', { decision: continuousDecision({ type: 'run_profile' }) }), { code: 'TASK_RUN_PAUSED' });
+        assert.deepEqual(await tools.close(), { settled: true });
+        currentTaskExecution().confirmStopped();
+        throw Object.assign(new Error('native stopped'), { code: 'STRUCTURED_PROVIDER_CANCELLED' });
+      } } });
+  const cycle = worker.runCycle(); await verifying.promise;
+  const view = await registry.get('code-job', durableJob.jobId);
+  await registry.control(view.kind, view.taskId, { runId: view.runId, expectedRevision: view.revision, command: 'pause' });
+  release.resolve(); await cycle;
+  assert.equal(executor.calls.some(({ method }) => method === 'perform'), false);
+  assert.equal((await jobs.getForWorker(durableJob.jobId)).execution.actionAdmission, null);
+});
+
+test("continuous completion rejects later instructions once final completion wins", async () => {
+  const { jobs, durableJob } = await createRealApprovedJob();
+  const executor = new FakeExecutor(durableJob);
+  const verifying = deferred(), release = deferred();
+  const registry = new TaskRunRegistry({ store: new IntegrationMemoryStore(), settleControl: async () => {} });
+  let returned = false, finalVerifications = 0;
+  const worker = new CodeJobWorkerService({ jobStore: jobs, executor, taskRuns: registry,
+    grantVerifier: { async verify(value) {
+      if (returned && ++finalVerifications === 2) { verifying.resolve(); await release.promise; }
+      return structuredClone(value);
+    } },
+    brainDirectory: { describe: () => ({ supportsCodeExecution: true, supportsCodeReading: true }),
+      async decide({ codeExecutionContext }) {
+        const tools = beginCodeExecutionSession(codeExecutionContext);
+        await tools.invoke('perform_action', { decision: continuousDecision({ type: 'run_profile' }) });
+        await tools.close(); returned = true;
+        return continuousDecision({ type: 'complete', outcome: 'done', evidence: [] });
+      } } });
+  const cycle = worker.runCycle(); await verifying.promise;
+  const view = await registry.get('code-job', durableJob.jobId);
+  try {
+    await assert.rejects(registry.control(view.kind, view.taskId, { runId: view.runId,
+      expectedRevision: view.revision, command: 'instruct', instruction: 'Too late for this completed turn' }),
+    { code: 'TASK_RUN_INSTRUCTIONS_CLOSED' });
+  } finally { release.resolve(); }
+  assert.equal((await cycle).outcomes[0].status, 'completed');
+  assert.deepEqual(await registry.list(), { enabled: true, items: [], held: [] });
+  await assert.rejects(registry.get('code-job', durableJob.jobId), { code: 'TASK_RUN_NOT_FOUND' });
 });
 
 function brain(responses, calls = []) {

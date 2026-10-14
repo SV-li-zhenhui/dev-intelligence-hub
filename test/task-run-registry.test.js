@@ -94,6 +94,71 @@ test('observing a controlled action never repeats the side effect for new instru
   finish.resolve();assert.equal(await operation,'executed');assert.equal(performed,1);
 });
 
+test('continuous completion waits for durable instructions until live steer is acknowledged', async (t) => {
+  for (const failed of [false, true]) await t.test(failed ? 'failed steer remains pending' : 'acknowledged steer permits completion', async () => {
+    const { registry } = fixture();
+    const entered = deferred(), steering = deferred(), acknowledge = deferred(), finish = deferred();
+    let context;
+    const operation = registry.run(task({ kind: 'code-job' }), async () => {
+      context = currentTaskExecution();
+      context.registerLiveControl({ interrupt: async () => {}, steer: async () => {
+        steering.resolve(); await acknowledge.promise;
+        if (failed) throw new Error('native turn already ended');
+      } });
+      entered.resolve(); await finish.promise; return 'one turn';
+    }, { repeatOnInstruction: false });
+    await entered.promise;
+    assert.equal(context.hasPendingInstructions(), false);
+    const view = await registry.get('code-job', 'work-1');
+    const controlResult = registry.control(view.kind, view.taskId, control(view, 'instruct', { instruction: 'Check cancellation' }));
+    const settled = failed ? assert.rejects(controlResult, { code: 'TASK_RUN_STEER_FAILED' }) : controlResult;
+    await steering.promise;
+    assert.equal(context.hasPendingInstructions(), true);
+    acknowledge.resolve(); await settled;
+    assert.equal(context.hasPendingInstructions(), failed);
+    assert.equal(await context.beginCompletion(), !failed);
+    finish.resolve(); assert.equal(await operation, 'one turn');
+    if (failed) await registry.run(task({ kind: 'code-job' }), async ({ instructions }) => {
+      assert.deepEqual(instructions, ['Check cancellation']);
+      assert.equal(await currentTaskExecution().beginCompletion(), true);
+    }, { repeatOnInstruction: false });
+  });
+});
+
+test('continuous completion rechecks a durable instruction when its write acknowledgement was lost', async () => {
+  const { registry, store } = fixture();
+  const entered = deferred(), finish = deferred();
+  let context;
+  const operation = registry.run(task({ kind: 'code-job' }), async () => {
+    context = currentTaskExecution(); entered.resolve(); await finish.promise;
+  }, { repeatOnInstruction: false });
+  await entered.promise;
+  const view = await registry.get('code-job', 'work-1');
+  store.failAfterWrite = true;
+  await assert.rejects(registry.control(view.kind, view.taskId,
+    control(view, 'instruct', { instruction: 'Check saved but unacknowledged requirement' })), /acknowledgement unavailable/);
+  store.failAfterWrite = false;
+  try { assert.equal(await context.beginCompletion(), false); }
+  finally { finish.resolve(); await operation; }
+});
+
+test('continuous completion rejects a durable pause when its write acknowledgement was lost', async () => {
+  const { registry, store } = fixture();
+  const entered = deferred(), finish = deferred();
+  let context;
+  const operation = registry.run(task({ kind: 'code-job' }), async () => {
+    context = currentTaskExecution(); entered.resolve(); await finish.promise;
+  }, { repeatOnInstruction: false });
+  await entered.promise;
+  const view = await registry.get('code-job', 'work-1');
+  store.failAfterWrite = true;
+  await assert.rejects(registry.control(view.kind, view.taskId, control(view, 'pause')), /acknowledgement unavailable/);
+  store.failAfterWrite = false;
+  const held = assert.rejects(operation, { code: 'TASK_RUN_PAUSED' });
+  try { await assert.rejects(context.beginCompletion(), { code: 'TASK_RUN_PAUSED' }); }
+  finally { finish.resolve(); await held; }
+});
+
 test('continuous code turns close admission at stop and retain holds until both owners confirm settlement', async (t) => {
   for (const confirmed of [false, true]) await t.test(confirmed ? 'confirmed stop' : 'unconfirmed host action', async () => {
     let settlements = 0, context;

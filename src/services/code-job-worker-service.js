@@ -141,6 +141,11 @@ function currentJobOutcome(jobId, current) {
   };
 }
 
+function isCurrentAuditedRead(job, observation) {
+  return observation.actionType === "read_text" && observation.status === "succeeded" &&
+    observation.workspaceRevision === job.execution.workspaceRevision;
+}
+
 function sessionTransitionLease(operationQueue = new OperationQueue()) {
   return Object.freeze({
     run(operation) {
@@ -672,8 +677,7 @@ export class CodeJobWorkerService {
     const latest = new Map();
     for (let index = job.execution.observations.length - 1; index >= 0; index -= 1) {
       const observation = job.execution.observations[index];
-      if (observation.actionType !== "read_text" || observation.status !== "succeeded" ||
-          observation.workspaceRevision !== job.execution.workspaceRevision) continue;
+      if (!isCurrentAuditedRead(job, observation)) continue;
       const action = trustedObservationAction(observation);
       if (onlyPath !== null && action.path !== onlyPath) continue;
       if (!latest.has(action.path)) latest.set(action.path, { action, observation });
@@ -762,12 +766,11 @@ export class CodeJobWorkerService {
       return state;
     };
     const latestRead = (job, sourcePath) => job.execution.observations.findLast((entry) =>
-      entry.actionType === "read_text" && entry.status === "succeeded" &&
-      entry.workspaceRevision === job.execution.workspaceRevision && trustedObservationAction(entry).path === sourcePath);
+      isCurrentAuditedRead(job, entry) && trustedObservationAction(entry).path === sourcePath);
     const currentReads = (job) => {
       const latest = new Map();
       for (const entry of job.execution.observations) {
-        if (entry.actionType === "read_text" && entry.status === "succeeded" && entry.workspaceRevision === job.execution.workspaceRevision) {
+        if (isCurrentAuditedRead(job, entry)) {
           latest.set(trustedObservationAction(entry).path, entry);
         }
       }
@@ -788,14 +791,13 @@ export class CodeJobWorkerService {
       }
       await assertFeedback();
       try {
-        const outcome = await this.#continuousAction(state, decision, readContext, signal);
+        await this.#continuousAction(state, decision, readContext, signal);
         const current = await this.#jobs.getForWorker(initial.jobId);
         if (current?.execution.workspaceRevision !== workspaceRevision) {
           closeReads(); workspaceRevision = current?.execution.workspaceRevision;
         }
         // A failed profile or non-active result cannot authorize later actions.
         if (current?.status !== "active") revokeCodeExecutionContext(capability);
-        return { outcome, current };
       } catch (error) {
         const current = await this.#jobs.getForWorker(initial.jobId);
         if (current?.execution.pendingAction !== null || isAuthorityErrorCode(error.code) || isFencingExecutorCode(error.code)) {
@@ -878,6 +880,10 @@ export class CodeJobWorkerService {
           entry.reader.assertComplete();
         }
         await assertFeedback();
+        const taskExecution = currentTaskExecution();
+        if (taskExecution?.beginCompletion && !(await taskExecution.beginCompletion())) {
+          return { jobId: initial.jobId, status: "active", actionType: null, code: "CODE_JOB_OWNER_INSTRUCTIONS_PENDING" };
+        }
         return this.#continuousAction(finalState, decision, null);
       } finally {
         await closeCodeExecutionContext(capability);
@@ -1303,6 +1309,7 @@ export class CodeJobWorkerService {
           return { admitted: false, job: fresh };
         }
         await this.#verifyAuthority(fresh.grant);
+        if (continuous) { currentTaskExecution()?.assertRunning?.(); signal?.throwIfAborted(); }
         const changed = await this.#jobs.admitAction({
           jobId: fresh.jobId,
           expectedRevision: fresh.revision,
