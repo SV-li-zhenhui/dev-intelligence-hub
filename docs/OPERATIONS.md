@@ -225,7 +225,7 @@ data nesting, and files that change while they are copied or verified. Managed
 external executors use Windows Job Objects so their descendants are reaped with
 the supervised invocation; recovery does not treat an arbitrary uncontained
 same-user process as belonging to MyDashboard. Preparation creates a
-byte-exact observational snapshot and an
+byte-exact observational snapshot of root state files and an
 authenticated `pre_termination` incident in the private runtime. It does not
 restore data, terminate a process, remove lifecycle evidence, restart the
 service, or open a browser. Record the exact snapshot identifier emitted by the
@@ -238,6 +238,16 @@ no-receipt incident uses the dedicated
 digests for both receipt paths. A receipt that appears later durably transitions
 the HMAC-authenticated incident to `invalidated`; deleting that receipt cannot
 revive the old recovery authority.
+
+The exact regular active directories `change-packages` and `code-executor`
+are managed components preserved in place, outside this root state snapshot.
+Their nested files are neither copied nor authenticated by the lifecycle snapshot;
+they are not regenerable caches. Root state references to executor artifacts remain
+byte-checked, and executor startup separately validates referenced audit artifacts
+before recovering sessions. The comprehensive backup checkpoint continues to
+include durable executor artifacts. Only the active data directory permits these
+exact names: links, wrong-case aliases, same-name files, unknown directories, and
+directories inside the snapshot remain rejected.
 
 After inspecting that evidence and granting a separate, snapshot-specific
 authorization, an operator may explicitly recover the failed lifecycle state:

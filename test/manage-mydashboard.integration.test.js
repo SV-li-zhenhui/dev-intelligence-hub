@@ -3945,3 +3945,53 @@ test(
     await unlink(secondRuntime.runtimeDirectory);
   },
 );
+
+for (const beforePreparation of [true, false]) {
+  test(
+    "RecoverFailedShutdown preserves code-executor artifacts " + (beforePreparation ? "present before preparation" : "added after snapshot"),
+    { skip: WINDOWS_MANAGER_SKIP },
+    async (t) => {
+      let fixture = await prepareFailedShutdownRecovery(t, { createRecoverySnapshot: !beforePreparation });
+      const artifactPath = path.join(fixture.root, "data", "code-executor", "artifacts", "output.json");
+      const artifact = Buffer.from('{"result":"audited immutable output"}\n');
+      await mkdir(path.dirname(artifactPath), { recursive: true });
+      await writeFile(artifactPath, artifact);
+      const rootPath = path.join(fixture.root, "data", "fixture-data.json");
+      if (beforePreparation) {
+        await writeFile(rootPath, '{"artifact":"code-executor/artifacts/output.json"}\n');
+        const prepared = invokeManager(fixture.root, "PrepareFailedShutdownRecovery", 10);
+        assert.equal(prepared.status, 0, prepared.stderr + prepared.stdout);
+        const snapshotId = prepared.stdout.match(/shutdown-failure-[0-9]{8}-[0-9]{6}-[a-f0-9]{32}/u)?.[0];
+        assert.equal(typeof snapshotId, "string");
+        fixture = { ...fixture, snapshotId, snapshotDirectory: path.join(fixture.runtime.runtimeDirectory, "recovery-snapshots", snapshotId) };
+      }
+      const rootBytes = await readFile(rootPath);
+      assert.deepEqual(await readFile(artifactPath), artifact);
+      assert.equal(await fileExists(path.join(fixture.snapshotDirectory, "data", "code-executor")), false);
+      assert.deepEqual(await readFile(path.join(fixture.snapshotDirectory, "data", "fixture-data.json")), rootBytes);
+      await assertRecoveryCompleted(fixture, invokeRecovery(fixture));
+      assert.deepEqual(await readFile(artifactPath), artifact);
+      assert.deepEqual(await readFile(rootPath), rootBytes);
+    },
+  );
+}
+
+for (const invalidKind of ["wrong case", "file", "junction", "snapshot directory"]) {
+  test(
+    "RecoverFailedShutdown rejects code-executor " + invalidKind + " before termination",
+    { skip: WINDOWS_MANAGER_SKIP },
+    async (t) => {
+      const fixture = await prepareFailedShutdownRecovery(t);
+      const component = path.join(fixture.root, "data", "code-executor");
+      if (invalidKind === "wrong case") await mkdir(path.join(fixture.root, "data", "Code-Executor"));
+      if (invalidKind === "file") await writeFile(component, "invalid component file\n");
+      if (invalidKind === "junction") {
+        const target = path.join(fixture.root, "executor-junction-target");
+        await mkdir(target);
+        await symlink(target, component, "junction");
+      }
+      if (invalidKind === "snapshot directory") await mkdir(path.join(fixture.snapshotDirectory, "data", "code-executor"));
+      await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+    },
+  );
+}

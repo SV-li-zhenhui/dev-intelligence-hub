@@ -1248,6 +1248,12 @@ function Test-RecoveryExcludedActiveDataDirectoryName {
             $Name,
             "change-packages",
             [System.StringComparison]::Ordinal
+        ) -or
+        # Managed executor state is preserved in place, like change-packages.
+        [string]::Equals(
+            $Name,
+            "code-executor",
+            [System.StringComparison]::Ordinal
         )
     )
 }
