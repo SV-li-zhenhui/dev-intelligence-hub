@@ -74,3 +74,5 @@ Code review: skipped (ce-code-review unavailable)。本会话此前正式 CE 流
 ### 取消任务导致整批入账失败
 
 重试请求返回 `OWNER_WORK_REQUEST_LEDGER_REJECTED`。纯内存重放真实台账及分配流，确认来源切换尝试把已取消的 #24723 任务 revision 11 改为 12，终态校验因此拒绝整批事件，连带阻挡 #24232。修复保持已取消任务不变：跨来源只保留阻塞，同来源后续观测记为 `pr_source_ignored / ignored_cancelled_source`。不放宽终态校验、不把取消视为允许重新执行。新增回归先失败后通过；切换、生命周期等相关测试 47/47，真实批次内存重放已成功推进游标并创建 #24232 的 queued 重试任务。生产部署结果另行核验。
+
+修复提交 `ec6b3cf16f` 已受管部署，系统就绪、维护模式 open，配置文件摘要不变。16:17:15 重试原请求返回 `deduplicated:true / intaken`，工作项 `work-item-e369e5f64d839ebcac521451f689b7ad217d15182c6fe64a391cd59c12d18142` 为 queued、尝试 0 次；台账游标已从 6970 推进至 6976。#24723 已取消根任务仍为 revision 11，未改写或复活。此时重试尚未执行，不能称为完整验证通过。
