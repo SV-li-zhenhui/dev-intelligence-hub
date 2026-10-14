@@ -17,7 +17,7 @@ const options = { id: "native-test", cliKind: "codex-cli", credentialMode: "code
 const success = (stdout = "") => ({ exitCode: 0, signal: null, stdout, stderr: "", stdoutBytes: Buffer.from(stdout), stderrBytes: Buffer.alloc(0) });
 const gate = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
 
-test('opt-in app-server retains native config, rule and feature isolation before starting a model',async(t)=>{
+test('opt-in app-server retains native home and explicit capability isolation before starting a model',async(t)=>{
   const f=await fixture(t);const calls=[];
   f.environment.DIH_CODEX_NATIVE_TRANSPORT='app-server';
   const provider=f.create(()=>assert.fail('must not silently fall back to exec'),{}, {appServerRunner:{async run(call){
@@ -25,8 +25,11 @@ test('opt-in app-server retains native config, rule and feature isolation before
     return success(JSON.stringify({type:'thread.started',thread_id:'thread-42'}));
   }}});
   assert.deepEqual(JSON.parse(await provider.generate(request())),{ok:true});
-  for(const flag of ['--ignore-user-config','--ignore-rules','--strict-config'])assert.ok(calls[0].args.includes(flag),flag);
-  for(const feature of ['hooks','plugins','apps','multi_agent'])assert.ok(calls[0].args.some((value,index)=>value==='--disable' && calls[0].args[index+1]===feature),feature);
+  assert.equal(calls[0].args.includes('--strict-config'),false);
+  for(const flag of ['--ignore-user-config','--ignore-rules'])assert.equal(calls[0].args.includes(flag),false);
+  for(const feature of ['hooks','plugins','apps','multi_agent','shell_tool'])assert.ok(calls[0].args.includes(`features.${feature}=false`),feature);
+  assert.equal(calls[0].appServer.isolation.ephemeral,true);
+  assert.ok(calls[0].appServer.isolation.agentConfigPath.endsWith('reviewer.toml'));
   assert.equal(calls[0].env.CODEX_HOME,f.home);await provider.close();
 });
 
@@ -61,7 +64,7 @@ async function fixture(t) {
   await writeFile(path.join(home, "auth.json"), "private-native-auth");
   await writeFile(path.join(home, "config.toml"), 'model = "user-preferred-model"\n');
   const calls = [];
-  const environment = { ...process.env, CODEX_HOME: home, GH_TOKEN: "private-gh-token", OPENAI_API_KEY: "must-not-override-native-login", NODE_OPTIONS: "must-not-inject", GIT_SSH_COMMAND: "must-not-inject" };
+  const environment = { ...process.env, DIH_CODEX_NATIVE_TRANSPORT: 'exec', CODEX_HOME: home, GH_TOKEN: "private-gh-token", OPENAI_API_KEY: "must-not-override-native-login", NODE_OPTIONS: "must-not-inject", GIT_SSH_COMMAND: "must-not-inject" };
   const dependencies = {
     environment, temporaryRoot: path.join(root, "runtime"),
     commandLocator: { async resolve() { return { command: process.execPath, prefixArgs: [] }; } },
@@ -76,6 +79,15 @@ async function fixture(t) {
   });
   return { root, home, calls, environment, dependencies, create, runtime: `${dependencies.temporaryRoot}-native` };
 }
+
+test('native Windows transport defaults to live app-server with an explicit exec fallback',async(t)=>{
+  const f=await fixture(t);delete f.environment.DIH_CODEX_NATIVE_TRANSPORT;
+  const provider=f.create();
+  assert.equal(provider.transport,process.platform==='win32'?'app-server':'exec');
+  await provider.close();
+  f.environment.DIH_CODEX_NATIVE_TRANSPORT='exec';
+  const fallback=f.create();assert.equal(fallback.transport,'exec');await fallback.close();
+});
 
 test("native provider runs a real fixture CLI in the original home and resumes its thread in place", async (t) => {
   const f = await fixture(t);

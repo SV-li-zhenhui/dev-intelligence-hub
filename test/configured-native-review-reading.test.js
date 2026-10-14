@@ -37,7 +37,7 @@ async function assertConfiguredNativeReviewReading(t, patch) {
   }, {
     supervisedCliProviderFactory(options) {
       return createNativeCodexBrainProvider(options, {
-        environment: { ...process.env, CODEX_HOME: home },
+        environment: { ...process.env, DIH_CODEX_NATIVE_TRANSPORT:'exec', CODEX_HOME: home },
         temporaryRoot: path.join(root, "runtime"),
         commandLocator: {
           async resolve() { return { command: process.execPath, prefixArgs: [] }; },

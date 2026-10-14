@@ -316,6 +316,7 @@ function windowsContainedInvocation(
   powerShell,
   wrapperPath,
   reapTimeoutMs,
+  interactive = false,
 ) {
   const packet = Buffer.from(JSON.stringify({
     schemaVersion: 1,
@@ -340,10 +341,11 @@ function windowsContainedInvocation(
       "Bypass",
       "-File",
       wrapperPath,
+      ...(interactive ? ["-Interactive"] : []),
     ],
     cwd: invocation.cwd,
     env: windowsWrapperEnvironment(),
-    input: packet,
+    input: interactive ? Buffer.concat([packet, Buffer.from("\n")]) : packet,
     detached: false,
   };
 }
@@ -504,6 +506,7 @@ export class SupervisedProcessRunner {
     timeoutMs,
     maxStdoutBytes,
     maxStderrBytes,
+    duplex = null,
   }, onSpawnAttempt) {
     const platform = this.#platform;
     const spawnImpl = this.#spawnImpl;
@@ -523,6 +526,10 @@ export class SupervisedProcessRunner {
       throw unavailableError();
     }
     const invocationArgs = processArguments(args);
+    if (duplex !== null && (typeof duplex !== "object" ||
+        typeof duplex.onReady !== "function" || typeof duplex.onOutput !== "function")) {
+      throw new TypeError("duplex callbacks are invalid");
+    }
     const normalizedInvocation = {
       cwd: processWorkingDirectory(cwd),
       env: processEnvironment(env, platform),
@@ -538,6 +545,7 @@ export class SupervisedProcessRunner {
         MAX_OUTPUT_BYTES,
       ),
     };
+    if (duplex && normalizedInvocation.input.length !== 0) throw new TypeError("duplex input starts empty");
     let remainingMs = remainingRequestTime(startedAt, requestTimeoutMs);
     if (remainingMs <= 0) throw timeoutError();
     let descriptor;
@@ -585,6 +593,7 @@ export class SupervisedProcessRunner {
           this.#windowsPowerShell,
           this.#windowsWrapperPath,
           terminationTimeoutMs,
+          Boolean(duplex),
         )
       : {
           command: invocation.command,
@@ -724,10 +733,14 @@ export class SupervisedProcessRunner {
       const onAbort = () => {
         void terminate(cancelledError());
       };
-      const acceptOutput = (state, chunk, maximum) => {
+      const acceptOutput = (state, chunk, maximum, stream) => {
         if (settled || terminalError) return;
         appendOutput(state, chunk, maximum);
         if (state.error) void terminate(state.error);
+        else if (duplex) {
+          try { duplex.onOutput({ stream, chunk: Buffer.from(chunk) }); }
+          catch { void terminate(failedError()); }
+        }
       };
       const handleStreamError = () => {
         void terminate(failedError());
@@ -777,10 +790,10 @@ export class SupervisedProcessRunner {
       };
 
       child.stdout?.on("data", (chunk) =>
-        acceptOutput(stdout, chunk, invocation.maxStdoutBytes),
+        acceptOutput(stdout, chunk, invocation.maxStdoutBytes, "stdout"),
       );
       child.stderr?.on("data", (chunk) =>
-        acceptOutput(stderr, chunk, invocation.maxStderrBytes),
+        acceptOutput(stderr, chunk, invocation.maxStderrBytes, "stderr"),
       );
       child.stdout?.on("error", handleStreamError);
       child.stderr?.on("error", handleStreamError);
@@ -820,7 +833,25 @@ export class SupervisedProcessRunner {
       }
       if (!terminalError) {
         try {
-          child.stdin?.end(spawnedInvocation.input);
+          if (duplex) {
+            if (spawnedInvocation.input.length) child.stdin.write(spawnedInvocation.input);
+            let inputBytes = 0;
+            let ended = false;
+            duplex.onReady(Object.freeze({
+              write(value) {
+                if (settled || closed || terminalError || ended) throw failedError();
+                const bytes = processInput(value);
+                inputBytes += bytes.length;
+                if (inputBytes > 8 * MAX_INPUT_BYTES) throw outputLimitError();
+                child.stdin.write(bytes);
+              },
+              end() {
+                if (ended) return;
+                ended = true;
+                child.stdin.end();
+              },
+            }));
+          } else child.stdin?.end(spawnedInvocation.input);
         } catch {
           void terminate(failedError());
         }

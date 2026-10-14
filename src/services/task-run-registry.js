@@ -9,6 +9,10 @@ const MAX_STATE_BYTES = 8 * 1024 * 1024;
 const MAX_INSTRUCTIONS = 20;
 const MAX_INSTRUCTION_BYTES = 4_000;
 const MAX_ROUNDS = 5;
+const MAX_EVENTS = 120;
+const MAX_EVENT_CHARACTERS = 2_000;
+const SESSION_STATUSES = new Set(["starting", "running", "completed", "interrupted", "failed"]);
+const EVENT_TYPES = new Set(["message", "tool", "plan", "status"]);
 const KINDS = new Set(["work-item", "code-job"]);
 const PRIORITIES = new Map([["normal", 0], ["high", 1], ["urgent", 2]]);
 const MODES = new Set(["active", "paused", "cancelled"]);
@@ -126,6 +130,51 @@ function displayText(value, maximum, error) {
     size += bytes;
   }
   return result;
+}
+
+function normalizeSession(value) {
+  const error = invalidInput();
+  exactKeys(value, ["transport", "threadId", "turnId", "status"], [], error);
+  if (value.transport !== "app-server" || !SESSION_STATUSES.has(value.status)) throw error;
+  identifier(value.threadId, error);
+  if (value.turnId !== null) identifier(value.turnId, error);
+  return { ...value };
+}
+
+function eventText(value) {
+  if (typeof value !== "string" || value.length > MAX_STATE_BYTES) throw invalidInput();
+  return value.replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/gu, "")
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/gu, "");
+}
+
+function boundedEventText(text) {
+  if (text.length <= MAX_EVENT_CHARACTERS) return text;
+  let tail = text.slice(-(MAX_EVENT_CHARACTERS - 1));
+  // Do not begin the displayed tail halfway through a surrogate pair.
+  if (/^[\udc00-\udfff]/u.test(tail)) tail = tail.slice(1);
+  return `…${tail}`;
+}
+
+function reportEvent(run, value, at) {
+  const error = invalidInput();
+  exactKeys(value, ["type", "text"], ["itemId"], error);
+  if (!EVENT_TYPES.has(value.type)) throw error;
+  if ("itemId" in value) identifier(value.itemId, error);
+  const text = eventText(value.text);
+  if (!text) return;
+  const previous = run.events.at(-1);
+  const merging = value.type === "message" && value.itemId &&
+    previous?.type === "message" && previous.itemId === value.itemId;
+  const event = { sequence: ++run.eventSequence, at, type: value.type,
+    text: boundedEventText(merging ? previous.text + text : text),
+    ...("itemId" in value ? { itemId: value.itemId } : {}) };
+  if (merging) run.events[run.events.length - 1] = event;
+  else {
+    run.events.push(event);
+    if (run.events.length > MAX_EVENTS) run.events.shift();
+  }
+  run.lastActivityAt = at;
 }
 
 function normalizeTask(value, error = invalidInput(), stored = false) {
@@ -263,6 +312,8 @@ function runView(record, run) {
     lastActivityAt: run?.lastActivityAt ?? record.startedAt,
     instructionReceipt: run?.instructionReceipt ?? (run?.liveControl ? 'ready' : 'checkpoint'),
     stopUnconfirmed: record.stopUnconfirmed === true,
+    session: run?.session ? { ...run.session } : null,
+    events: run?.events.map((event) => ({ ...event })) ?? [],
   };
 }
 
@@ -291,16 +342,25 @@ export class TaskRunRegistry {
       let instructions = run.instructions;
       for (let round = 1; ; round += 1) {
         let result;
+        const scope = Symbol("task execution round");
+        run.scope = scope;
+        const current = () => run.scope === scope && this.#active.get(run.key) === run;
         const context = {
-          reportProgress: (text) => { run.progress = displayText(text, 500, invalidInput()); run.lastActivityAt = this.#now(); },
+          reportProgress: (text) => { if (current()) { run.progress = displayText(text, 500, invalidInput()); run.lastActivityAt = this.#now(); } },
+          reportSession: (session) => { if (current()) { run.session = normalizeSession(session); run.lastActivityAt = this.#now(); } },
+          reportEvent: (event) => { if (current()) reportEvent(run, event, this.#now()); },
           registerLiveControl: (control) => {
+            if (!current()) return () => {};
             if (typeof control?.steer !== 'function' || typeof control?.interrupt !== 'function') throw invalidInput();
             run.liveControl = control;
-            return () => { if (run.liveControl === control) run.liveControl = null; };
+            return () => { if (current() && run.liveControl === control) run.liveControl = null; };
           },
-          confirmStopped: () => { run.stoppedConfirmed = true; },
+          confirmStopped: () => { if (current()) run.stoppedConfirmed = true; },
         };
-        try { result = await withTaskExecution(context, () => operation({ instructions: [...instructions] })); }
+        try {
+          try { result = await withTaskExecution(context, () => operation({ instructions: [...instructions] })); }
+          finally { run.scope = null; run.liveControl = null; }
+        }
         catch (error) {
           await this.#queue.enqueue(async () => {
             const state = await this.#readState();
@@ -403,6 +463,7 @@ export class TaskRunRegistry {
       appliedRevision: current?.revision ?? 0,
       instructionCount: current?.instructions.length ?? 0,
       instructions: current?.instructions.map(({ text }) => text) ?? [],
+      session: null, events: [], eventSequence: 0,
     };
     if (current) {
       await this.#writeRecord(state, {

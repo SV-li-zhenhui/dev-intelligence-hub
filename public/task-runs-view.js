@@ -12,6 +12,8 @@ function taskUrl(task) {
 }
 
 function phaseLabel(task) {
+  if (task.readOnly && task.phase === "preparing") return "正在准备执行环境";
+  if (task.readOnly && task.phase === "waiting_step") return "等待下一步骤";
   if (task.phase === "control_failed") return "停止尚未确认";
   if (task.pendingCommand === "pause") return task.live ? "暂停请求已提交，等待停止确认" : "暂停请求已提交，等待检查点";
   if (task.pendingCommand === "cancel") return task.live ? "取消请求已提交，等待停止确认" : "取消请求已提交，等待检查点";
@@ -32,20 +34,22 @@ function taskRow(task) {
   </button></li>`;
 }
 
-export function renderTaskRuns({ loaded = false, loading = false, enabled = false, items = [], held = [], error = "" } = {}) {
+export function renderTaskRuns({ loaded = false, loading = false, enabled = false, items = [], held = [], background = [], error = "" } = {}) {
   const active = items.filter((task) => task.active === true);
   const paused = held.filter((task) => task.active !== true);
   return `<div class="section-heading task-runs-heading"><h2 id="task-runs-title">当前运行任务</h2>
     <button type="button" class="secondary-button" data-task-runs-refresh ${loading ? "disabled" : ""}>${loading ? "读取中…" : "刷新任务"}</button></div>
-    <p class="task-runs-hint">正在执行的任务，包括模型判断和受控动作。点击查看进展或调整要求。</p>
+    <p class="task-runs-hint">点击正在运行的任务，查看 CLI 会话和微调要求；后台作业显示步骤间的进度。</p>
     ${error ? `<p class="task-runs-error" role="status">${escapeHtml(error)}${loaded ? "；当前显示上次读取结果。" : "；可点击刷新任务重试。"}</p>` : ""}
     ${loaded && !enabled ? '<p class="task-runs-empty">当前服务未启用运行任务控制。</p>' : ""}
     ${enabled || !loaded ? `<div class="task-runs-groups"><div><h3>正在运行 · ${active.length}</h3>
       ${active.length ? `<ul class="task-runs-list">${active.map(taskRow).join("")}</ul>` : `<p class="task-runs-empty">${loaded ? "当前没有正在运行的模型任务。" : "正在读取运行任务…"}</p>`}</div>
-      ${paused.length ? `<div class="task-runs-held"><h3>暂停与待确认 · ${paused.length}</h3><ul class="task-runs-list">${paused.map(taskRow).join("")}</ul></div>` : ""}</div>` : ""}`;
+      ${paused.length ? `<div class="task-runs-held"><h3>暂停与待确认 · ${paused.length}</h3><ul class="task-runs-list">${paused.map(taskRow).join("")}</ul></div>` : ""}
+      ${background.length ? `<div class="task-runs-background"><h3>后台作业 · ${background.length}</h3><p class="task-runs-hint">作业尚未结束，当前未在执行模型回合。点击查看已记录的进展。</p><ul class="task-runs-list">${background.map(taskRow).join("")}</ul></div>` : ""}</div>` : ""}`;
 }
 
 function deliveryMarkup(task) {
+  if (task.readOnly) return "后台作业详情只读；当前没有可微调的 CLI 回合。模型开始下一步骤后，可打开当前会话并补充要求。";
   if (task.instructionReceipt === "failed") return "实时引导未确认送达；补充要求已保存，将在安全检查点续接，请先核对已提交的要求。";
   if (task.live === true) {
     if (task.instructionReceipt === "submitted") return "实时引导已提交；回执不代表模型已经采用，请继续查看进展。";
@@ -56,7 +60,7 @@ function deliveryMarkup(task) {
 }
 
 function allowedCommand(task, command) {
-  if (!task || !commands.has(command) || task.phase === "cancelled" || task.phase === "control_failed") return false;
+  if (!task || task.readOnly || !commands.has(command) || task.phase === "cancelled" || task.phase === "control_failed") return false;
   if (command === "resume") return task.active !== true && task.phase === "paused" && task.mode === "paused" && !task.pendingCommand;
   if (command === "priority") return task.active === true || task.phase === "paused";
   if (command === "cancel") return !task.pendingCommand && (task.active === true || task.phase === "paused");
@@ -73,7 +77,7 @@ export function renderTaskRunSummary(task) {
       <div><dt>关联对象</dt><dd>${escapeHtml(task.subject || "无")}</dd></div>
       <div><dt>开始时间</dt><dd>${timeMarkup(task.startedAt)}</dd></div>
       <div><dt>优先级</dt><dd>${escapeHtml(priorities[task.priority] || "未知")}</dd></div>
-      <div><dt>控制修订</dt><dd>${escapeHtml(task.revision)} · 已交给模型的修订 ${escapeHtml(task.appliedRevision)}</dd></div>
+      <div><dt>${task.readOnly ? "作业修订" : "控制修订"}</dt><dd>${escapeHtml(task.revision)}${task.readOnly ? "" : ` · 已交给模型的修订 ${escapeHtml(task.appliedRevision)}`}</dd></div>
       ${task.lastActivityAt ? `<div><dt>最近活动</dt><dd>${timeMarkup(task.lastActivityAt)}</dd></div>` : ""}
     </dl>
     ${task.progress ? `<p class="task-run-progress">${escapeHtml(task.progress)}</p>` : ""}
@@ -81,6 +85,27 @@ export function renderTaskRunSummary(task) {
     ${task.phase === "control_failed" ? '<p class="task-runs-error">停止尚未确认，请等待维护确认后再继续。</p>' : ""}
     <details class="task-run-instructions"><summary>已提交的补充要求（${task.instructions?.length || 0}）</summary>
       ${task.instructions?.length ? `<ol>${task.instructions.map((instruction) => `<li><p>${escapeHtml(instruction.text)}</p><small>${timeMarkup(instruction.at)}</small></li>`).join("")}</ol>` : "<p>尚未提交补充要求。</p>"}</details>`;
+}
+
+function renderTaskRunSession(task) {
+  const session = task?.session;
+  const statuses = { starting: "正在连接", running: "当前回合进行中", completed: "本回合已完成", interrupted: "本回合已中断", failed: "本回合失败" };
+  const types = { message: "模型输出", tool: "工具活动", plan: "计划更新", status: "状态" };
+  const events = task?.events || [];
+  return `<section class="task-run-session" aria-labelledby="task-run-session-title">
+    <h3 id="task-run-session-title">${task?.readOnly ? "最近受控动作" : "CLI 会话"}</h3>
+    ${session ? `<dl class="task-run-metadata">
+      <div><dt>连接</dt><dd>${escapeHtml(session.transport)} · ${escapeHtml(statuses[session.status] || "状态待确认")}</dd></div>
+      <div><dt>会话</dt><dd>${escapeHtml(session.threadId)}</dd></div>
+      <div><dt>当前回合</dt><dd>${escapeHtml(session.turnId || "等待开始")}</dd></div>
+    </dl>` : '<p class="task-runs-empty">当前步骤未连接实时 CLI 会话。</p>'}
+    <p class="task-runs-hint">${task?.readOnly ? "显示最近 8 条动作的类型、结果、时间和相对路径。" : "显示本次运行最近 120 条输出；较长内容显示末尾，以“…”标记。"}</p>
+    <div class="task-run-events" data-task-run-events role="log" aria-label="${task?.readOnly ? "后台作业动作记录" : "CLI 会话输出"}" aria-live="off" tabindex="0">
+      ${events.length ? `<ol>${events.map((event) => `<li data-task-run-event="${escapeHtml(event.sequence)}">
+        <div class="task-run-event-heading"><strong>${escapeHtml(types[event.type] || "活动")}</strong>${timeMarkup(event.at)}</div>
+        <p>${escapeHtml(event.text)}</p></li>`).join("")}</ol>` : '<p class="task-runs-empty">尚无输出。任务开始读取代码或产生消息后会显示在这里。</p>'}
+    </div>
+  </section>`;
 }
 
 function controlDisabled(state, command) {
@@ -91,18 +116,19 @@ export function renderTaskRunDetail(state = {}) {
   const { detail, draft = { instruction: "", priority: "normal" } } = state;
   const disabled = (command) => controlDisabled(state, command) ? "disabled" : "";
   return `<div class="detail task-run-detail"><div data-task-run-summary>${renderTaskRunSummary(detail)}</div>
+    <div data-task-run-session>${renderTaskRunSession(detail)}</div>
     <p class="task-run-notice" data-task-run-notice role="status">${escapeHtml(state.notice || "")}</p>
     <p class="task-runs-error" data-task-run-error role="status">${escapeHtml(state.detailError || "")}</p>
     <button type="button" class="secondary-button" data-task-run-reload ${state.detailLoading ? "disabled" : ""}>刷新详情</button>
     <form data-task-run-instruction-form>
       <label for="task-run-instruction">补充要求</label>
-      <textarea id="task-run-instruction" name="instruction" rows="4" maxlength="4000" aria-describedby="task-run-permission">${escapeHtml(draft.instruction)}</textarea>
+      <textarea id="task-run-instruction" name="instruction" rows="4" maxlength="4000" aria-describedby="task-run-permission" ${detail?.readOnly ? "disabled" : ""}>${escapeHtml(draft.instruction)}</textarea>
       <p id="task-run-permission">补充要求不能扩大原任务权限，原有测试和发布授权仍然生效。</p>
       <button type="submit" class="secondary-button" data-task-run-command="instruct" ${disabled("instruct")}>提交补充要求</button>
     </form>
     <form data-task-run-priority-form class="task-run-priority-form">
       <label for="task-run-priority">后续调度优先级</label>
-      <select id="task-run-priority" name="priority">${Object.entries(priorities).map(([value, label]) => `<option value="${value}" ${draft.priority === value ? "selected" : ""}>${label}</option>`).join("")}</select>
+      <select id="task-run-priority" name="priority" ${detail?.readOnly ? "disabled" : ""}>${Object.entries(priorities).map(([value, label]) => `<option value="${value}" ${draft.priority === value ? "selected" : ""}>${label}</option>`).join("")}</select>
       <button type="submit" class="secondary-button" data-task-run-command="priority" ${disabled("priority")}>保存优先级</button>
     </form>
     <div class="task-run-actions" data-task-run-actions>${renderTaskRunActions(state)}</div>
@@ -144,7 +170,7 @@ export function createTaskRunsController({
   setTimeoutImpl = globalThis.setTimeout,
   clearTimeoutImpl = globalThis.clearTimeout,
 } = {}) {
-  const state = { loaded: false, loading: false, enabled: false, items: [], held: [], error: "",
+  const state = { loaded: false, loading: false, enabled: false, items: [], held: [], background: [], error: "",
     selected: null, detail: null, detailLoading: false, detailStale: false, detailError: "",
     submitting: false, notice: "", draft: { instruction: "", priority: "normal" } };
   const drafts = new Map();
@@ -184,8 +210,9 @@ export function createTaskRunsController({
     listRequest = (async () => {
       try {
         const body = await readResponse(await fetchImpl("/api/task-runs", { cache: "no-store" }));
-        if (typeof body.enabled !== "boolean" || !Array.isArray(body.items) || !Array.isArray(body.held)) throw new Error("运行任务列表格式无效");
-        Object.assign(state, { loaded: true, enabled: body.enabled, items: body.items, held: body.held, error: "" });
+        if (typeof body.enabled !== "boolean" || !Array.isArray(body.items) || !Array.isArray(body.held) ||
+            (body.background !== undefined && !Array.isArray(body.background))) throw new Error("运行任务列表格式无效");
+        Object.assign(state, { loaded: true, enabled: body.enabled, items: body.items, held: body.held, background: body.background || [], error: "" });
       } catch (error) { state.error = error.message; }
       finally { state.loading = false; listRequest = null; notify(); }
     })();
@@ -244,6 +271,7 @@ export function createTaskRunsController({
     const key = identity(detail);
     state.items = state.items.filter((task) => identity(task) !== key);
     state.held = state.held.filter((task) => identity(task) !== key);
+    state.background = state.background.filter((task) => identity(task) !== key);
     if (detail.active) state.items.push(detail);
     else if (detail.phase === "paused" || detail.pendingCommand) state.held.push(detail);
   }
@@ -317,6 +345,7 @@ export function createTaskRunsView({ container, dialog, documentImpl = document,
   let renderedSelection = "";
   let lastListMarkup = "";
   let lastSummaryMarkup = "";
+  let lastSessionMarkup = "";
   let lastActionsMarkup = "";
   const controller = createTaskRunsController({ ...options, onChange: render });
 
@@ -340,6 +369,7 @@ export function createTaskRunsView({ container, dialog, documentImpl = document,
       detailContent.innerHTML = renderTaskRunDetail(state);
       renderedSelection = selected;
       lastSummaryMarkup = "";
+      lastSessionMarkup = "";
       lastActionsMarkup = "";
     }
     const summaryMarkup = renderTaskRunSummary(state.detail);
@@ -350,12 +380,27 @@ export function createTaskRunsView({ container, dialog, documentImpl = document,
       if (historyOpen) summary.querySelector("details").open = true;
       lastSummaryMarkup = summaryMarkup;
     }
+    const sessionMarkup = renderTaskRunSession(state.detail);
+    if (sessionMarkup !== lastSessionMarkup) {
+      const session = detailContent.querySelector("[data-task-run-session]");
+      const output = session.querySelector("[data-task-run-events]");
+      const scrollTop = output?.scrollTop || 0;
+      const following = !output || output.scrollHeight - output.scrollTop - output.clientHeight < 32;
+      const focused = documentImpl.activeElement === output;
+      session.innerHTML = sessionMarkup;
+      const nextOutput = session.querySelector("[data-task-run-events]");
+      nextOutput.scrollTop = following ? nextOutput.scrollHeight : scrollTop;
+      if (focused) nextOutput.focus({ preventScroll: true });
+      lastSessionMarkup = sessionMarkup;
+    }
     detailContent.querySelector("[data-task-run-notice]").textContent = state.notice;
     detailContent.querySelector("[data-task-run-error]").textContent = state.detailError;
     const instruction = detailContent.querySelector("textarea");
     const priority = detailContent.querySelector("select");
     if (instruction.value !== state.draft.instruction) instruction.value = state.draft.instruction;
     if (priority.value !== state.draft.priority) priority.value = state.draft.priority;
+    instruction.disabled = state.detail?.readOnly === true;
+    priority.disabled = state.detail?.readOnly === true;
     detailContent.querySelector("[data-task-run-reload]").disabled = state.detailLoading || state.submitting;
     for (const button of detailContent.querySelectorAll("form button[data-task-run-command]")) button.disabled = controlDisabled(state, button.dataset.taskRunCommand);
     const actionsMarkup = renderTaskRunActions(state);

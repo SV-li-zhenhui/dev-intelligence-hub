@@ -8,17 +8,19 @@ import { projectRoot } from "../lib/config.js";
 import { KnownCliLocator } from "../lib/known-cli-locator.js";
 import { PRODUCTION_PRIVATE_DIRECTORY_MANAGER } from "../lib/private-directory-manager.js";
 import { SupervisedProcessRunner, didSupervisedProcessNotStart, readReapedProcessFailureOutput } from "../lib/supervised-process-runner.js";
-import { CodexAppServerRunner, didAppServerNotStart, readAppServerFailureOutput } from '../lib/codex-app-server-runner.js';
+import { CodexAppServerRunner, didAppServerNotStart, didAppServerNotStartModel, readAppServerFailureOutput } from '../lib/codex-app-server-runner.js';
 import { normalizeStructuredBrainRequest, readStructuredBrainGenerateInput } from "../lib/structured-brain-request.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { parseJsonWithUniqueKeys } from "../lib/strict-json.js";
 import { GitHubReviewReader } from "./github-review-reader.js";
 import { CodexNativeSessionStore, isNativeCodexThreadId, nativeCodexDigest, nativeCodexHomeIdentity } from "./codex-native-session-store.js";
 import { loadNativeReviewSkill, NATIVE_REVIEW_SKILL_DOCUMENT, NATIVE_REVIEW_SKILL_FILE, NATIVE_REVIEW_SKILL_NAME } from "../lib/native-review-skill.js";
+import { appServerArguments, reviewerConfiguration, NATIVE_CHANNEL_INSTRUCTIONS } from '../lib/codex-app-server-policy.js';
 
 const HOMES = new Map();
 const SETTLED_FAILURE_OUTPUT = new WeakMap();
 const SETTLED_NOT_STARTED = new WeakSet();
+const SETTLED_NO_MODEL = new WeakSet();
 const SAFE_MODEL = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$/u;
 const ENVELOPE_SCHEMA = { type: "object", additionalProperties: false, required: ["result"], properties: { result: { type: "string" } } };
 const DEFINITIONS = {
@@ -143,17 +145,6 @@ function argumentsFor(request, directory, threadId, reader, nativeSkill = false)
   ];
 }
 
-function appServerArguments(args) {
-  const options=[];
-  for(let index=1;index<args.length;index++) {
-    if (['-c','--disable'].includes(args[index])) options.push(args[index],args[++index]);
-    else if (['--ignore-user-config','--ignore-rules','--strict-config'].includes(args[index])) options.push(args[index]);
-  }
-  // Unsupported isolation options must reject this opt-in transport before a turn,
-  // rather than inherit host MCP servers, hooks, plugins or custom rules.
-  return ['app-server',...options];
-}
-
 function threadFrom(result, previous = null) {
   let found = null;
   const bytes = result?.stdoutBytes ?? result?.stdout ?? "";
@@ -226,10 +217,10 @@ export class NativeCodexBrainProvider {
     };
     // Snapshot at construction: browser configuration can never choose a home.
     const environment = { ...(dependencies.environment ?? process.env) };
-    const transport = environment.DIH_CODEX_NATIVE_TRANSPORT ?? 'exec';
+    const transport = environment.DIH_CODEX_NATIVE_TRANSPORT ?? (process.platform==='win32' ? 'app-server' : 'exec');
     if (!['exec','app-server'].includes(transport)) throw new TypeError('Native Codex transport is invalid');
     this.transport = transport;
-    this.supportsNativeReviewSkills = transport === 'exec';
+    this.supportsNativeReviewSkills = true;
     this.#nativeHome = absolute(environment.CODEX_HOME || path.join(homedir(), ".codex"));
     const temporaryRoot = absolute(dependencies.temporaryRoot ?? path.join(homedir(), ".mydashboard-supervised-cli-v1"));
     this.#root = `${temporaryRoot}-native`;
@@ -309,6 +300,7 @@ export class NativeCodexBrainProvider {
       await unlink(marker);
       if (signal.aborted) {
         if (didSupervisedProcessNotStart(outcome.error) || didAppServerNotStart(outcome.error)) SETTLED_NOT_STARTED.add(signal.reason);
+        if (didAppServerNotStartModel(outcome.error)) SETTLED_NO_MODEL.add(signal.reason);
         const output = outcome.value ?? readReapedProcessFailureOutput(outcome.error) ?? readAppServerFailureOutput(outcome.error);
         if (output) SETTLED_FAILURE_OUTPUT.set(signal.reason, output);
         throw signal.reason;
@@ -397,6 +389,14 @@ export class NativeCodexBrainProvider {
         }
         await writeFile(path.join(directory, "output-schema.json"), JSON.stringify(ENVELOPE_SCHEMA), { flag: "wx", mode: 0o600 });
         await writeFile(path.join(directory, "task.json"), wireInput, { flag: "wx", mode: 0o600 });
+        const live = this.transport === 'app-server';
+        const instructionsFile = path.join(directory,'model-instructions.txt');
+        const agentConfigPath = path.join(directory,'reviewer.toml');
+        if(live) {
+          files.push('model-instructions.txt','reviewer.toml');
+          await writeFile(instructionsFile,NATIVE_CHANNEL_INSTRUCTIONS,{flag:'wx',mode:0o600});
+          await writeFile(agentConfigPath,reviewerConfiguration(request,instructionsFile),{flag:'wx',mode:0o600});
+        }
         if (reader) {
           await writeFile(path.join(directory, "review.diff"), reader.diffText, { flag: "wx", mode: 0o600 });
           await writeFile(path.join(directory, "review-manifest.json"), reader.manifestText, { flag: "wx", mode: 0o600 });
@@ -408,16 +408,17 @@ export class NativeCodexBrainProvider {
         let processAttempted = false;
         try {
           const args = argumentsFor(request, directory, previous, reader, Boolean(skill));
-          const live = this.transport === 'app-server';
-          processResult = await this.#runProcess({ executable: descriptor, args: live ? appServerArguments(args) : args, cwd: directory, env: this.#dependencies.environment,
-            ...(live ? {appServer:{input:wireInput,model:request.model,effort:request.reasoningEffort,schema:ENVELOPE_SCHEMA,previous}} : {}),
+          processResult = await this.#runProcess({ executable: descriptor, args: live ? appServerArguments(request,instructionsFile,Boolean(skill)) : args, cwd: directory, env: this.#dependencies.environment,
+            ...(live ? {appServer:{input:wireInput,model:request.model,effort:request.reasoningEffort,schema:ENVELOPE_SCHEMA,previous,
+              isolation:{reader:reader?{url:reader.url}:null,agentConfigPath,ephemeral:!request.sessionKey,
+                ...(skill?{skill:{name:NATIVE_REVIEW_SKILL_NAME,path:path.join(directory,NATIVE_REVIEW_SKILL_FILE)}}:{})}}} : {}),
             input: Buffer.from(wireInput), timeoutMs: this.#options.timeoutMs, maxStdoutBytes: request.reviewTarget ? 64 * 1024 * 1024 : 1024 * 1024, maxStderrBytes: this.#options.maxResponseBytes }, operationSignal, this.#marker(), () => { processAttempted = true; }, live ? this.#dependencies.appServerRunner : this.#dependencies.processRunner);
           this.#state.lastStatus = status("available");
         } catch (failure) { processFailure = failure; }
         if (request.sessionKey && !this.#state.blocked) {
           const threadId = threadFrom(processResult ?? SETTLED_FAILURE_OUTPUT.get(processFailure) ?? readReapedProcessFailureOutput(processFailure) ?? readAppServerFailureOutput(processFailure), previous);
           if (threadId) await this.#sessions.save({ sessionKey: request.sessionKey, threadId });
-          else if (!processAttempted || didSupervisedProcessNotStart(processFailure) || didAppServerNotStart(processFailure) || SETTLED_NOT_STARTED.has(processFailure)) await this.#sessions.cancel?.({ sessionKey: request.sessionKey });
+          else if (!processAttempted || didSupervisedProcessNotStart(processFailure) || didAppServerNotStart(processFailure) || didAppServerNotStartModel(processFailure) || SETTLED_NOT_STARTED.has(processFailure) || SETTLED_NO_MODEL.has(processFailure)) await this.#sessions.cancel?.({ sessionKey: request.sessionKey });
           else throw failure("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
         }
         if (processFailure) throw processFailure;

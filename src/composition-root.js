@@ -67,6 +67,7 @@ import { LocalSessionImporter } from "./services/local-session-importer.js";
 import { GitActivityImporter } from "./services/git-activity-importer.js";
 import { ProactiveWorkLoop } from "./services/proactive-work-loop.js";
 import { TaskRunRegistry } from './services/task-run-registry.js';
+import { createTaskRunView } from './services/task-run-view.js';
 import { createTaskRunSettler,canUseNativeStopEvidence } from './services/work-ledger-run-control.js';
 import { OrchestratorService } from "./services/orchestrator-service.js";
 import { RoleContextAssembler } from "./services/role-context-assembler.js";
@@ -2782,7 +2783,7 @@ export async function createApplication({
       workflowRouting,
       codeJobReader,
       codeJobControl,
-      taskRuns: coordinationEnabled ? Object.freeze({list:()=>taskRuns.list(),get:(...args)=>taskRuns.get(...args),
+      taskRuns: coordinationEnabled ? Object.freeze({...createTaskRunView({registry:taskRuns,codeJobReader}),
         control:(...args)=>ordinaryActionAdmissionGate ? ordinaryActionAdmissionGate.run(()=>taskRuns.control(...args)) : taskRuns.control(...args)}) : null,
       codeJobEvidenceReader,
       workLedgerView,

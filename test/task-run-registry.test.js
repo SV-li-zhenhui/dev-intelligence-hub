@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { StateStore } from "../src/lib/state-store.js";
+import { currentTaskExecution } from "../src/lib/task-execution-context.js";
 import {
   TASK_RUN_STATE_KEY,
   TaskRunControlError,
@@ -11,6 +12,79 @@ import {
 } from "../src/services/task-run-registry.js";
 
 const NOW = "2026-10-13T08:00:00.000Z";
+
+test('live session output is bound to its run, sanitized, cloned and never persisted', async () => {
+  const {registry,store}=fixture();const entered=deferred(),finish=deferred();let context;
+  const result=registry.run(task(),async()=>{context=currentTaskExecution();entered.resolve();await finish.promise;return 'done';});
+  await entered.promise;
+  assert.equal((await registry.get('work-item','work-1')).session,null);
+  context.reportSession({transport:'app-server',threadId:'thread-1',turnId:null,status:'starting'});
+  context.reportSession({transport:'app-server',threadId:'thread-1',turnId:'turn-1',status:'running'});
+  context.reportEvent({type:'message',itemId:'message-1',text:'\u001b[31mReading\u001b[0m\n'});
+  context.reportEvent({type:'message',itemId:'message-1',text:'code\u0000\u001b]0;private-title\u0007'});
+  context.reportEvent({type:'tool',itemId:'tool-1',text:'Read Source/example.cpp'});
+  context.reportEvent({type:'message',itemId:'message-1',text:'Finished reading'});
+  const view=await registry.get('work-item','work-1');
+  assert.deepEqual(view.session,{transport:'app-server',threadId:'thread-1',turnId:'turn-1',status:'running'});
+  assert.deepEqual(view.events.map(({type,text,itemId})=>({type,text,itemId})),[
+    {type:'message',text:'Reading\ncode',itemId:'message-1'},
+    {type:'tool',text:'Read Source/example.cpp',itemId:'tool-1'},
+    {type:'message',text:'Finished reading',itemId:'message-1'},
+  ]);
+  assert.ok(view.events.every((event)=>event.at===NOW));
+  assert.ok(view.events.every((event,index)=>index===0||event.sequence>view.events[index-1].sequence));
+  view.session.threadId='changed';view.events[0].text='changed';
+  assert.equal((await registry.get('work-item','work-1')).session.threadId,'thread-1');
+  assert.equal((await registry.get('work-item','work-1')).events[0].text,'Reading\ncode');
+  assert.equal(store.writes,0);
+  await registry.control(view.kind,view.taskId,control(view,'priority',{priority:'high'}));
+  assert.equal(store.writes,1);
+  assert.equal(JSON.stringify(store.value).includes('thread-1'),false);
+  assert.equal(JSON.stringify(store.value).includes('Reading'),false);
+  finish.resolve();await result;
+  context.reportEvent({type:'message',text:'late output'});
+  assert.deepEqual(await registry.list(),{enabled:true,items:[],held:[]});
+  assert.deepEqual((await registry.get('work-item','work-1')).events,[]);
+});
+
+test('live session output stays bounded and invalid protocol metadata fails closed', async () => {
+  const {registry}=fixture();const entered=deferred(),finish=deferred();let context;
+  const result=registry.run(task(),async()=>{context=currentTaskExecution();entered.resolve();await finish.promise;});
+  await entered.promise;
+  for(const session of [
+    {transport:'shell',threadId:'thread-1',turnId:null,status:'starting'},
+    {transport:'app-server',threadId:'thread-1',turnId:'bad\nturn',status:'running'},
+    {transport:'app-server',threadId:'thread-1',turnId:null,status:'unknown'},
+    {transport:'app-server',threadId:'thread-1',turnId:null,status:'starting',raw:'secret'},
+  ]) assert.throws(()=>context.reportSession(session),hasError('TASK_RUN_INPUT_INVALID',400));
+  assert.throws(()=>context.reportEvent({type:'protocol',text:'raw packet'}),hasError('TASK_RUN_INPUT_INVALID',400));
+  for(let index=0;index<125;index++) context.reportEvent({type:'status',text:`step ${index}`});
+  context.reportEvent({type:'message',itemId:'long',text:'x'.repeat(3000)});
+  context.reportEvent({type:'message',itemId:'long',text:'tail'});
+  const view=await registry.get('work-item','work-1');
+  assert.equal(view.events.length,120);
+  assert.equal(view.events[0].text,'step 6');
+  assert.ok(view.events.at(-1).text.length<=2000);
+  assert.match(view.events.at(-1).text,/^…[\s\S]*tail$/);
+  finish.resolve();await result;
+});
+
+test('late callbacks from an earlier checkpoint cannot alter a later model turn', async () => {
+  const {registry}=fixture();const first=deferred(),second=deferred(),entered=deferred();const contexts=[];
+  const result=registry.run(task(),async()=>{contexts.push(currentTaskExecution());entered.resolve();return contexts.length===1?first.promise:second.promise;});
+  await entered.promise;
+  const initial=await registry.get('work-item','work-1');
+  contexts[0].reportSession({transport:'app-server',threadId:'thread-1',turnId:'turn-1',status:'running'});
+  await registry.control('work-item','work-1',control(initial,'instruct',{instruction:'Check another path'}));
+  first.resolve('old result');await new Promise((resolve)=>setImmediate(resolve));
+  contexts[1].reportSession({transport:'app-server',threadId:'thread-1',turnId:'turn-2',status:'running'});
+  contexts[0].reportSession({transport:'app-server',threadId:'thread-1',turnId:'turn-1',status:'completed'});
+  contexts[0].reportEvent({type:'status',text:'late old turn'});
+  const view=await registry.get('work-item','work-1');
+  assert.equal(view.session.turnId,'turn-2');
+  assert.equal(view.events.length,0);
+  second.resolve('current result');assert.equal(await result,'current result');
+});
 
 test('observing a controlled action never repeats the side effect for new instructions',async()=>{
   const {registry}=fixture();const entered=deferred(),finish=deferred();let performed=0;

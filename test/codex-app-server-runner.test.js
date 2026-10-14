@@ -3,16 +3,17 @@ import test from 'node:test';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { CodexAppServerRunner,didAppServerNotStart } from '../src/lib/codex-app-server-runner.js';
+import { CodexAppServerRunner,didAppServerNotStart,didAppServerNotStartModel } from '../src/lib/codex-app-server-runner.js';
 import { ManagedProcess } from '../src/lib/managed-process.js';
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { withTaskExecution } from '../src/lib/task-execution-context.js';
+import { createTestSupervisedProcessRunner } from '../src/lib/supervised-process-runner.js';
 const threadId='01973bca-3d8b-7000-a000-123456789abc';
-test('production app-server refuses a direct-child transport without tree containment before spawn',async()=>{
+test('production app-server certifies invalid invocations as not started',async()=>{
   const runner=new CodexAppServerRunner({materialize:async()=>assert.fail('must not materialize or spawn')});
   await assert.rejects(runner.run({}),error=>error.code==='STRUCTURED_PROVIDER_UNAVAILABLE' && didAppServerNotStart(error));
 });
-function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null}={}) {
+function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null,initializationFailure=false}={}) {
   let options; const calls=[]; let finish,interruptId,signalStopping;
   const stopping=new Promise(resolve=>{signalStopping=resolve;});
   const done = new Promise((r)=>{finish=r;});
@@ -21,9 +22,10 @@ function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=fals
   const process={done,exited:false,start(value){options=value;},write(line){
     const request=JSON.parse(line); if(!request.id)return;
     calls.push(request); let result={};
+    if(request.method==='initialize' && initializationFailure){send({id:request.id,error:{code:-32600,message:'fixture startup refused'}});return;}
     if(request.method.startsWith('thread/'))result={thread:{id:threadId}};
     if(request.method==='turn/start')result={turn:{id:'turn-1'}};
-    if(request.method==='turn/steer' && steerTurnId)result={turnId:steerTurnId};
+    if(request.method==='turn/steer')result=steerTurnId===false?{}:{turnId:steerTurnId??'turn-1'};
     if(request.method==='turn/interrupt' && manualInterrupt){interruptId=request.id;return;}
     send({id:request.id,result});
     if(request.method==='turn/start' && !hold)queueMicrotask(complete);
@@ -66,6 +68,21 @@ test('live steering goes to the same active turn without rerunning the operation
 test('failed turns never publish a structured result',async()=>{
   await assert.rejects(invocation(fixture({failed:true}).runner),e=>e.code==='STRUCTURED_PROVIDER_PROCESS_FAILED');
 });
+
+test('a reaped initialization failure certifies no model turn without claiming no process spawned',async()=>{
+  await assert.rejects(invocation(fixture({initializationFailure:true}).runner),error=>
+    didAppServerNotStartModel(error) && !didAppServerNotStart(error));
+});
+
+test('unknown terminal status is not accepted as a completed response',async()=>{
+  const f=fixture({hold:true});
+  await assert.rejects(invocation(f.runner,async run=>{
+    const result=run();void result.catch(()=>{});
+    for(let i=0;i<100&&!f.calls.some(x=>x.method==='turn/start');i++)await new Promise(resolve=>setImmediate(resolve));
+    await new Promise(resolve=>setImmediate(resolve));
+    f.send({method:'turn/completed',params:{threadId,turn:{id:'turn-1',status:'inProgress'}}});return result;
+  }),{code:'STRUCTURED_PROVIDER_RESPONSE_INVALID'});
+});
 test('unconfirmed process stop remains fenced',async()=>{
   await assert.rejects(invocation(fixture({stopFailure:true}).runner),e=>e.code==='STRUCTURED_PROVIDER_REAP_FAILED');
 });
@@ -74,6 +91,19 @@ test('the real managed stdio process exchanges RPC frames without closing its in
   const source=`import readline from 'node:readline';const send=x=>console.log(JSON.stringify(x));readline.createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line);if(r.id===undefined)return;let result={};if(r.method.startsWith('thread/'))result={thread:{id:'${threadId}'}};if(r.method==='turn/start')result={turn:{id:'turn-1'}};send({id:r.id,result});if(r.method==='turn/start'){send({method:'item/completed',params:{threadId:'${threadId}',turnId:'turn-1',item:{type:'agentMessage',text:JSON.stringify({result:JSON.stringify({ok:true})})}}});send({method:'turn/completed',params:{threadId:'${threadId}',turn:{id:'turn-1',status:'completed'}}});}});`;
   const runner=new CodexAppServerRunner({processFactory:()=>new ManagedProcess(),materialize:async()=>({command:process.execPath,prefixArgs:['--input-type=module','-e',source]})});
   const result=await invocation(runner);assert.equal(result.exitCode,0);
+});
+
+test('contained stdio drives RPC through the Windows Job Object supervisor', {skip:process.platform!=='win32'},async(t)=>{
+  const source=`const send=x=>console.log(JSON.stringify(x));require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line);if(r.id===undefined)return;let result={};if(r.method.startsWith('thread/'))result={thread:{id:'${threadId}'}};if(r.method==='turn/start')result={turn:{id:'turn-1'}};send({id:r.id,result});if(r.method==='turn/start'){send({method:'item/completed',params:{threadId:'${threadId}',turnId:'turn-1',item:{id:'final',type:'agentMessage',text:JSON.stringify({result:JSON.stringify({ok:true})})}}});send({method:'turn/completed',params:{threadId:'${threadId}',turn:{id:'turn-1',status:'completed'}}});}});`;
+  const processRunner=createTestSupervisedProcessRunner({descriptorMaterializer:async descriptor=>descriptor});
+  const runner=new CodexAppServerRunner({processRunner});
+  const directory=await mkdtemp(path.join(tmpdir(),'contained-app-server-'));
+  t.after(()=>rm(directory,{recursive:true,force:true}));
+  const result=await runner.run({executable:{command:process.execPath,prefixArgs:['-e',source]},args:[],cwd:directory,env:{},timeoutMs:15_000,
+    appServer:{input:'safe task',model:'test-model',schema:{type:'object'},previous:null}});
+  assert.equal(runner.supportsContainedExecution,true);
+  assert.equal(result.exitCode,0);
+  assert.equal(JSON.parse(await readFile(path.join(directory,'last-message.json'),'utf8')).result,'{"ok":true}');
 });
 
 test('live pause waits for interrupted turn and confirmed process exit before settling',async()=>{
@@ -129,12 +159,44 @@ test('another thread or turn cannot complete the active response',async()=>{
   });
 });
 
+test('notifications preceding turn start response are fenced by the returned turn ID',async()=>{
+  let options;
+  const process={exited:false,start(value){options=value;},write(line){
+    const r=JSON.parse(line);if(!r.id)return;
+    const send=value=>options.onLine({stream:'stdout',line:JSON.stringify(value)});
+    if(r.method==='turn/start') {
+      send({method:'turn/completed',params:{threadId,turn:{id:'old-turn',status:'completed'}}});
+      send({method:'item/agentMessage/delta',params:{threadId,turnId:'turn-1',itemId:'answer',delta:'visible progress'}});
+    }
+    send({id:r.id,result:r.method.startsWith('thread/')?{thread:{id:threadId}}:r.method==='turn/start'?{turn:{id:'turn-1'}}:{}});
+    if(r.method==='turn/start')queueMicrotask(()=>{
+      send({method:'item/completed',params:{threadId,turnId:'turn-1',item:{id:'answer',type:'agentMessage',text:'{"result":"{\\"ok\\":true}"}'}}});
+      send({method:'turn/completed',params:{threadId,turn:{id:'turn-1',status:'completed'}}});
+    });
+  },async stop(){this.exited=true;}};
+  const events=[];const sessions=[];
+  await invocation(new CodexAppServerRunner({processFactory:()=>process,materialize:async()=>({command:'codex',prefixArgs:[]})}),
+    run=>withTaskExecution({reportProgress(){},reportEvent:value=>events.push(value),reportSession:value=>sessions.push(value)},run));
+  assert.equal(events.length,1);assert.equal(events[0].text,'visible progress');
+  assert.equal(sessions.at(-1).status,'completed');assert.equal(sessions.at(-1).turnId,'turn-1');
+});
+
 test('a steer acknowledgement for a different turn is rejected',async()=>{
   const f=fixture({hold:true,steerTurnId:'different-turn'});
   await invocation(f.runner,async(run)=>{
     let live;const running=withTaskExecution({reportProgress(){},registerLiveControl:value=>{live=value;return()=>{};}},run);
     for(let i=0;i<100 && !live;i++)await new Promise(resolve=>setImmediate(resolve));
     await assert.rejects(live.steer('check races','message-1'),error=>error.code==='STRUCTURED_PROVIDER_RESPONSE_INVALID');
+    f.complete();await running;
+  });
+});
+
+test('a missing steer acknowledgement turn ID cannot certify delivery',async()=>{
+  const f=fixture({hold:true,steerTurnId:false});
+  await invocation(f.runner,async run=>{
+    let live;const running=withTaskExecution({reportProgress(){},registerLiveControl:value=>{live=value;return()=>{};}},run);
+    for(let i=0;i<100&&!live;i++)await new Promise(resolve=>setImmediate(resolve));
+    await assert.rejects(live.steer('check races','message-1'),{code:'STRUCTURED_PROVIDER_RESPONSE_INVALID'});
     f.complete();await running;
   });
 });

@@ -113,25 +113,45 @@ actions. Queued ledger items are not presented as running. The detail endpoint
 to reject stale controls. Adjustment settings and holds live in the existing
 data directory as `task-run-settings.json`; preserve this file in backups.
 
-The native-login provider retains the exec/resume route by default. An app-server
-protocol adapter exists, but its production transport is **not enabled**:
-the installed CLI rejects the required `--ignore-user-config` / `--ignore-rules`
-options, and a contained bidirectional supervisor has not passed acceptance.
-`DIH_CODEX_NATIVE_TRANSPORT=app-server` therefore reports unavailable before
-starting a process; use unset or `exec`. Do not remove the isolation checks or
-substitute a direct-child exit for process-tree termination. This setting applies
-only to `codex-native-login`; it does not change legacy broker/API-key modes,
-authentication, selected models or reasoning effort. Preserve the original
-`CODEX_HOME`.
+On Windows, native login now defaults to the contained app-server transport.
+`DIH_CODEX_NATIVE_TRANSPORT=exec` selects checkpoint compatibility;
+`app-server` explicitly selects live operation. Other platforms retain exec.
+This applies only to `codex-native-login`, preserving authentication, configured
+models/effort, the original `CODEX_HOME` and entity thread references. New durable
+threads request legacy history; existing threads resume by their exact ID.
 
-The app-server route uses the verified installed CLI, explicit read-only turn
-policy, the pinned PR reader and existing entity session references. It accepts
-live `turn/steer` instructions only for the bound current turn in protocol tests.
-Before production activation, supply verified tree containment and demonstrate
-equivalent config/rule isolation on the installed CLI. The isolated real-CLI
-initialize handshake passed; it did not start a model turn and is not live-task
-acceptance. No CLI version string is hard-coded as a gate. Request acknowledgements
-do not prove semantic adoption of an instruction.
+The same Windows Job Object wrapper now carries a framed invocation header and
+persistent stdin. It starts the verified binary suspended, assigns the process
+tree before resuming, and retains the existing termination proof and limits.
+Direct-child exit is not substituted for tree cleanup. Live instructions use
+`turn/steer` with the current thread and expected turn ID. Acknowledgements must
+return that exact turn ID; they do not prove semantic adoption.
+
+App-server does not support exec's ignore-config/rules flags. It also cannot
+strictly validate an entire older personal config without rejecting unrelated
+retired keys. The adapter instead verifies its effective capability settings,
+the returned read-only/no-network sandbox, and the MCP inventory before a turn.
+It disables inherited MCP servers individually and exposes only the invocation's
+three pinned read tools under a fresh namespace. Shell, hooks, plugins, apps and
+external actions remain disabled; the code-mode host stays enabled because it
+routes those read tools. Review skills are passed explicitly, and personal agent
+role files are replaced for this invocation with a trusted read-only profile.
+No original configuration file is edited. Home `AGENTS.md` can still be loaded
+as guidance; do not describe this as completely ignoring personal instructions.
+Structured results retain no action authority. No CLI version string is a gate.
+
+Real native-model acceptance verified same-turn steering, exact-thread resume,
+and T2 review with two independent reviewers and complete pinned reads, without
+GitHub writes. See [live CLI validation](validation/2026-10-14-live-cli-session.md).
+Before-turn failures after confirmed cleanup can clear only a fresh, unused
+session journal; uncertain process termination remains fenced.
+
+The task API adds a separate read-only `background` group for active/starting
+code jobs between model steps. Its last eight action facts exclude source text
+and grants. Real model/held runs take precedence, and background details cannot
+submit controls using their synthetic display ID. Live session metadata and the
+bounded 120-event transcript remain process-private and are not written to the
+durable adjustment settings.
 
 Code actions are observed without replaying them when requirements change.
 Pause/cancel requests remain pending until the ledger or controlled executor

@@ -4,11 +4,16 @@ import { materializeVerifiedCliDescriptor } from './known-cli-locator.js';
 import { parseJsonWithUniqueKeys } from './strict-json.js';
 import { currentTaskExecution } from './task-execution-context.js';
 import { isNativeCodexThreadId } from '../adapters/codex-native-session-store.js';
+import { ContainedStdioProcess } from './contained-stdio-process.js';
+import { randomBytes } from 'node:crypto';
+import { threadConfiguration, assertEffectiveAppServerPolicy, NATIVE_CHANNEL_INSTRUCTIONS } from './codex-app-server-policy.js';
 
 const FAILURE_OUTPUT = new WeakMap();
 const NOT_STARTED = new WeakSet();
+const NO_MODEL_TURN = new WeakSet();
 export const readAppServerFailureOutput = (error) => FAILURE_OUTPUT.get(error) ?? null;
 export const didAppServerNotStart = (error) => NOT_STARTED.has(error);
+export const didAppServerNotStartModel = (error) => NO_MODEL_TURN.has(error);
 function failure(code='STRUCTURED_PROVIDER_PROCESS_FAILED') {
   return Object.assign(new Error(code),{code,statusCode:code==='STRUCTURED_PROVIDER_TIMEOUT'?504:502});
 }
@@ -21,24 +26,28 @@ function deferred() {
 }
 
 export class CodexAppServerRunner {
-  constructor({processFactory=null,materialize=materializeVerifiedCliDescriptor}={}) {
+  constructor({processFactory=null,materialize=materializeVerifiedCliDescriptor,processRunner}={}) {
     this.processFactory=processFactory; this.materialize=materialize;
-    this.supportsContainedExecution=false;
+    this.processRunner=processRunner;
+    this.supportsContainedExecution=!processFactory && process.platform==='win32';
   }
 
   async run({executable,args,cwd,env,signal,timeoutMs,appServer}) {
     // Protocol fixtures can inject a process. Production needs a contained,
     // bidirectional supervisor: a direct child's exit is not tree-reap proof.
-    if (!this.processFactory) {
+    if ((!this.processFactory && !this.supportsContainedExecution) || !appServer ||
+        !Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
       const error=failure('STRUCTURED_PROVIDER_UNAVAILABLE');NOT_STARTED.add(error);throw error;
     }
     let descriptor;
-    try { descriptor=await this.materialize(executable,{signal}); }
+    try { if(this.processFactory)descriptor=await this.materialize(executable,{signal}); }
     catch(cause){const error=failure('STRUCTURED_PROVIDER_UNAVAILABLE');NOT_STARTED.add(error);throw error;}
     if(signal?.aborted){const error=failure('STRUCTURED_PROVIDER_CANCELLED');NOT_STARTED.add(error);throw error;}
-    const process=this.processFactory(); const completed=deferred(); const pending=new Map();
+    const process=this.processFactory ? this.processFactory() : new ContainedStdioProcess(this.processRunner);
+    const completed=deferred(); const pending=new Map();
     const context=currentTaskExecution(); let threadId=appServer.previous,turnId=null,text=null;
-    let sequence=0,started=false,initialized=false,terminal=false,interrupted=false,detach,output,error;
+    let sequence=0,started=false,initialized=false,terminal=false,interrupted=false,detach,output,error,turnAttempted=false;
+    const earlyEvents=[];const streamedItems=new Set();let earlyBytes=0;
     const request=(method,params)=>{
       if(process.exited) return Promise.reject(failure());
       const id=++sequence; const waiting=deferred();
@@ -70,10 +79,31 @@ export class CodexAppServerRunner {
         }
         const params=message.params??{};
         if(params.threadId!==threadId)return;
+        if(!turnId) {
+          earlyBytes+=Buffer.byteLength(line);
+          if(earlyEvents.length>=512 || earlyBytes>8*1024*1024)throw failure('STRUCTURED_PROVIDER_OUTPUT_LIMIT');
+          earlyEvents.push({stream,line});return;
+        }
         const eventTurn=params.turnId??params.turn?.id;
-        if(turnId && eventTurn && eventTurn!==turnId)return;
-        if(message.method==='turn/started' && params.turn?.id)turnId=params.turn.id;
+        if(eventTurn && eventTurn!==turnId)return;
+        if(terminal)return;
         if(message.method==='item/completed' && params.item?.type==='agentMessage')text=params.item.text;
+        if(message.method==='item/agentMessage/delta' && typeof params.delta==='string') {
+          streamedItems.add(params.itemId);
+          context?.reportEvent?.({type:'message',text:params.delta,...(params.itemId?{itemId:params.itemId}:{})});
+        }
+        if(message.method==='item/completed' && params.item?.type==='agentMessage' && !streamedItems.has(params.item.id)) {
+          context?.reportEvent?.({type:'message',text:params.item.text,...(params.item.id?{itemId:params.item.id}:{})});
+        }
+        if(message.method==='item/started' && params.item?.type==='mcpToolCall') {
+          context?.reportEvent?.({type:'tool',text:`${params.item.server ?? 'MCP'} / ${params.item.tool ?? '读取资料'}`,...(params.item.id?{itemId:params.item.id}:{})});
+        }
+        if(message.method==='item/started' && ['subAgentActivity','collabAgentToolCall'].includes(params.item?.type)) {
+          context?.reportEvent?.({type:'tool',text:`独立审查员：${params.item.kind ?? params.item.tool ?? '活动更新'}`,...(params.item.id?{itemId:params.item.id}:{})});
+        }
+        if(message.method==='turn/plan/updated' && Array.isArray(params.plan)) {
+          context?.reportEvent?.({type:'plan',text:params.plan.map(step=>`${step.status}: ${step.step}`).join('\n')});
+        }
         const progress={
           'turn/started':'正在分析任务', 'item/started':'正在读取或检查代码',
           'item/completed':'检查步骤已完成', 'item/commandExecution/outputDelta':'代码检查有新输出',
@@ -82,8 +112,10 @@ export class CodexAppServerRunner {
         }[message.method];
         if(progress)context?.reportProgress(progress);
         if(message.method==='turn/completed'){
+          if(!['completed','failed','interrupted'].includes(params.turn?.status))throw failure('STRUCTURED_PROVIDER_RESPONSE_INVALID');
           terminal=true;turnId=params.turn?.id??turnId;
           interrupted=params.turn?.status==='interrupted';
+          context?.reportSession?.({transport:'app-server',threadId,turnId,status:interrupted?'interrupted':params.turn?.status==='failed'?'failed':'completed'});
           if(params.turn?.status==='failed')completed.reject(failure());
           else completed.resolve();
         }
@@ -94,30 +126,65 @@ export class CodexAppServerRunner {
     const deadline=setTimeout(()=>fail(failure('STRUCTURED_PROVIDER_TIMEOUT')),timeoutMs);
     signal?.addEventListener('abort',abort,{once:true});
     try {
-      process.start({command:descriptor.command,args:[...descriptor.prefixArgs,...args],cwd,env,
+      started=true;
+      await process.start({...(descriptor ? {command:descriptor.command,args:[...descriptor.prefixArgs,...args]} : {executable,args}),cwd,env,
+        timeoutMs,maxStdoutBytes:64*1024*1024,maxStderrBytes:1024*1024,
         keepStdinOpen:true,onLine:receive,onError:fail,onLimit:()=>fail(failure('STRUCTURED_PROVIDER_OUTPUT_LIMIT')),
         onExit:()=>{if(!terminal)fail(failure(initialized ? 'STRUCTURED_PROVIDER_PROCESS_FAILED' : 'STRUCTURED_PROVIDER_UNAVAILABLE'));}});
-      started=true;
       await request('initialize',{clientInfo:{name:'dev_intelligence_hub',version:'0.1.0'},capabilities:{experimentalApi:true}});
       initialized=true;
       process.write(`${JSON.stringify({method:'initialized',params:{}})}\n`);
+      let config,namespace;
+      if(appServer.isolation) {
+        const effective=await request('config/read',{includeLayers:false,cwd});
+        assertEffectiveAppServerPolicy(effective?.config);
+        namespace=`dih_pr_review_${randomBytes(8).toString('hex')}`;
+        config=threadConfiguration(effective?.config,{...appServer.isolation,namespace});
+      }
       const resumed=await request(threadId?'thread/resume':'thread/start',{
         ...(threadId?{threadId}:{}),cwd,model:appServer.model,approvalPolicy:'never',sandbox:'read-only',
+        ...(appServer.isolation?{config,modelProvider:'openai',baseInstructions:NATIVE_CHANNEL_INSTRUCTIONS,developerInstructions:NATIVE_CHANNEL_INSTRUCTIONS,
+          runtimeWorkspaceRoots:[cwd],...(threadId?{excludeTurns:true}:{ephemeral:appServer.isolation.ephemeral,historyMode:'legacy'})}:{}),
       });
       const actual=resumed?.thread?.id;
       if(!isNativeCodexThreadId(actual) || (threadId && actual!==threadId))throw failure('STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED');
       threadId=actual;
+      if(appServer.isolation) {
+        if(resumed.approvalPolicy!=='never' || resumed.sandbox?.type!=='readOnly' || resumed.sandbox.networkAccess!==false)throw failure('STRUCTURED_PROVIDER_UNAVAILABLE');
+        let cursor=null,seenReader=false;const cursors=new Set();
+        do {
+          const servers=await request('mcpServerStatus/list',{threadId,limit:100,detail:'toolsAndAuthOnly',...(cursor?{cursor}:{})});
+          if(!Array.isArray(servers?.data))throw failure('STRUCTURED_PROVIDER_UNAVAILABLE');
+          for(const server of servers.data) {
+            const tools=Object.keys(server.tools??{});
+            if(server.name===namespace) {
+              if(tools.length!==3 || !['read_document','read_source','list_directory'].every(tool=>tools.includes(tool)))throw failure('STRUCTURED_PROVIDER_UNAVAILABLE');
+              seenReader=true;
+            } else if(tools.length)throw failure('STRUCTURED_PROVIDER_UNAVAILABLE');
+          }
+          cursor=servers.nextCursor??null;
+          if(cursor && (cursors.has(cursor) || cursors.size>=3))throw failure('STRUCTURED_PROVIDER_UNAVAILABLE');
+          if(cursor)cursors.add(cursor);
+        }while(cursor);
+        if(appServer.isolation.reader && !seenReader)throw failure('STRUCTURED_PROVIDER_UNAVAILABLE');
+      }
+      context?.reportSession?.({transport:'app-server',threadId,turnId:null,status:'starting'});
+      const skill=appServer.isolation?.skill;
+      const input=namespace && appServer.isolation.reader ? `For this invocation, references to pr_review in task and skill instructions mean the read-only MCP server ${namespace}.\n${appServer.input}` : appServer.input;
+      turnAttempted=true;
       const begun=await request('turn/start',{threadId,cwd,model:appServer.model,
         ...(appServer.effort?{effort:appServer.effort}:{}),
-        input:[{type:'text',text:appServer.input}],outputSchema:appServer.schema,
+        input:[{type:'text',text:input,text_elements:[]},...(skill?[{type:'skill',name:skill.name,path:skill.path}]:[])],outputSchema:appServer.schema,
         approvalPolicy:'never',sandboxPolicy:{type:'readOnly',networkAccess:false}});
       if(typeof begun?.turn?.id!=='string' || !begun.turn.id || (turnId && turnId!==begun.turn.id))throw failure('STRUCTURED_PROVIDER_RESPONSE_INVALID');
       turnId=begun.turn.id;
+      context?.reportSession?.({transport:'app-server',threadId,turnId,status:'running'});
+      for(const event of earlyEvents)receive(event);
       if(!terminal)detach=context?.registerLiveControl({
         steer:async(instruction,clientUserMessageId)=>{
           if(terminal)throw failure();
-          const accepted=await request('turn/steer',{threadId,expectedTurnId:turnId,input:[{type:'text',text:instruction}],clientUserMessageId});
-          if(accepted?.turnId && accepted.turnId!==turnId)throw failure('STRUCTURED_PROVIDER_RESPONSE_INVALID');
+          const accepted=await request('turn/steer',{threadId,expectedTurnId:turnId,input:[{type:'text',text:instruction,text_elements:[]}],clientUserMessageId});
+          if(accepted?.turnId!==turnId)throw failure('STRUCTURED_PROVIDER_RESPONSE_INVALID');
         },
         interrupt:()=>request('turn/interrupt',{threadId,turnId}),
       });
@@ -133,14 +200,18 @@ export class CodexAppServerRunner {
       clearTimeout(deadline);signal?.removeEventListener('abort',abort);detach?.();
       for(const waiting of pending.values()){clearTimeout(waiting.timer);waiting.reject(error??failure());}pending.clear();
       if(started){
-        try { await process.stop({gracefulMs:100});if(!process.exited)throw failure(); }
-        catch { error=failure('STRUCTURED_PROVIDER_REAP_FAILED'); }
+        try { await process.stop({gracefulMs:1_000});if(!process.exited)throw failure(); }
+        catch (cause) {
+          if(!process.exited || cause?.code==='STRUCTURED_PROVIDER_REAP_FAILED')error=failure('STRUCTURED_PROVIDER_REAP_FAILED');
+          else error??=cause;
+        }
       }
       if(interrupted && !error)context?.confirmStopped();
     }
     if(error){
-      if(threadId)FAILURE_OUTPUT.set(error,{stdoutBytes:Buffer.from(JSON.stringify({type:'thread.started',thread_id:threadId})+'\n')});
-      if(!started)NOT_STARTED.add(error);
+      if(threadId && (appServer.previous || turnAttempted))FAILURE_OUTPUT.set(error,{stdoutBytes:Buffer.from(JSON.stringify({type:'thread.started',thread_id:threadId})+'\n')});
+      if(!started || process.notStarted)NOT_STARTED.add(error);
+      if(!turnAttempted && process.exited)NO_MODEL_TURN.add(error);
       throw error;
     }
     return output;

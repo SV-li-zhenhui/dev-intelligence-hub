@@ -522,6 +522,56 @@ h1 {
   color: var(--muted);
 }
 
+.task-run-session {
+  margin: 20px 0;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.task-run-session h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.task-run-events {
+  max-height: 320px;
+  padding: 12px;
+  overflow: auto;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.task-run-events:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 3px;
+}
+
+.task-run-events ol {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.task-run-event-heading {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 12px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.task-run-events li p {
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .task-run-detail form {
   display: grid;
   gap: 10px;

@@ -136,6 +136,41 @@ test("supervised runner delivers only the explicit cwd, environment, and stdin",
   assert.equal(process.env[secretParentKey], "must-not-be-inherited");
 });
 
+test("contained duplex stdin exchanges multiple frames before EOF and reaps descendants", {
+  skip: WINDOWS_JOB_OBJECT_SKIP,
+}, async (t) => {
+  const directory = await temporaryDirectory(t, "supervised-duplex-");
+  const marker = path.join(directory, "descendant-pid.txt");
+  let control;
+  let output = "";
+  const script = `const {spawn}=require('node:child_process');
+    const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
+    require('node:fs').writeFileSync(${JSON.stringify(marker)},String(child.pid));
+    require('node:readline').createInterface({input:process.stdin}).on('line',line=>{
+      console.log('reply:'+line);
+      if(line==='第二次')process.exit(0);
+    });`;
+  const result = await testRunner().run(request(directory, script, {
+    timeoutMs: 15_000,
+    duplex: {
+      onReady(value) { control = value; control.write("第一次\n"); },
+      onOutput({ stream, chunk }) {
+        if (stream !== "stdout") return;
+        output += chunk.toString("utf8");
+        if (output.includes("reply:第一次") && !output.includes("second-sent")) {
+          output += "second-sent";
+          control.write("第二次\n");
+        }
+      },
+    },
+  }));
+  assert.match(result.stdout, /reply:第一次\r?\nreply:第二次/u);
+  assert.match(output, /reply:第二次/u);
+  const descendantPid = Number(await waitForMarker(marker));
+  assert.equal(await waitForProcessExit(descendantPid), true);
+  assert.throws(() => control.write("late\n"));
+});
+
 test("supervised runner rejects a pre-aborted request without spawning", async (t) => {
   const directory = await temporaryDirectory(t, "supervised-runner-pre-abort-");
   const marker = path.join(directory, "spawned.txt");

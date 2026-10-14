@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([switch]$Interactive)
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -32,6 +32,7 @@ namespace MyDashboard
         private const uint WAIT_OBJECT_0 = 0;
         private const uint INFINITE = 0xffffffff;
         private const int STD_OUTPUT_HANDLE = -11;
+        private const int STD_INPUT_HANDLE = -10;
         private const int STD_ERROR_HANDLE = -12;
         private static readonly IntPtr InvalidHandle = new IntPtr(-1);
 
@@ -241,7 +242,9 @@ namespace MyDashboard
             {
                 executableLock = LockAndVerifyExecutable(command, expectedSha256);
                 job = CreateKillOnCloseJob();
-                input = OpenInheritedInput(inputPath);
+                input = String.IsNullOrEmpty(inputPath)
+                    ? DuplicateInheritedStandardHandle(STD_INPUT_HANDLE)
+                    : OpenInheritedInput(inputPath);
                 output = DuplicateInheritedStandardHandle(STD_OUTPUT_HANDLE);
                 error = DuplicateInheritedStandardHandle(STD_ERROR_HANDLE);
                 environment = CreateEnvironmentBlock(environmentNames, environmentValues);
@@ -540,7 +543,25 @@ namespace MyDashboard
 $inputPath = $null
 try {
     Add-Type -TypeDefinition $nativeSource -Language CSharp
-    $packetText = [Console]::In.ReadToEnd()
+    if ($Interactive) {
+        # Consume only the invocation header. StreamReader.ReadLine can buffer
+        # subsequent RPC bytes that belong to the child's inherited stdin.
+        $packetStream = [Console]::OpenStandardInput()
+        $header = [System.IO.MemoryStream]::new()
+        try {
+            while ($true) {
+                $byte = $packetStream.ReadByte()
+                if ($byte -eq -1) { throw "Missing invocation header" }
+                if ($byte -eq 10) { break }
+                if ($header.Length -ge (3 * 1024 * 1024)) { throw "Invocation packet is too large" }
+                $header.WriteByte([byte]$byte)
+            }
+            $packetText = [System.Text.UTF8Encoding]::new($false, $true).GetString($header.ToArray())
+        }
+        finally { $header.Dispose() }
+    } else {
+        $packetText = [Console]::In.ReadToEnd()
+    }
     if ([System.Text.Encoding]::UTF8.GetByteCount($packetText) -gt (3 * 1024 * 1024)) {
         throw "Invocation packet is too large"
     }
@@ -569,7 +590,9 @@ try {
     if ($inputBytes.Length -gt (1024 * 1024)) {
         throw "Child input is too large"
     }
-    $inputPath = [System.IO.Path]::Combine(
+    if ($Interactive -and $inputBytes.Length -ne 0) { throw "Interactive input starts empty" }
+    if (-not $Interactive) {
+      $inputPath = [System.IO.Path]::Combine(
         $packet.cwd,
         ".supervised-stdin-$([System.Guid]::NewGuid().ToString('N')).bin"
     )
@@ -583,8 +606,9 @@ try {
         $inputStream.Write($inputBytes, 0, $inputBytes.Length)
         $inputStream.Flush($true)
     }
-    finally {
+      finally {
         $inputStream.Dispose()
+      }
     }
 
     $environment = @{}
