@@ -4092,51 +4092,55 @@ export function startApplicationBackgroundWork(
   );
   let backgroundOperationActive = false;
   let factsReady = false;
-  const reviewFactWaiters = new Set();
-  let activeReviewCycles = 0;
+  const independentEmployeeFactWaiters = new Set();
+  let activeIndependentEmployeeCycles = 0;
   let pendingFactCycles = 0;
   let factCycleSequence = 0;
   let readyFactCycleSequence = 0;
   const coalescedAgencyCycles = new Map();
   const coalescedRefreshCycles = new Map();
 
-  function releaseReviewFactWaiters(ready) {
-    for (const resolve of reviewFactWaiters) resolve(ready);
-    reviewFactWaiters.clear();
+  function releaseIndependentEmployeeFactWaiters(ready) {
+    for (const resolve of independentEmployeeFactWaiters) resolve(ready);
+    independentEmployeeFactWaiters.clear();
   }
 
-  function waitForReviewFacts() {
+  function waitForIndependentEmployeeFacts() {
     if (stopped) return Promise.resolve(false);
     if (factsReady && readyFactCycleSequence === factCycleSequence) return Promise.resolve(true);
     if (pendingFactCycles === 0) return Promise.resolve(false);
-    return new Promise((resolve) => reviewFactWaiters.add(resolve));
+    return new Promise((resolve) => independentEmployeeFactWaiters.add(resolve));
   }
 
-  function isIndependentReviewCycle(options) {
-    return !options.includeLegacyEmployees &&
-      options.employeeIds?.length === 1 && options.employeeIds[0] === "pr-engineer";
+  function isIndependentEmployeeCycle(options) {
+    if (options.includeLegacyEmployees || options.employeeIds?.length !== 1) return false;
+    const employeeId = options.employeeIds[0];
+    return employeeId === "pr-engineer" || (employeeId === "developer" &&
+      application.config.githubActions?.enabled === true &&
+      application.config.githubActions.automaticOwnPrRepair === true);
   }
 
-  async function runIndependentReview(options) {
+  async function runIndependentEmployee(options) {
     options.signal.throwIfAborted();
     if (stopped || !factsReady || readyFactCycleSequence !== factCycleSequence) {
       return { skipped: "facts_not_ready" };
     }
-    activeReviewCycles += 1;
+    const employeeId = options.employeeIds[0];
+    activeIndependentEmployeeCycles += 1;
     try {
-      // The role runs its own scoped coordination and publication. General
-      // code jobs and memory projection must not hold up incoming Reviews.
+      // Each role keeps its scoped coordination and execution checks. General
+      // code jobs and memory projection must not delay Reviews or own-PR repair.
       await runDrainParticipant(DRAIN_PARTICIPANTS.employeeExecution, () => {
         const runOptions = backgroundOperationOptions({ trigger: options.trigger }, options.signal);
         return typeof employeeRegistry.runSelected === "function"
-          ? employeeRegistry.runSelected(["pr-engineer"], runOptions)
-          : employeeRegistry.run("pr-engineer", runOptions);
+          ? employeeRegistry.runSelected([employeeId], runOptions)
+          : employeeRegistry.run(employeeId, runOptions);
       });
       options.signal.throwIfAborted();
-      await recoverReviewHandoffs(options.signal);
+      if (employeeId === "pr-engineer") await recoverReviewHandoffs(options.signal);
       return { skipped: null };
     } finally {
-      activeReviewCycles -= 1;
+      activeIndependentEmployeeCycles -= 1;
     }
   }
 
@@ -4394,11 +4398,11 @@ export function startApplicationBackgroundWork(
     priority,
     { admitOnDequeue = false } = {},
   ) {
-    if (isIndependentReviewCycle(options)) {
+    if (isIndependentEmployeeCycle(options)) {
       // Waiting for a refresh is not active work: maintenance must be able to
       // close admission without needing another admitted refresh to release it.
-      return waitForReviewFacts().then((ready) => ready && !stopped
-        ? operationalAdmission.run(() => runIndependentReview(options))
+      return waitForIndependentEmployeeFacts().then((ready) => ready && !stopped
+        ? operationalAdmission.run(() => runIndependentEmployee(options))
         : { skipped: "facts_not_ready" });
     }
     const operation = () => admitOnDequeue
@@ -4453,7 +4457,10 @@ export function startApplicationBackgroundWork(
     priority,
     runOptions = {},
   ) {
-    if (isIndependentReviewCycle(options)) runOptions = { ...runOptions, admitOnDequeue: true };
+    if (isIndependentEmployeeCycle(options)) {
+      key = `employee:${options.employeeIds[0]}`;
+      runOptions = { ...runOptions, admitOnDequeue: true };
+    }
     return runCoalescedTracked(
       coalescedAgencyCycles,
       key,
@@ -4495,7 +4502,7 @@ export function startApplicationBackgroundWork(
         if (stopped) return result;
         factsReady = true;
         readyFactCycleSequence = sequence;
-        if (readyFactCycleSequence === factCycleSequence) releaseReviewFactWaiters(true);
+        if (readyFactCycleSequence === factCycleSequence) releaseIndependentEmployeeFactWaiters(true);
         if (pendingFactCycles === 1) {
           confirmationAccess.open();
           try {
@@ -4513,7 +4520,7 @@ export function startApplicationBackgroundWork(
       } finally {
         pendingFactCycles -= 1;
         if (stopped) factsReady = false;
-        if (pendingFactCycles === 0 && !factsReady) releaseReviewFactWaiters(false);
+        if (pendingFactCycles === 0 && !factsReady) releaseIndependentEmployeeFactWaiters(false);
       }
     };
     return enqueueBackgroundOperation(
@@ -4590,7 +4597,7 @@ export function startApplicationBackgroundWork(
     if (stopPromise) return stopPromise;
     stopped = true;
     factsReady = false;
-    releaseReviewFactWaiters(false);
+    releaseIndependentEmployeeFactWaiters(false);
     workController.abort(shutdownAbort());
     for (const timer of timers) clearIntervalFn(timer);
     const tasksToDrain = [...activeTasks];
@@ -4621,7 +4628,7 @@ export function startApplicationBackgroundWork(
     return backgroundDrainStatus({
       runDrainParticipant,
       activeTaskCount: activeTasks.size,
-      backgroundOperationActive: backgroundOperationActive || activeReviewCycles > 0,
+      backgroundOperationActive: backgroundOperationActive || activeIndependentEmployeeCycles > 0,
       confirmationOperationCount:
         confirmationAccess.activeCount() + confirmationReadAccess.activeCount(),
       queuedOperationCount: [...backgroundQueues.values()]

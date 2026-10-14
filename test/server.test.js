@@ -3815,13 +3815,14 @@ test("Review waits for fresh facts, coalesces ticks and cancels a startup wait o
   try {
     const first = timers[1].callback();
     const second = timers[1].callback();
+    const manual = background.runEmployee("pr-engineer");
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(runs, 0);
     releaseRefresh.resolve();
     await background.initialRefresh;
     assert.equal(runs, 1);
     releaseReview.resolve();
-    await Promise.all([first, second]);
+    await Promise.all([first, second, manual]);
   } finally {
     releaseRefresh.resolve(); releaseReview.resolve();
     await background.stop();
@@ -3940,6 +3941,258 @@ test("Review waits for a newer refresh queued behind a developer", async () => {
     releaseDeveloper.resolve(); releaseRefresh.resolve(); await background.stop();
   }
 });
+
+for (const blocker of ["memory projection", "legacy patrol"]) {
+  test(`automatic own-PR developer bypasses stalled ${blocker}, coalesces manual ticks and drains`, async () => {
+    const blocked = deferred();
+    const releaseBlocked = deferred();
+    const releaseDeveloper = deferred();
+    const timers = [];
+    let developerRuns = 0;
+    let handoffs = 0;
+    const background = startApplicationBackgroundWork({
+      config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+      employeeRegistry: {
+        schedules: () => [{ id: "developer", intervalMinutes: 10 }],
+        async runSelected(ids) {
+          if (ids[0] === "pr-reviewer" && blocker === "legacy patrol") {
+            blocked.resolve(); await releaseBlocked.promise;
+          }
+          if (ids[0] !== "developer") return;
+          developerRuns += 1;
+          await releaseDeveloper.promise;
+        },
+      },
+      refreshService: { async refresh() {} },
+      ...(blocker === "memory projection" ? {
+        memoryProjector: { async runCycle() { blocked.resolve(); await releaseBlocked.promise; } },
+      } : {}),
+      reviewHandoffReconciler: { async runCycle() { handoffs += 1; } },
+    }, {
+      setIntervalFn(callback) { const timer = { callback, unref() {} }; timers.push(timer); return timer; },
+      clearIntervalFn() {},
+    });
+    try {
+      await blocked.promise;
+      const handoffsBeforeDeveloper = handoffs;
+      const scheduled = timers[1].callback();
+      const manual = background.runEmployee("developer");
+      manual.catch(() => {});
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(developerRuns, 1, "fresh own-PR repair must not wait for optional memory or legacy work");
+      assert.equal(handoffs, handoffsBeforeDeveloper, "developer must not run Review-only handoff recovery");
+      assert.ok(background.drainStatus().activeParticipants.some(
+        ({ id }) => id === DRAIN_PARTICIPANTS.employeeExecution.id,
+      ));
+      const refreshed = assert.rejects(background.initialRefresh, { code: "LIFECYCLE_SHUTDOWN_ABORTED" });
+      const manualStopped = assert.rejects(manual, { code: "LIFECYCLE_SHUTDOWN_ABORTED" });
+      let stopped = false;
+      const stopping = background.stop().then(() => { stopped = true; });
+      releaseBlocked.resolve();
+      await refreshed;
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(stopped, false, "shutdown must drain the independent developer");
+      assert.equal(background.drainStatus().backgroundOperationActive, true);
+      releaseDeveloper.resolve();
+      await Promise.all([scheduled, manualStopped, stopping]);
+      assert.equal(developerRuns, 1, "manual and scheduled requests must share one role cycle");
+    } finally {
+      releaseBlocked.resolve(); releaseDeveloper.resolve(); await background.stop();
+    }
+  });
+}
+
+test("automatic own-PR developer uses scoped coordination while general code jobs are busy", async () => {
+  const codeJobsStarted = deferred();
+  const releaseCodeJobs = deferred();
+  const workScopes = [];
+  const noOpCycle = { async runCycle() {} };
+  const coordination = new WorkCoordinationService({
+    ledger: { async intake() {} },
+    proposalResultReconciler: noOpCycle,
+    attentionResultReconciler: noOpCycle,
+    conditionWaker: noOpCycle,
+    codeJobRunner: { async runCycle() { codeJobsStarted.resolve(); await releaseCodeJobs.promise; } },
+    workLoop: { async runCycle(options) { workScopes.push(options); } },
+    dispatcher: { async dispatchPending() {} },
+  });
+  const registry = new EmployeeRegistry(["pr-reviewer", "developer"].map((id) => ({
+    id,
+    async view() {},
+    async roleView() {},
+    async control() {},
+    run(options) {
+      return id === "developer" ? coordination.runCycle({
+        trigger: "employee:developer", includeWork: true, roleId: id, signal: options.signal,
+      }) : Promise.resolve();
+    },
+  })));
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    employeeRegistry: registry,
+    workCoordination: coordination,
+    refreshService: { async refresh() {} },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
+  try {
+    await codeJobsStarted.promise;
+    const developer = background.runEmployee("developer");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(workScopes.length, 1, "scoped developer decisions must not wait for general code jobs");
+    assert.equal(workScopes[0].roleId, "developer");
+    assert.equal(workScopes[0].trigger, "employee:developer");
+    assert.equal(workScopes[0].signal instanceof AbortSignal, true);
+    assert.equal(workScopes[0].signal.aborted, false);
+    await developer;
+    releaseCodeJobs.resolve();
+    await background.initialRefresh;
+  } finally { releaseCodeJobs.resolve(); await background.stop(); }
+});
+
+test("automatic own-PR developer waits for the latest queued refresh behind general work", async () => {
+  const timers = [];
+  const generalStarted = deferred();
+  const releaseGeneral = deferred();
+  const releaseRefresh = deferred();
+  let refreshes = 0;
+  let developers = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    employeeRegistry: {
+      schedules: () => [{ id: "requirements-analyst", intervalMinutes: 10 }, { id: "developer", intervalMinutes: 11 }],
+      async runSelected(ids) {
+        if (ids[0] === "requirements-analyst") { generalStarted.resolve(); await releaseGeneral.promise; }
+        if (ids[0] === "developer") developers += 1;
+      },
+    },
+    refreshService: { async refresh() { if (++refreshes > 1) await releaseRefresh.promise; } },
+  }, {
+    setIntervalFn(callback) { const timer = { callback, unref() {} }; timers.push(timer); return timer; },
+    clearIntervalFn() {},
+  });
+  try {
+    await background.initialRefresh;
+    const general = timers[1].callback();
+    await generalStarted.promise;
+    const refresh = timers[0].callback();
+    const developer = timers[2].callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(developers, 0, "a queued refresh must invalidate the previous facts");
+    releaseGeneral.resolve();
+    await general;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(developers, 0, "the developer must wait until refreshed facts are admitted");
+    releaseRefresh.resolve();
+    await Promise.all([refresh, developer]);
+    assert.equal(developers, 1);
+  } finally {
+    releaseGeneral.resolve(); releaseRefresh.resolve(); await background.stop();
+  }
+});
+
+test("automatic own-PR developer cancels a startup fact wait on stop", async () => {
+  const releaseRefresh = deferred();
+  let developers = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    employeeRegistry: {
+      schedules: () => [],
+      async runSelected(ids) { if (ids[0] === "developer") developers += 1; },
+    },
+    refreshService: { async refresh() { await releaseRefresh.promise; } },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
+  try {
+    const developer = background.runEmployee("developer");
+    const refreshing = assert.rejects(background.initialRefresh, { code: "LIFECYCLE_SHUTDOWN_ABORTED" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(developers, 0);
+    const stopping = background.stop();
+    releaseRefresh.resolve();
+    await Promise.all([developer, stopping, refreshing]);
+    assert.equal(developers, 0);
+  } finally { releaseRefresh.resolve(); await background.stop(); }
+});
+
+test("automatic own-PR developer respects maintenance admission and drain", async () => {
+  const gate = new OperationalQuiescenceGate();
+  const started = deferred();
+  const release = deferred();
+  let developers = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    operations: { admission: { run: gate.run.bind(gate) } },
+    employeeRegistry: {
+      schedules: () => [],
+      async runSelected(ids) {
+        if (ids[0] !== "developer") return;
+        developers += 1; started.resolve(); await release.promise;
+      },
+    },
+    refreshService: { async refresh() {} },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError() {} });
+  try {
+    await background.initialRefresh;
+    const developer = background.runEmployee("developer");
+    await started.promise;
+    const closing = gate.enter();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(gate.readStatus().mode, "closing");
+    release.resolve();
+    await developer;
+    const token = await closing;
+    await assert.rejects(background.runEmployee("developer"), { code: "SYSTEM_QUIESCING" });
+    assert.equal(developers, 1);
+    gate.leave(token);
+  } finally { release.resolve(); await background.stop(); }
+});
+
+test("automatic own-PR developer without fresh facts does not hold maintenance admission", async () => {
+  const gate = new OperationalQuiescenceGate({ drainTimeoutMs: 100 });
+  let developers = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    operations: { admission: { run: gate.run.bind(gate) } },
+    employeeRegistry: {
+      schedules: () => [],
+      async runSelected(ids) { if (ids[0] === "developer") developers += 1; },
+    },
+    refreshService: { async refresh() { throw new Error("upstream unavailable"); } },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError() {} });
+  try {
+    await assert.rejects(background.initialRefresh, /upstream unavailable/);
+    await background.runEmployee("developer");
+    assert.equal(gate.readStatus().activeOperations, 0);
+    const token = await gate.enter();
+    gate.leave(token);
+    assert.equal(developers, 0);
+  } finally { await background.stop(); }
+});
+
+for (const githubActions of [undefined, { enabled: true },
+  { enabled: true, automaticOwnPrRepair: false }, { enabled: false, automaticOwnPrRepair: true }]) {
+  test(`developer keeps serialized scheduling without enabled automatic own-PR repair: ${JSON.stringify(githubActions)}`, async () => {
+    const memoryStarted = deferred();
+    const releaseMemory = deferred();
+    let developers = 0;
+    const background = startApplicationBackgroundWork({
+      config: { refreshMinutes: 7, githubActions },
+      employeeRegistry: {
+        schedules: () => [],
+        async runSelected(ids) { if (ids[0] === "developer") developers += 1; },
+      },
+      refreshService: { async refresh() {} },
+      memoryProjector: { async runCycle() { memoryStarted.resolve(); await releaseMemory.promise; } },
+    }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
+    try {
+      await memoryStarted.promise;
+      const developer = background.runEmployee("developer");
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(developers, 0);
+      releaseMemory.resolve();
+      await Promise.all([background.initialRefresh, developer]);
+      assert.equal(developers, 1);
+    } finally { releaseMemory.resolve(); await background.stop(); }
+  });
+}
 
 test("overlapping scheduled role and refresh ticks are coalesced", async () => {
   const roleStarted = deferred();
