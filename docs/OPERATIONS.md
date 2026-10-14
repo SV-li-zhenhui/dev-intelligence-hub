@@ -131,14 +131,39 @@ App-server does not support exec's ignore-config/rules flags. It also cannot
 strictly validate an entire older personal config without rejecting unrelated
 retired keys. The adapter instead verifies its effective capability settings,
 the returned read-only/no-network sandbox, and the MCP inventory before a turn.
-It disables inherited MCP servers individually and exposes only the invocation's
-three pinned read tools under a fresh namespace. Shell, hooks, plugins, apps and
+It disables inherited MCP servers individually. Review/decision invocations expose
+three pinned read tools; continuous code invocations expose exactly
+`perform_action`, `read_source`, and `get_state` under a separate fresh namespace.
+Shell, hooks, plugins, apps and
 external actions remain disabled; the code-mode host stays enabled because it
-routes those read tools. Review skills are passed explicitly, and personal agent
+routes the scoped MCP tools. Review skills are passed explicitly, and personal agent
 role files are replaced for this invocation with a trusted read-only profile.
 No original configuration file is edited. Home `AGENTS.md` can still be loaded
 as guidance; do not describe this as completely ignoring personal instructions.
 Structured results retain no action authority. No CLI version string is a gate.
+
+Code jobs on this route use one model turn for several audited executor actions.
+This capability is selected by the native App Server adapter without rewriting
+configuration, grants, models, effort, login, or retained session references.
+The per-turn timeout is at least 900,000 ms, or the longer configured provider
+timeout. Fixed test-profile timeouts and the job's action limit still apply.
+Other transports retain the previous one-action model decisions.
+
+Monitor one actual job after deployment: it should keep one thread/turn while
+multiple action observations appear, then produce the normal result/memory/package
+records. In the running-task detail, verify steering receipts and new progress.
+Undelivered saved instructions keep the job active for a subsequent turn, without
+repeating audited actions. Once final completion has won the task-control fence,
+new instructions receive `TASK_RUN_INSTRUCTIONS_CLOSED`; they are not silently
+saved and discarded. Pause/cancel controls remain available during finalization.
+A stop first denies new actions, drains already admitted actions and verifies
+native process-tree exit. `stopUnconfirmed` or an unknown action is a reconciliation
+hold, not a successful pause. Do not clear it or delete session history to resume.
+Unexpected direct writes, duplicate actions, stale source pages or a premature stop
+confirmation are rollback triggers. Pause the affected job, preserve evidence,
+reconcile the action, and use the compatibility transport during a managed restart.
+Synthetic tests and real PR acceptance are recorded separately in
+[continuous development validation](validation/2026-10-14-continuous-codex-development.md).
 
 Real native-model acceptance verified same-turn steering, exact-thread resume,
 and T2 review with two independent reviewers and complete pinned reads, without

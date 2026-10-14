@@ -103,7 +103,8 @@ alongside the native home for disaster recovery.
 Codex PR review invocations receive a scoped read-only MCP reader for the
 complete change manifest, final diff, and related source at immutable head/base
 commits. The MCP endpoint has no writes and retains GitHub credentials in the
-service. Native mode also permits Codex's own read-only shell tools for staged
+service. The App Server route disables shell tools and verifies its scoped MCP
+inventory; the compatibility exec route can use read-only shell tools for staged
 task documents. Inline previews are bounded; complete change-set reading is a
 separate enforced evidence condition. Neither native mode nor the MCP reader
 grants direct GitHub publishing authority.
@@ -118,12 +119,14 @@ schema, and records actual coverage; it is not the unmodified CE workflow.
 
 The native read-only sandbox restricts writes, not read confidentiality across
 the service account's filesystem. Native mode therefore trusts Codex's local
-read capability for that account. Automation ignores host Codex user config,
-execpolicy `.rules`, custom MCP registrations, plugins and hooks; only its fixed
-review MCP endpoint is configured. Native mode also disables automatic
-`AGENTS.md` instruction injection with `project_doc_max_bytes=0`. Sanitized
-environment and a read-only sandbox do not
-constitute isolation from all host-readable files or on-disk credentials.
+read capability for that account. The compatibility exec transport uses
+ignore-config/rules flags. App Server instead verifies effective capability
+settings, disables inherited MCP registrations, and verifies the invocation's
+scoped tool inventory. Shell tools, plugins, hooks and apps are disabled.
+Personal `AGENTS.md` can still supply guidance on the App Server route; it is not
+execution authority. No original configuration is edited. A sanitized environment
+and read-only sandbox do not isolate all host-readable files or on-disk
+credentials. See the transport-specific [operations notes](OPERATIONS.md#running-task-controls-and-optional-codex-app-server).
 
 The vendor strategies use fixed mode-specific sandbox flags and accept only
 bounded, strict structured output. Output is untrusted: it returns to the existing
@@ -133,8 +136,31 @@ cancellation, malformed result, output overflow, unavailable binary, or process
 reaping failure ends that attempt; the role does not ask the CLI to repair its
 own response. Cross-task coordination belongs to MyDashboard's durable ledger
 and memory, while same-entity conversations follow the selected mode's session
-storage. Native code modification and a general native build/test tool loop are
-not introduced by this route; code jobs retain the controlled executor.
+storage. Native App Server code jobs now execute several controlled tools within
+one turn; code jobs retain the controlled executor for every code/test action.
+
+The continuous code route carries a process-private `codeExecutionContext`
+through versioned authority, the brain directory and router. Its temporary MCP
+endpoint exposes only `perform_action`, `read_source`, and `get_state`. The worker
+reloads job/session state and grant authority, binds trusted fields, prepares and
+admits each action, verifies its audit result, and records its durable observation.
+Tool requests serialize; repeated mutation request IDs reuse a receipt and
+conflicting payloads are rejected. Endpoint receipts live only for that invocation;
+crash recovery remains the durable action reconciliation protocol.
+
+Source pages bind a current audited read action and workspace revision. Full-read
+proofs are committed before an overwrite; writes revoke old revision proofs.
+Current source metadata remains available after resume even when initial inline
+observations have been compacted. Final `complete` is admitted only after native
+process exit, tool drain, current required profiles and complete reads. A short
+task-control completion fence checks durable owner instructions before closing
+instruction acceptance. Undelivered requirements defer completion to the next
+scheduling turn without replaying audited actions; late instructions receive an
+explicit conflict. Asynchronous grant verification is followed by another stop
+check before action admission. The native
+turn has a 15-minute minimum budget or the longer configured provider timeout;
+the existing action budget remains enforced. Other providers keep one-action
+decisions. No configuration or native-history migration is performed.
 
 Owner-created work enters through a separate structured command-center
 contract. The browser supplies business content only; role, node, permission,
@@ -161,11 +187,13 @@ Unconfirmed native process stops require positive recovery evidence; code-job
 terminal states win late controls. Scheduled coordination performs reconciliation,
 whereas list/detail reads do not mutate the task ledger.
 
-The app-server protocol implementation binds steering and interruption to an
-exact native thread/turn, but the production runner currently rejects it before
-spawn. Required config/rule isolation and bidirectional process-tree containment
-are not yet available together on the installed CLI. Protocol fixtures and an
-initialize-only probe do not authorize production activation. See
+Windows native login uses the contained App Server transport by default and
+binds steering/interruption to the exact native thread/turn. A continuous code
+turn owns one task-run record for both reasoning and executor actions. Persisted
+stop controls close subsequent action admission; native exit and host-action
+settlement must both be proved before the stop is confirmed. Unknown results keep
+their existing fences. Protocol and synthetic-process checks are separate from
+production activation and real PR acceptance. See
 [operations](OPERATIONS.md#running-task-controls-and-optional-codex-app-server).
 
 ## Confirmation and side effects
