@@ -12,7 +12,7 @@ import { BrainRouter } from "../src/services/brain-router.js";
 import { CodexAppServerRunner } from '../src/lib/codex-app-server-runner.js';
 import { createCodeReadContext, hasCompleteCodeRead } from "../src/lib/code-read-context.js";
 import { createCodeJobArtifactReader } from "../src/adapters/code-job-artifact-reader.js";
-import { createCodeExecutionContext } from "../src/lib/code-execution-context.js";
+import { beginCodeExecutionSession, createCodeExecutionContext } from "../src/lib/code-execution-context.js";
 import { withTaskExecution } from "../src/lib/task-execution-context.js";
 
 const schema = { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false };
@@ -181,6 +181,29 @@ test("execution capability is not serialized, combined with readers, or accepted
   await assert.rejects(provider.generate(request({ codeExecutionContext: context, codeReadContext: auditedCode().context })), /codeExecutionContext is invalid/);
   await assert.rejects(provider.generate(request({ codeExecutionContext: context, reviewTarget: {} })), /codeExecutionContext is invalid/);
   assert.equal(starts, 0); await provider.close();
+});
+
+test("continuous CLI lookup failure closes and revokes the host capability before any model starts", async (t) => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = "app-server";
+  let closed = 0, starts = 0, endpoints = 0;
+  const context = createCodeExecutionContext({
+    performAction() {}, readSource() {}, getState() {},
+    close() { closed++; return { settled: true }; },
+  });
+  const provider = f.create(() => { starts++; assert.fail("lookup failure must not launch exec"); }, {}, {
+    commandLocator: { async resolve() { throw error("STRUCTURED_PROVIDER_UNAVAILABLE"); } },
+    appServerRunner: { async run() { starts++; assert.fail("lookup failure must not launch App Server"); } },
+    codeExecutionFactory() { endpoints++; assert.fail("lookup failure precedes endpoint construction"); },
+  });
+  try {
+    await assert.rejects(provider.generate(request({ codeExecutionContext: context })), { code: "STRUCTURED_PROVIDER_UNAVAILABLE" });
+    assert.equal(closed, 1);
+    assert.throws(() => beginCodeExecutionSession(context), { code: "CODE_EXECUTION_SESSION_REVOKED" });
+    assert.equal(endpoints, 0);
+    assert.equal(starts, 0);
+    assert.equal(f.calls.length, 0);
+  } finally { await provider.close(); }
+  assert.equal(closed, 1);
 });
 
 test("native code reader reaches the full audited BOM source tail and preserves exact write proof", async (t) => {

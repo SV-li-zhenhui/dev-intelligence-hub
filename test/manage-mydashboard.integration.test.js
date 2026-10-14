@@ -395,7 +395,15 @@ async function rewriteFixtureManager(root, find, replace) {
   const source = await readFile(managerPath, "utf8");
   const changed = source.replace(find, replace);
   assert.notEqual(changed, source, "fixture manager mutation must match production source");
-  await writeFile(managerPath, changed, "utf8");
+  // Windows can briefly retain a script handle after the preceding manager exits.
+  // Retry only that transient fixture write; persistent locks still fail the test.
+  for (let attempt = 0; ; attempt += 1) {
+    try { await writeFile(managerPath, changed, "utf8"); return; }
+    catch (error) {
+      if (error.code !== "EBUSY" || attempt >= 19) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
 }
 
 async function installRecoveryTerminationTrap(root, markerPath) {

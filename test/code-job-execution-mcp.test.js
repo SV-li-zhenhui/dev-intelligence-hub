@@ -76,6 +76,23 @@ test("mutating request IDs cache concurrent and reordered canonical replays with
   assert.equal(calls, 3, "numeric and string request IDs stay distinct");
 });
 
+test("standard MCP tool metadata and omitted empty arguments do not change semantic authority", async (t) => {
+  const endpoint = await fixture(t);
+  for (const params of [
+    { name: "get_state", arguments: {}, _meta: { progressToken: "native-progress-1" } },
+    { name: "get_state", _meta: { progressToken: 2 } },
+  ]) {
+    const result = await rpc(endpoint, "tools/call", params);
+    assert.notEqual(result.isError, true);
+    assert.deepEqual(JSON.parse(result.content[0].text), { revision: 1 });
+  }
+  for (const params of [
+    { name: "get_state", arguments: null },
+    { name: "get_state", arguments: {}, command: "shell" },
+    { name: "get_state", arguments: {}, _meta: [] },
+  ]) assert.equal((await rpc(endpoint, "tools/call", params)).isError, true);
+});
+
 test("failed admitted actions also retain replay receipts without leaking host error text", async (t) => {
   let calls = 0;
   const endpoint = await fixture(t, { performAction: async () => { calls += 1; throw new Error("SECRET_TOKEN_IN_HOST_ERROR"); } });

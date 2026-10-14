@@ -101,8 +101,13 @@ export async function createCodeJobExecutionMcp(context, { signal = null } = {})
   const callTool = async (message, response) => {
     try {
       session.assertActive();
-      const params = exactArguments(message.params, ["name", "arguments"]);
-      const args = normalizeArguments(params.name, params.arguments);
+      const params = exactArguments(message.params, ["name"], ["arguments", "_meta"]);
+      if (Object.hasOwn(params, "_meta") && (!params._meta || typeof params._meta !== "object" || Array.isArray(params._meta))) {
+        throw failure("CODE_EXECUTION_ARGUMENT_INVALID");
+      }
+      // MCP clients may omit an empty arguments object and attach progress
+      // metadata. Neither changes the validated semantic tool arguments.
+      const args = normalizeArguments(params.name, Object.hasOwn(params, "arguments") ? params.arguments : {});
       trackResponse(response);
       const invoke = async () => {
         try {

@@ -1,3 +1,5 @@
+import { OperationQueue } from "./operation-queue.js";
+
 const contexts = new WeakMap();
 const CALLBACKS = new Map([
   ["perform_action", "performAction"],
@@ -26,7 +28,7 @@ export function createCodeExecutionContext({ performAction, readSource, getState
   contexts.set(context, {
     callbacks: { performAction, readSource, getState, close },
     controller: new AbortController(), started: false, revoked: false,
-    tail: Promise.resolve(), closing: null, removeParentAbort: null,
+    queue: new OperationQueue(), closing: null, removeParentAbort: null,
   });
   return context;
 }
@@ -54,7 +56,7 @@ export function closeCodeExecutionContext(context) {
   revokeCodeExecutionContext(context);
   return state.closing ??= (async () => {
     try {
-      await state.tail;
+      await state.queue.tail;
       return await state.callbacks.close?.();
     } finally {
       state.removeParentAbort?.();
@@ -78,13 +80,10 @@ export function beginCodeExecutionSession(context, { signal = null } = {}) {
         assertActive(state);
         const callback = CALLBACKS.get(name);
         if (!callback) throw failure("CODE_EXECUTION_TOOL_NOT_ALLOWED");
-        const operation = state.tail.then(async () => {
+        return state.queue.enqueue(async () => {
           assertActive(state);
           return await state.callbacks[callback](args, { signal: state.controller.signal });
         });
-        // Failed calls retain their own receipt and do not poison later calls.
-        state.tail = operation.then(() => undefined, () => undefined);
-        return operation;
       } catch (error) {
         return Promise.reject(error);
       }
