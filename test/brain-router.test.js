@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { CodexCliSessionStore } from "../src/adapters/codex-cli-session-store.js";
 import { BrainRouter } from "../src/services/brain-router.js";
+import { createCodeReadContext } from "../src/lib/code-read-context.js";
 
 const BRAIN = Object.freeze({
   provider: "codex",
@@ -281,4 +282,20 @@ test("PR read access requires code authorization and is forwarded only to a capa
   await router.generate({ ...request, dataClasses: ["code"] });
   assert.deepEqual(requests[0].reviewTarget, reviewTarget);
   assert.equal(router.describe(BRAIN).supportsReviewReading, true);
+});
+
+test("opaque controlled code reading preserves authorization, capability identity and provider support", async () => {
+  const context = createCodeReadContext({ jobId: "job-one", workspaceRevision: "a".repeat(64), documents: [] });
+  const calls = [];
+  const router = new BrainRouter({ providers: [provider({ supportsCodeReading: true, async generate(value) { calls.push(value); return '{"ok":true}'; } })] });
+  const request = { brain: BRAIN, messages: [], schema: { type: "object" }, codeReadContext: context };
+  await assert.rejects(router.generate({ ...request, dataClasses: ["requirements"] }), { code: "REMOTE_DATA_CLASSIFICATION_REQUIRED" });
+  await assert.rejects(router.generate({ ...request, brain: { ...BRAIN, remoteData: { ...BRAIN.remoteData, code: false } }, dataClasses: ["code"] }), { code: "REMOTE_DATA_NOT_AUTHORIZED" });
+  await assert.rejects(router.generate({ ...request, codeReadContext: structuredClone(context), dataClasses: ["code"] }), { code: "REMOTE_DATA_CLASSIFICATION_REQUIRED" });
+  const unsupported = new BrainRouter({ providers: [provider()] });
+  await assert.rejects(unsupported.generate({ ...request, dataClasses: ["code"] }), { code: "CODE_READING_UNAVAILABLE" });
+  assert.equal(calls.length, 0);
+  await router.generate({ ...request, dataClasses: ["code"] });
+  assert.equal(calls[0].codeReadContext, context);
+  assert.equal(router.describe(BRAIN).supportsCodeReading, true);
 });

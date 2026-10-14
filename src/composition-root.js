@@ -1634,7 +1634,7 @@ export async function createApplication({
         ),
         brainDirectory: frozenPort(
           codeJobBrainDirectory,
-          ["decide"],
+          ["decide", ...(typeof codeJobBrainDirectory.describe === "function" ? ["describe"] : [])],
           "codeJobBrainDirectory",
         ),
         workerLimits: {

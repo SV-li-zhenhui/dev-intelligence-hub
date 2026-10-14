@@ -3,6 +3,7 @@ import { normalizeWorkspacePath } from "../domain/code-execution-policy.js";
 import { codeExecutionSourceAllowsWrite } from "../domain/code-execution-source.js";
 import { projectTestSummary } from "../domain/test-result-summary.js";
 import { requiresBrainOperatorPause } from "./brain-failure-policy.js";
+import { hasCompleteCodeRead, isCodeReadContext } from "../lib/code-read-context.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
@@ -41,6 +42,8 @@ const DETERMINISTIC_FAILURE_CODES = new Set([
   "CODE_BRAIN_CONTEXT_UNFIT",
 ]);
 const OPERATOR_PAUSE_CODES = new Set([
+  "CODE_ARTIFACT_READ_INCOMPLETE",
+  "CODE_ARTIFACT_READ_INVALID",
   "CODE_REVIEW_REPAIR_CONTEXT_NOT_CONFIGURED",
   "CODE_BRAIN_ACTION_NOT_PERMITTED",
   "CODE_BRAIN_CHECKS_ALREADY_PASSED",
@@ -461,7 +464,7 @@ function incompleteReadError(path) {
   );
 }
 
-function expectedWriteSha(job, path, workspaceRevision, visibleObservations) {
+function expectedWriteSha(job, path, workspaceRevision, visibleObservations, codeReadContext) {
   for (let index = job.execution.observations.length - 1; index >= 0; index -= 1) {
     const observation = job.execution.observations[index];
     if (
@@ -474,6 +477,14 @@ function expectedWriteSha(job, path, workspaceRevision, visibleObservations) {
     const action = trustedObservationAction(observation);
     if (action.path !== path) continue;
     const result = observation.detail?.result;
+    if (isCodeReadContext(codeReadContext)) {
+      if (action.expectedWorkspaceRevision === workspaceRevision && isSha256(result?.sha256) && hasCompleteCodeRead(codeReadContext, {
+        jobId: job.jobId, workspaceRevision, actionId: action.actionId, path, sha256: result.sha256,
+      })) return result.sha256;
+      // The directory may repack previews while adding the document manifest.
+      // Only actual native reads prove what that invocation could see.
+      throw incompleteReadError(path);
+    }
     const visible = visibleObservations.some((entry) => {
       if (entry.actionType !== "read_text" || entry.status !== "succeeded") return false;
       try {
@@ -496,9 +507,9 @@ function expectedWriteSha(job, path, workspaceRevision, visibleObservations) {
   return null;
 }
 
-export function assertPreparedWriteRead(job, session, action, visibleObservations) {
+export function assertPreparedWriteRead(job, session, action, visibleObservations, codeReadContext) {
   if (action.type !== "write_text" || action.expectedSha256 === null) return;
-  if (expectedWriteSha(job, action.path, session.workspaceRevision, visibleObservations) !== action.expectedSha256) {
+  if (expectedWriteSha(job, action.path, session.workspaceRevision, visibleObservations, codeReadContext) !== action.expectedSha256) {
     throw incompleteReadError(action.path);
   }
 }
@@ -513,7 +524,7 @@ function actionId(job, semanticAction) {
   return `action-${digest.slice(0, 55)}`;
 }
 
-export function bindTrustedAction(job, session, semanticAction, remainingProfiles, visibleObservations = []) {
+export function bindTrustedAction(job, session, semanticAction, remainingProfiles, visibleObservations = [], codeReadContext) {
   if (!job.grant.allowedActions.includes(semanticAction.type)) {
     throw workerError(
       "CODE_BRAIN_ACTION_NOT_PERMITTED",
@@ -563,6 +574,7 @@ export function bindTrustedAction(job, session, semanticAction, remainingProfile
         path,
         session.workspaceRevision,
         visibleObservations,
+        codeReadContext,
       ),
     };
   }

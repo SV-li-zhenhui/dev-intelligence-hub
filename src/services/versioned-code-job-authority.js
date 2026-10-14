@@ -898,6 +898,30 @@ export class VersionedCodeJobAuthority {
     return null;
   }
 
+  async describe(roleId, brainDigest) {
+    this.#assertOpen();
+    decisionRoleId({ roleId });
+    if (brainDigest !== undefined &&
+        (typeof brainDigest !== "string" || !/^[a-f0-9]{64}$/.test(brainDigest))) {
+      throw new TypeError("code brain digest is invalid");
+    }
+    const current = await this.#current();
+    const context = brainDigest === undefined || current.brainDigests.get(roleId) === brainDigest
+      ? current : this.#brainCandidateContext(current, roleId, brainDigest);
+    if (!context || current.roleAuthorityDigest(roleId) === undefined ||
+        current.roleAuthorityDigest(roleId) !== context.roleAuthorityDigest(roleId)) {
+      throw invalid("岗位大脑封印已不受当前活动配置授权");
+    }
+    const describe = optionalMethod(this.#directory(context), "describe");
+    const result = describe ? await describe(roleId) : { supportsCodeReading: false };
+    this.#assertOpen();
+    const latest = await this.#current();
+    if (latest.roleAuthorityDigest(roleId) !== context.roleAuthorityDigest(roleId)) {
+      throw invalid("岗位大脑配置在能力读取时已变化");
+    }
+    return result;
+  }
+
   async decide(value, authorization) {
     this.#assertOpen();
     const { beforeGenerate, brainDigest } = decisionAuthorization(authorization);

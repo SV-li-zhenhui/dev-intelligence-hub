@@ -7,6 +7,8 @@ import {
   createConfiguredCodeJobBrainDirectory,
 } from "../src/services/code-job-brain-directory.js";
 import { BrainRouter } from "../src/services/brain-router.js";
+import { createHash } from "node:crypto";
+import { createCodeReadContext, beginCodeReadSession, hasCompleteCodeRead } from "../src/lib/code-read-context.js";
 
 function roleBrain(remoteData = {
   requirements: false,
@@ -92,6 +94,36 @@ function fakeRouter(responses = [decision()]) {
 function authorized(callback = async () => {}) {
   return { beforeGenerate: callback };
 }
+
+test("directory forwards opaque audit access and revokes proofs when its business permission validation fails", async () => {
+  const content = "\uFEFF中文" + "x".repeat(70 * 1024) + "TAIL";
+  const document = { path: "src/large.cpp", actionId: "read-one", content,
+    sha256: createHash("sha256").update(content).digest("hex"), bytes: Buffer.byteLength(content) };
+  const binding = { jobId: "job-one", workspaceRevision: "a".repeat(64) };
+  const context = createCodeReadContext({ ...binding, documents: [document] });
+  let forwarded = 0;
+  const directory = new CodeJobBrainDirectory({ roles: roleBrain(), brainRouter: {
+    describe() { return { singleAttempt: true, supportsCodeReading: true }; },
+    async generate(request) {
+      forwarded += 1;
+      assert.equal(request.codeReadContext, context);
+      const manifest = JSON.parse(request.messages[1].content).codeReadDocuments;
+      assert.deepEqual(manifest, { documents: [{ path: document.path, bytes: document.bytes }] });
+      assert.equal(JSON.stringify(request.messages).includes(content), false);
+      const session = beginCodeReadSession(context);
+      let offset = 0;
+      do { offset = session.readDocument(document.path, offset).nextOffset; } while (offset !== null);
+      session.assertComplete(); session.commit(); session.close();
+      assert.equal(hasCompleteCodeRead(context, { ...binding, ...document }), true);
+      return decision({ type: "write_text", path: document.path, content: "replacement" });
+    },
+  } });
+  const request = input({ codeReadContext: context, capabilities: { allowedActions: ["read_text", "complete"], writablePaths: [], requiredProfilesRemaining: 0 } });
+  await assert.rejects(directory.decide(request, authorized()), { code: "CODE_BRAIN_RESPONSE_INVALID" });
+  assert.equal(forwarded, 1);
+  assert.equal(hasCompleteCodeRead(context, { ...binding, ...document }), false);
+  await assert.rejects(directory.decide({ ...request, codeReadContext: structuredClone(context) }, authorized()), /codeReadContext is invalid/);
+});
 
 test("a role brain receives only bounded semantic code context", async () => {
   const router = fakeRouter();

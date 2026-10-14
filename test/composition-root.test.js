@@ -3357,6 +3357,28 @@ test("non-versioned Code Job startup adopts partial configured directory cleanup
   assert.equal(lifecycle.readStatus().complete, true);
 });
 
+test("Code Job composition forwards controlled reading support through the frozen brain boundary", async () => {
+  for (const versioned of [false, true]) {
+    const config = defaultCodeJobConfiguration();
+    const calls = {}; const closeCalls = [];
+    const application = await createApplication({
+      ...defaultCodeJobApplicationOptions({ config, calls, closeCalls,
+        lifecycle: createApplicationRuntimeLifecycle(), versioned }),
+      codeJobBrainDirectoryFactory() {
+        return { async decide() {}, describe(roleId) {
+          assert.equal(roleId, "developer");
+          return { supportsCodeReading: true };
+        }, hiddenWrite() { assert.fail("must not be exposed"); }, async close() {} };
+      },
+    });
+    assert.equal(Object.isFrozen(calls.codeJobRuntime.brainDirectory), true);
+    assert.equal(typeof calls.codeJobRuntime.brainDirectory.describe, "function");
+    assert.equal((await calls.codeJobRuntime.brainDirectory.describe("developer")).supportsCodeReading, true);
+    assert.equal(Object.hasOwn(calls.codeJobRuntime.brainDirectory, "hiddenWrite"), false);
+    await application.close();
+  }
+});
+
 test("default non-versioned Code Job validates every role before CLI acquisition", async (t) => {
   const roleFailure = new TypeError("employees.roles.invalid-extra is invalid");
   const invalidRole = new Proxy({}, {

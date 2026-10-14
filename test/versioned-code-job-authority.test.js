@@ -526,6 +526,75 @@ function deferred() {
   return { promise, resolve };
 }
 
+test("code reading description follows the active and historically sealed brain", async () => {
+  const descriptions = [];
+  const context = fixture({ brainDirectoryFactory: ({ roles }) => ({
+    async decide() {},
+    describe(roleId) {
+      descriptions.push(roles[roleId].taskBrain.model);
+      return { supportsCodeReading: roles[roleId].taskBrain.model !== "new-local-model",
+        model: roles[roleId].taskBrain.model };
+    },
+  }) });
+  const oldGrant = (await context.authority.create(proposal(context.startup))).grant;
+  assert.deepEqual(await context.authority.describe("developer", oldGrant.brainDigest), {
+    supportsCodeReading: true, model: context.startup.employees.roles.developer.taskBrain.model,
+  });
+  const changed = structuredClone(context.startup);
+  changed.employees.roles.developer.taskBrain.model = "new-local-model";
+  context.activate(changed);
+  const newGrant = (await context.authority.create(proposal(changed))).grant;
+  assert.equal((await context.authority.describe("developer")).supportsCodeReading, false);
+  assert.equal((await context.authority.describe("developer", newGrant.brainDigest)).supportsCodeReading, false);
+  assert.equal((await context.authority.describe("developer", oldGrant.brainDigest)).supportsCodeReading, true);
+  assert.deepEqual(descriptions, [context.startup.employees.roles.developer.taskBrain.model,
+    "new-local-model", "new-local-model", context.startup.employees.roles.developer.taskBrain.model]);
+});
+
+test("code reading description supports legacy directories without invoking describe accessors", async () => {
+  let getters = 0;
+  const context = fixture({ brainDirectoryFactory: () => ({
+    async decide() {},
+    get describe() { getters += 1; throw new Error("must not invoke getter"); },
+  }) });
+  assert.deepEqual(await context.authority.describe("developer"), { supportsCodeReading: false });
+  assert.equal(getters, 0);
+});
+
+test("code reading description rejects invalid or disabled authority before constructing a directory", async (t) => {
+  for (const mode of ["invalid role", "invalid digest", "disabled role", "executor changed", "closed"]) {
+    await t.test(mode, async () => {
+      let directories = 0;
+      const context = fixture({ brainDirectoryFactory: () => {
+        directories += 1;
+        return { async decide() {}, describe: () => ({ supportsCodeReading: true }) };
+      } });
+      const changed = structuredClone(context.startup);
+      if (mode === "disabled role") changed.employees.roles.developer.enabled = false;
+      if (mode === "executor changed") changed.codeExecutor.docker.executable = "changed";
+      if (["disabled role", "executor changed"].includes(mode)) context.activate(changed);
+      if (mode === "closed") await context.authority.close();
+      await assert.rejects(context.authority.describe(mode === "invalid role" ? "../developer" : "developer",
+        mode === "invalid digest" ? "not-a-digest" : undefined));
+      assert.equal(directories, 0);
+    });
+  }
+});
+
+test("code reading description checks role authority again after asynchronous description", async () => {
+  let context;
+  context = fixture({ brainDirectoryFactory: () => ({
+    async decide() {},
+    async describe() {
+      const changed = structuredClone(context.startup);
+      changed.employees.roles.developer.enabled = false;
+      context.activate(changed);
+      return { supportsCodeReading: true };
+    },
+  }) });
+  await assert.rejects(context.authority.describe("developer"), { code: "INVALID_CODE_JOB_AUTHORITY" });
+});
+
 test("review repair authority requires enablement and binds only its trusted Head mirror", async () => {
   const context = fixture();
   const enabled = structuredClone(context.startup);

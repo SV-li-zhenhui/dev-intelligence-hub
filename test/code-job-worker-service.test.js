@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   CODE_JOB_ACTIONS_BY_OPERATION,
   createCodeJobGrant,
@@ -10,13 +11,14 @@ import { summarizeOwnReviewFeedback } from "../src/adapters/github-own-review-fe
 import { ReviewRepairContextReader } from "../src/services/review-repair-context-reader.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
+import { beginCodeReadSession, createCodeReadContext, describeCodeReadContext } from "../src/lib/code-read-context.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
 import { CodeJobStore } from "../src/services/code-job-store.js";
 import { CodeJobBrainDirectory } from "../src/services/code-job-brain-directory.js";
 import { CodeJobWorkerService } from "../src/services/code-job-worker-service.js";
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { createTaskRunSettler } from '../src/services/work-ledger-run-control.js';
-import { modelObservation, observationDetail, verificationFailure } from "../src/services/code-job-worker-policy.js";
+import { assertPreparedWriteRead, bindTrustedAction, modelObservation, observationDetail, verificationFailure } from "../src/services/code-job-worker-policy.js";
 
 const REVISION_A = "a".repeat(64);
 const REVISION_B = "b".repeat(64);
@@ -1674,6 +1676,340 @@ function trustedRead(content, { id = "read-current", truncated = false } = {}) {
     bytes: Buffer.byteLength(content), truncated,
   } });
 }
+
+test("native code reading receives full audited text outside the compact model preview", async () => {
+  const content = "\uFEFF" + "字\\\"".repeat(24 * 1024) + "\nFILE_END";
+  const raw = {
+    path: "src/app.js", content,
+    sha256: createHash("sha256").update(content, "utf8").digest("hex"),
+    bytes: Buffer.byteLength(content),
+  };
+  const readAction = {
+    type: "read_text", actionId: "full-read-current",
+    expectedWorkspaceRevision: REVISION_A, path: raw.path,
+  };
+  const audited = { action: {
+    id: readAction.actionId, type: "read_text", status: "succeeded", attemptNumber: 1,
+    workspaceRevisionBefore: REVISION_A, workspaceRevisionAfter: REVISION_A,
+    error: null,
+  }, result: raw };
+  const read = observation(readAction, { result: observationDetail(readAction, {
+    session: { status: "active", attempt: { number: 1 } }, action: audited.action,
+  }, raw).result });
+  const unrelated = observation({ type: "list_files", actionId: "list-later",
+    path: "", expectedWorkspaceRevision: REVISION_A }, { result: { files: [raw.path] } });
+  const initial = job({ status: "active", execution: {
+    ...job().execution, sessionId: job().jobId, workspaceRevision: REVISION_A,
+    turn: 2, observations: [read, unrelated],
+  } });
+  const store = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial);
+  const getActionResult = executor.getActionResult.bind(executor);
+  executor.getActionResult = async (value) => {
+    if (value.actionId !== readAction.actionId) return getActionResult(value);
+    executor.calls.push({ method: "getActionResult", value });
+    assert.deepEqual(value, { sessionId: initial.jobId, actionId: readAction.actionId });
+    return structuredClone(audited);
+  };
+  let codeReadContext;
+  const directory = {
+    describe: () => ({ supportsCodeReading: true }),
+    async decide(value) {
+      codeReadContext = value.codeReadContext;
+      assert.equal(value.observations.some(({ actionType }) => actionType === "read_text"), false);
+      assert.deepEqual(describeCodeReadContext(codeReadContext), {
+        documents: [{ path: raw.path, bytes: raw.bytes }],
+      });
+      const reader = beginCodeReadSession(codeReadContext);
+      let offset = 0;
+      let actual = "";
+      do {
+        const page = reader.readDocument(raw.path, offset, 16_000);
+        actual += page.text;
+        offset = page.nextOffset;
+      } while (offset !== null);
+      reader.assertComplete();
+      reader.commit();
+      reader.close();
+      assert.equal(actual, content);
+      assert.equal(actual[0], "\uFEFF");
+      assert.match(actual, /FILE_END$/);
+      return { schemaVersion: 1, confidence: 90, summary: "Read fixed profile", reason: "Verify",
+        action: { type: "run_profile" } };
+    },
+  };
+  const worker = new CodeJobWorkerService({
+    jobStore: store, executor, brainDirectory: directory, grantVerifier: verifier([]), observationLimit: 1,
+  });
+  const result = await worker.runCycle();
+  assert.equal(result.outcomes[0].actionType, "run_profile");
+  assert.ok(codeReadContext, "complete audited code must be available through the opaque read context");
+  assert.equal(executor.calls.filter(({ method }) => method === "getActionResult").length, 2);
+});
+
+function fullAuditRead(content, { id = "full-read-current", path = "src/app.js", workspaceRevision = REVISION_A } = {}) {
+  const action = { type: "read_text", actionId: id, expectedWorkspaceRevision: workspaceRevision, path };
+  const audited = { action: {
+    id, type: "read_text", status: "succeeded", attemptNumber: 1,
+    workspaceRevisionBefore: workspaceRevision, workspaceRevisionAfter: workspaceRevision, error: null,
+  }, result: { path, content, sha256: createHash("sha256").update(content, "utf8").digest("hex"),
+    bytes: Buffer.byteLength(content) } };
+  const read = observation(action, { workspaceRevision, result: observationDetail(action, {
+    session: { status: "active", attempt: { number: 1 } }, action: audited.action,
+  }, audited.result).result });
+  return { action, audited, read };
+}
+
+function auditedReadExecutor(initial, reads) {
+  const executor = new FakeExecutor(initial);
+  const normalGet = executor.getActionResult.bind(executor);
+  executor.getActionResult = async (value) => {
+    const read = reads.find(({ action }) => action.actionId === value.actionId);
+    if (!read) return normalGet(value);
+    executor.calls.push({ method: "getActionResult", value: structuredClone(value) });
+    return structuredClone(read.audited);
+  };
+  return executor;
+}
+
+function currentReadJob(observations) {
+  return job({ status: "active", execution: {
+    ...job().execution, sessionId: job().jobId, workspaceRevision: REVISION_A,
+    turn: observations.length, observations,
+  } });
+}
+
+test("native code reading rejects mismatched audited file bindings before deciding", async (t) => {
+  const mutations = [
+    ["action id", (entry) => { entry.action.id = "other-read"; }],
+    ["action type", (entry) => { entry.action.type = "write_text"; }],
+    ["action status", (entry) => { entry.action.status = "failed"; }],
+    ["workspace before", (entry) => { entry.action.workspaceRevisionBefore = REVISION_B; }],
+    ["workspace after", (entry) => { entry.action.workspaceRevisionAfter = REVISION_B; }],
+    ["attempt", (entry) => { entry.action.attemptNumber = 2; }],
+    ["result path", (entry) => { entry.result.path = "src/other.js"; }],
+    ["result hash", (entry) => { entry.result.sha256 = FILE_SHA; }],
+    ["result byte count", (entry) => { entry.result.bytes -= 1; }],
+    ["truncated audit", (entry) => { entry.result.truncated = true; }],
+    ["audit error", (entry) => { entry.result.error = { code: "READ_FAILED" }; }],
+    ["changed full text", (entry) => {
+      entry.result.content += "changed";
+      entry.result.bytes = Buffer.byteLength(entry.result.content);
+      entry.result.sha256 = createHash("sha256").update(entry.result.content).digest("hex");
+    }],
+  ];
+  for (const [name, mutate] of mutations) {
+    await t.test(name, async () => {
+      const read = fullAuditRead("x".repeat(80 * 1024));
+      const initial = currentReadJob([read.read]);
+      mutate(read.audited);
+      const executor = auditedReadExecutor(initial, [read]);
+      let decisions = 0;
+      const worker = new CodeJobWorkerService({ jobStore: new FakeJobStore([initial]), executor,
+        grantVerifier: verifier([]), brainDirectory: {
+          describe: () => ({ supportsCodeReading: true }),
+          decide: async () => { decisions += 1; },
+        } });
+      const result = await worker.runCycle();
+      assert.equal(result.outcomes[0].code, "CODE_JOB_AUDIT_RESULT_INVALID");
+      assert.equal(result.outcomes[0].status, "fenced");
+      assert.equal(decisions, 0);
+      assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
+    });
+  }
+});
+
+test("native code reading chooses only the latest successful read per current-revision path", async () => {
+  const old = fullAuditRead("old", { id: "old" });
+  const latest = fullAuditRead("\uFEFF" + "字".repeat(30 * 1024), { id: "latest" });
+  const stale = fullAuditRead("stale", { id: "stale", path: "src/stale.js", workspaceRevision: REVISION_B });
+  const failed = fullAuditRead("failed", { id: "failed" });
+  failed.read.status = "failed";
+  const initial = currentReadJob([old.read, latest.read, stale.read, failed.read]);
+  const executor = auditedReadExecutor(initial, [old, latest, stale, failed]);
+  let manifest;
+  const worker = new CodeJobWorkerService({ jobStore: new FakeJobStore([initial]), executor,
+    grantVerifier: verifier([]), observationLimit: 1, brainDirectory: {
+      describe: () => ({ supportsCodeReading: true }),
+      decide: async ({ codeReadContext }) => {
+        manifest = describeCodeReadContext(codeReadContext);
+        return { action: { type: "run_profile" } };
+      },
+    } });
+  assert.equal((await worker.runCycle()).outcomes[0].actionType, "run_profile");
+  assert.deepEqual(manifest, { documents: [{ path: "src/app.js", bytes: latest.audited.result.bytes }] });
+  assert.deepEqual(executor.calls.filter(({ method, value }) => method === "getActionResult" &&
+    ["old", "latest", "stale", "failed"].includes(value.actionId)).map(({ value }) => value.actionId), ["latest"]);
+});
+
+test("native full-read proof permits a large overwrite only after complete actual page coverage", async (t) => {
+  for (const mode of ["complete", "partial", "uncommitted", "revoked", "aborted", "cloned"]) {
+    await t.test(mode, async () => {
+      const read = fullAuditRead("\uFEFF" + "字\\\"".repeat(24 * 1024));
+      const initial = currentReadJob([read.read]);
+      const store = new FakeJobStore([initial]);
+      const executor = auditedReadExecutor(initial, [read]);
+      const worker = new CodeJobWorkerService({ jobStore: store, executor, grantVerifier: verifier([]),
+        brainDirectory: {
+          describe: () => ({ supportsCodeReading: true }),
+          async decide({ codeReadContext }) {
+            if (mode === "cloned") {
+              assert.throws(() => beginCodeReadSession(structuredClone(codeReadContext)));
+            } else {
+              const abort = new AbortController();
+              const reader = beginCodeReadSession(codeReadContext, { signal: abort.signal });
+              let offset = 0;
+              do {
+                const page = reader.readDocument(read.action.path, offset, 16_000);
+                offset = page.nextOffset;
+                if (mode === "partial") break;
+              } while (offset !== null);
+              if (mode !== "uncommitted") reader.commit();
+              if (mode === "revoked") reader.revoke();
+              if (mode === "aborted") abort.abort();
+              reader.close();
+            }
+            return { action: { type: "write_text", path: read.action.path, content: "replacement\n" } };
+          },
+        } });
+      const result = await worker.runCycle();
+      const perform = executor.calls.find(({ method }) => method === "perform");
+      if (mode === "complete") {
+        assert.equal(result.outcomes[0].actionType, "write_text");
+        assert.equal(perform.value.action.expectedSha256, read.audited.result.sha256);
+        assert.equal(perform.value.action.expectedWorkspaceRevision, REVISION_A);
+        assert.equal((await store.getForWorker(initial.jobId)).execution.observations[0].detail.result.truncated, true);
+      } else {
+        assert.equal(result.outcomes[0].code, "CODE_BRAIN_INCOMPLETE_READ");
+        assert.equal(result.outcomes[0].status, "paused");
+        assert.equal(perform, undefined);
+      }
+    });
+  }
+});
+
+test("native code reading requires actual coverage even when the original inline preview was complete", async (t) => {
+  for (const complete of [false, true]) {
+    await t.test(complete ? "read proof permits overwrite" : "inline preview cannot replace native proof", async () => {
+      const read = fullAuditRead("small complete inline file\n");
+      const initial = currentReadJob([read.read]);
+      const executor = auditedReadExecutor(initial, [read]);
+      const worker = new CodeJobWorkerService({ jobStore: new FakeJobStore([initial]), executor,
+        grantVerifier: verifier([]), brainDirectory: {
+          describe: () => ({ supportsCodeReading: true }),
+          async decide({ codeReadContext, observations }) {
+            assert.equal(JSON.parse(observations[0].detail).truncated, false);
+            if (complete) {
+              const reader = beginCodeReadSession(codeReadContext);
+              reader.readDocument(read.action.path, 0);
+              reader.commit();
+              reader.close();
+            }
+            return { action: { type: "write_text", path: read.action.path, content: "replacement\n" } };
+          },
+        } });
+      const result = await worker.runCycle();
+      if (complete) {
+        assert.equal(result.outcomes[0].actionType, "write_text");
+        assert.equal(executor.calls.find(({ method }) => method === "perform").value.action.expectedSha256,
+          read.audited.result.sha256);
+      } else {
+        assert.equal(result.outcomes[0].code, "CODE_BRAIN_INCOMPLETE_READ");
+        assert.equal(result.outcomes[0].status, "paused");
+        assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
+      }
+    });
+  }
+});
+
+test("large-file write proofs bind exact job, workspace, action, path and hash", async (t) => {
+  const read = fullAuditRead("x".repeat(80 * 1024));
+  const initial = currentReadJob([read.read]);
+  const session = new FakeExecutor(initial).session;
+  const document = { actionId: read.action.actionId, ...read.audited.result };
+  const cases = [
+    ["same binding", {}], ["other job", { jobId: "other-job" }],
+    ["other workspace", { workspaceRevision: REVISION_B }],
+    ["other action", { document: { ...document, actionId: "other-read" } }],
+    ["other path", { document: { ...document, path: "src/other.js" } }],
+    ["other hash", { document: { ...document, content: "different", bytes: 9,
+      sha256: createHash("sha256").update("different").digest("hex") } }],
+  ];
+  for (const [name, change] of cases) {
+    await t.test(name, () => {
+      const context = createCodeReadContext({ jobId: change.jobId ?? initial.jobId,
+        workspaceRevision: change.workspaceRevision ?? REVISION_A, documents: [change.document ?? document] });
+      const reader = beginCodeReadSession(context);
+      const path = (change.document ?? document).path;
+      let offset = 0;
+      do { offset = reader.readDocument(path, offset).nextOffset; } while (offset !== null);
+      reader.commit();
+      reader.close();
+      const bind = () => bindTrustedAction(initial, session,
+        { type: "write_text", path: read.action.path, content: "replacement" }, [], [], context);
+      const prepared = { type: "write_text", path: read.action.path, expectedSha256: read.audited.result.sha256 };
+      const assertPrepared = () => assertPreparedWriteRead(initial, session, prepared, [], context);
+      if (name === "same binding") {
+        assert.equal(bind().expectedSha256, read.audited.result.sha256);
+        assert.doesNotThrow(assertPrepared);
+      } else {
+        assert.throws(bind, { code: "CODE_BRAIN_INCOMPLETE_READ" });
+        assert.throws(assertPrepared, { code: "CODE_BRAIN_INCOMPLETE_READ" });
+      }
+    });
+  }
+});
+
+test("incomplete native artifact reading pauses without misclassifying a code failure", async () => {
+  const initial = job();
+  const store = new FakeJobStore([initial]);
+  const worker = new CodeJobWorkerService({ jobStore: store, executor: new FakeExecutor(initial),
+    grantVerifier: verifier([]), brainDirectory: brain([
+      Object.assign(new Error("Read remaining pages first"), { code: "CODE_ARTIFACT_READ_INCOMPLETE" }),
+    ]) });
+  const result = await worker.runCycle();
+  assert.equal(result.outcomes[0].status, "paused");
+  assert.equal(result.outcomes[0].code, "CODE_ARTIFACT_READ_INCOMPLETE");
+});
+
+test("invalid native artifact reader pauses without indefinitely retrying", async () => {
+  const initial = job();
+  const store = new FakeJobStore([initial]);
+  const calls = [];
+  const worker = new CodeJobWorkerService({ jobStore: store, executor: new FakeExecutor(initial),
+    grantVerifier: verifier([]), brainDirectory: brain([
+      Object.assign(new Error("Artifact reader validation failed"), { code: "CODE_ARTIFACT_READ_INVALID" }),
+    ], calls) });
+  const result = await worker.runCycle();
+  assert.equal(result.outcomes[0].status, "paused");
+  assert.equal(result.outcomes[0].code, "CODE_ARTIFACT_READ_INVALID");
+  await worker.runCycle();
+  assert.equal(calls.length, 1);
+});
+
+test("native capable recovery cannot reconstruct proof for a durable prepared large overwrite", async () => {
+  const read = fullAuditRead("x".repeat(80 * 1024));
+  const initial = currentReadJob([read.read]);
+  const action = { type: "write_text", actionId: "prepared-native-overwrite",
+    path: read.action.path, content: "replacement", expectedWorkspaceRevision: REVISION_A,
+    expectedSha256: read.audited.result.sha256 };
+  initial.execution.pendingAction = {
+    turn: 2, actionId: action.actionId, actionDigest: digestValue(action), action,
+    preparedAt: "2026-08-01T00:00:01.000Z",
+  };
+  const executor = auditedReadExecutor(initial, [read]);
+  const store = new FakeJobStore([initial]);
+  const worker = new CodeJobWorkerService({ jobStore: store, executor, grantVerifier: verifier([]),
+    brainDirectory: {
+      describe: () => ({ supportsCodeReading: true }),
+      decide: () => { assert.fail("prepared action recovery must not ask for a new decision"); },
+    } });
+  const result = await worker.runCycle();
+  assert.equal(result.outcomes[0].code, "CODE_BRAIN_INCOMPLETE_READ");
+  assert.equal(result.outcomes[0].status, "paused");
+  assert.equal(executor.calls.some(({ method }) => ["perform", "getActionResult"].includes(method)), false);
+  assert.deepEqual((await store.getForWorker(initial.jobId)).execution.pendingAction.action, action);
+});
 
 test("read observations report every content truncation to the model", async (t) => {
   for (const content of ["x".repeat(30 * 1024), "字".repeat(10 * 1024)]) {

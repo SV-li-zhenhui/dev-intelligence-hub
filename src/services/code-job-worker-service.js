@@ -1,4 +1,6 @@
 import { OperationQueue } from "../lib/operation-queue.js";
+import { createHash } from "node:crypto";
+import { createCodeReadContext } from "../lib/code-read-context.js";
 import { TaskRunControlError } from './task-run-registry.js';
 import { currentTaskExecution } from '../lib/task-execution-context.js';
 import { digestValue } from "../domain/code-executor-contract.js";
@@ -293,7 +295,9 @@ export class CodeJobWorkerService {
       ],
       "controlled code executor",
     );
-    this.#brain = requirePort(brainDirectory, ["decide"], "code job brain");
+    this.#brain = requirePort(brainDirectory,
+      typeof brainDirectory?.describe === "function" ? ["decide", "describe"] : ["decide"],
+      "code job brain");
     this.#taskRuns = taskRuns;
     this.#reviewRepairContextReader = reviewRepairContextReader === undefined
       ? null : requirePort(reviewRepairContextReader, ["read"], "review repair context reader");
@@ -583,6 +587,7 @@ export class CodeJobWorkerService {
     );
     await this.#verifyAuthority(job.grant);
     const brainContext = this.#brainContext(job, remainingProfiles);
+    const codeReadContext = await this.#codeReadContext(job);
     const reviewRepairFeedback = await this.#readReviewRepairFeedback(job);
     const sessionKey = Number.isSafeInteger(job.grant.subject?.number) &&
         job.grant.subject.number > 0
@@ -597,6 +602,7 @@ export class CodeJobWorkerService {
         roleId: job.grant.requestedBy.roleId,
         ...(sessionKey === null ? {} : { sessionKey }),
         ...brainContext,
+        ...(codeReadContext === null ? {} : { codeReadContext }),
         ...(instructions === undefined ? {} : {instructions}),
         ...(reviewRepairFeedback === null ? {} : { reviewRepairFeedback }),
       },
@@ -618,6 +624,7 @@ export class CodeJobWorkerService {
       decision.action,
       remainingProfiles,
       brainContext.observations,
+      codeReadContext,
     );
     await this.#verifyAuthority(job.grant);
     job = (await this.#jobs.prepareAction({
@@ -648,6 +655,49 @@ export class CodeJobWorkerService {
         .slice(-this.#observationLimit)
         .map(modelObservation),
     });
+  }
+
+  async #codeReadContext(job) {
+    if ((await this.#brain.describe?.(job.grant.requestedBy.roleId, job.grant.brainDigest))?.supportsCodeReading !== true) {
+      return null;
+    }
+    const latest = new Map();
+    for (let index = job.execution.observations.length - 1; index >= 0; index -= 1) {
+      const observation = job.execution.observations[index];
+      if (observation.actionType !== "read_text" || observation.status !== "succeeded" ||
+          observation.workspaceRevision !== job.execution.workspaceRevision) continue;
+      const action = trustedObservationAction(observation);
+      if (!latest.has(action.path)) latest.set(action.path, { action, observation });
+    }
+    const documents = await Promise.all([...latest.values()].map(async ({ action, observation }) => {
+      const audited = await this.#executor.getActionResult({ sessionId: job.jobId, actionId: action.actionId });
+      const result = audited?.result;
+      const bytes = typeof result?.content === "string" ? Buffer.from(result.content, "utf8") : null;
+      const currentRevision = job.execution.workspaceRevision;
+      if (
+        action.expectedWorkspaceRevision !== currentRevision ||
+        audited?.action?.id !== action.actionId || audited.action.type !== "read_text" ||
+        audited.action.status !== "succeeded" || audited.action.error != null ||
+        audited.action.workspaceRevisionBefore !== currentRevision ||
+        audited.action.workspaceRevisionAfter !== currentRevision ||
+        audited.action.attemptNumber !== observation.detail?.executor?.actionAttemptNumber ||
+        result?.path !== action.path || bytes === null ||
+        result.content !== bytes.toString("utf8") || result.bytes !== bytes.length ||
+        result.sha256 !== createHash("sha256").update(bytes).digest("hex") ||
+        result.truncated === true || result.error != null ||
+        !sameValue(observationDetail(action, {
+          session: { status: observation.detail?.executor?.sessionStatus,
+            attempt: { number: observation.detail?.executor?.sessionAttemptNumber } },
+          action: audited.action,
+        }, result).result, observation.detail?.result)
+      ) {
+        throw workerError("CODE_JOB_AUDIT_RESULT_INVALID", "Audited text does not match its current workspace read observation");
+      }
+      return { actionId: action.actionId, path: action.path, sha256: result.sha256,
+        bytes: result.bytes, content: result.content };
+    }));
+    return createCodeReadContext({ jobId: job.jobId,
+      workspaceRevision: job.execution.workspaceRevision, documents });
   }
 
   async #readReviewRepairFeedback(job) {

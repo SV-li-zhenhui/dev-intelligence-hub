@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { normalizeSessionKey } from "../lib/session-key.js";
+import { isCodeReadContext } from "../lib/code-read-context.js";
 
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
@@ -177,6 +178,7 @@ function normalizeProvider(value) {
     singleAttempt: attemptDescriptor?.value === true,
     supportsEntitySessions: value.supportsEntitySessions === true,
     supportsReviewReading: value.supportsReviewReading === true,
+    supportsCodeReading: value.supportsCodeReading === true,
     supportsNativeReviewSkills: value.supportsNativeReviewSkills === true,
     ...(value.supportsEntitySessions === true
       ? { sessionIsolationKey: value.sessionIsolationKey }
@@ -216,6 +218,7 @@ function frozenDescription(provider, brain) {
     remoteData: Object.freeze({ ...brain.remoteData }),
     ...(provider.singleAttempt ? { singleAttempt: true } : {}),
     ...(provider.supportsReviewReading ? { supportsReviewReading: true } : {}),
+    ...(provider.supportsCodeReading ? { supportsCodeReading: true } : {}),
     ...(provider.supportsNativeReviewSkills ? { supportsNativeReviewSkills: true } : {}),
   });
 }
@@ -249,12 +252,20 @@ export class BrainRouter {
     sessionKey: sessionKeyValue = null,
     signal = null,
     reviewTarget = null,
+    codeReadContext = null,
   } = {}) {
     const brain = normalizeBrainConfig(brainValue);
     const provider = this.#provider(brain.provider);
     const classes = normalizeDataClasses(dataClasses);
     if (reviewTarget !== null && !classes.includes("code")) {
       throw routerError("REMOTE_DATA_CLASSIFICATION_REQUIRED", "PR reading requires code classification", 403);
+    }
+    if (codeReadContext !== null &&
+        (!isCodeReadContext(codeReadContext) || !classes.includes("code"))) {
+      throw routerError("REMOTE_DATA_CLASSIFICATION_REQUIRED", "Code reading requires trusted code classification", 403);
+    }
+    if (codeReadContext !== null && !provider.supportsCodeReading) {
+      throw routerError("CODE_READING_UNAVAILABLE", "Brain does not support controlled code reading", 503);
     }
     const requestSignal = normalizeAbortSignal(signal);
     if (requestSignal?.aborted) {
@@ -289,6 +300,7 @@ export class BrainRouter {
       messages,
       schema,
       ...(reviewTarget !== null && provider.supportsReviewReading ? { reviewTarget } : {}),
+      ...(codeReadContext === null ? {} : { codeReadContext }),
       ...(sessionKeyValue === null || !provider.supportsEntitySessions
         ? {}
         : { sessionKey: authorizedSessionKey(sessionKeyValue, provider, brain, classes) }),

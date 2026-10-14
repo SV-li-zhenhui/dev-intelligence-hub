@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import { createNativeCodexBrainProvider } from "../src/adapters/native-codex-brain-provider.js";
@@ -9,6 +10,8 @@ import { nativeCodexDigest, nativeCodexHomeIdentity } from "../src/adapters/code
 import { createTestSupervisedProcessRunner } from "../src/lib/supervised-process-runner.js";
 import { BrainRouter } from "../src/services/brain-router.js";
 import { CodexAppServerRunner } from '../src/lib/codex-app-server-runner.js';
+import { createCodeReadContext, hasCompleteCodeRead } from "../src/lib/code-read-context.js";
+import { createCodeJobArtifactReader } from "../src/adapters/code-job-artifact-reader.js";
 
 const schema = { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false };
 const request = (overrides = {}) => ({ model: "gpt-6.1-sol", reasoningEffort: "high", messages: [{ role: "user", content: "PRIVATE_TASK_INPUT" }], schema, ...overrides });
@@ -16,6 +19,117 @@ const error = (code) => Object.assign(new Error("private diagnostic must not esc
 const options = { id: "native-test", cliKind: "codex-cli", credentialMode: "codex-native-login", timeoutMs: 3000 };
 const success = (stdout = "") => ({ exitCode: 0, signal: null, stdout, stderr: "", stdoutBytes: Buffer.from(stdout), stderrBytes: Buffer.alloc(0) });
 const gate = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
+
+function auditedCode(content = "\uFEFF中文开头\n" + "x".repeat(80 * 1024) + "\n完整文件尾部") {
+  const document = { actionId: "read-current", path: "src/large.cpp", content,
+    bytes: Buffer.byteLength(content), sha256: createHash("sha256").update(content).digest("hex") };
+  const binding = { jobId: "code-job-test", workspaceRevision: "a".repeat(64) };
+  return { document, binding, context: createCodeReadContext({ ...binding, documents: [document] }) };
+}
+
+async function readAuditedPages(url, path, { firstPageOnly = false } = {}) {
+  let offset = 0;
+  let text = "";
+  do {
+    const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: offset + 1, method: "tools/call",
+        params: { name: "read_source", arguments: { path, offset, length: 24_000 } } }) });
+    assert.equal(response.status, 200);
+    const message = await response.json();
+    assert.notEqual(message.result.isError, true);
+    const page = JSON.parse(message.result.content[0].text);
+    text += page.text;
+    offset = page.nextOffset;
+    if (firstPageOnly) break;
+  } while (offset !== null);
+  return text;
+}
+
+const codeDecision = (action) => ({ schemaVersion: 1, confidence: 90, summary: "检查当前代码", reason: "使用完整受控读取", action });
+
+test("native code reader reaches the full audited BOM source tail and preserves exact write proof", async (t) => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = "app-server";
+  const source = auditedCode();
+  const provider = f.create(() => assert.fail("must use native app-server"), {}, { appServerRunner: { async run(call) {
+    assert.equal(call.appServer.isolation.reader.url.includes("/code-read/"), true);
+    assert.equal(call.maxStdoutBytes, 64 * 1024 * 1024);
+    assert.equal(call.appServer.input.includes(source.document.content), false);
+    assert.equal(await readAuditedPages(call.appServer.isolation.reader.url, source.document.path), source.document.content);
+    const manifest = JSON.parse(await readFile(path.join(call.cwd, "code-read-manifest.json"), "utf8"));
+    assert.deepEqual(manifest, { documents: [{ path: source.document.path, bytes: source.document.bytes }] });
+    await writeFile(path.join(call.cwd, "last-message.json"), JSON.stringify({ result: JSON.stringify(codeDecision({ type: "write_text", path: source.document.path, content: "replacement" })) }));
+    return success();
+  } } });
+  const result = JSON.parse(await provider.generate(request({ codeReadContext: source.context })));
+  assert.equal(result.action.type, "write_text");
+  assert.equal(hasCompleteCodeRead(source.context, { ...source.binding, ...source.document }), true);
+  await provider.close();
+});
+
+test("native completion rejects a truncated preview without all audited pages", async (t) => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = "app-server";
+  const source = auditedCode();
+  const provider = f.create(result, {}, { appServerRunner: { async run(call) {
+    await readAuditedPages(call.appServer.isolation.reader.url, source.document.path, { firstPageOnly: true });
+    await writeFile(path.join(call.cwd, "last-message.json"), JSON.stringify({ result: JSON.stringify(codeDecision({ type: "complete", outcome: "done", evidence: [] })) }));
+    return success();
+  } } });
+  await assert.rejects(provider.generate(request({ codeReadContext: source.context })), { code: "CODE_ARTIFACT_READ_INCOMPLETE" });
+  assert.equal(hasCompleteCodeRead(source.context, { ...source.binding, ...source.document }), false);
+  await provider.close();
+});
+
+test("native reader maps invalid controlled artifacts explicitly and rejects serialized capability copies", async (t) => {
+  const f = await fixture(t); const source = auditedCode();
+  const provider = f.create(() => assert.fail("invalid reader must not start a model"), {}, {
+    codeReaderFactory: async () => { throw error("CODE_READ_DOCUMENT_INVALID"); },
+  });
+  await assert.rejects(provider.generate(request({ codeReadContext: source.context })), { code: "CODE_ARTIFACT_READ_INVALID" });
+  await assert.rejects(provider.generate(request({ codeReadContext: structuredClone(source.context) })), /codeReadContext is invalid/);
+  assert.equal(hasCompleteCodeRead(source.context, { ...source.binding, ...source.document }), false);
+  await provider.close();
+});
+
+test("native code reader allows a newly created file without requiring an existing-file read", async (t) => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = "app-server";
+  const source = auditedCode();
+  const provider = f.create(result, {}, { appServerRunner: { async run(call) {
+    await writeFile(path.join(call.cwd, "last-message.json"), JSON.stringify({ result: JSON.stringify(codeDecision({ type: "write_text", path: "src/new.cpp", content: "new file" })) }));
+    return success();
+  } } });
+  assert.equal(JSON.parse(await provider.generate(request({ codeReadContext: source.context }))).action.path, "src/new.cpp");
+  assert.equal(hasCompleteCodeRead(source.context, { ...source.binding, ...source.document }), false);
+  await provider.close();
+});
+
+test("native code reader revokes full-read proof on invalid output, cleanup failure, and cancellation", async (t) => {
+  for (const scenario of ["invalid-business-output", "cleanup-failure", "cancel-after-commit"]) {
+    await t.test(scenario, async (t) => {
+      const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = "app-server";
+      const source = auditedCode(); const controller = new AbortController();
+      const provider = f.create(result, {}, {
+        ...(scenario === "cancel-after-commit" ? { codeReaderFactory: async (context, options) => {
+          const reader = await createCodeJobArtifactReader(context, options);
+          return { ...reader, commit() { reader.commit(); controller.abort(); } };
+        } } : {}),
+        appServerRunner: { async run(call) {
+          await readAuditedPages(call.appServer.isolation.reader.url, source.document.path);
+          if (scenario === "cleanup-failure") await writeFile(path.join(call.cwd, "unexpected-runtime-file"), "preserve unknown file");
+          const action = scenario === "invalid-business-output" ? { type: "write_text", path: source.document.path, content: "replacement", untrusted: true }
+            : { type: "write_text", path: source.document.path, content: "replacement" };
+          await writeFile(path.join(call.cwd, "last-message.json"), JSON.stringify({ result: JSON.stringify(codeDecision(action)) }));
+          return success();
+        } },
+      });
+      await assert.rejects(provider.generate(request({ codeReadContext: source.context, signal: controller.signal })), {
+        code: scenario === "cleanup-failure" ? "STRUCTURED_PROVIDER_CLEANUP_FAILED"
+          : scenario === "cancel-after-commit" ? "STRUCTURED_PROVIDER_CANCELLED" : "STRUCTURED_PROVIDER_RESPONSE_INVALID",
+      });
+      assert.equal(hasCompleteCodeRead(source.context, { ...source.binding, ...source.document }), false);
+      await provider.close();
+    });
+  }
+});
 
 test('opt-in app-server retains native home and explicit capability isolation before starting a model',async(t)=>{
   const f=await fixture(t);const calls=[];
