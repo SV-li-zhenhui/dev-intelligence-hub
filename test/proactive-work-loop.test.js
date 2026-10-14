@@ -1291,6 +1291,118 @@ test("configured roots with more settled child work close before peer roots", as
   assert.equal(ledger.calls.stageIntent[0].itemId, laterRoot.itemId);
 });
 
+function rootProgressPriorityLoop({ blockedBy = "child", useCandidateFacts = false, priority = "high", delivery = null, settledChild = false, orchestrateWaiting = false }) {
+  const time = controlledClock();
+  const waitingRoot = workItem(51, { type: "role", id: "orchestrator" });
+  const healthyRoot = workItem(52, { type: "role", id: "orchestrator" });
+  for (const root of [waitingRoot, healthyRoot]) {
+    root.event.eventType = "pull_request.owner_requested";
+    root.event.source = { provider: "local-owner", scopeId: `owner-request:${root.itemId}` };
+    root.event.payload.priority = root === waitingRoot ? priority : "high";
+  }
+  waitingRoot.statusReason = "waiting_for_children";
+  const blocker = workItem(53, { type: "role", id: "developer" });
+  blocker.status = "blocked";
+  if (blockedBy === "child") blocker.graph.parentItemId = waitingRoot.itemId;
+  else waitingRoot.graph.dependsOnItemIds = [blocker.itemId];
+  if (delivery !== null) blocker.graph.deliveries = [{ status: delivery }];
+  const cancelled = workItem(24723, { type: "role", id: "orchestrator" });
+  Object.assign(cancelled, { status: "cancelled", revision: 11 });
+  const settled = workItem(54, { type: "role", id: "tester" });
+  settled.status = "completed";
+  settled.graph.parentItemId = waitingRoot.itemId;
+  const ledger = new FakeLedger({
+    source: [waitingRoot, healthyRoot, blocker, cancelled, ...(settledChild ? [settled] : [])], time,
+  });
+  if (useCandidateFacts) {
+    ledger.listClaimCandidates = async () => ({
+      items: [clone(waitingRoot), clone(healthyRoot)], nextCursor: null,
+      activeQuestionTargets: [],
+      facts: [waitingRoot, healthyRoot].map((root) => ({
+        itemId: root.itemId, graphBlocked: root === waitingRoot,
+        submittedChildren: root === waitingRoot && delivery === "submitted" ? 1 : 0,
+        satisfiedChildren: root === waitingRoot && settledChild ? 1 : 0,
+      })),
+    });
+  }
+  const decisions = [];
+  const executions = [];
+  const loop = createLoop({ ledger, time,
+    directory: new FakeRoleDirectory({
+      orchestrator: worker({ roleId: "orchestrator", workerId: "employee-orchestrator",
+        async decide({ item }) {
+          decisions.push(item.itemId);
+          return item.itemId === waitingRoot.itemId && orchestrateWaiting
+            ? orchestrationDecision(item) : completeDecision();
+        } }),
+      developer: worker({ roleId: "developer" }),
+    }),
+    roleContextAssembler: { async assemble({ roleId, item }) { return contextPacket(item, roleId); } },
+    orchestratorService: { async execute({ item }) {
+      executions.push(item.itemId); return { applied: true };
+    } },
+  });
+  return { loop, ledger, waitingRoot, healthyRoot, cancelled, decisions, executions };
+}
+
+test("ready roots precede equally urgent parents waiting without child results", async (t) => {
+  for (const blockedBy of ["child", "dependency"]) {
+    for (const useCandidateFacts of [false, true]) {
+      await t.test(`${blockedBy}, candidate facts: ${useCandidateFacts}`, async () => {
+        const { loop, ledger, healthyRoot, cancelled, decisions } = rootProgressPriorityLoop({ blockedBy, useCandidateFacts });
+        await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+        assert.deepEqual(decisions, [healthyRoot.itemId]);
+        assert.deepEqual(ledger.calls.claim.map(({ itemId }) => itemId), [healthyRoot.itemId]);
+        assert.deepEqual(ledger.items.find(({ itemId }) => itemId === cancelled.itemId), cancelled);
+      });
+    }
+  }
+});
+
+test("higher owner priority retains waiting-root orchestration ahead of ready peers", async () => {
+  const { loop, ledger, waitingRoot, decisions, executions } = rootProgressPriorityLoop({ priority: "urgent", orchestrateWaiting: true });
+  const result = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+  assert.equal(result.orchestrated, 1);
+  assert.deepEqual(decisions, [waitingRoot.itemId]);
+  assert.deepEqual(executions, [waitingRoot.itemId]);
+  assert.equal(ledger.calls.claim.length, 0);
+});
+
+test("urgent issue roots retain priority while waiting for blocked child work", async () => {
+  const { loop, ledger, waitingRoot, healthyRoot, decisions } = rootProgressPriorityLoop({});
+  for (const root of ledger.source.filter(({ itemId }) =>
+    itemId === waitingRoot.itemId || itemId === healthyRoot.itemId)) {
+    root.event = issueWorkItem(root.event.payload.number, "2026-08-02T07:30:00.000Z",
+      root.itemId === waitingRoot.itemId ? ["P0"] : []).event;
+  }
+  const result = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+  assert.deepEqual(decisions, [waitingRoot.itemId]);
+  assert.equal(result.outcomes[0].status, "graph_blocked");
+  assert.equal(ledger.calls.claim.length, 0);
+});
+
+test("submitted child results retain waiting-root priority ahead of ready peers", async (t) => {
+  for (const useCandidateFacts of [false, true]) {
+    await t.test(`candidate facts: ${useCandidateFacts}`, async () => {
+      const { loop, waitingRoot, decisions } = rootProgressPriorityLoop({ delivery: "submitted", useCandidateFacts, orchestrateWaiting: true });
+      const result = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+      assert.equal(result.orchestrated, 1);
+      assert.deepEqual(decisions, [waitingRoot.itemId]);
+    });
+  }
+});
+
+test("settled child results retain priority even while another child is blocked", async (t) => {
+  for (const useCandidateFacts of [false, true]) {
+    await t.test(`candidate facts: ${useCandidateFacts}`, async () => {
+      const { loop, waitingRoot, decisions } = rootProgressPriorityLoop({ settledChild: true, useCandidateFacts, orchestrateWaiting: true });
+      const result = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+      assert.equal(result.orchestrated, 1);
+      assert.deepEqual(decisions, [waitingRoot.itemId]);
+    });
+  }
+});
+
 test("graph-blocked parents do not consume the claim budget before ready children", async () => {
   const time = controlledClock();
   const parent = workItem(1);

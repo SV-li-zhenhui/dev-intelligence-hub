@@ -333,7 +333,7 @@ function issuePriority(item) {
     : 0;
 }
 
-function prioritizeWorkItems(items, candidateFacts = null) {
+function prioritizeWorkItems(items, candidateFacts, graphBlocked) {
   const childrenByParent = new Map();
   for (const item of items) {
     const parentItemId = item.graph?.parentItemId;
@@ -346,11 +346,16 @@ function prioritizeWorkItems(items, candidateFacts = null) {
     .map((item, index) => {
       const issueEvent = issueEventFacts(item);
       const facts = candidateFacts?.get(item.itemId);
-      const children = item.currentTarget?.type === "role" &&
+      const isRoot = item.currentTarget?.type === "role" &&
           item.currentTarget.id === ORCHESTRATOR_ROLE_ID &&
-          item.graph?.parentItemId === null
-        ? childrenByParent.get(item.itemId) ?? []
-        : [];
+          item.graph?.parentItemId === null;
+      const children = isRoot ? childrenByParent.get(item.itemId) ?? [] : [];
+      const submittedChildren = facts?.submittedChildren ?? children.filter((child) =>
+        child.graph?.deliveries?.at(-1)?.status === "submitted"
+      ).length;
+      const satisfiedChildren = facts?.satisfiedChildren ?? children.filter((child) =>
+        SETTLED_GRAPH_CHILD_STATUSES.has(child.status)
+      ).length;
       return {
         item,
         index,
@@ -358,12 +363,10 @@ function prioritizeWorkItems(items, candidateFacts = null) {
         issuePriority: issuePriority(item),
         issueUpdatedAt: issueUpdatedAt(issueEvent) ?? 0,
         isIssue: issueEvent !== null,
-        submittedChildren: facts?.submittedChildren ?? children.filter((child) =>
-          child.graph?.deliveries?.at(-1)?.status === "submitted"
-        ).length,
-        satisfiedChildren: facts?.satisfiedChildren ?? children.filter((child) =>
-          SETTLED_GRAPH_CHILD_STATUSES.has(child.status)
-        ).length,
+        submittedChildren,
+        satisfiedChildren,
+        waitingRoot: isRoot && graphBlocked.has(item.itemId) &&
+          submittedChildren === 0 && satisfiedChildren === 0,
       };
     })
     .sort((left, right) =>
@@ -371,6 +374,7 @@ function prioritizeWorkItems(items, candidateFacts = null) {
       right.submittedChildren - left.submittedChildren ||
       right.satisfiedChildren - left.satisfiedChildren ||
       right.issuePriority - left.issuePriority ||
+      Number(left.waitingRoot) - Number(right.waitingRoot) ||
       (left.isIssue && right.isIssue
         ? right.issueUpdatedAt - left.issueUpdatedAt
         : 0) ||
@@ -895,7 +899,7 @@ export class ProactiveWorkLoop {
     );
     const claimAttemptLimit = Math.max(availabilityCheckLimit * 8, 32);
 
-    const prioritized = prioritizeWorkItems(items, candidateWindow.facts);
+    const prioritized = prioritizeWorkItems(items, candidateWindow.facts, graphBlocked);
     const scheduled = this.taskRuns ? await this.taskRuns.order(prioritized, 'work-item', 'itemId') : prioritized;
     let completedCandidateSweep = true;
     for (const item of scheduled) {
