@@ -160,6 +160,7 @@ export function beginCodeReadSession(context, { signal = null } = {}) {
     return ranges?.length === 1 && ranges[0][0] === 0 && ranges[0][1] === document.content.length;
   };
   return Object.freeze({
+    assertActive,
     readDocument(path, offset, length = 24_000) {
       assertActive();
       safePath(path);

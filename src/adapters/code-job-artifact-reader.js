@@ -61,7 +61,7 @@ export async function createCodeJobArtifactReader(context, { signal = null } = {
   let closed = false;
   const callTool = (name, rawArguments) => {
     if (closed || signal?.aborted) throw failure("CODE_READ_SESSION_REVOKED");
-    session.listDocuments(); // Also fences an invocation revoked by the host.
+    session.assertActive();
     if (name === "read_document") {
       const args = argumentsFor(rawArguments, ["document", "offset"], ["length"]);
       if (args.document !== MANIFEST) throw failure("CODE_READ_DOCUMENT_NOT_FOUND");
