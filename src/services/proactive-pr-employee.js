@@ -348,6 +348,16 @@ export class ProactivePrEmployeeService {
   #admitAction;
 
   #isCandidate(item) {
+    // The GitHub source already routes authored review feedback to developer.
+    // A legacy owner-request handoff would supersede that automatic repair root.
+    if (
+      this.config.triageOnly === true &&
+      this.config.automaticOwnPrRepair === true &&
+      item?.relation === "authored" &&
+      item.nextAction === "address_review"
+    ) {
+      return false;
+    }
     const policy = this.config.automaticReviewPolicy;
     return isCandidate(item) && (policy == null || item.relation !== "review_requested" ||
       (policy.enabled && automaticReviewEligibility(item, policy.account, this.clock()) === null));
@@ -1072,7 +1082,10 @@ export class ProactivePrEmployeeService {
     const current = snapshot?.items?.find(
       (item) => item.id === job.subjectId,
     );
-    if (!jobMatchesCurrentCandidate(job, current, this.config.policyVersion)) {
+    if (
+      !this.#isCandidate(current) ||
+      !jobMatchesCurrentCandidate(job, current, this.config.policyVersion)
+    ) {
       const completedAt = this.clock().toISOString();
       state.jobs[index] = {
         ...job,

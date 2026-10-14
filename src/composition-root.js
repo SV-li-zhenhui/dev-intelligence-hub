@@ -2165,6 +2165,7 @@ export async function createApplication({
       // The legacy PR employee is the low-risk Ollama patrol/triage role.
       // Evidence-bound code Review belongs exclusively to pr-engineer.
       config: { ...roleConfig, triageOnly: true,
+        automaticOwnPrRepair: ownPrRepairEnabled,
         automaticReviewPolicy: Object.hasOwn(config.githubActions || {}, "automaticReview")
           ? { enabled: config.githubActions.automaticReview, account: config.githubActions.actorAccountId } : null,
       },

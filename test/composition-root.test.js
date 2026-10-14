@@ -4181,6 +4181,7 @@ test("automatic own PR repair composes internal push with ownership guards and c
         githubReviewProposalRunnerFactory: () => ({ async runCycle() {} }),
       });
       try {
+        assert.equal(application.prEmployee.config.automaticOwnPrRepair, true);
         assert.deepEqual(calls.externalExecutor.enabledActions, ["push"]);
         assert.deepEqual(config.githubActions.enabledActions, explicitPush ? ["push"] : []);
         assert.equal(typeof calls.codeJobRuntime.reviewRepairContextReader.read, "function");

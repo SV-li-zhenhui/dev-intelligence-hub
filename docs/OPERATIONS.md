@@ -415,6 +415,15 @@ the repair. Inspect success alone is not evidence of code changes or publication
 Object preparation accepts validated mirror branch refs containing `#`; a missing
 bound Head must be fetched by the trusted object synchronizer before creating the
 code snapshot. Keep the failed job and audit trail when retrying the original task.
+When automatic own-PR repair is enabled, legacy PR patrol leaves authored
+`address_review` items to the canonical developer route and supersedes its old
+competing patrol jobs. Already emitted triage owner requests require separate
+source reconciliation. A maintainer may replay a native `pull_request.observed`
+event generated from a fresh complete successful GitHub snapshot through production
+routing and ledger intake, after verifying the same current Head, feedback, actor,
+generated-triage provenance and absence of live children/intents. Preserve the
+original snapshot timestamp and audit history; ordinary manual owner requests are
+not candidates for this repair.
 
 The following capture and cleanup rules describe compatibility invocation
 profiles. Native mode keeps conversations in the fixed Codex home and only

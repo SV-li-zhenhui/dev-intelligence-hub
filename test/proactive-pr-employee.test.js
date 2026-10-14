@@ -985,12 +985,13 @@ test("an authored PR produces an internal work plan without entering approval", 
   const owned = pullRequest({
     relation: "authored",
     author: "local-owner",
-    nextAction: "fix_ci",
-    actionReasons: ["需要你处理检查失败"],
+    nextAction: "address_review",
+    actionReasons: ["需要处理评审意见"],
   });
   const store = new MemoryStore({ snapshot: snapshot([owned]) });
   const service = createService({
     store,
+    config: { automaticOwnPrRepair: true },
     github: {
       async loadReviewContext(item) {
         return { ...item, patch: "failure handling diff", patchTruncated: false, files: [] };
@@ -1024,7 +1025,7 @@ test("triage-only PR promoter classifies work without reading patches or draftin
   let handoffInput = null;
   const service = createService({
     store,
-    config: { triageOnly: true },
+    config: { triageOnly: true, automaticOwnPrRepair: true },
     triageHandoff: durableTriageHandoff((input) => {
       handoffInput = input;
     }),
@@ -1082,7 +1083,7 @@ test("triage-only PR promoter durably routes authored fixes to developer", async
   const handoffs = [];
   const service = createService({
     store,
-    config: { triageOnly: true },
+    config: { triageOnly: true, automaticOwnPrRepair: true },
     triageHandoff: durableTriageHandoff((input) => handoffs.push(input)),
     github: {
       async loadReviewContext(item, options) {
@@ -1115,6 +1116,106 @@ test("triage-only PR promoter durably routes authored fixes to developer", async
     nextAction: "fix_ci",
     expectedHeadRefOid: HEAD_42,
   });
+});
+
+test("automatic own PR repair keeps legacy triage from creating competing owner requests", async () => {
+  const owned = pullRequest({
+    relation: "authored",
+    author: "local-owner",
+    nextAction: "address_review",
+  });
+  const store = new MemoryStore({ snapshot: snapshot([owned]) });
+  const service = createService({
+    store,
+    config: { triageOnly: true, automaticOwnPrRepair: true },
+    triageHandoff: { async submit() { assert.fail("automatic repair owns this PR"); } },
+    github: { async loadReviewContext() { assert.fail("legacy triage must not read it"); } },
+    reviewer: { async analyze() { assert.fail("legacy triage must not analyze it"); } },
+  });
+
+  for (let tick = 0; tick < 2; tick += 1) {
+    const result = await service.tick();
+    assert.deepEqual(result.jobs, []);
+    assert.equal(result.role.lastRun.newJobs, 0);
+  }
+});
+
+test("automatic own PR repair retires pending legacy triage without pretending repair completed", async (t) => {
+  for (const status of ["queued", "retry_wait", "blocked", "ready"]) {
+    await t.test(status, async () => {
+      const owned = pullRequest({ relation: "authored", nextAction: "address_review" });
+      const store = new MemoryStore({
+        snapshot: snapshot([owned]),
+        "pr-employee-state": queuedState(owned, {
+          policyVersion: 3,
+          status,
+          attempts: 2,
+          error: "previous transport failure",
+          nextAttemptAt: "2026-07-31T09:00:00.000Z",
+        }),
+      });
+      const service = createService({
+        store,
+        config: { triageOnly: true, automaticOwnPrRepair: true },
+        triageHandoff: { async submit() { assert.fail("no competing handoff"); } },
+        reviewer: { async analyze() { assert.fail("no legacy retry"); } },
+      });
+
+      const result = await service.tick();
+      assert.equal(result.jobs.length, 1);
+      assert.equal(result.jobs[0].status, "superseded");
+      assert.equal(result.jobs[0].attempts, 2);
+      assert.equal(result.jobs[0].handoffWorkItemId, undefined);
+      assert.equal(result.role.lastError, "");
+    });
+  }
+});
+
+test("automatic own PR repair prevents manual retries from reviving a competing legacy job", async () => {
+  const owned = pullRequest({ relation: "authored", nextAction: "address_review" });
+  const store = new MemoryStore({
+    snapshot: snapshot([owned]),
+    "pr-employee-state": queuedState(owned, { policyVersion: 3, status: "blocked" }),
+  });
+  const service = createService({
+    store,
+    config: { triageOnly: true, automaticOwnPrRepair: true },
+    triageHandoff: durableTriageHandoff(),
+  });
+
+  await assert.rejects(
+    service.resolveBlockedJob("pr-work-existing", "retry", {
+      headRefOid: HEAD_42, expectedRevision: 3,
+    }),
+    (error) => error.statusCode === 409,
+  );
+  assert.equal((await service.view()).jobs[0].status, "superseded");
+});
+
+test("legacy triage still hands off review feedback when automatic repair is disabled", async (t) => {
+  for (const automaticOwnPrRepair of [false, undefined, "true"]) {
+    await t.test(String(automaticOwnPrRepair), async () => {
+      const owned = pullRequest({
+        relation: "authored", nextAction: "address_review", automaticOwnPrRepair: true,
+      });
+      const handoffs = [];
+      const service = createService({
+        store: new MemoryStore({ snapshot: snapshot([owned]) }),
+        config: { triageOnly: true, automaticOwnPrRepair },
+        triageHandoff: durableTriageHandoff((input) => handoffs.push(input)),
+        github: { async loadReviewContext(item) { return item; } },
+        reviewer: { async analyze() { return reviewResult({
+          workType: "triage_plan", reviewVerdict: "none", reviewBody: "", requiresApproval: false,
+        }); } },
+      });
+
+      const result = await service.tick();
+      assert.equal(handoffs.length, 1);
+      assert.equal(handoffs[0].nextAction, "address_review");
+      assert.equal(result.jobs[0].status, "ready");
+      assert.equal(result.jobs[0].handoffWorkItemId, "work-item-developer");
+    });
+  }
 });
 
 test("triage-only PR promoter does not finish when durable handoff fails", async () => {
