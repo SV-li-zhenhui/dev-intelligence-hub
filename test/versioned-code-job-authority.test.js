@@ -551,6 +551,20 @@ test("code reading description follows the active and historically sealed brain"
     "new-local-model", "new-local-model", context.startup.employees.roles.developer.taskBrain.model]);
 });
 
+test("continuous cancellation signal passes through versioned admission without serialization", async () => {
+  let seen;
+  const context = fixture({ brainDirectoryFactory: () => ({
+    async decide(value, authorization) { seen = authorization.signal; await authorization.beforeGenerate(); return value; },
+  }) });
+  const grant = (await context.authority.create(proposal(context.startup))).grant;
+  const controller = new AbortController();
+  assert.deepEqual(await context.authority.decide({ roleId: "developer" }, {
+    beforeGenerate: async () => {}, brainDigest: grant.brainDigest, signal: controller.signal,
+  }), { roleId: "developer" });
+  assert.equal(seen, controller.signal);
+  await context.authority.close();
+});
+
 test("code reading description supports legacy directories without invoking describe accessors", async () => {
   let getters = 0;
   const context = fixture({ brainDirectoryFactory: () => ({

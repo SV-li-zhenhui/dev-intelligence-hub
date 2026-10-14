@@ -1,6 +1,8 @@
 import { OperationQueue } from "../lib/operation-queue.js";
 import { createHash } from "node:crypto";
-import { createCodeReadContext } from "../lib/code-read-context.js";
+import { beginCodeReadSession, createCodeReadContext, hasCompleteCodeRead } from "../lib/code-read-context.js";
+import { createCodeExecutionContext, closeCodeExecutionContext, revokeCodeExecutionContext } from "../lib/code-execution-context.js";
+import { normalizeStructuredCodeActionDecision } from "../domain/structured-code-action-contract.js";
 import { TaskRunControlError } from './task-run-registry.js';
 import { currentTaskExecution } from '../lib/task-execution-context.js';
 import { digestValue } from "../domain/code-executor-contract.js";
@@ -243,6 +245,7 @@ export class CodeJobWorkerService {
   #reconcilableCursor;
   #preferReconcilable;
   #cancellationControllers;
+  #continuousControllers;
 
   constructor({
     jobStore,
@@ -334,6 +337,7 @@ export class CodeJobWorkerService {
     this.#reconcilableCursor = 0;
     this.#preferReconcilable = true;
     this.#cancellationControllers = new Map();
+    this.#continuousControllers = new Map();
     Object.freeze(this);
   }
 
@@ -347,9 +351,10 @@ export class CodeJobWorkerService {
       throw new TypeError("code job id is invalid");
     }
     const controller = this.#cancellationControllers.get(jobId);
-    if (controller === undefined) return false;
-    controller.abort();
-    return true;
+    const continuous = this.#continuousControllers.get(jobId);
+    controller?.abort();
+    continuous?.abort();
+    return controller !== undefined || continuous !== undefined;
   }
 
   async #runCycle(options) {
@@ -581,6 +586,9 @@ export class CodeJobWorkerService {
       });
     }
 
+    const description = await this.#brain.describe?.(job.grant.requestedBy.roleId, job.grant.brainDigest);
+    if (description?.supportsCodeExecution === true) return this.#runContinuous(job);
+
     const passedProfiles = successfulProfiles(job, session);
     const remainingProfiles = job.grant.requiredProfiles.filter(
       ({ id }) => !passedProfiles.has(id),
@@ -657,7 +665,7 @@ export class CodeJobWorkerService {
     });
   }
 
-  async #codeReadContext(job) {
+  async #codeReadContext(job, { onlyPath = null } = {}) {
     if ((await this.#brain.describe?.(job.grant.requestedBy.roleId, job.grant.brainDigest))?.supportsCodeReading !== true) {
       return null;
     }
@@ -667,6 +675,7 @@ export class CodeJobWorkerService {
       if (observation.actionType !== "read_text" || observation.status !== "succeeded" ||
           observation.workspaceRevision !== job.execution.workspaceRevision) continue;
       const action = trustedObservationAction(observation);
+      if (onlyPath !== null && action.path !== onlyPath) continue;
       if (!latest.has(action.path)) latest.set(action.path, { action, observation });
     }
     const documents = await Promise.all([...latest.values()].map(async ({ action, observation }) => {
@@ -698,6 +707,191 @@ export class CodeJobWorkerService {
     }));
     return createCodeReadContext({ jobId: job.jobId,
       workspaceRevision: job.execution.workspaceRevision, documents });
+  }
+
+  async #continuousSnapshot(jobId) {
+    currentTaskExecution()?.assertRunning?.();
+    const job = await this.#jobs.getForWorker(jobId);
+    if (job?.status !== "active" || job.execution.pendingAction !== null) {
+      throw workerError("CODE_JOB_SESSION_BUSY", "Continuous code job is not ready for another action");
+    }
+    await this.#verifyAuthority(job.grant);
+    const session = await this.#executor.view({ sessionId: jobId });
+    assertJobSessionBinding(job, session);
+    if (session.status !== "active" || session.workspaceRevision !== job.execution.workspaceRevision) {
+      throw workerError("CODE_JOB_WORKSPACE_DIVERGED", "Continuous job no longer matches the active executor workspace");
+    }
+    const passed = successfulProfiles(job, session);
+    const remainingProfiles = job.grant.requiredProfiles.filter(({ id }) => !passed.has(id));
+    return { job, session, remainingProfiles, context: this.#brainContext(job, remainingProfiles) };
+  }
+
+  async #continuousAction(snapshot, decision, codeReadContext, signal) {
+    const { job, session, remainingProfiles, context } = snapshot;
+    currentTaskExecution()?.assertRunning?.();
+    signal?.throwIfAborted();
+    if (job.execution.turn >= this.#maxTurns) {
+      return this.#finishFailed(job, { code: "CODE_JOB_TURN_LIMIT", message: "Code job reached its configured action limit" });
+    }
+    const action = bindTrustedAction(job, session, decision.action, remainingProfiles, context.observations, codeReadContext);
+    await this.#verifyAuthority(job.grant);
+    currentTaskExecution()?.assertRunning?.();
+    const prepared = (await this.#jobs.prepareAction({ jobId: job.jobId, expectedRevision: job.revision, action })).job;
+    currentTaskExecution()?.reportProgress(`正在执行受控动作：${action.type}`);
+    currentTaskExecution()?.reportEvent?.({ type: "tool", text: `${action.type}${action.path ? ` · ${action.path}` : ""}`, itemId: action.actionId });
+    return this.#executePending(prepared, session, { continuous: true, signal });
+  }
+
+  async #runContinuous(initial) {
+    const controller = new AbortController();
+    const reads = new Map();
+    let workspaceRevision = initial.execution.workspaceRevision;
+    let fatal = null;
+    const feedback = await this.#readReviewRepairFeedback(initial);
+    const closeReads = () => {
+      for (const { reader } of reads.values()) { reader.revoke(); reader.close(); }
+      reads.clear();
+    };
+    const snapshot = async () => {
+      controller.signal.throwIfAborted();
+      if (fatal) throw fatal;
+      const state = await this.#continuousSnapshot(initial.jobId);
+      if (workspaceRevision !== state.job.execution.workspaceRevision) {
+        closeReads(); workspaceRevision = state.job.execution.workspaceRevision;
+      }
+      return state;
+    };
+    const latestRead = (job, sourcePath) => job.execution.observations.findLast((entry) =>
+      entry.actionType === "read_text" && entry.status === "succeeded" &&
+      entry.workspaceRevision === job.execution.workspaceRevision && trustedObservationAction(entry).path === sourcePath);
+    const currentReads = (job) => {
+      const latest = new Map();
+      for (const entry of job.execution.observations) {
+        if (entry.actionType === "read_text" && entry.status === "succeeded" && entry.workspaceRevision === job.execution.workspaceRevision) {
+          latest.set(trustedObservationAction(entry).path, entry);
+        }
+      }
+      return latest;
+    };
+    const assertFeedback = async () => {
+      if (feedback !== null && (await this.#readReviewRepairFeedback(initial)).reviewFeedbackDigest !== feedback.reviewFeedbackDigest) {
+        throw workerError("CODE_REVIEW_REPAIR_CONTEXT_STALE", "Review feedback changed during continuous execution");
+      }
+    };
+    let capability;
+    const perform = async (decision, state, { signal } = {}) => {
+      let readContext;
+      if (decision.action.type === "write_text") {
+        const entry = reads.get(decision.action.path);
+        if (entry) { entry.reader.assertComplete(); entry.reader.commit(); readContext = entry.context; }
+        else readContext = await this.#codeReadContext(state.job, { onlyPath: decision.action.path });
+      }
+      await assertFeedback();
+      try {
+        const outcome = await this.#continuousAction(state, decision, readContext, signal);
+        const current = await this.#jobs.getForWorker(initial.jobId);
+        if (current?.execution.workspaceRevision !== workspaceRevision) {
+          closeReads(); workspaceRevision = current?.execution.workspaceRevision;
+        }
+        // A failed profile or non-active result cannot authorize later actions.
+        if (current?.status !== "active") revokeCodeExecutionContext(capability);
+        return { outcome, current };
+      } catch (error) {
+        const current = await this.#jobs.getForWorker(initial.jobId);
+        if (current?.execution.pendingAction !== null || isAuthorityErrorCode(error.code) || isFencingExecutorCode(error.code)) {
+          fatal = error;
+          revokeCodeExecutionContext(capability);
+          await this.#handleFailure(initial.jobId, error);
+        }
+        throw error;
+      }
+    };
+    const getState = async () => {
+      const state = await snapshot();
+      return { status: state.job.status, turn: state.job.execution.turn, remainingActions: Math.max(0, this.#maxTurns - state.job.execution.turn),
+        capabilities: state.context.capabilities, observation: state.context.observations.at(-1) ?? null,
+        sources: [...currentReads(state.job)].map(([sourcePath, observation]) => ({ path: sourcePath, sourceVersion: observation.actionId,
+          fullyRead: hasCompleteCodeRead(reads.get(sourcePath)?.context, { jobId: state.job.jobId, workspaceRevision,
+            actionId: observation.actionId, path: sourcePath, sha256: observation.detail?.result?.sha256 }) })) };
+    };
+    capability = createCodeExecutionContext({
+      getState,
+      performAction: async ({ decision: rawDecision }, options) => {
+        const decision = normalizeStructuredCodeActionDecision(rawDecision);
+        if (decision.action.type === "complete") throw workerError("CODE_EXECUTION_COMPLETE_NOT_ALLOWED", "Complete is a final decision, not a tool action");
+        await perform(decision, await snapshot(), options);
+        const current = await this.#jobs.getForWorker(initial.jobId);
+        return current?.status === "active" ? getState() : { status: current?.status ?? "missing" };
+      },
+      readSource: async ({ path: sourcePath, offset, length, sourceVersion }, options) => {
+        let state = await snapshot();
+        let entry = reads.get(sourcePath);
+        const audit = latestRead(state.job, sourcePath);
+        if (entry && entry.actionId !== audit?.actionId) {
+          entry.reader.revoke(); entry.reader.close(); reads.delete(sourcePath); entry = null;
+        }
+        if ((sourceVersion !== undefined && sourceVersion !== (entry?.actionId ?? audit?.actionId)) ||
+            (offset !== 0 && (!entry || sourceVersion !== entry.actionId))) {
+          throw workerError("CODE_READ_REVISION_INVALID", "Source pages must belong to the current audited read");
+        }
+        if (!entry) {
+          if (!audit) {
+            await perform({ action: { type: "read_text", path: sourcePath } }, state, options);
+            state = await snapshot();
+          }
+          const currentRead = latestRead(state.job, sourcePath);
+          if (!currentRead) throw workerError("CODE_READ_DOCUMENT_NOT_FOUND", "Controlled source read did not succeed");
+          const context = await this.#codeReadContext(state.job, { onlyPath: sourcePath });
+          if (context === null) throw workerError("CODE_ARTIFACT_READ_INVALID", "Continuous execution requires audited source reading");
+          entry = { context, reader: beginCodeReadSession(context, options), actionId: currentRead.actionId };
+          reads.set(sourcePath, entry);
+        }
+        const page = entry.reader.readDocument(sourcePath, offset, length);
+        entry.reader.commit();
+        return { ...page, sourceVersion: entry.actionId };
+      },
+      close: async () => {
+        const current = await this.#jobs.getForWorker(initial.jobId);
+        return { settled: Boolean(current) && current.status !== "unknown" && current.execution.actionAdmission === null };
+      },
+    });
+    const execute = async ({ instructions } = {}) => {
+      try {
+        const state = await snapshot();
+        const subject = initial.grant.subject;
+        const sessionKey = Number.isSafeInteger(subject?.number) && subject.number > 0
+          ? githubEntitySessionKey({ kind: initial.grant.inputBinding === null ? "issue" : "pull_request", repository: initial.grant.repository, number: subject.number }) : null;
+        const decision = await this.#brain.decide({ roleId: initial.grant.requestedBy.roleId,
+          ...state.context, codeExecutionContext: capability,
+          ...(sessionKey === null ? {} : { sessionKey }), ...(instructions === undefined ? {} : { instructions }),
+          ...(feedback === null ? {} : { reviewRepairFeedback: feedback }) },
+        { beforeGenerate: () => this.#verifyAuthority(initial.grant), brainDigest: initial.grant.brainDigest, signal: controller.signal });
+        await closeCodeExecutionContext(capability);
+        if (fatal) throw fatal;
+        const current = await this.#jobs.getForWorker(initial.jobId);
+        if (current?.status !== "active") return currentJobOutcome(initial.jobId, current);
+        if (decision.action?.type !== "complete") throw workerError("CODE_BRAIN_RESPONSE_INVALID", "Continuous turn must return a final completion decision");
+        const finalState = await snapshot();
+        for (const [sourcePath, latest] of currentReads(finalState.job)) {
+          const entry = reads.get(sourcePath);
+          if (!entry || entry.actionId !== latest.actionId) throw workerError("CODE_ARTIFACT_READ_INCOMPLETE", "Current audited source was not fully read");
+          entry.reader.assertComplete();
+        }
+        await assertFeedback();
+        return this.#continuousAction(finalState, decision, null);
+      } finally {
+        await closeCodeExecutionContext(capability);
+        closeReads();
+      }
+    };
+    this.#continuousControllers.set(initial.jobId, controller);
+    try {
+      return await (this.#taskRuns ? this.#taskRuns.run({ kind: "code-job", taskId: initial.jobId, roleId: initial.grant.requestedBy.roleId,
+        title: initial.grant.objective, subject: initial.grant.repository, revision: initial.revision }, execute,
+      { repeatOnInstruction: false, requireStopConfirmation: true }) : execute());
+    } finally {
+      if (this.#continuousControllers.get(initial.jobId) === controller) this.#continuousControllers.delete(initial.jobId);
+    }
   }
 
   async #readReviewRepairFeedback(job) {
@@ -1056,6 +1250,8 @@ export class CodeJobWorkerService {
       reconcileExisting = false,
       reconciled = null,
       acceptInterrupted = false,
+      continuous = false,
+      signal = null,
     } = {},
   ) {
     const pending = job.execution.pendingAction;
@@ -1098,6 +1294,7 @@ export class CodeJobWorkerService {
       result = current.result;
     } else {
       const admission = await this.#actionAdmission(async () => {
+        if (continuous) { currentTaskExecution()?.assertRunning?.(); signal?.throwIfAborted(); }
         const fresh = await this.#jobs.getForWorker(job.jobId);
         if (
           fresh?.status !== "active" ||
@@ -1123,6 +1320,9 @@ export class CodeJobWorkerService {
       }
       job = admission.job;
       const controller = new AbortController();
+      const onAbort = () => controller.abort();
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
       this.#cancellationControllers.set(job.jobId, controller);
       try {
         const admitted = await this.#jobs.getForWorker(job.jobId);
@@ -1155,6 +1355,7 @@ export class CodeJobWorkerService {
           ),
         );
       } finally {
+        signal?.removeEventListener("abort", onAbort);
         if (this.#cancellationControllers.get(job.jobId) === controller) {
           this.#cancellationControllers.delete(job.jobId);
         }

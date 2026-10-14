@@ -333,11 +333,12 @@ export class TaskRunRegistry {
     this.verifyStopped = verifyStopped;
   }
 
-  async run(input, operation, {repeatOnInstruction = true} = {}) {
+  async run(input, operation, {repeatOnInstruction = true, requireStopConfirmation = false} = {}) {
     const task = normalizeTask(input);
     if (typeof operation !== "function") throw new TypeError("operation must be a function");
     const run = await this.#queue.enqueue(() => this.#register(task));
     run.repeatOnInstruction = repeatOnInstruction;
+    run.requireStopConfirmation = requireStopConfirmation;
     try {
       let instructions = run.instructions;
       for (let round = 1; ; round += 1) {
@@ -356,6 +357,10 @@ export class TaskRunRegistry {
             return () => { if (current() && run.liveControl === control) run.liveControl = null; };
           },
           confirmStopped: () => { if (current()) run.stoppedConfirmed = true; },
+          assertRunning: () => {
+            if (!current()) throw registryError("TASK_RUN_NOT_ACTIVE", "任务运行已结束");
+            if (run.stopRequested) throw heldError(run.stopRequested);
+          },
         };
         try {
           try { result = await withTaskExecution(context, () => operation({ instructions: [...instructions] })); }
@@ -366,7 +371,7 @@ export class TaskRunRegistry {
             const state = await this.#readState();
             const current = findRecord(state, run.key);
             if (!current || current.mode === 'active') return;
-            if (error?.code === 'STRUCTURED_PROVIDER_REAP_FAILED' && !run.stoppedConfirmed) {
+            if ((error?.code === 'STRUCTURED_PROVIDER_REAP_FAILED' || run.requireStopConfirmation) && !run.stoppedConfirmed) {
               throw new TaskRunControlError('TASK_RUN_CONTROL_PENDING','停止尚未确认，等待维护核实',409,{cause:error});
             }
             await this.#checkpoint(run,round);
@@ -500,9 +505,10 @@ export class TaskRunRegistry {
       candidate.mode = command === "pause" ? "paused" : "cancelled";
       candidate.pendingCommand = command;
       candidate.phase = "waiting_checkpoint";
-      if (run?.repeatOnInstruction) candidate.stopUnconfirmed = true;
+      if (run?.repeatOnInstruction || run?.requireStopConfirmation) candidate.stopUnconfirmed = true;
     }
     const committed = await this.#writeRecord(state, candidate);
+    if (run && ['pause','cancel'].includes(command)) run.stopRequested = candidate.mode;
     if (run?.liveControl && command === 'instruct') {
       try {
         await run.liveControl.steer(input.instruction, `${run.runId}:${candidate.revision}`);
@@ -543,6 +549,9 @@ export class TaskRunRegistry {
     let state = await this.#readState();
     let current = findRecord(state, run.key);
     if (current && current.mode !== "active") {
+      if (run.requireStopConfirmation && !run.stoppedConfirmed) {
+        throw new TaskRunControlError('TASK_RUN_CONTROL_PENDING','停止尚未确认，等待执行器和原生进程收尾',409);
+      }
       let settled;
       try {
         if (current.stopUnconfirmed) {

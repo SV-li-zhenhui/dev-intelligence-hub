@@ -94,6 +94,32 @@ test('observing a controlled action never repeats the side effect for new instru
   finish.resolve();assert.equal(await operation,'executed');assert.equal(performed,1);
 });
 
+test('continuous code turns close admission at stop and retain holds until both owners confirm settlement', async (t) => {
+  for (const confirmed of [false, true]) await t.test(confirmed ? 'confirmed stop' : 'unconfirmed host action', async () => {
+    let settlements = 0, context;
+    const { registry } = fixture({ settleControl: async () => { settlements++; } });
+    const entered = deferred(), finish = deferred();
+    const running = registry.run(task({ kind: 'code-job' }), async () => {
+      context = currentTaskExecution();
+      context.registerLiveControl({ steer: async () => {}, interrupt: async () => {} });
+      context.assertRunning(); entered.resolve();
+      await finish.promise;
+      assert.throws(() => context.assertRunning(), { code: 'TASK_RUN_PAUSED' });
+      if (confirmed) context.confirmStopped();
+      return 'one turn';
+    }, { repeatOnInstruction: false, requireStopConfirmation: true });
+    await entered.promise;
+    const view = await registry.get('code-job', 'work-1');
+    await registry.control(view.kind, view.taskId, control(view, 'pause'));
+    const rejected = assert.rejects(running, { code: confirmed ? 'TASK_RUN_PAUSED' : 'TASK_RUN_CONTROL_PENDING' });
+    finish.resolve(); await rejected;
+    const held = (await registry.list()).held[0];
+    assert.equal(held.stopUnconfirmed, !confirmed);
+    assert.equal(settlements, confirmed ? 1 : 0);
+    if (!confirmed) { await registry.reconcile(); assert.equal(settlements, 0); }
+  });
+});
+
 test('pending cancellation is reconciled only after the executor confirms terminal state',async()=>{
   let confirmed=false;
   const {registry}=fixture({settleControl:async()=>confirmed?undefined:{pending:true}});

@@ -12,12 +12,14 @@ import { ReviewRepairContextReader } from "../src/services/review-repair-context
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { beginCodeReadSession, createCodeReadContext, describeCodeReadContext } from "../src/lib/code-read-context.js";
+import { beginCodeExecutionSession } from "../src/lib/code-execution-context.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
 import { CodeJobStore } from "../src/services/code-job-store.js";
 import { CodeJobBrainDirectory } from "../src/services/code-job-brain-directory.js";
 import { CodeJobWorkerService } from "../src/services/code-job-worker-service.js";
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { createTaskRunSettler } from '../src/services/work-ledger-run-control.js';
+import { currentTaskExecution } from '../src/lib/task-execution-context.js';
 import { assertPreparedWriteRead, bindTrustedAction, modelObservation, observationDetail, verificationFailure } from "../src/services/code-job-worker-policy.js";
 
 const REVISION_A = "a".repeat(64);
@@ -765,6 +767,198 @@ class FakeExecutor {
     };
   }
 }
+
+function continuousFixture(decide, { content = "\uFEFForiginal\n", maxTurns = 64, requiredProfiles = [] } = {}) {
+  const initial = currentReadJob([]);
+  initial.grant.requiredProfiles = requiredProfiles;
+  const jobs = new FakeJobStore([initial]);
+  const executor = new FakeExecutor(initial);
+  const perform = executor.perform.bind(executor);
+  const audited = new Map();
+  executor.perform = async (value, options) => {
+    const response = await perform(value, options);
+    if (value.action.type === "read_text") response.result = { path: value.action.path, content,
+      bytes: Buffer.byteLength(content), sha256: createHash("sha256").update(content).digest("hex") };
+    if (value.action.type === "write_text") content = value.action.content;
+    executor.last = response;
+    audited.set(value.action.actionId, structuredClone(response));
+    return response;
+  };
+  executor.getActionResult = async ({ actionId }) => structuredClone(audited.get(actionId));
+  let calls = 0;
+  const createWorker = () => new CodeJobWorkerService({ jobStore: jobs, executor, maxTurns,
+    brainDirectory: { describe: () => ({ supportsCodeExecution: true, supportsCodeReading: true }),
+      async decide(input, authorization) { calls++; await authorization.beforeGenerate(); return decide(input); } },
+    grantVerifier: verifier([]) });
+  return { initial, jobs, executor, get worker() { return createWorker(); }, calls: () => calls };
+}
+
+function continuousDecision(action) {
+  return { schemaVersion: 1, confidence: 100, summary: "Controlled development", reason: "Current evidence", action };
+}
+
+test("continuous tools require complete current pages and reject old source versions after writes", async () => {
+  const content = "\uFEFF" + "字\\\"".repeat(24_000) + "TAIL";
+  let actual = "";
+  const fixture = continuousFixture(async ({ codeExecutionContext }) => {
+    const tools = beginCodeExecutionSession(codeExecutionContext);
+    let page = await tools.invoke("read_source", { path: "src/app.js", offset: 0, length: 1_000 });
+    const oldVersion = page.sourceVersion;
+    assert.deepEqual((await tools.invoke("get_state", {})).sources, [{ path: "src/app.js", sourceVersion: oldVersion, fullyRead: false }]);
+    await assert.rejects(tools.invoke("perform_action", { decision: continuousDecision({ type: "write_text", path: "src/app.js", content: "fixed\n" }) }),
+      { code: "CODE_ARTIFACT_READ_INCOMPLETE" });
+    actual += page.text;
+    while (page.nextOffset !== null) {
+      page = await tools.invoke("read_source", { path: "src/app.js", offset: page.nextOffset, sourceVersion: page.sourceVersion });
+      actual += page.text;
+    }
+    assert.equal((await tools.invoke("get_state", {})).sources[0].fullyRead, true);
+    await tools.invoke("perform_action", { decision: continuousDecision({ type: "write_text", path: "src/app.js", content: "fixed\n" }) });
+    await assert.rejects(tools.invoke("read_source", { path: "src/app.js", offset: 1, sourceVersion: oldVersion }), { code: "CODE_READ_REVISION_INVALID" });
+    assert.equal((await tools.invoke("get_state", {})).turn, 2);
+    await tools.close();
+    return continuousDecision({ type: "complete", outcome: "fixed", evidence: [] });
+  }, { content });
+  const result = await fixture.worker.runCycle();
+  assert.equal(result.outcomes[0].status, "completed", JSON.stringify(result));
+  assert.equal(actual, content);
+  assert.equal(fixture.calls(), 1);
+  assert.deepEqual(fixture.executor.calls.filter(({ method }) => method === "perform").map(({ value }) => value.action.type), ["read_text", "write_text", "complete"]);
+});
+
+test("continuous final completion checks current required profiles and current full reads", async (t) => {
+  for (const missing of ["profile", "pages"]) await t.test(missing, async () => {
+    const fixture = continuousFixture(async ({ codeExecutionContext }) => {
+      const tools = beginCodeExecutionSession(codeExecutionContext);
+      if (missing === "pages") await tools.invoke("read_source", { path: "src/app.js", offset: 0, length: 1 });
+      await tools.close();
+      return continuousDecision({ type: "complete", outcome: "claimed complete", evidence: [] });
+    }, { requiredProfiles: missing === "profile" ? [{ id: "node-tests", configDigest: PROFILE_DIGEST }] : [] });
+    const result = await fixture.worker.runCycle();
+    assert.equal(result.outcomes[0].status, "paused", JSON.stringify(result));
+    assert.equal(result.outcomes[0].code, missing === "profile" ? "CODE_BRAIN_COMPLETION_NOT_READY" : "CODE_ARTIFACT_READ_INCOMPLETE");
+    assert.equal(fixture.executor.calls.some(({ method, value }) => method === "perform" && value.action.type === "complete"), false);
+  });
+});
+
+test("continuous code actions preserve action budget and sealed write scope", async (t) => {
+  for (const violation of ["budget", "scope"]) await t.test(violation, async () => {
+    const fixture = continuousFixture(async ({ codeExecutionContext }) => {
+      const tools = beginCodeExecutionSession(codeExecutionContext);
+      await tools.invoke("perform_action", { decision: continuousDecision({ type: "list_files", path: "" }) });
+      if (violation === "scope") await assert.rejects(tools.invoke("perform_action", {
+        decision: continuousDecision({ type: "write_text", path: "Other/app.js", content: "forbidden" }),
+      }), { code: "CODE_BRAIN_WRITE_NOT_PERMITTED" });
+      await tools.close();
+      return continuousDecision({ type: "complete", outcome: "complete", evidence: [] });
+    }, { maxTurns: violation === "budget" ? 1 : 64 });
+    const result = await fixture.worker.runCycle();
+    assert.equal(result.outcomes[0].status, violation === "budget" ? "failed" : "completed", JSON.stringify(result));
+    assert.equal(fixture.executor.calls.filter(({ method }) => method === "perform").some(({ value }) => value.action.path === "Other/app.js"), false);
+    if (violation === "budget") assert.equal(result.outcomes[0].code, "CODE_JOB_TURN_LIMIT");
+  });
+});
+
+test("continuous execution records an uncertain admitted action and never admits a later tool", async () => {
+  const fixture = continuousFixture(async ({ codeExecutionContext }) => {
+    const tools = beginCodeExecutionSession(codeExecutionContext);
+    await assert.rejects(tools.invoke("perform_action", { decision: continuousDecision({ type: "list_files", path: "" }) }),
+      { code: "CODE_JOB_ACTION_INTERRUPTED" });
+    await assert.rejects(tools.invoke("perform_action", { decision: continuousDecision({ type: "list_files", path: "src" }) }),
+      { code: "CODE_EXECUTION_SESSION_REVOKED" });
+    assert.deepEqual(await tools.close(), { settled: false });
+    return continuousDecision({ type: "complete", outcome: "unconfirmed", evidence: [] });
+  });
+  const perform = fixture.executor.perform.bind(fixture.executor);
+  fixture.executor.perform = async (...args) => {
+    await perform(...args);
+    throw Object.assign(new Error("lost response"), { code: "CODE_JOB_ACTION_INTERRUPTED" });
+  };
+  const result = await fixture.worker.runCycle();
+  const current = await fixture.jobs.getForWorker(fixture.initial.jobId);
+  assert.equal(result.outcomes[0].status, "unknown", JSON.stringify(result));
+  assert.equal(current.execution.actionAdmission !== null, true);
+  assert.equal(fixture.executor.calls.filter(({ method }) => method === "perform").length, 1);
+});
+
+test("continuous model failure after a settled write preserves audit and resumes without replaying it", async () => {
+  let tools;
+  const fixture = continuousFixture(async ({ codeExecutionContext }) => {
+    tools = beginCodeExecutionSession(codeExecutionContext);
+    await tools.invoke("read_source", { path: "src/app.js", offset: 0 });
+    await tools.invoke("perform_action", { decision: continuousDecision({ type: "write_text", path: "src/app.js", content: "fixed\n" }) });
+    throw Object.assign(new Error("model process ended"), { code: "STRUCTURED_PROVIDER_PROCESS_FAILED" });
+  });
+  const first = await fixture.worker.runCycle();
+  assert.equal(first.outcomes[0].status, "paused");
+  assert.equal((await fixture.jobs.getForWorker(fixture.initial.jobId)).execution.observations.at(-1).actionType, "write_text");
+  await assert.rejects(tools.invoke("get_state", {}), { code: "CODE_EXECUTION_SESSION_REVOKED" });
+  // Operator resumes the same paused job after the provider is repaired.
+  fixture.jobs.jobs.get(fixture.initial.jobId).status = "active";
+  // A fresh worker uses the same durable job and executor; only completion is left.
+  const resumed = new CodeJobWorkerService({ jobStore: fixture.jobs, executor: fixture.executor,
+    brainDirectory: { describe: () => ({ supportsCodeExecution: true, supportsCodeReading: true }),
+      decide: async () => continuousDecision({ type: "complete", outcome: "done", evidence: [] }) }, grantVerifier: verifier([]) });
+  assert.equal((await resumed.runCycle()).outcomes[0].status, "completed");
+  assert.equal(fixture.executor.calls.filter(({ method, value }) => method === "perform" && value.action.type === "write_text").length, 1);
+});
+
+test("continuous live pause waits for an admitted profile and prevents a second tool", async () => {
+  const { jobs, durableJob } = await createRealApprovedJob();
+  const executor = new FakeExecutor(durableJob);
+  const entered = deferred(), finish = deferred(), interrupted = deferred();
+  const perform = executor.perform.bind(executor);
+  executor.perform = async (...args) => { entered.resolve(); await finish.promise; return perform(...args); };
+  const settle = createTaskRunSettler({ codeJobReader: { get: id => jobs.getForWorker(id) },
+    codeJobControl: Object.fromEntries(['pause','cancel','resume'].map(name => [name, value => jobs[name](value)])) });
+  const registry = new TaskRunRegistry({ store: new IntegrationMemoryStore(), settleControl: settle });
+  let stopped = false;
+  const worker = new CodeJobWorkerService({ jobStore: jobs, executor, taskRuns: registry,
+    grantVerifier: { verify: async value => structuredClone(value) },
+    brainDirectory: { describe: () => ({ supportsCodeExecution: true, supportsCodeReading: true }),
+      async decide({ codeExecutionContext }) {
+        const tools = beginCodeExecutionSession(codeExecutionContext);
+        currentTaskExecution().registerLiveControl({ steer: async () => {}, interrupt: async () => { tools.revoke(); interrupted.resolve(); } });
+        const action = tools.invoke('perform_action', { decision: continuousDecision({ type: 'run_profile' }) });
+        await interrupted.promise;
+        await assert.rejects(tools.invoke('perform_action', { decision: continuousDecision({ type: 'list_files', path: '' }) }), { code: 'CODE_EXECUTION_SESSION_REVOKED' });
+        await assert.rejects(action, { code: 'TASK_RUN_PAUSED' });
+        assert.deepEqual(await tools.close(), { settled: true });
+        currentTaskExecution().confirmStopped(); stopped = true;
+        throw Object.assign(new Error('native turn interrupted'), { code: 'STRUCTURED_PROVIDER_CANCELLED' });
+      } } });
+  const cycle = worker.runCycle(); await entered.promise;
+  const view = await registry.get('code-job', durableJob.jobId);
+  await registry.control(view.kind, view.taskId, { runId: view.runId, expectedRevision: view.revision, command: 'pause' });
+  await interrupted.promise;
+  assert.equal(stopped, false);
+  assert.equal((await registry.get(view.kind, view.taskId)).stopUnconfirmed, true);
+  finish.resolve(); const result = await cycle;
+  assert.equal(result.outcomes[0].status, 'paused', JSON.stringify(result));
+  assert.equal((await jobs.getForWorker(durableJob.jobId)).execution.pendingAction, null);
+  assert.equal(executor.calls.filter(({ method }) => method === 'perform').length, 1);
+});
+
+test("continuous cancellation aborts reasoning without an active executor action", async () => {
+  const { jobs, durableJob } = await createRealApprovedJob();
+  const entered = deferred();
+  const executor = new FakeExecutor(durableJob);
+  const worker = new CodeJobWorkerService({ jobStore: jobs, executor,
+    grantVerifier: { verify: async value => structuredClone(value) },
+    brainDirectory: { describe: () => ({ supportsCodeExecution: true, supportsCodeReading: true }),
+      async decide(value, authorization) {
+        entered.resolve();
+        await new Promise((resolve, reject) => authorization.signal.addEventListener('abort', () => reject(
+          Object.assign(new Error('cancelled'), { code: 'STRUCTURED_PROVIDER_CANCELLED' })), { once: true }));
+      } } });
+  const cycle = worker.runCycle(); await entered.promise;
+  const current = await jobs.getForWorker(durableJob.jobId);
+  await jobs.cancel({ jobId: current.jobId, expectedRevision: current.revision, reason: 'cancel reasoning' });
+  assert.equal(worker.requestCancellation(current.jobId), true);
+  assert.equal((await cycle).outcomes[0].status, 'cancelling');
+  assert.equal(worker.requestCancellation(current.jobId), false);
+  assert.equal(executor.calls.some(({ method }) => method === 'perform'), false);
+});
 
 function brain(responses, calls = []) {
   return {

@@ -9,6 +9,7 @@ import { codeExecutionSourceWritablePaths } from "../domain/code-execution-sourc
 import { CodeExecutionPolicy } from "../domain/code-execution-policy.js";
 import { workProposalError } from "../domain/work-proposal-contract.js";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
+import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { createConfiguredCodeJobBrainDirectory } from "./code-job-brain-directory.js";
 import {
   createConfiguredConstructionCleanupOwner,
@@ -521,27 +522,31 @@ function requireTrackedRepository(configuration, repository) {
 
 function decisionAuthorization(value) {
   const keys = value && typeof value === "object" ? Reflect.ownKeys(value) : [];
+  const hasSignal = keys.includes("signal");
   if (
     !value ||
     Object.getPrototypeOf(value) !== Object.prototype ||
-    keys.length !== 2 ||
+    keys.length !== (hasSignal ? 3 : 2) ||
     !keys.includes("beforeGenerate") ||
     !keys.includes("brainDigest")
   ) {
     throw new TypeError("code brain authorization is invalid");
   }
   const brainDigest = Object.getOwnPropertyDescriptor(value, "brainDigest");
+  const signal = hasSignal ? Object.getOwnPropertyDescriptor(value, "signal") : null;
   if (
     !brainDigest?.enumerable ||
     !("value" in brainDigest) ||
     typeof brainDigest.value !== "string" ||
-    !/^[a-f0-9]{64}$/.test(brainDigest.value)
+    !/^[a-f0-9]{64}$/.test(brainDigest.value) ||
+    (hasSignal && (!signal?.enumerable || !("value" in signal)))
   ) {
     throw new TypeError("code brain authorization is invalid");
   }
   return {
     beforeGenerate: method(value, "beforeGenerate", "code brain authorization"),
     brainDigest: brainDigest.value,
+    ...(hasSignal ? { signal: normalizeAbortSignal(signal.value) } : {}),
   };
 }
 
@@ -924,7 +929,7 @@ export class VersionedCodeJobAuthority {
 
   async decide(value, authorization) {
     this.#assertOpen();
-    const { beforeGenerate, brainDigest } = decisionAuthorization(authorization);
+    const { beforeGenerate, brainDigest, signal } = decisionAuthorization(authorization);
     const roleId = decisionRoleId(value);
     const current = await this.#current();
     let context = current.brainDigests.get(roleId) === brainDigest
@@ -951,6 +956,7 @@ export class VersionedCodeJobAuthority {
       },
       brainDigest,
       admitGenerate: this.#actionAdmission,
+      ...(signal === undefined ? {} : { signal }),
     });
     this.#assertOpen();
     return result;
