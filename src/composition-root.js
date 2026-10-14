@@ -2490,6 +2490,7 @@ export async function createApplication({
       const dispatcher = workIntentDispatcherFactory({
         ledger: workLedgerRuntime,
         policy,
+        leaseDurationMs: coordinationConfig.leaseDurationMs,
         attentionProducer: attentionInboxRuntime.producer,
         proposalProducer: workProposalRuntime.producer,
         ...(automaticOwnPrRepair === null ? {} : { reviewRepairSourcePreparer: automaticOwnPrRepair }),

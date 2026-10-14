@@ -30,6 +30,10 @@ import {
   createPrTriageHandoff,
 } from "../src/composition-root.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
+import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { createWorkLedgerRuntime } from "../src/work-ledger-runtime.js";
+import { createLocalWorkLedgerCandidateProcessor } from
+  "../src/services/work-ledger-candidate-processor.js";
 import {
   KnownCliLocator,
   materializeVerifiedCliDescriptor,
@@ -2107,6 +2111,130 @@ test("work coordination normalizes omitted timing before composing the loop and 
     );
 
     await application.close();
+  }
+});
+
+test("composed intent dispatch honors configured leases and fences expired acknowledgements", async (t) => {
+  const cases = [
+    { name: "configured lease accommodates slow delivery", leaseDurationMs: 180_000, delayMs: 35_000, delivered: 1 },
+    { name: "omitted lease preserves the dispatcher default", delayMs: 35_000, delivered: 0 },
+    { name: "configured lease still expires", leaseDurationMs: 180_000, delayMs: 180_001, delivered: 0 },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async (t) => {
+      let now = Date.parse("2026-10-14T04:00:00.000Z");
+      const clock = () => new Date(now).toISOString();
+      const config = workCoordinationConfig({ externalActions: false });
+      if (scenario.leaseDurationMs === undefined) {
+        delete config.workCoordination.leaseDurationMs;
+      } else {
+        config.workCoordination.leaseDurationMs = scenario.leaseDurationMs;
+      }
+      const event = normalizeWorkflowEvent({
+        schemaVersion: 1,
+        eventType: "issue.created",
+        occurredAt: clock(),
+        source: { provider: "github", scopeId: "lease-regression" },
+        subject: { id: "github:issue:acme/repo#42", repository: "acme/repo", number: 42 },
+        payload: { title: "Clarify acceptance", state: "open" },
+      });
+      const assignment = {
+        sequence: 1,
+        assignment: {
+          assignmentId: "workflow-assignment-lease-regression",
+          eventId: event.eventId,
+          target: { type: "role", id: "requirements-analyst" },
+          reason: "requirements",
+          createdAt: clock(),
+        },
+        event,
+      };
+      const calls = {};
+      const stubs = localCoordinationStubs({ calls, closeCalls: [], runners: {} });
+      delete stubs.workIntentDispatcherFactory;
+      delete stubs.workIntentPolicyFactory;
+      let ledger;
+      let attentionCreates = 0;
+      const application = await createApplication({
+        config,
+        store: storedValues({}),
+        externalActions: false,
+        ...stubs,
+        workCoordinationDependencies: { clock },
+        workflowRoutingRuntimeFactory: async () => ({
+          async readAssignmentBatch({ afterSequence }) {
+            return {
+              items: afterSequence === 0 ? [assignment] : [],
+              nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1,
+            };
+          },
+          async close() {},
+        }),
+        workLedgerRuntimeFactory: async (options) => {
+          ledger = await createWorkLedgerRuntime({
+            ...options,
+            clock,
+            createCandidateProcessor: createLocalWorkLedgerCandidateProcessor,
+            createGuard: () => ({ ...inProcessExclusiveGuard(), async acquire() {} }),
+          });
+          return ledger;
+        },
+        attentionInboxRuntimeFactory: async () => ({
+          producer: {
+            async create() {
+              attentionCreates += 1;
+              now += scenario.delayMs;
+              return { requestId: "attention-lease-regression" };
+            },
+          },
+          consumer: { async readOutbox() {} },
+          browser: {
+            async next() {}, async answer() {}, async reject() {}, async later() {},
+            async listMaintenance() { return { items: [], total: 0 }; },
+          },
+          async close() {},
+        }),
+      });
+      t.after(() => application.close());
+      await ledger.intake();
+      const queued = (await ledger.listItems()).items[0];
+      const claimed = await ledger.claim({
+        itemId: queued.itemId, expectedRevision: queued.revision,
+        workerId: "employee-requirements-analyst", leaseDurationMs: 60_000,
+      });
+      await ledger.stageIntent({
+        itemId: claimed.itemId, expectedRevision: claimed.revision,
+        leaseId: claimed.leaseId, actorId: claimed.ownerId, roleId: "requirements-analyst",
+        intent: {
+          schemaVersion: 1, type: "ask_user", summary: "Clarify acceptance", reason: "Evidence is incomplete",
+          question: "Continue with this acceptance criterion?",
+          choices: [
+            { id: "yes", label: "Continue", description: "Keep the criterion" },
+            { id: "no", label: "Revise", description: "Revise the criterion" },
+          ],
+        },
+      });
+
+      const result = await calls.coordination.dispatcher.dispatchPending();
+
+      assert.equal(attentionCreates, 1);
+      assert.equal(result.delivered, scenario.delivered, JSON.stringify(result));
+      assert.equal(result.uncertain, 1 - scenario.delivered);
+      const persisted = (await ledger.listOutbox()).items[0];
+      assert.equal(persisted.status, scenario.delivered ? "delivered" : "dispatching");
+      const item = await ledger.readItemForReconciliation({ itemId: queued.itemId });
+      assert.equal(item.status, scenario.delivered ? "waiting_user" : "dispatch_pending");
+      if (scenario.delivered) {
+        assert.equal((await calls.coordination.dispatcher.dispatchPending()).scanned, 0);
+        assert.equal(attentionCreates, 1);
+      } else {
+        assert.equal(result.items[0].code, "ack-result-uncertain");
+        assert.equal(
+          Date.parse(persisted.dispatchLeaseUntil) - Date.parse("2026-10-14T04:00:00.000Z"),
+          scenario.leaseDurationMs ?? 30_000,
+        );
+      }
+    });
   }
 });
 
