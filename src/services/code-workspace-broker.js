@@ -73,7 +73,8 @@ function decodeText(value) {
     throw new CodeExecutionError("TEXT_REQUIRED", "只能读取或写入纯文本文件");
   }
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(value);
+    // Keep a BOM in the content so UTF-8 round trips match the audited bytes.
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(value);
   } catch {
     throw new CodeExecutionError("TEXT_REQUIRED", "只能读取或写入纯文本文件");
   }

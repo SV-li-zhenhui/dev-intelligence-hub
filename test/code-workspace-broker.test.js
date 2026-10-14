@@ -341,6 +341,58 @@ test("a sanitized copy supports bounded edits and reports changes without touchi
   await assert.rejects(access(path.join(sourceRoot, "docs", "notes.md")));
 });
 
+test("UTF-8 BOM reads preserve content bytes and hash through an unchanged write", async (t) => {
+  const original = Buffer.from("\ufeff// 采集上下文\r\nexport const value = 1;\r\n", "utf8");
+  const { broker, sourceRoot } = await fixture(t, {
+    files: { "src/app.js": original },
+  });
+  const execution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "bom-run",
+  });
+  const current = await broker.readFile({ ...execution, path: "src/app.js" });
+
+  assert.equal(current.content, original.toString("utf8"));
+  assert.equal(Buffer.byteLength(current.content, "utf8"), current.bytes);
+  assert.equal(current.bytes, original.length);
+  assert.equal(current.sha256, createHash("sha256").update(original).digest("hex"));
+
+  const written = await broker.writeFile({
+    ...execution,
+    path: "src/app.js",
+    content: current.content,
+    expectedSha256: current.sha256,
+    expectedWorkspaceRevision: execution.workspaceRevision,
+  });
+  assert.equal(written.workspaceRevision, execution.workspaceRevision);
+  assert.deepEqual(
+    await readFile(path.join(await broker.getSandboxWorkspacePath(execution), "src", "app.js")),
+    original,
+  );
+  assert.deepEqual(await readFile(path.join(sourceRoot, "src", "app.js")), original);
+  const manifest = await broker.getChangeManifest(execution);
+  assert.deepEqual(manifest.modified, []);
+});
+
+test("text reads still reject malformed UTF-8 and NUL bytes after a BOM", async (t) => {
+  const { broker } = await fixture(t, {
+    files: {
+      "src/invalid.cpp": Buffer.from([0xef, 0xbb, 0xbf, 0xc3, 0x28]),
+      "src/binary.cpp": Buffer.from([0xef, 0xbb, 0xbf, 0x61, 0x00, 0x62]),
+    },
+  });
+  const execution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "invalid-text-run",
+  });
+  for (const file of ["src/invalid.cpp", "src/binary.cpp"]) {
+    await assert.rejects(
+      broker.readFile({ ...execution, path: file }),
+      (error) => error.code === "TEXT_REQUIRED",
+    );
+  }
+});
+
 test("a PR-bound execution materializes only its sealed Git Head and echoes a detached binding", async (t) => {
   const boundaryDigest = "f".repeat(64);
   const snapshotter = fixedSnapshotter({
