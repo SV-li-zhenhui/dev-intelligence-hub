@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import http from "node:http";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -8343,6 +8344,111 @@ test("a bounded shutdown timeout retains the application and writer lease fail-c
   await assert.rejects(server.shutdown(), { code: "LIFECYCLE_DRAIN_TIMEOUT" });
   assert.equal(applicationCloses, 0);
   assert.equal(leaseCloses, 0);
+});
+
+test("shutdown closes browser preconnections that have not sent an HTTP request", async () => {
+  const events = [];
+  const application = startupApplication({
+    async close() { events.push("application-close"); },
+  });
+  const server = createDashboardServer(application, {
+    backgroundWork: { async stop() { events.push("background-stop"); } },
+    writerLease: {
+      async acquire() {},
+      async close() { events.push("lease-close"); },
+    },
+    shutdownDrainTimeoutMs: 250,
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const accepted = new Promise((resolve) => server.once("connection", resolve));
+  const client = net.createConnection({ host: "127.0.0.1", port: server.address().port });
+  const connected = new Promise((resolve, reject) => {
+    client.once("connect", resolve);
+    client.once("error", reject);
+  });
+  await Promise.all([accepted, connected]);
+  try {
+    assert.equal(client.bytesWritten, 0);
+    await server.shutdown();
+    assert.deepEqual(events, ["background-stop", "application-close", "lease-close"]);
+  } finally {
+    client.destroy();
+    await server.shutdown().catch(() => {});
+  }
+});
+
+test("shutdown waits for an accepted POST instead of treating it as a browser preconnection", async () => {
+  const started = deferred();
+  const release = deferred();
+  const events = [];
+  const application = startupApplication({
+    async refresh() { started.resolve(); return release.promise; },
+    async close() { events.push("application-close"); },
+  });
+  application.config.port = 4173;
+  const server = createDashboardServer(application, {
+    writerLease: {
+      async acquire() {},
+      async close() { events.push("lease-close"); },
+    },
+    shutdownDrainTimeoutMs: 1_000,
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  let socket;
+  server.once("request", (incoming) => { socket = incoming.socket; });
+  const pending = request(server, {
+    method: "POST", path: "/api/refresh",
+    headers: { origin: "http://127.0.0.1:4173", "x-mydashboard-action": "1", connection: "close" },
+  });
+  await started.promise;
+  const stopping = server.shutdown();
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(socket.destroyed, false);
+    assert.deepEqual(events, []);
+    release.resolve(healthyRefreshResult());
+    assert.equal((await pending).status, 200);
+    await stopping;
+    assert.deepEqual(events, ["application-close", "lease-close"]);
+  } finally {
+    release.resolve(healthyRefreshResult());
+    await pending.catch(() => {});
+    await stopping.catch(() => {});
+  }
+});
+
+test("an unfinished POST keeps shutdown and the writer lease fail-closed", async () => {
+  const started = deferred();
+  const release = deferred();
+  const events = [];
+  const application = startupApplication({
+    async refresh() { started.resolve(); return release.promise; },
+    async close() { events.push("application-close"); },
+  });
+  application.config.port = 4173;
+  const server = createDashboardServer(application, {
+    writerLease: {
+      async acquire() {},
+      async close() { events.push("lease-close"); },
+    },
+    shutdownDrainTimeoutMs: 100,
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  let socket;
+  server.once("request", (incoming) => { socket = incoming.socket; });
+  const pending = request(server, {
+    method: "POST", path: "/api/refresh",
+    headers: { origin: "http://127.0.0.1:4173", "x-mydashboard-action": "1", connection: "close" },
+  });
+  await started.promise;
+  try {
+    await assert.rejects(server.shutdown(), { code: "LIFECYCLE_DRAIN_TIMEOUT" });
+    assert.equal(socket.destroyed, false);
+    assert.deepEqual(events, []);
+  } finally {
+    release.resolve(healthyRefreshResult());
+    await pending;
+  }
 });
 
 test("the writer lease excludes restore before recovery has opened a listener", async () => {

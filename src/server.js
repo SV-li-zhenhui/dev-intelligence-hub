@@ -2470,6 +2470,19 @@ function attachServerLifecycle(
 ) {
   const closeServer = server.close.bind(server);
   let shutdownPromise = null;
+  let httpClosing = false;
+  const unusedConnections = new Set();
+  server.on("connection", (socket) => {
+    if (httpClosing) {
+      socket.destroy();
+      return;
+    }
+    unusedConnections.add(socket);
+    socket.once("close", () => unusedConnections.delete(socket));
+  });
+  server.prependListener("request", (request) => {
+    unusedConnections.delete(request.socket);
+  });
 
   async function performShutdown() {
     const deadline = Date.now() + shutdownDrainTimeoutMs;
@@ -2477,7 +2490,12 @@ function attachServerLifecycle(
     const stoppingBackground = backgroundWork?.stop
       ? runLifecycleStep(() => backgroundWork.stop({ signal: controller.signal }))
       : Promise.resolve();
+    httpClosing = true;
     const closingHttp = closeHttpServer(closeServer);
+    // Browser preconnections never enter an HTTP handler, so server.close()
+    // cannot drain them. Connections that have served a request retain the
+    // normal drain and failure barrier, including unfinished write actions.
+    for (const socket of unusedConnections) socket.destroy();
     const serviceResults = await settleBeforeDeadline(
       [stoppingBackground, closingHttp],
       deadline,
