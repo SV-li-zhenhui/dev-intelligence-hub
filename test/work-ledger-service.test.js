@@ -92,6 +92,8 @@ import {
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { createOwnerIssueEvent } from "../src/domain/owner-work-request.js";
 import { createWorkIntentDispatchBinding } from "../src/domain/work-intent-dispatch-binding.js";
+import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
+import { WorkIntentDispatcher } from "../src/services/work-intent-dispatcher.js";
 import {
   createPullRequestExecutionBinding,
 } from "../src/domain/pull-request-execution-binding.js";
@@ -13798,6 +13800,159 @@ function authoredReviewRepairAssignment(sequence, overrides = {}) {
   record.assignment.reason = "authored-pr-self-fix";
   return record;
 }
+
+async function contractedInspectionFixture({ automatic = false } = {}) {
+  const record = automatic
+    ? prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })
+    : ownerRequestedPrAssignment(1);
+  if (!automatic) record.assignment.target = { type: "role", id: "orchestrator" };
+  const fixture = await createFixture({ records: [record] });
+  await fixture.service.intake();
+  const root = (await fixture.service.listItems()).items[0];
+  const command = prGraphChildCommand(
+    root,
+    (await fixture.service.getSummary()).revision,
+    "inspect-and-verify",
+  );
+  command.command.acceptanceContract.expectedDeliverables = [
+    { deliverableId: "implementation", kind: "change-package", description: "必要修改", required: false },
+    { deliverableId: "verification", kind: "test-report", description: "受控验证", required: true },
+  ];
+  const child = await fixture.service.createGraphChild(command);
+  const proposals = [];
+  const dispatcher = new WorkIntentDispatcher({
+    ledger: fixture.service,
+    policy: createWorkIntentPolicy({
+      version: 1,
+      capabilityRoles: { development: "developer" },
+      codeActionRoles: ["developer"],
+      workspaceByRepository: { "acme/repo": "dashboard" },
+    }),
+    attentionProducer: { async create() { throw new Error("unexpected attention"); } },
+    proposalProducer: {
+      async create(value) {
+        const proposal = normalizeBoundWorkProposal(value);
+        proposals.push(proposal);
+        return { proposalId: proposal.proposalId, contentDigest: proposal.contentDigest,
+          kind: proposal.kind, status: "pending_delivery", revision: 1, createdAt: fixture.time.clock() };
+      },
+    },
+    clock: fixture.time.clock,
+  });
+  async function dispatch(operation) {
+    const current = await fixture.service.readItemForReconciliation({ itemId: child.taskId });
+    const claimed = await fixture.service.claim({
+      itemId: current.itemId, expectedRevision: current.revision,
+      workerId: "employee-developer", leaseDurationMs: 30_000,
+    });
+    await fixture.service.stageIntent({
+      itemId: claimed.itemId, expectedRevision: claimed.revision,
+      leaseId: claimed.leaseId, actorId: "employee-developer", roleId: "developer",
+      intent: codeActionIntent({ operation }),
+    });
+    assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+    return proposals.at(-1);
+  }
+  return { ...fixture, childId: child.taskId, dispatch };
+}
+
+test("contracted PR child inspection requeues for authoritative verification", async () => {
+  const fixture = await contractedInspectionFixture();
+  const original = await fixture.service.readItemForReconciliation({ itemId: fixture.childId });
+  const proposal = await fixture.dispatch("inspect");
+  assert.equal(Object.hasOwn(proposal.binding, "evidenceTarget"), false);
+  const result = createWorkProposalResult({
+    proposal, sequence: 1,
+    transition: { status: "succeeded", summary: "只读检查完成，仍需验证", evidence: ["inspection-audit"] },
+    downstreamRef: "inspection-confirmation", at: fixture.time.clock(),
+  });
+  await fixture.service.applyProposalBatch({
+    items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1,
+  });
+  const queued = await fixture.service.readItemForReconciliation({ itemId: fixture.childId });
+  assert.equal(queued.status, "queued");
+  assert.equal(queued.activeIntentId, null);
+  assert.deepEqual(queued.graph, original.graph);
+  assert.deepEqual(currentWorkItemInputBinding(queued), currentWorkItemInputBinding(original));
+  assert.equal(queued.decisionContext.referenceId, proposal.proposalId);
+  assert.equal(queued.decisionContext.value.resultDigest, result.contentDigest);
+  assert.deepEqual(queued.decisionContext.value.evidence, result.evidence);
+
+  const verification = await fixture.dispatch("verify");
+  assert.deepEqual(verification.binding.inputBinding, proposal.binding.inputBinding);
+  assert.deepEqual(verification.binding.evidenceTarget, createDeliveryEvidenceTarget({
+    taskId: fixture.childId, roleId: "developer",
+    acceptanceContract: queued.graph.acceptanceContracts.at(-1), deliverableId: "verification",
+  }));
+});
+
+test("contracted PR child inspection failures and stale outcomes stay blocked", async (t) => {
+  for (const outcome of ["failed", "stale"]) {
+    await t.test(outcome, async () => {
+      const fixture = await contractedInspectionFixture();
+      const proposal = await fixture.dispatch("inspect");
+      const result = createWorkProposalResult({
+        proposal, sequence: 1,
+        transition: { status: outcome, summary: `Inspection ${outcome}`, evidence: [] },
+        downstreamRef: "inspection-confirmation", at: fixture.time.clock(),
+      });
+      await fixture.service.applyProposalBatch({
+        items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1,
+      });
+      const item = await fixture.service.readItemForReconciliation({ itemId: fixture.childId });
+      assert.equal(item.status, "blocked");
+      assert.equal(item.statusReason, `proposal_${outcome}`);
+      assert.deepEqual(item.graph.deliveries, []);
+    });
+  }
+});
+
+test("contracted PR child inspection settles without reviving a pending newer Head", async () => {
+  const fixture = await contractedInspectionFixture({ automatic: true });
+  const proposal = await fixture.dispatch("inspect");
+  const updated = prAssignment(2, {
+    occurredAt: "2026-08-02T01:15:00.000Z",
+    headRefOid: PR_HEAD_B,
+    gitFacts: prGitFacts(PR_HEAD_B),
+    previousHeadRefOid: PR_HEAD_A,
+    changedFields: ["headRefOid"],
+  });
+  fixture.source.records.push(updated);
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  const root = (await fixture.service.listItems()).items.find((item) => item.kind === "source_root");
+  assert.notEqual(root.source.pendingRevision, null);
+  const result = createWorkProposalResult({
+    proposal, sequence: 1,
+    transition: { status: "succeeded", summary: "旧 Head 检查完成", evidence: ["inspection-audit"] },
+    downstreamRef: "inspection-confirmation", at: fixture.time.clock(),
+  });
+
+  await fixture.service.applyProposalBatch({
+    items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1,
+  });
+
+  const item = await fixture.service.readItemForReconciliation({ itemId: fixture.childId });
+  assert.equal(item.status, "blocked");
+  assert.equal(item.statusReason, "proposal_source_stale");
+  assert.equal(item.activeIntentId, null);
+  assert.deepEqual(item.graph.deliveries, []);
+  assert.equal(item.decisionContext.referenceId, proposal.proposalId);
+
+  const pending = await fixture.service.readItemForReconciliation({ itemId: root.itemId });
+  const activated = await fixture.service.reconcilePullRequestSource({
+    itemId: pending.itemId, expectedRevision: pending.revision,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    expectedPendingRevision: pending.source.pendingRevision,
+  });
+  assert.equal(activated.applied, true);
+  const current = await fixture.service.readItemForReconciliation({ itemId: root.itemId });
+  assert.equal(current.source.pendingRevision, null);
+  assert.equal(current.source.current.headRefOid, PR_HEAD_B);
+  const oldChild = await fixture.service.readItemForReconciliation({ itemId: fixture.childId });
+  assert.notEqual(oldChild.status, "queued");
+  assert.deepEqual(oldChild.graph.deliveries, []);
+});
 
 test("own PR review repair continues after successful inspection without a graph evidence target", async () => {
   const fixture = await createFixture({

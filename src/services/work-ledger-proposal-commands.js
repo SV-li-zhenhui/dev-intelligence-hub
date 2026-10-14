@@ -15,6 +15,7 @@ import {
 import {
   currentWorkItemExecutionBinding,
   currentWorkItemEvent,
+  pullRequestHeadAdmission,
   LEGACY_PR_SOURCE_CUTOVER_REASON,
   LEGACY_PR_SOURCE_QUARANTINE_KIND,
 } from "./work-ledger-pr-source.js";
@@ -85,6 +86,40 @@ function continuesOwnPullRequestRepairInspection(item, outbox, result) {
     );
   } catch {
     return false;
+  }
+}
+
+function contractedPullRequestInspectionStatus(state, item, outbox, result) {
+  const boundIntent = outbox.dispatchBinding?.boundIntent;
+  const contract = item.graph?.acceptanceContracts?.at(-1);
+  if (
+    item.kind !== "graph_task" ||
+    typeof item.graph?.parentItemId !== "string" ||
+    !(contract?.expectedDeliverables?.length > 0) ||
+    result.kind !== "code_action_proposal" ||
+    item.currentTarget?.type !== "role" ||
+    item.currentTarget.id !== result.requestedBy.roleId ||
+    outbox.sourceBinding?.kind !== "pull_request" ||
+    outbox.intent.operation !== "inspect" ||
+    boundIntent?.payload?.operation !== "inspect"
+  ) {
+    return null;
+  }
+  const admission = pullRequestHeadAdmission(state, item);
+  if (!admission.applies || !admission.current || admission.pending) {
+    return "blocked";
+  }
+  const current = currentWorkItemExecutionBinding(item);
+  if (!samePullRequestSourceBinding(current, outbox.sourceBinding)) {
+    return "blocked";
+  }
+  try {
+    return current?.schemaVersion === 2 && samePullRequestExecutionBinding(
+      current,
+      boundIntent.binding.inputBinding,
+    ) ? "queued" : "blocked";
+  } catch {
+    return "blocked";
   }
 }
 
@@ -427,24 +462,34 @@ export function planProposalBatchApplication({ state, input, clock }) {
       "intentId",
       outboxResult,
     );
+    const inspectionStatus = succeeded
+      ? contractedPullRequestInspectionStatus(workingState, item, outbox, result)
+      : null;
     const continueForEvidence = succeeded && (
       evidenceTarget !== null ||
+      inspectionStatus === "queued" ||
       // Inspection must return to the developer's repair decision.
       continuesOwnPullRequestRepairInspection(item, outbox, result)
     );
     let nextStatus = "blocked";
     if (succeeded) {
-      nextStatus = continueForEvidence ? "queued" : "completed";
+      nextStatus = continueForEvidence
+        ? "queued"
+        : inspectionStatus ?? "completed";
     }
     const sealedByLegacyCutover = isWorkItemInLegacyPullRequestCutover(item);
+    let reason = `proposal_${result.outcome}`;
+    if (sealedByLegacyCutover) {
+      reason = LEGACY_PR_SOURCE_CUTOVER_REASON;
+    } else if (continueForEvidence) {
+      reason = "proposal_evidence_ready";
+    } else if (inspectionStatus === "blocked") {
+      reason = "proposal_source_stale";
+    }
     const itemResult = moveWorkItem(item, {
       status: sealedByLegacyCutover ? "blocked" : nextStatus,
       now,
-      reason: sealedByLegacyCutover
-        ? LEGACY_PR_SOURCE_CUTOVER_REASON
-        : continueForEvidence
-          ? "proposal_evidence_ready"
-          : `proposal_${result.outcome}`,
+      reason,
       activeIntentId: null,
       decisionContext,
     });

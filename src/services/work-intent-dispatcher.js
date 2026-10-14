@@ -463,6 +463,14 @@ function evidenceTargetFor(item, requester, intent) {
   ].includes(intent.type)) {
     return null;
   }
+  if (
+    intent.type === "propose_code_action" &&
+    intent.operation === "inspect" &&
+    intent.deliverableId === undefined &&
+    currentWorkItemInputBinding(item) !== null
+  ) {
+    return null;
+  }
   const contract = item?.graph?.acceptanceContracts?.at(-1);
   if (
     contract === undefined ||

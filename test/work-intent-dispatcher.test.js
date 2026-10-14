@@ -1036,6 +1036,61 @@ test("proposal authority auto-selects the sole action-compatible deliverable", a
   ]);
 });
 
+test("a contracted PR child can inspect without claiming its final delivery", async () => {
+  const pair = workPair(6, codeIntent({ operation: "inspect" }), {
+    target: { type: "role", id: "developer" },
+  });
+  const sourceBinding = {
+    ...currentWorkItemInputBinding(pair.item),
+    rootItemId: "work-item-orchestrator-root",
+  };
+  pair.item.kind = "graph_task";
+  pair.item.source = null;
+  pair.item.assignment.graphTask = { sourceBinding };
+  const acceptanceContract = {
+    revision: 3,
+    acceptanceCriteria: [
+      { criterionId: "verified", description: "检查后提供权威验证证据" },
+    ],
+    expectedDeliverables: [
+      {
+        deliverableId: "implementation",
+        kind: "change-package",
+        description: "必要修改的受控变更包",
+        required: false,
+      },
+      {
+        deliverableId: "verification",
+        kind: "test-report",
+        description: "受控测试报告",
+        required: true,
+      },
+    ],
+  };
+  attachChildContract(pair, acceptanceContract);
+  const originalGraph = clone(pair.item.graph);
+  const { dispatcher, ledger, proposals } = fixture([pair]);
+
+  const result = await dispatcher.dispatchPending();
+
+  assert.equal(result.delivered, 1);
+  assert.equal(result.blocked, 0);
+  assert.equal(proposals.calls.length, 1);
+  const proposal = proposals.calls[0];
+  assert.equal(proposal.payload.operation, "inspect");
+  assert.deepEqual(
+    proposal.binding.inputBinding,
+    createPullRequestExecutionBinding({ sourceBinding, event: pair.item.event }),
+  );
+  assert.equal(Object.hasOwn(proposal.binding, "evidenceTarget"), false);
+  assert.equal(
+    Object.hasOwn(ledger.bindCalls[0].boundIntent.binding, "evidenceTarget"),
+    false,
+  );
+  assert.equal(ledger.items[0].status, "waiting_external");
+  assert.deepEqual(ledger.items[0].graph, originalGraph);
+});
+
 test("a structured role decision reaches dispatcher action-compatible selection", async () => {
   const acceptanceContract = {
     revision: 3,
@@ -1158,7 +1213,13 @@ test("proposal enqueue rejects action-incompatible authoritative delivery", asyn
     {
       name: "inspect cannot create authoritative evidence",
       roleId: "developer",
+      intent: codeIntent({ operation: "inspect", deliverableId: "verification" }),
+    },
+    {
+      name: "contracted inspect without a PR binding retains its existing rejection",
+      roleId: "developer",
       intent: codeIntent({ operation: "inspect" }),
+      withoutPrSource: true,
     },
   ];
   for (const [index, entry] of cases.entries()) {
@@ -1167,6 +1228,11 @@ test("proposal enqueue rejects action-incompatible authoritative delivery", asyn
         target: { type: "role", id: entry.roleId },
       });
       attachChildContract(pair, acceptanceContract);
+      if (entry.withoutPrSource) {
+        pair.item.kind = "graph_task";
+        pair.item.source = null;
+        pair.item.assignment.graphTask = { sourceBinding: null };
+      }
       const { dispatcher, ledger, proposals } = fixture([pair]);
 
       const result = await dispatcher.dispatchPending();
