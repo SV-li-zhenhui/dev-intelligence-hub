@@ -40,7 +40,9 @@ import {
 import {
   boundedWorkflowString,
   cloneWorkflowValue,
+  hasExactWorkflowKeys,
   identifiedWorkflowRecord,
+  isPlainWorkflowObject,
   normalizeWorkflowTimestamp,
   workflowDigest,
   workflowServiceError,
@@ -65,6 +67,29 @@ function validateLimit(value, maximum, name) {
     throw new TypeError(`${name} is invalid`);
   }
   return value;
+}
+
+function isContentVersion(value) {
+  return (
+    isPlainWorkflowObject(value) &&
+    Reflect.ownKeys(value).length === 0 &&
+    Object.isFrozen(value)
+  );
+}
+
+function normalizeVersionedRead(result, expectedVersion) {
+  const expectedKeys = result?.changed === true
+    ? ["changed", "version", "value"]
+    : ["changed", "version"];
+  if (
+    !hasExactWorkflowKeys(result, expectedKeys) ||
+    !isContentVersion(result.version) ||
+    (result.changed !== true && result.changed !== false) ||
+    (result.changed === false && result.version !== expectedVersion)
+  ) {
+    throw new TypeError("StateStore versioned read result is invalid");
+  }
+  return result;
 }
 
 export class WorkflowRoutingService {
@@ -135,6 +160,7 @@ export class WorkflowRoutingService {
       issueActiveWindowDays,
     });
     this.state = emptyWorkflowState();
+    this.durableContentVersion = undefined;
     this.ready = false;
     this.recoveryPromise = null;
   }
@@ -520,7 +546,15 @@ export class WorkflowRoutingService {
       );
     }
     try {
-      await this.store.write(WORKFLOW_STATE_KEY, normalized);
+      const writtenVersion = await this.store.write(
+        WORKFLOW_STATE_KEY,
+        normalized,
+      );
+      this.durableContentVersion =
+        typeof this.store.readVersioned === "function" &&
+        isContentVersion(writtenVersion)
+          ? writtenVersion
+          : undefined;
     } catch {
       throw workflowServiceError(
         "WORKFLOW_STATE_WRITE_FAILED",
@@ -532,7 +566,21 @@ export class WorkflowRoutingService {
   }
 
   async #readDurableState() {
-    const stored = await this.store.read(WORKFLOW_STATE_KEY, null);
+    let stored;
+    let observedVersion;
+    if (typeof this.store.readVersioned === "function") {
+      const result = normalizeVersionedRead(
+        await this.store.readVersioned(WORKFLOW_STATE_KEY, null, {
+          ifVersion: this.durableContentVersion,
+        }),
+        this.durableContentVersion,
+      );
+      if (!result.changed) return this.state;
+      stored = result.value;
+      observedVersion = result.version;
+    } else {
+      stored = await this.store.read(WORKFLOW_STATE_KEY, null);
+    }
     if (stored === null) {
       if (this.ready && this.state.revision !== 0) {
         throw workflowServiceError(
@@ -541,6 +589,7 @@ export class WorkflowRoutingService {
           503,
         );
       }
+      this.durableContentVersion = observedVersion;
       return emptyWorkflowState();
     }
     const legacy = isLegacyWorkflowPersistedState(stored);
@@ -584,7 +633,15 @@ export class WorkflowRoutingService {
         );
       }
       try {
-        await this.store.write(WORKFLOW_STATE_KEY, normalized);
+        const writtenVersion = await this.store.write(
+          WORKFLOW_STATE_KEY,
+          normalized,
+        );
+        observedVersion =
+          typeof this.store.readVersioned === "function" &&
+          isContentVersion(writtenVersion)
+            ? writtenVersion
+            : undefined;
       } catch {
         throw workflowServiceError(
           "WORKFLOW_STATE_WRITE_FAILED",
@@ -594,6 +651,7 @@ export class WorkflowRoutingService {
       }
       durable = normalized;
     }
+    this.durableContentVersion = observedVersion;
     return durable;
   }
 

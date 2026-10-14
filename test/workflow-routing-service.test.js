@@ -106,6 +106,34 @@ class MemoryStore {
   }
 }
 
+class ContentVersionMemoryStore extends MemoryStore {
+  constructor(entries = {}) {
+    super(entries);
+    this.versions = new Map();
+    this.valueReads = 0;
+  }
+
+  async readVersioned(name, fallback = null, { ifVersion } = {}) {
+    if (!this.versions.has(name)) this.versions.set(name, Object.freeze({}));
+    const version = this.versions.get(name);
+    if (ifVersion === version) return { changed: false, version };
+    this.valueReads += 1;
+    return { changed: true, version, value: await super.read(name, fallback) };
+  }
+
+  async write(name, value) {
+    await super.write(name, value);
+    const version = Object.freeze({});
+    this.versions.set(name, version);
+    return version;
+  }
+
+  replaceStored(name, value) {
+    super.replaceStored(name, value);
+    this.versions.set(name, Object.freeze({}));
+  }
+}
+
 class StubRouter {
   constructor(route = defaultRoute) {
     this.routeResult = route;
@@ -341,6 +369,135 @@ function assertPage(page) {
     true,
   );
 }
+
+test("versioned routing reads reuse validated state after committed writes", async () => {
+  const store = new ContentVersionMemoryStore();
+  const { service } = await createFixture({ store });
+  await configure(service);
+  const ingested = await service.ingest({ event: workflowEvent() });
+  const valueReads = store.valueReads;
+  const writes = store.writes.length;
+  store.read = async () => { throw new Error("unversioned read is forbidden"); };
+
+  const first = await service.readAssignmentBatch({ afterSequence: 0, limit: 100 });
+  const second = await service.readAssignmentBatch({ afterSequence: 1, limit: 100 });
+
+  assert.equal(first.items[0].assignment.assignmentId, ingested.assignments[0].assignmentId);
+  first.items[0].assignment.target.id = "mutated-projection";
+  assert.equal((await service.readAssignmentBatch({ afterSequence: 0, limit: 100 }))
+    .items[0].assignment.target.id, "pr-reviewer");
+  assert.equal(second.items.length, 0);
+  assert.equal(store.valueReads, valueReads);
+  assert.equal(store.writes.length, writes);
+});
+
+test("versioned routing reads observe another writer before reusing state", async () => {
+  const store = new ContentVersionMemoryStore();
+  const { service } = await createFixture({ store });
+  await configure(service);
+  const { service: writer } = await createFixture({ store });
+  const ingested = await writer.ingest({ event: workflowEvent() });
+  const valueReads = store.valueReads;
+
+  const batch = await service.readAssignmentBatch({ afterSequence: 0, limit: 100 });
+  await service.readAssignmentBatch({ afterSequence: 0, limit: 100 });
+
+  assert.equal(batch.items[0].assignment.assignmentId, ingested.assignments[0].assignmentId);
+  assert.equal(store.valueReads, valueReads + 1);
+});
+
+test("versioned routing reads keep rejecting changed invalid or conflicting content", async () => {
+  for (const [change, expectedCode] of [
+    [(state) => { state.events.push(clone(state.events[0])); state.revision += 1; },
+      "WORKFLOW_STATE_CORRUPTED"],
+    [(_state, older) => older, "WORKFLOW_STATE_REVISION_CONFLICT"],
+    [(state) => {
+      state.currentConfig.changedBy = "another-owner";
+      state.configHistory.at(-1).changedBy = "another-owner";
+    }, "WORKFLOW_STATE_REVISION_CONFLICT"],
+    [() => null, "WORKFLOW_STATE_CORRUPTED"],
+    [(state) => {
+      state.schemaVersion = 1;
+      delete state.assignmentFeed;
+      delete state.assignmentHighWatermark;
+      delete state.assignmentOldestAvailableSequence;
+    }, "WORKFLOW_STATE_REVISION_CONFLICT"],
+  ]) {
+    const store = new ContentVersionMemoryStore();
+    const { service } = await createFixture({ store });
+    await configure(service);
+    const older = store.stored(STATE_KEY);
+    await service.ingest({ event: workflowEvent() });
+    const original = store.stored(STATE_KEY);
+    const changed = clone(original);
+    const replacement = change(changed, older);
+    store.replaceStored(STATE_KEY, replacement === undefined ? changed : replacement);
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await assert.rejects(service.readAssignmentBatch({ afterSequence: 0, limit: 100 }),
+        (error) => error.code === expectedCode);
+    }
+    const readsAfterFailure = store.valueReads;
+    store.replaceStored(STATE_KEY, original);
+    assert.equal((await service.readAssignmentBatch({ afterSequence: 0, limit: 100 })).items.length, 1);
+    assert.equal(store.valueReads, readsAfterFailure + 1);
+  }
+});
+
+test("versioned routing reads fail closed on malformed or unknown content versions", async () => {
+  const malformedResults = [
+    { changed: false, version: Object.freeze({}) },
+    { changed: false, version: undefined },
+    { changed: true, version: "unknown", value: null },
+    { changed: true, version: {}, value: null },
+    { changed: true, version: Object.freeze({ unexpected: true }), value: null },
+    { changed: true, version: Object.freeze(new Date()), value: null },
+    { changed: true, version: Object.freeze({}) },
+  ];
+  for (const result of malformedResults) {
+    const store = new ContentVersionMemoryStore();
+    const { service } = await createFixture({ store });
+    await configure(service);
+    const writes = store.writes.length;
+    store.readVersioned = async () => result;
+    await assert.rejects(service.readAssignmentBatch({ afterSequence: 0, limit: 100 }),
+      /StateStore versioned read result is invalid/);
+    assert.equal(store.writes.length, writes);
+  }
+});
+
+test("versioned routing migration records the committed upgrade content version", async () => {
+  const { service: original, store: originalStore } = await createFixture();
+  await configure(original);
+  await original.ingest({ event: workflowEvent() });
+  const legacy = originalStore.stored(STATE_KEY);
+  legacy.schemaVersion = 1;
+  delete legacy.assignmentFeed;
+  delete legacy.assignmentHighWatermark;
+  delete legacy.assignmentOldestAvailableSequence;
+  const store = new ContentVersionMemoryStore({ [STATE_KEY]: legacy });
+  const { service } = await createFixture({ store });
+  const valueReads = store.valueReads;
+
+  assert.equal((await service.readAssignmentBatch({ afterSequence: 0, limit: 100 })).items.length, 1);
+  assert.equal(store.valueReads, valueReads);
+  assert.equal(store.stored(STATE_KEY).schemaVersion, 2);
+});
+
+test("versioned routing writes without a trustworthy version force a full reread", async () => {
+  for (const writtenVersion of [undefined, "unknown", {}, Object.freeze({ invalid: true })]) {
+    const store = new ContentVersionMemoryStore();
+    const write = store.write.bind(store);
+    store.write = async (...args) => { await write(...args); return writtenVersion; };
+    const { service } = await createFixture({ store });
+    await configure(service);
+    const valueReads = store.valueReads;
+
+    await service.readAssignmentBatch({ afterSequence: 0, limit: 100 });
+
+    assert.equal(store.valueReads, valueReads + 1);
+  }
+});
 
 test("an explicit invalid workflow admission gate never degrades to direct mode", async () => {
   await assert.rejects(
