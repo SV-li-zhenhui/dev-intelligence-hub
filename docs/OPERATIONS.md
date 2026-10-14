@@ -446,6 +446,12 @@ memory projection. Manual and scheduled requests for the same independent role
 coalesce. Proposal execution, code jobs and publication still use their existing
 controlled stages; a staged modify proposal is not evidence that code has run.
 
+Native Codex availability admission does not enqueue a redundant login probe
+behind work already using the same native home. This keeps ordinary contention
+from becoming a pre-claim resolution timeout. Actual generations remain serialized
+and validate the home, session and CLI; cancelled, closed, blocked or unsupported
+providers are still rejected. Busy admission does not certify a completed model call.
+
 Intent dispatch uses the active configuration's `workCoordination.leaseDurationMs`.
 This differs from the role decision timeout and the proposal handler deadline.
 If a proposal handler times out, inspect its downstream confirmation and code-job

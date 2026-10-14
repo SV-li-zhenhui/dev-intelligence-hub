@@ -188,6 +188,41 @@ test("native FIFO is shared across providers and a cancelled queued request neve
   assert.ok(f.calls[1].input.toString().includes("SECOND"));
 });
 
+test("native availability does not queue behind the first active model in the shared home", async (t) => {
+  const f = await fixture(t);
+  const started = gate();
+  const finish = gate();
+  const handler = async (call, count) => {
+    if (call.args[0] === "login") return success("Logged in using ChatGPT\n");
+    if (count === 1) { started.resolve(); await finish.promise; }
+    return result(call);
+  };
+  const first = f.create(handler);
+  const second = f.create(handler);
+  const generation = first.generate(request());
+  await started.promise;
+  let available = false;
+  const probe = second.checkAvailability().then(() => { available = true; });
+  try {
+    await new Promise(setImmediate);
+    assert.equal(available, true, "an active model must not make another role time out before claiming");
+    assert.equal(f.calls.length, 1, "do not launch a redundant login probe");
+    const controller = new AbortController(); controller.abort();
+    await assert.rejects(second.checkAvailability({ signal: controller.signal }), { code: "STRUCTURED_PROVIDER_CANCELLED" });
+    f.environment.DIH_CODEX_NATIVE_TRANSPORT = "app-server";
+    const unsupported = f.create(handler, {}, { appServerRunner: { supportsContainedExecution: false } });
+    await assert.rejects(unsupported.checkAvailability(), { code: "STRUCTURED_PROVIDER_UNAVAILABLE" });
+    await unsupported.close();
+    await second.close();
+    await assert.rejects(second.checkAvailability(), { code: "STRUCTURED_PROVIDER_UNAVAILABLE" });
+  } finally {
+    finish.resolve();
+    await Promise.all([generation, probe]);
+    await first.close();
+    await second.close();
+  }
+});
+
 test("native timeout waits for supervised exit before the next queued provider launches", { timeout: 10_000 }, async (t) => {
   const f = await fixture(t);
   t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -502,6 +537,7 @@ test("uncertain reap preserves the owned invocation and persistent marker and fe
   assert.equal(entries.filter((name) => name.startsWith("invocation-")).length, 1);
   await assert.rejects(f.create().generate(request()), { code: "STRUCTURED_PROVIDER_REAP_FAILED" });
   assert.equal((await provider.readStatus()).state, "broker_blocked");
+  await assert.rejects(provider.checkAvailability(), { code: "STRUCTURED_PROVIDER_REAP_FAILED" });
   await assert.rejects(provider.close(), { code: "STRUCTURED_PROVIDER_REAP_FAILED" });
   assert.equal(f.calls.length, 1);
 });

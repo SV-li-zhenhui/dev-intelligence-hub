@@ -473,7 +473,15 @@ export class NativeCodexBrainProvider {
   }
 
   async checkAvailability(request = {}) {
-    const result = await this.readStatus(request);
+    const signal = normalizeAbortSignal(request.signal ?? null);
+    if (signal?.aborted) throw failure("STRUCTURED_PROVIDER_CANCELLED");
+    if (this.#closed) throw failure();
+    if (this.#state.blocked) throw failure("STRUCTURED_PROVIDER_REAP_FAILED");
+    if (this.transport === 'app-server' && this.#dependencies.appServerRunner.supportsContainedExecution === false) throw failure();
+    // Availability is admission, not a second serialized model operation.
+    // Each queued generation still validates the home, session and CLI itself.
+    if (this.#state.active) return;
+    const result = await this.readStatus({ signal });
     if (result.state !== "available") throw failure(result.state === "broker_blocked" ? "STRUCTURED_PROVIDER_REAP_FAILED" :
       result.state === "file_login_unavailable" ? "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE" : "STRUCTURED_PROVIDER_UNAVAILABLE");
   }
