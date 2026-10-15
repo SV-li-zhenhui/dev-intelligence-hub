@@ -9,6 +9,7 @@ import { WorkLedgerService } from "../src/services/work-ledger-service.js";
 import { WorkIntentDispatcher } from "../src/services/work-intent-dispatcher.js";
 import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
 import { ConfirmationQueue, ConfirmationExecutionError } from "../src/services/confirmation-queue.js";
+import { ledgerDigest } from "../src/services/work-ledger-values.js";
 import { createCompletedReviewConfirmationSettlement, hasReviewConfirmationSettlement,
   reviewConfirmationSettlementIds } from "../src/services/work-ledger-review-confirmation-settlement.js";
 
@@ -22,12 +23,14 @@ class MemoryStore {
 }
 const lease = () => ({ run: (operation) => operation() });
 
-function assignment(sequence, scope = "initial", head = HEAD) {
-  const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.updated",
-    occurredAt: `2026-10-15T01:0${sequence}:00.000Z`, source: { provider: "github", scopeId: scope },
+function assignment(sequence, scope = "initial", head = HEAD, {
+  eventType = "pull_request.updated", provider = "github",
+} = {}) {
+  const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType,
+    occurredAt: `2026-10-15T01:0${sequence}:00.000Z`, source: { provider, scopeId: scope },
     subject: { id: "github:pr:acme/repo#42", repository: "acme/repo", number: 42 },
     payload: { headRefOid: head, title: "Repair review", state: "open", gitTargetAvailable: true,
-      ...(head === HEAD ? {} : { changedFields: ["headRefOid"], previousHeadRefOid: HEAD }),
+      ...(head === HEAD || eventType !== "pull_request.updated" ? {} : { changedFields: ["headRefOid"], previousHeadRefOid: HEAD }),
       gitTarget: { schemaVersion: 1, provider: "github", sourceAccountId: "review-account",
         baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "b".repeat(40),
         headRepository: "contributor/repo", headRefName: "fix/review", headRefOid: head } } });
@@ -35,8 +38,17 @@ function assignment(sequence, scope = "initial", head = HEAD) {
     target: { type: "role", id: "pr-engineer" }, reason: "review", createdAt: event.occurredAt } };
 }
 
+function scopeLifecycleAssignment(sequence, event) {
+  return { sequence, event, assignment: { assignmentId: `scope-lifecycle-${sequence}`, eventId: event.eventId,
+    eventType: event.eventType, subject: event.subject, configVersion: 1, configDigest: "1".repeat(64),
+    ruleId: PULL_REQUEST_SCOPE_LIFECYCLE_RULE_ID, target: PULL_REQUEST_SCOPE_LIFECYCLE_TARGET,
+    priority: PULL_REQUEST_SCOPE_LIFECYCLE_PRIORITY, reason: PULL_REQUEST_SCOPE_LIFECYCLE_REASON,
+    createdAt: event.occurredAt } };
+}
+
 async function fixture({ outcome = "applied", transformPlan = (plan) => plan, downstream = false,
-  followupScope = "followup", followupHead = HEAD, leaveScope = false, leaveScopeAfterResult = false } = {}) {
+  followupScope = "followup", followupHead = HEAD, leaveScope = false, leaveScopeAfterResult = false,
+  ignoredReentry = false, ownerFollowup = false } = {}) {
   const store = new MemoryStore();
   const records = [assignment(1)];
   const source = { async readAssignmentBatch({ afterSequence, limit }) {
@@ -84,13 +96,11 @@ async function fixture({ outcome = "applied", transformPlan = (plan) => plan, do
     expectedItemRevision: queued.itemRevision, displayedPayloadDigest: queued.displayedPayloadDigest,
     approvalBindingDigest: queued.approvalBindingDigest });
   const leaveAutomaticScope = async () => {
+    const sequence = records.length + 1;
     const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.left_scope",
-      occurredAt: "2026-10-15T01:02:00.000Z", source: { provider: "github", scopeId: "initial" },
+      occurredAt: `2026-10-15T01:0${sequence}:00.000Z`, source: { provider: "github", scopeId: "initial" },
       subject: records[0].event.subject, payload: { ...records[0].event.payload, headRefOid: HEAD, state: "open" } });
-    records.push({ sequence: 2, event, assignment: { assignmentId: "scope-exit-2", eventId: event.eventId,
-      eventType: event.eventType, subject: event.subject, configVersion: 1, configDigest: "1".repeat(64),
-      ruleId: PULL_REQUEST_SCOPE_LIFECYCLE_RULE_ID, target: PULL_REQUEST_SCOPE_LIFECYCLE_TARGET,
-      priority: PULL_REQUEST_SCOPE_LIFECYCLE_PRIORITY, reason: PULL_REQUEST_SCOPE_LIFECYCLE_REASON, createdAt: event.occurredAt } });
+    records.push(scopeLifecycleAssignment(sequence, event));
     await service.intake();
   };
   if (leaveScope) await leaveAutomaticScope();
@@ -100,15 +110,43 @@ async function fixture({ outcome = "applied", transformPlan = (plan) => plan, do
       : ["authorization_changed", `proposal:${proposal.proposalId}`] } });
   await service.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
   const staleHistory = (await service.listOutbox()).items[0];
+  if (ignoredReentry && ownerFollowup) {
+    records.push(assignment(records.length + 1, "owner-request:123e4567-e89b-42d3-a456-426614174001", HEAD,
+      { eventType: "pull_request.owner_requested", provider: "local-owner" }));
+    await service.intake();
+  }
   if (leaveScopeAfterResult) await leaveAutomaticScope();
-  records.push(assignment(records.length + 1, followupScope, followupHead)); await service.intake();
+  if (ignoredReentry) {
+    const lifecycle = assignment(records.length + 1, "initial", followupHead, { eventType: "pull_request.created" });
+    const reentry = assignment(records.length + 2, "initial", followupHead, { eventType: "pull_request.created" });
+    records.push(scopeLifecycleAssignment(lifecycle.sequence, lifecycle.event), reentry);
+    await service.intake();
+    // Older persisted ledgers label these rejected observations as audit-only.
+    // Replay only that historical representation; business state and bindings stay intact.
+    const stored = await store.read("work-ledger-state", null);
+    const observations = stored.timeline.filter((entry) => entry.itemId === root.itemId &&
+      [lifecycle.sequence, reentry.sequence].includes(entry.details.sourceSequence));
+    assert.equal(observations.length, 2);
+    assert.ok(observations.every((entry) => entry.details.disposition === "ignored_unproven_head"));
+    for (const entry of observations) {
+      entry.type = "pr_source_ignored";
+      const { timelineId, contentDigest, ...content } = entry;
+      entry.contentDigest = ledgerDigest(content);
+      entry.timelineId = `work-timeline-${entry.contentDigest}`;
+    }
+    await store.write("work-ledger-state", stored);
+    service = makeService(); await service.recover();
+  }
+  records.push(assignment(records.length + 1, followupScope, followupHead, ownerFollowup
+    ? { eventType: "pull_request.owner_requested", provider: "local-owner" } : {})); await service.intake();
   return { store, records, plan, proposal, reads, staleHistory,
     get service() { return service; }, get queue() { return queue; }, get executions() { return executions; },
     overrideRead(value) { overrideRead = value; },
     async restart() { queue = makeQueue(); await queue.recover(); service = makeService(); await service.recover(); },
     async command() {
       const items = (await service.listItems()).items;
-      const pending = items.find((row) => row.itemId !== root.itemId) ?? items[0];
+      const pending = items.filter((row) => row.itemId !== root.itemId)
+        .sort((left, right) => right.source.current.sourceSequence - left.source.current.sourceSequence)[0] ?? items[0];
       return { itemId: pending.itemId, expectedRevision: pending.revision,
         expectedPendingRevision: pending.source.pendingRevision ?? pending.source.activeRevision,
         expectedGraphRevision: (await service.getSummary()).revision };
@@ -191,6 +229,45 @@ test("completed Review proof recovers the stale proposal after automatic assignm
   assert.deepEqual(result.blockers, []);
   assert.equal((await f.service.readItemForReconciliation({ itemId: result.itemId })).status, "queued");
   assert.equal(f.executions, 1);
+});
+
+test("ignored old-scope reentry preserves completed Review proof for a fresh owner Head after restart", async () => {
+  const nextHead = "9".repeat(40);
+  const f = await fixture({ downstream: true, leaveScopeAfterResult: true, ignoredReentry: true,
+    ownerFollowup: true, followupScope: "owner-request:123e4567-e89b-42d3-a456-426614174000", followupHead: nextHead });
+  const history = (await f.service.listTimeline({ limit: 100 })).items;
+  const ignored = history.filter((entry) => entry.itemId === f.proposal.requestedBy.workItemId &&
+    entry.type === "pr_source_ignored" && entry.details.disposition === "ignored_unproven_head");
+  assert.equal(ignored.length, 2, "both lifecycle and role reentry remain audited");
+  const settledProof = history.find((entry) => entry.type === "proposal_result_applied");
+  assert.ok(ignored.every((entry) => entry.sequence > settledProof.sequence));
+  await f.restart();
+  const command = await f.command();
+  const pending = await f.service.readItemForReconciliation({ itemId: command.itemId });
+  assert.equal(pending.source.scope.kind, "owner_requested");
+  assert.equal(pending.source.current.headRefOid, nextHead);
+  const old = await f.service.readItemForReconciliation({ itemId: f.proposal.requestedBy.workItemId });
+  const byId = new Map((await f.service.listOutbox()).items.map((row) => [row.intentId, row]));
+  const snapshots = await Promise.all(reviewConfirmationSettlementIds(old, byId)
+    .map((confirmationId) => f.queue.readSettlement({ confirmationId })));
+  assert.ok(createCompletedReviewConfirmationSettlement(old, byId, snapshots), "the exact completed Review proof remains valid");
+  const result = await f.service.reconcilePullRequestSource(command);
+  assert.equal(result.applied, true, JSON.stringify(result));
+  assert.deepEqual(result.blockers, []);
+  const ready = await f.service.readItemForReconciliation({ itemId: result.itemId });
+  const claimed = await f.service.claim({ itemId: ready.itemId, expectedRevision: ready.revision,
+    workerId: "employee-pr-engineer", leaseDurationMs: 30_000 });
+  assert.equal(claimed.status, "working");
+  assert.equal(claimed.source.current.headRefOid, nextHead);
+  assert.deepEqual((await f.service.listOutbox()).items[0], f.staleHistory);
+  const retained = (await f.service.listTimeline({ limit: 100 })).items;
+  assert.deepEqual(retained.filter((row) => ignored.some((entry) => row.sequence === entry.sequence)), ignored);
+  const roots = (await f.service.listItems()).items;
+  const oldOwner = roots.find((row) => row.source.current.event.source.scopeId ===
+    "owner-request:123e4567-e89b-42d3-a456-426614174001");
+  assert.equal(oldOwner.status, "superseded", "the older owner request stays behind the newer scope exit");
+  assert.equal((await f.queue.get(f.plan.id)).status, "completed");
+  assert.equal(f.executions, 1, "settlement never republishes the old Review");
 });
 
 for (const downstream of [false, true]) test(`a completed Review on retained rev1 settles after same-Head scope rev2 became current (downstream=${downstream})`, async () => {

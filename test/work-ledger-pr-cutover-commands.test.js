@@ -295,6 +295,39 @@ test("cutover proof expires when unrelated same-batch events rotate it out", () 
   assert.deepEqual(blockers.map(({ itemId }) => itemId), ["root-a"]);
 });
 
+test("ignored source observations preserve retained proof but still consume its global window", () => {
+  const decision = { source: "proposal", outcome: "rejected", contentDigest: "f".repeat(64) };
+  const rejected = root({ revision: 1, statusReason: "proposal_rejected", decisionContext: decision });
+  const proof = { sequence: 1, itemId: rejected.itemId, type: "proposal_result_applied",
+    details: { outcome: "rejected", workItemRevision: 1, decision } };
+  const timelineIndex = createPullRequestCutoverTimelineIndex([proof], 3);
+  const inspect = () => inspectPullRequestSourceCutover(rejected, [rejected], new Map(), { timelineIndex });
+  for (const sequence of [2, 3]) {
+    appendPullRequestCutoverTimelineEvent(timelineIndex, { sequence, itemId: rejected.itemId,
+      type: "pr_source_ignored", details: { disposition: "ignored_unproven_head" } });
+    const result = inspect();
+    assert.deepEqual(result.blockers, [], "audit events must not replace retained final business evidence");
+    assert.deepEqual(result.proposalSettlements.map((entry) => entry.proof), [proof]);
+  }
+  appendPullRequestCutoverTimelineEvent(timelineIndex, { sequence: 4, itemId: rejected.itemId,
+    type: "pr_source_ignored", details: { disposition: "ignored_unproven_head" } });
+  const expired = inspect();
+  assert.deepEqual(expired.blockers.map((entry) => entry.itemId), [rejected.itemId]);
+  assert.deepEqual(expired.proposalSettlements, [], "audit entries must evict proof at the same global limit");
+});
+
+test("a later business event invalidates proposal proof even across ignored source observations", () => {
+  const decision = { source: "proposal", outcome: "rejected", contentDigest: "f".repeat(64) };
+  const rejected = root({ revision: 1, statusReason: "proposal_rejected", decisionContext: decision });
+  const proof = { sequence: 1, itemId: rejected.itemId, type: "proposal_result_applied",
+    details: { outcome: "rejected", workItemRevision: 1, decision } };
+  const ignored = { itemId: rejected.itemId, type: "pr_source_ignored", details: {} };
+  const timeline = [proof, { ...ignored, sequence: 2 },
+    { sequence: 3, itemId: rejected.itemId, type: "transitioned", details: {} },
+    { ...ignored, sequence: 4 }];
+  assert.deepEqual(blockersFor(rejected, [], { timeline }).map((entry) => entry.itemId), [rejected.itemId]);
+});
+
 test("cutover keeps a newer same-item proof when the older record expires after compaction", () => {
   const decisionDigest = "9".repeat(64);
   const rejected = root({

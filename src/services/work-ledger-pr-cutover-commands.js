@@ -61,7 +61,8 @@ function recordCutoverTimelineEvent(index, entry) {
   const state = pullRequestCutoverTimelineIndexes.get(index);
   if (state === undefined) return;
   const itemId =
-    typeof entry?.itemId === "string" && entry.type !== "pr_source_revised"
+    typeof entry?.itemId === "string" &&
+      entry.type !== "pr_source_revised" && entry.type !== "pr_source_ignored"
       ? entry.itemId
       : null;
   const record = { entry, itemId };

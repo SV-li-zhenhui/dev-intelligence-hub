@@ -4361,11 +4361,12 @@ test("an owner-requested PR root supersedes a child with a durably rejected prop
   assert.equal(active.status, "queued");
 });
 
-test("an intervening source audit in the same intake batch keeps rejected proposal cutover blocked", async () => {
+test("an ignored stale source audit preserves rejected proposal settlement in the same intake batch", async () => {
   const fixture = await createFixture({
     records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })],
   });
   const predecessor = await rejectSealedPullRequestProposal(fixture);
+  const deliveredHistory = (await fixture.service.listOutbox()).items;
   fixture.source.records.push(
     prAssignment(2, {
       eventType: "pull_request.status",
@@ -4386,13 +4387,13 @@ test("an intervening source audit in the same intake batch keeps rejected propos
   assert.match(blocked.source.revisions.at(-1).disposition, /^ignored_/);
   assert.equal(
     blocked.statusReason,
-    `pr_source_cross_root_cutover_blocker:${pending.itemId}`,
+    "pr_source_cross_root_cutover_retired",
   );
-  assert.equal(pending.status, "blocked");
-  assert.equal(
-    pending.statusReason,
-    `pr_source_cross_root_cutover_pending:${blocked.itemId}`,
-  );
+  assert.equal(pending.status, "queued");
+  assert.equal(pending.statusReason, null);
+  assert.deepEqual((await fixture.service.listOutbox()).items, deliveredHistory);
+  assert.ok((await fixture.service.listTimeline({ itemId: predecessor.itemId })).items
+    .some((entry) => entry.type === "pr_source_ignored"));
 });
 
 test("a persisted rejected-proposal blocker recovers through restart and real reconciliation", async () => {
