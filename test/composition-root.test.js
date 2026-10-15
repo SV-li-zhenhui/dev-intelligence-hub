@@ -1338,6 +1338,25 @@ test("the PR employee can use its own model without changing its role", () => {
   assert.equal(reviewer.contextTokens, 4096);
 });
 
+test("application wires the PR promoter primary router and owns its shutdown", async () => {
+  const config = applicationConfig();
+  config.brain = { enabled: true, provider: "ollama", model: "qwen3.5:9b" };
+  config.employees.prReviewer = { enabled: true, initialPaused: true, allowRemoteCodeContext: true,
+    primaryBrain: { provider: "codex-login-cli", model: "gpt-5.6-luna", remoteData: { requirements: true, code: true, memory: false } } };
+  let constructions = 0; let closes = 0;
+  const application = await createApplication({ config, store: memoryStore(),
+    prEmployeeBrainRouterFactory() {
+      constructions += 1;
+      return { async generate() { throw new Error("No generation during construction"); }, async close() { closes += 1; } };
+    },
+  });
+  assert.equal(constructions, 1);
+  assert.equal(application.prEmployee.reviewer.model, "gpt-5.6-luna");
+  assert.equal(application.prEmployee.reviewer.fallback.model, "qwen3.5:9b");
+  await application.close();
+  assert.equal(closes, 1);
+});
+
 test("employee registry keeps role instances discoverable by id", () => {
   const employee = (id) => ({
     id,

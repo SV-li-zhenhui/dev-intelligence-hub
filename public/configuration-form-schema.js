@@ -202,6 +202,7 @@ const LABELS = deepFreeze({
   maximumConcurrent: "最大并发数",
   brain: "大脑",
   taskBrain: "任务大脑",
+  primaryBrain: "主推进大脑（既有大脑为备选）",
   localBrain: "本地大脑",
   provider: "Provider",
   model: "模型",
@@ -421,6 +422,7 @@ const FIELD_RULES = deepFreeze([
   { pattern: ["brain", "provider"], control: "select", kind: "text", options: ["ollama"] },
   { pattern: ["employees", "prReviewer", "brain", "provider"], control: "select", kind: "text", options: ["ollama"] },
   ...[
+    ["employees", "prReviewer", "primaryBrain", "provider"],
     ["employees", "roles", "*", "brain", "provider"],
     ["employees", "roles", "*", "taskBrain", "provider"],
     ["memory", "answering", "brain", "provider"],
@@ -469,6 +471,7 @@ const FIELD_RULES = deepFreeze([
   { pattern: ["brain", "model"], kind: "text", maximumBytes: 256 },
   { pattern: ["employees", "prReviewer", "name"], kind: "text", maximumBytes: 256 },
   { pattern: ["employees", "prReviewer", "brain", "model"], kind: "text", maximumBytes: 256 },
+  { pattern: ["employees", "prReviewer", "primaryBrain", "model"], kind: "text", maximumBytes: 256 },
   { pattern: ["employees", "prReviewer", "brain", "baseUrl"], kind: "text", format: "endpoint", maximumBytes: 2_048 },
   { pattern: ["employees", "roles", "*", "name"], kind: "text", maximumBytes: 256 },
   { pattern: ["employees", "roles", "*", "mission"], kind: "text", maximumBytes: 4_096 },
@@ -625,6 +628,13 @@ const SLOTS = deepFreeze([
   {
     pattern: ["employees", "roles", "*", "taskBrain"],
     label: "任务大脑",
+    template: "task-brain",
+    optional: true,
+    operations: ["add", "remove", "replace"],
+  },
+  {
+    pattern: ["employees", "prReviewer", "primaryBrain"],
+    label: "主推进大脑（既有大脑为备选）",
     template: "task-brain",
     optional: true,
     operations: ["add", "remove", "replace"],

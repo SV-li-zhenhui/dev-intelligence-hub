@@ -202,6 +202,59 @@ function isAnalysisBlocked(job) {
   );
 }
 
+function brainIdentity(brain) {
+  if (typeof brain?.provider !== "string" || !brain.provider ||
+      typeof brain.model !== "string" || !brain.model) return null;
+  return { provider: brain.provider, model: brain.model };
+}
+
+function sameBrain(left, right) {
+  return Boolean(left && right && left.provider === right.provider && left.model === right.model);
+}
+
+function hasValidAnalysisAttemptBudget(job) {
+  const budget = job.analysisAttemptBudget;
+  return budget === undefined || Boolean(brainIdentity(budget) &&
+    Number.isSafeInteger(budget.attemptOffset) && budget.attemptOffset >= 0 &&
+    Number.isSafeInteger(job.attempts) && budget.attemptOffset <= job.attempts);
+}
+
+function analysisAttemptBudget(job, brain) {
+  if (!hasValidAnalysisAttemptBudget(job)) return null;
+  const budget = job.analysisAttemptBudget;
+  if (job.status === "retry_wait" && canRebindAnalysisModel(job, brain)) {
+    return { ...brain, attemptOffset: job.attempts };
+  }
+  return sameBrain(budget, brain) ? { ...brain, attemptOffset: budget.attemptOffset }
+    : { ...brain, attemptOffset: 0 };
+}
+
+function isLegacyOllamaTransportFailure(job) {
+  return job.failureCode === undefined && job.failurePhase === undefined &&
+    job.brain?.provider === "ollama" &&
+    job.error === "Ollama employee transport request failed";
+}
+
+function canRebindAnalysisModel(job, brain) {
+  if (!brain || !["blocked", "retry_wait"].includes(job.status) ||
+      job.confirmationId || job.confirmationFailure || job.confirmationIntent || job.handoffWorkItemId ||
+      job.completedAt || job.decision || job.leaseUntil ||
+      !Number.isSafeInteger(job.attempts) || job.attempts < 1 || job.attempts >= Number.MAX_SAFE_INTEGER) return false;
+  const failure = job.analysisFailure;
+  if (failure === undefined ? !isLegacyOllamaTransportFailure(job)
+    : failure?.phase !== "analysis" || failure.modelFailure !== true) return false;
+  if (!hasValidAnalysisAttemptBudget(job)) return false;
+  const previousBrain = brainIdentity(job.analysisAttemptBudget ?? job.brain?.fallbackFrom ?? job.brain);
+  return Boolean(previousBrain && !sameBrain(previousBrain, brain));
+}
+
+function recoverForChangedAnalysisModel(job, brain, runAt) {
+  if (!isAnalysisBlocked(job) || !canRebindAnalysisModel(job, brain)) return null;
+  return { ...job, status: "queued", error: "", startedAt: null, leaseUntil: null, nextAttemptAt: null,
+    analysisAttemptBudget: { ...brain, attemptOffset: job.attempts },
+    modelRetryRequestedAt: runAt, updatedAt: runAt };
+}
+
 function jobFingerprint(item, policyVersion) {
   return [
     item.id,
@@ -1104,6 +1157,9 @@ export class ProactivePrEmployeeService {
         ...job,
         status: "queued",
         attempts: 0,
+        ...(job.analysisAttemptBudget ? {
+          analysisAttemptBudget: { ...job.analysisAttemptBudget, attemptOffset: 0 },
+        } : {}),
         error: "",
         startedAt: null,
         leaseUntil: null,
@@ -1276,6 +1332,20 @@ export class ProactivePrEmployeeService {
       signal?.throwIfAborted();
     }
 
+    const requestedBrain = brainIdentity(this.reviewer);
+    const recoveredJobs = state.jobs.map((job) => {
+      const current = currentBySubject.get(job.subjectId);
+      if (!jobMatchesCurrentCandidate(job, current, this.config.policyVersion) ||
+          job.repo !== current.repo || job.number !== current.number ||
+          job.fingerprint !== jobFingerprint(current, this.config.policyVersion)) return job;
+      return recoverForChangedAnalysisModel(job, requestedBrain, runAt) ?? job;
+    });
+    if (recoveredJobs.some((job, index) => job !== state.jobs[index])) {
+      state = await runAdmittedOperation(this.#admitAction,
+        () => this.controller.writeState({ ...state, jobs: recoveredJobs }));
+      signal?.throwIfAborted();
+    }
+
     const fingerprints = new Set(
       [
         ...state.jobs,
@@ -1382,6 +1452,8 @@ export class ProactivePrEmployeeService {
     let index = state.jobs.findIndex((job) => job.id === id);
     if (index < 0) return state;
     const startedAt = this.clock().toISOString();
+    const requestedBrain = brainIdentity(this.reviewer);
+    const budget = requestedBrain ? analysisAttemptBudget(state.jobs[index], requestedBrain) : null;
     const claimed = {
       ...state.jobs[index],
       status: "running",
@@ -1390,10 +1462,12 @@ export class ProactivePrEmployeeService {
       updatedAt: startedAt,
       leaseUntil: new Date(Date.parse(startedAt) + 120_000).toISOString(),
       error: "",
+      analysisFailure: null,
       brain: {
         provider: this.reviewer?.provider || "",
         model: this.reviewer?.model || "",
       },
+      ...(budget ? { analysisAttemptBudget: budget } : {}),
     };
     const claimedState = {
       ...state,
@@ -1407,6 +1481,8 @@ export class ProactivePrEmployeeService {
     );
     signal?.throwIfAborted();
 
+    let attemptBrain = claimed.brain;
+    let failurePhase = "context";
     try {
       if (!this.reviewer) throw new Error("岗位大脑未配置");
       const snapshot = await this.store.read("snapshot");
@@ -1434,17 +1510,23 @@ export class ProactivePrEmployeeService {
       ) {
         return this.#finishAsSuperseded(state, claimed.id);
       }
-      const analysis = await runAdmittedOperation(
+      const { analysis, brain: actualBrain } = await runAdmittedOperation(
         this.#admitAction,
-        () => this.reviewer.analyze(
-          {
+        async () => {
+          const input = {
             ...context,
             workMode: policy.mode,
             requestedAction: item.nextAction,
-          },
-          signal === null ? undefined : { signal },
-        ),
+          };
+          const options = signal === null ? undefined : { signal };
+          failurePhase = "analysis";
+          return typeof this.reviewer.analyzeWithReceipt === "function"
+            ? this.reviewer.analyzeWithReceipt(input, options)
+            : { analysis: await this.reviewer.analyze(input, options), brain: claimed.brain };
+        },
       );
+      attemptBrain = actualBrain;
+      failurePhase = "post_analysis";
       signal?.throwIfAborted();
       const latest = await this.store.read("snapshot");
       signal?.throwIfAborted();
@@ -1464,6 +1546,7 @@ export class ProactivePrEmployeeService {
 
       index = state.jobs.findIndex((job) => job.id === claimed.id);
       const completedAt = this.clock().toISOString();
+      failurePhase = "handoff";
       const handoff = policy.targetRoleId
         ? await this.triageHandoff.submit({
             requestKey: claimed.id,
@@ -1497,7 +1580,7 @@ export class ProactivePrEmployeeService {
         ...(policy.targetRoleId ? { targetRoleId: policy.targetRoleId } : {}),
         ...(handoff ? { handoffWorkItemId: handoff.workItemId } : {}),
         status: policy.requiresApproval ? "ready_for_human" : "ready",
-        brain: { ...claimed.brain },
+        brain: { ...actualBrain },
         updatedAt: completedAt,
         completedAt,
         leaseUntil: null,
@@ -1515,6 +1598,7 @@ export class ProactivePrEmployeeService {
       } else {
         state.jobs[index] = completed;
       }
+      failurePhase = "persistence";
       state.lastError = "";
       state = this.#queueMemory(state, state.jobs[index], "analysis_ready");
       signal?.throwIfAborted();
@@ -1545,15 +1629,24 @@ export class ProactivePrEmployeeService {
       }
       const failedAt = this.clock().toISOString();
       const attempts = state.jobs[index].attempts || 1;
-      const blocked = attempts >= this.config.maxAttempts;
+      const modelAttempts = attempts - (budget?.attemptOffset ?? 0);
+      const blocked = modelAttempts >= this.config.maxAttempts;
       const retryIndex = Math.min(
-        attempts - 1,
+        modelAttempts - 1,
         this.config.retryMinutes.length - 1,
       );
       const retryMinutes = this.config.retryMinutes[retryIndex] || 1;
+      const failureReceipt = failurePhase === "analysis" && typeof this.reviewer?.getFailureReceipt === "function"
+        ? this.reviewer.getFailureReceipt(error) : null;
+      const failureBrain = failureReceipt?.brain ?? attemptBrain;
+      const legacyTransportFailure = failureBrain?.provider === "ollama" &&
+        error?.code === undefined && error?.message === "Ollama employee transport request failed";
       state.jobs[index] = {
         ...state.jobs[index],
         status: blocked ? "blocked" : "retry_wait",
+        brain: { ...failureBrain },
+        analysisFailure: { phase: failurePhase, code: stableFailureCode(error),
+          modelFailure: failurePhase === "analysis" && (failureReceipt?.modelFailure ?? legacyTransportFailure) },
         error: error.message || String(error),
         updatedAt: failedAt,
         leaseUntil: null,

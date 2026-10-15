@@ -515,6 +515,21 @@ from becoming a pre-claim resolution timeout. Actual generations remain serializ
 and validate the home, session and CLI; cancelled, closed, blocked or unsupported
 providers are still rejected. Busy admission does not certify a completed model call.
 
+PR patrol can set `employees.prReviewer.primaryBrain` to a configured Codex
+provider and exact model, with explicit requirements/code remote authorization
+and `allowRemoteCodeContext`. Its existing `brain` remains the Ollama fallback.
+Primary absence preserves old configurations. Only settled availability,
+transport, deadline or output failures trigger one local fallback; cancellation,
+authorization, source drift and unconfirmed stop/cleanup failures do not.
+The job records the model actually used and a fallback reason, including failed
+fallback attempts and later handoff failures. After a model change, healthy
+matching PR facts can recover exhausted model-analysis failures once for the
+new requested model, preserving the job/request key and cumulative attempts.
+The per-model budget uses the requested primary even when the fallback fails;
+restarts do not reset it. Paused, completed, confirmation-bearing and unknown
+failures remain untouched. PR patrol still does triage; complete code Review
+remains the PR engineer's responsibility.
+
 Intent dispatch uses the active configuration's `workCoordination.leaseDurationMs`.
 This differs from the role decision timeout and the proposal handler deadline.
 If a proposal handler times out, inspect its downstream confirmation and code-job

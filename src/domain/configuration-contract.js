@@ -741,6 +741,7 @@ function normalizePrReviewer(value, path) {
     "jobLimit",
     "allowRemoteCodeContext",
     "brain",
+    "primaryBrain",
   ];
   const config = fields(value, path, allowed, [
     "enabled",
@@ -792,6 +793,7 @@ function normalizePrReviewer(value, path) {
       `${path}.allowRemoteCodeContext`,
     ),
     brain: normalizeLegacyBrain(config.brain, `${path}.brain`, { partial: true }),
+    ...optional(config, "primaryBrain", (entry) => normalizeAssignedBrain(entry, `${path}.primaryBrain`)),
   };
 }
 
@@ -1551,6 +1553,7 @@ function assertProviderReferences(document) {
   if (nativeCapacities.size > 1) throw invalid("brainProviders", "共享原生 Codex 登录的并发容量必须一致");
   const references = [
     ["brain.provider", document.brain.provider],
+    ...(document.employees.prReviewer.primaryBrain ? [["employees.prReviewer.primaryBrain.provider", document.employees.prReviewer.primaryBrain.provider]] : []),
     ...Object.entries(document.employees.roles).flatMap(([id, role]) => [
       [
         `employees.roles.${id}.brain.provider`,
@@ -1574,6 +1577,7 @@ function assertProviderReferences(document) {
     if (!providers.has(provider)) throw invalid(path, "引用了未知 Provider");
   }
   const assignedBrains = [
+    ...(document.employees.prReviewer.primaryBrain ? [["employees.prReviewer.primaryBrain", document.employees.prReviewer.primaryBrain]] : []),
     ...Object.entries(document.employees.roles).flatMap(([id, role]) => [
       [`employees.roles.${id}.brain`, role.brain],
       ...(role.taskBrain
@@ -1595,6 +1599,12 @@ function assertProviderReferences(document) {
         "仅 Codex CLI 岗位大脑支持推理档位",
       );
     }
+  }
+  const primary = document.employees.prReviewer.primaryBrain;
+  if (primary && (!document.employees.prReviewer.allowRemoteCodeContext ||
+      (document.brainProviders[primary.provider].remote &&
+        (primary.remoteData.code !== true || primary.remoteData.requirements !== true)))) {
+    throw invalid("employees.prReviewer.primaryBrain", "远程 PR 推进主模型需要显式授权需求和代码上下文");
   }
 }
 
@@ -1847,7 +1857,7 @@ function authorityDirection(change) {
   }
   if (
     path === "brain.provider" ||
-    /\.(?:brain|localBrain|taskBrain)\.provider$/.test(path)
+    /\.(?:brain|localBrain|taskBrain|primaryBrain)\.provider$/.test(path)
   ) {
     return {
       tightening: before !== undefined && before !== after,
@@ -1858,7 +1868,7 @@ function authorityDirection(change) {
     const direction = setDirection(before, after);
     return { tightening: direction.removed, expansion: direction.added };
   }
-  if (/^employees\.roles\.[^.]+\.taskBrain$/.test(path)) {
+  if (/^employees\.roles\.[^.]+\.taskBrain$/.test(path) || path === "employees.prReviewer.primaryBrain") {
     return {
       tightening: before !== undefined && before !== after,
       expansion: after !== undefined && before !== after,

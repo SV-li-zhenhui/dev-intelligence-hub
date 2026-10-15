@@ -25,6 +25,35 @@ function document() {
   return structuredClone(committedDocument);
 }
 
+test("PR promoter primary brain is optional, explicit, versioned and preserved by form round trips", () => {
+  const old = document();
+  const oldDigest = configurationDocumentDigest(old);
+  const configured = structuredClone(old);
+  configured.brainProviders["promoter-codex"] = { kind: "codex-cli", credentialMode: "codex-native-login", remote: true };
+  configured.employees.prReviewer.allowRemoteCodeContext = true;
+  configured.employees.prReviewer.primaryBrain = { provider: "promoter-codex", model: "gpt-5.6-luna", reasoningEffort: "medium",
+    remoteData: { requirements: true, code: true, memory: false } };
+  const normalized = normalizeConfigurationDocument(configured);
+  assert.deepEqual(normalized.employees.prReviewer.primaryBrain, configured.employees.prReviewer.primaryBrain);
+  const form = configurationDocumentFromForm(createConfigurationFormState(normalized));
+  assert.equal(form.ok, true);
+  assert.deepEqual(form.configuration.employees.prReviewer.primaryBrain, configured.employees.prReviewer.primaryBrain);
+  const impact = configurationDocumentImpact(old, configured);
+  assert.ok(impact.restart_required.includes("employees.prReviewer.primaryBrain"));
+  assert.ok(impact.authority_expansion.includes("employees.prReviewer.primaryBrain"));
+  assert.equal(configurationDocumentDigest(old), oldDigest);
+  assert.equal(Object.hasOwn(normalizeConfigurationDocument(old).employees.prReviewer, "primaryBrain"), false);
+  for (const mutate of [
+    (value) => { value.employees.prReviewer.primaryBrain.provider = "missing"; },
+    (value) => { value.employees.prReviewer.allowRemoteCodeContext = false; },
+    (value) => { value.employees.prReviewer.primaryBrain.remoteData.code = false; },
+    (value) => { value.employees.prReviewer.primaryBrain.remoteData.requirements = false; },
+  ]) {
+    const invalid = structuredClone(configured); mutate(invalid);
+    assert.throws(() => normalizeConfigurationDocument(invalid));
+  }
+});
+
 test("mail summary is opt in without rewriting historical configuration digests", () => {
   const old = document();
   const before = configurationDocumentDigest(old);

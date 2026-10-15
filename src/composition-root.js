@@ -16,6 +16,7 @@ import { createGitHubPullRequestActionTransport } from "./adapters/github-pull-r
 import { createGhLoginCredentialSource } from "./adapters/gh-login-credential-source.js";
 import { OllamaBrain } from "./adapters/ollama-brain.js";
 import { OllamaPrEmployeeReviewer } from "./adapters/ollama-pr-employee-reviewer.js";
+import { RoutedPrEmployeeReviewer } from "./adapters/routed-pr-employee-reviewer.js";
 import { TokenEnvCredentialSource } from "./adapters/token-env-credential-source.js";
 import { createAttentionInboxRuntime } from "./attention-inbox-runtime.js";
 import { createChangePackageRuntime } from "./change-package-runtime.js";
@@ -792,13 +793,20 @@ export function createPrEmployeeReviewer(
   const config = { ...baseConfig, ...roleOverrides };
   if (!config.enabled) return null;
   if (config.provider === "ollama") {
-    return new OllamaPrEmployeeReviewer({
+    const fallback = new OllamaPrEmployeeReviewer({
       ...config,
       ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
       ...(dependencies.actionAdmissionGate === undefined
         ? {}
         : { actionAdmissionGate: dependencies.actionAdmissionGate }),
     });
+    if (dependencies.primaryBrain && config.allowRemoteCodeContext !== true) {
+      throw new Error("PR employee primary brain requires explicit remote code context authorization");
+    }
+    return dependencies.primaryBrain
+      ? new RoutedPrEmployeeReviewer({ router: dependencies.router, primaryBrain: dependencies.primaryBrain,
+          fallback, timeoutMs: config.timeoutMs, contextTokens: config.contextTokens ?? config.numCtx })
+      : fallback;
   }
   throw new Error(
     `Unsupported PR employee brain provider: ${config.provider || "(empty)"}`,
@@ -854,6 +862,7 @@ export async function createApplication({
   agentMemoryQueryServiceFactory = (options) =>
     new AgentMemoryQueryService(options),
   memoryBrainRouterFactory = createConfiguredBrainRouter,
+  prEmployeeBrainRouterFactory = createConfiguredBrainRouter,
   memoryAnswerDependencies = {},
   codexLoginCredentialBrokerFactory =
     createProductionCodexLoginCredentialBroker,
@@ -2230,6 +2239,16 @@ export async function createApplication({
     if (proposalRunners.length && !proposalRunner) {
       throw new Error("工作提案 runner 组合失败");
     }
+    const prEmployeeBrainRouter = roleConfig.enabled && roleConfig.primaryBrain
+      ? trackRuntime(prEmployeeBrainRouterFactory({
+          constructionCleanupOwner: configuredConstructionCleanupOwner,
+          brainProviders: config.brainProviders || {},
+          dependencies: brainDependencies(
+            workCoordinationDependencies.brainDependencies || {},
+            prEmployeeBrainRouterFactory === createConfiguredBrainRouter,
+          ),
+        }))
+      : null;
     const prEmployee = new ProactivePrEmployeeService({
       github,
       reviewer: roleConfig.enabled
@@ -2239,13 +2258,14 @@ export async function createApplication({
               ...roleConfig.brain,
               allowRemoteCodeContext: roleConfig.allowRemoteCodeContext,
             },
-            ordinaryActionAdmissionGate === null
-              ? {}
-              : { actionAdmissionGate: ordinaryActionAdmissionGate },
+            {
+              ...(ordinaryActionAdmissionGate === null ? {} : { actionAdmissionGate: ordinaryActionAdmissionGate }),
+              ...(prEmployeeBrainRouter ? { router: prEmployeeBrainRouter, primaryBrain: roleConfig.primaryBrain } : {}),
+            },
           )
         : null,
       store,
-      // The legacy PR employee is the low-risk Ollama patrol/triage role.
+      // The legacy PR employee handles low-risk patrol and triage.
       // Evidence-bound code Review belongs exclusively to pr-engineer.
       config: { ...roleConfig, triageOnly: true,
         automaticOwnPrRepair: ownPrRepairEnabled,

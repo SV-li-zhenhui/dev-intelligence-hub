@@ -436,6 +436,7 @@ function assertEmployees(value, path) {
       "jobLimit",
       "allowRemoteCodeContext",
       "brain",
+      "primaryBrain",
     ],
     [
       "enabled",
@@ -456,6 +457,7 @@ function assertEmployees(value, path) {
   );
   requireArray(value.prReviewer.retryMinutes, `${reviewerPath}.retryMinutes`);
   assertLegacyBrain(value.prReviewer.brain, `${reviewerPath}.brain`, { partial: true });
+  if (value.prReviewer.primaryBrain) assertAssignedBrain(value.prReviewer.primaryBrain, `${reviewerPath}.primaryBrain`);
   assertNamedMap(value.roles, `${path}.roles`, assertRole);
 }
 
@@ -1194,6 +1196,9 @@ function configurationReferenceIssues(configuration) {
   const profiles = new Set(Object.keys(configuration.codeExecutor.profiles || {}));
   const providerFields = [
     [["brain", "provider"], configuration.brain.provider],
+    ...(configuration.employees.prReviewer.primaryBrain ? [[
+      ["employees", "prReviewer", "primaryBrain", "provider"], configuration.employees.prReviewer.primaryBrain.provider,
+    ]] : []),
     ...Object.entries(configuration.employees.roles).flatMap(([id, role]) => [
       [
         ["employees", "roles", id, "brain", "provider"],
@@ -2752,6 +2757,9 @@ function providerReferences(configuration, id, references) {
   }
   if (configuration.employees.prReviewer.brain.provider === id) {
     addReference(references, "employees.prReviewer.brain.provider", "employee_brain");
+  }
+  if (configuration.employees.prReviewer.primaryBrain?.provider === id) {
+    addReference(references, "employees.prReviewer.primaryBrain.provider", "employee_primary_brain");
   }
   for (const [roleId, roleValue] of Object.entries(configuration.employees.roles)) {
     if (roleValue.brain.provider === id) {

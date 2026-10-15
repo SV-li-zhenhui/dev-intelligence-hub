@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 import { normalizePullRequestGitTarget } from "../src/domain/git-tool-contract.js";
 import { OllamaPrEmployeeReviewer } from "../src/adapters/ollama-pr-employee-reviewer.js";
+import { RoutedPrEmployeeReviewer } from "../src/adapters/routed-pr-employee-reviewer.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { ProactivePrEmployeeService } from "../src/services/proactive-pr-employee.js";
 
@@ -270,6 +271,246 @@ function durableTriageHandoff(onSubmit = () => {}) {
     },
   };
 }
+
+function exhaustedOllamaState(item = pullRequest(), overrides = {}) {
+  return queuedState(item, { policyVersion: 3, status: "blocked", attempts: 3,
+    error: "Ollama employee transport request failed",
+    brain: { provider: "ollama", model: "qwen3.5:9b" }, ...overrides });
+}
+
+function routedTriageReviewer({ primary, fallback } = {}) {
+  return new RoutedPrEmployeeReviewer({
+    primaryBrain: { provider: "codex-login-cli", model: "gpt-5.6-luna", remoteData: { requirements: true, code: true, memory: false } },
+    router: { generate: primary || (async () => JSON.stringify(reviewResult({ workType: "triage_plan", reviewVerdict: "none", reviewBody: "", requiresApproval: false }))) },
+    fallback: { provider: "ollama", model: "qwen3.5:9b", analyze: fallback || (async () => { throw new Error("Unexpected fallback"); }) },
+  });
+}
+
+test("primary model activation recovers one exhausted Ollama job without replacing requests or completed triage", async () => {
+  const item = pullRequest();
+  const completedItem = pullRequest({ id: "github:pr:acme/repo#43", number: 43, headRefOid: HEAD_43 });
+  const initial = exhaustedOllamaState(item);
+  const completed = queuedState(completedItem, { policyVersion: 3, id: "pr-work-completed", status: "ready", attempts: 1,
+    completedAt: "2026-07-31T09:59:00.000Z", handoffWorkItemId: "work-item-already-delivered" }).jobs[0];
+  initial.jobs.push(completed);
+  const store = new MemoryStore({ snapshot: snapshot([item, completedItem]), "pr-employee-state": initial });
+  let primaryCalls = 0;
+  const handoffs = [];
+  const reviewer = routedTriageReviewer({ primary: async () => {
+    primaryCalls += 1;
+    return JSON.stringify(reviewResult({ workType: "triage_plan", reviewVerdict: "none", reviewBody: "", requiresApproval: false }));
+  } });
+  const options = { store, reviewer, config: { triageOnly: true }, github: { async loadReviewContext() { return { ...item }; } },
+    triageHandoff: durableTriageHandoff((request) => handoffs.push(request)) };
+  await createService(options).tick();
+  const after = await store.read("pr-employee-state");
+  assert.equal(after.jobs.length, 2);
+  assert.equal(after.jobs[0].id, initial.jobs[0].id);
+  assert.equal(after.jobs[0].fingerprint, initial.jobs[0].fingerprint);
+  assert.equal(after.jobs[0].status, "ready");
+  assert.equal(after.jobs[0].attempts, 4);
+  assert.deepEqual(after.jobs[0].analysisAttemptBudget, { provider: "codex-login-cli", model: "gpt-5.6-luna", attemptOffset: 3 });
+  assert.deepEqual(after.jobs[1], completed);
+  assert.equal(handoffs[0].requestKey, initial.jobs[0].id);
+  await createService(options).tick();
+  assert.equal(primaryCalls, 1);
+  assert.equal(handoffs.length, 1);
+  assert.deepEqual((await store.read("pr-employee-state")).jobs, after.jobs);
+});
+
+test("failed primary and backup consume the new model budget once and persist actual failure attribution across restart", async () => {
+  const item = pullRequest();
+  const store = new MemoryStore({ snapshot: snapshot([item]), "pr-employee-state": exhaustedOllamaState(item) });
+  let primaryCalls = 0; let fallbackCalls = 0;
+  const reviewer = routedTriageReviewer({
+    primary: async () => { primaryCalls += 1; throw Object.assign(new Error("Codex process ended"), { code: "STRUCTURED_PROVIDER_PROCESS_FAILED" }); },
+    fallback: async () => { fallbackCalls += 1; throw new Error("Ollama employee transport request failed"); },
+  });
+  const options = { store, reviewer, config: { triageOnly: true }, github: { async loadReviewContext() { return { ...item }; } },
+    triageHandoff: durableTriageHandoff(() => assert.fail("failed analysis must not hand off")) };
+  for (const now of ["2026-07-31T10:01:00.000Z", "2026-07-31T10:03:00.000Z", "2026-07-31T10:10:00.000Z"]) {
+    await createService({ ...options, now }).tick();
+  }
+  const blocked = (await store.read("pr-employee-state")).jobs[0];
+  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.attempts, 6);
+  assert.equal(blocked.error, "Ollama employee transport request failed");
+  assert.deepEqual(blocked.brain, { provider: "ollama", model: "qwen3.5:9b", fallbackFrom: {
+    provider: "codex-login-cli", model: "gpt-5.6-luna", reason: "STRUCTURED_PROVIDER_PROCESS_FAILED" } });
+  assert.deepEqual(blocked.analysisAttemptBudget, { provider: "codex-login-cli", model: "gpt-5.6-luna", attemptOffset: 3 });
+  await createService({ ...options, now: "2026-08-01T10:01:00.000Z" }).tick();
+  assert.deepEqual([primaryCalls, fallbackCalls], [3, 3]);
+  assert.deepEqual((await store.read("pr-employee-state")).jobs[0], blocked);
+});
+
+for (const [receiptName, failureReceipt] of [
+  ["legacy", {}],
+  ["recorded", { analysisAttemptBudget: { provider: "ollama", model: "qwen3.5:9b", attemptOffset: 0 },
+    analysisFailure: { phase: "analysis", code: "PR_EMPLOYEE_JOB_FAILED", modelFailure: true } }],
+]) {
+  test(`a due ${receiptName} known analysis retry binds the new model budget without advancing its existing retry time`, async () => {
+    const item = pullRequest();
+    const initial = exhaustedOllamaState(item, { status: "retry_wait", attempts: 2, nextAttemptAt: "2026-07-31T10:02:00.000Z", ...failureReceipt });
+    const store = new MemoryStore({ snapshot: snapshot([item]), "pr-employee-state": initial });
+    let primaryCalls = 0; let fallbackCalls = 0;
+    const reviewer = routedTriageReviewer({
+      primary: async () => { primaryCalls += 1; throw Object.assign(new Error("Codex ended"), { code: "STRUCTURED_PROVIDER_PROCESS_FAILED" }); },
+      fallback: async () => { fallbackCalls += 1; throw new Error("Ollama employee transport request failed"); },
+    });
+    const options = { store, reviewer, config: { triageOnly: true }, github: { async loadReviewContext() { return { ...item }; } },
+      triageHandoff: durableTriageHandoff(() => assert.fail("failed retry must not hand off")) };
+    await createService({ ...options, now: "2026-07-31T10:01:00.000Z" }).tick();
+    assert.deepEqual((await store.read("pr-employee-state")).jobs, initial.jobs);
+    assert.equal(primaryCalls, 0);
+    await createService({ ...options, now: "2026-07-31T10:03:00.000Z" }).tick();
+    const first = (await store.read("pr-employee-state")).jobs[0];
+    assert.equal(first.id, initial.jobs[0].id);
+    assert.equal(first.fingerprint, initial.jobs[0].fingerprint);
+    assert.equal(first.status, "retry_wait");
+    assert.equal(first.attempts, 3);
+    assert.deepEqual(first.analysisAttemptBudget, { provider: "codex-login-cli", model: "gpt-5.6-luna", attemptOffset: 2 });
+    for (const now of ["2026-07-31T10:05:00.000Z", "2026-07-31T10:11:00.000Z", "2026-08-01T10:01:00.000Z"]) {
+      await createService({ ...options, now }).tick();
+    }
+    const blocked = (await store.read("pr-employee-state")).jobs[0];
+    assert.equal(blocked.status, "blocked");
+    assert.equal(blocked.attempts, 5);
+    assert.equal(blocked.analysisAttemptBudget.attemptOffset, 2);
+    assert.deepEqual([primaryCalls, fallbackCalls], [3, 3]);
+  });
+}
+
+for (const [name, changes] of [
+  ["unknown failure", { error: "unknown failure" }],
+  ["context failure", { analysisFailure: { phase: "context", code: "PR_EMPLOYEE_JOB_FAILED", modelFailure: false } }],
+  ["handoff failure", { analysisFailure: { phase: "handoff", code: "PR_EMPLOYEE_JOB_FAILED", modelFailure: false } }],
+  ["same primary after fallback", { brain: { provider: "ollama", model: "qwen3.5:9b", fallbackFrom: {
+    provider: "codex-login-cli", model: "gpt-5.6-luna", reason: "STRUCTURED_PROVIDER_PROCESS_FAILED" } } }],
+]) {
+  test(`a due ${name} retry does not get an extra budget through model binding`, async () => {
+    const item = pullRequest();
+    const initial = exhaustedOllamaState(item, { status: "retry_wait", attempts: 2, nextAttemptAt: "2026-07-31T10:00:00.000Z", ...changes });
+    const store = new MemoryStore({ snapshot: snapshot([item]), "pr-employee-state": initial });
+    let primaryCalls = 0;
+    const reviewer = routedTriageReviewer({ primary: async () => { primaryCalls += 1; throw Object.assign(new Error("Codex ended"), { code: "STRUCTURED_PROVIDER_PROCESS_FAILED" }); },
+      fallback: async () => { throw new Error("Ollama employee transport request failed"); } });
+    const options = { store, reviewer, config: { triageOnly: true }, github: { async loadReviewContext() { return { ...item }; } },
+      triageHandoff: durableTriageHandoff() };
+    await createService(options).tick();
+    const blocked = (await store.read("pr-employee-state")).jobs[0];
+    assert.equal(blocked.status, "blocked");
+    assert.equal(blocked.attempts, 3);
+    assert.equal(blocked.analysisAttemptBudget.attemptOffset, 0);
+    await createService({ ...options, now: "2026-08-01T10:01:00.000Z" }).tick();
+    assert.equal(primaryCalls, 1);
+  });
+}
+
+for (const [name, jobChanges, snapshotChanges, stateChanges] of [
+  ["unknown failure", { error: "ledger unavailable" }],
+  ["confirmation-bearing work", { confirmationId: "confirmation-existing" }],
+  ["confirmation intent", { confirmationIntent: { id: "confirmation-existing" } }],
+  ["completed handoff", { handoffWorkItemId: "work-item-existing" }],
+  ["handoff failure", { analysisFailure: { phase: "handoff", code: "PR_EMPLOYEE_JOB_FAILED", modelFailure: false } }],
+  ["context failure", { analysisFailure: { phase: "context", code: "PR_EMPLOYEE_JOB_FAILED", modelFailure: false } }],
+  ["persistence failure", { analysisFailure: { phase: "persistence", code: "PR_EMPLOYEE_JOB_FAILED", modelFailure: false } }],
+  ["unknown model failure", { analysisFailure: { phase: "analysis", code: "UNKNOWN_ERROR", modelFailure: false } }],
+  ["cleanup failure", { analysisFailure: { phase: "analysis", code: "STRUCTURED_PROVIDER_REAP_FAILED", modelFailure: false } }],
+  ["authorization failure", { analysisFailure: { phase: "analysis", code: "REMOTE_DATA_NOT_AUTHORIZED", modelFailure: false } }],
+  ["maintenance failure", { analysisFailure: { phase: "analysis", code: "RUNTIME_RESTART_REQUIRED", modelFailure: false } }],
+  ["same requested primary after backup failure", { brain: { provider: "ollama", model: "qwen3.5:9b",
+    fallbackFrom: { provider: "codex-login-cli", model: "gpt-5.6-luna", reason: "STRUCTURED_PROVIDER_PROCESS_FAILED" } } }],
+  ["invalid budget offset", { analysisAttemptBudget: { provider: "ollama", model: "qwen3.5:9b", attemptOffset: 4 } }],
+  ["paused job", { status: "paused" }],
+  ["dismissed job", { status: "dismissed" }],
+  ["unhealthy facts", {}, { sourceStatus: { githubPullRequests: { ok: false } } }],
+  ["paused employee", {}, {}, { paused: true }],
+]) {
+  test(`primary activation does not resume ${name}`, async () => {
+    const item = pullRequest();
+    const initial = { ...exhaustedOllamaState(item, jobChanges), ...stateChanges };
+    const store = new MemoryStore({ snapshot: snapshot([item], snapshotChanges), "pr-employee-state": initial });
+    const options = { store, reviewer: routedTriageReviewer({ primary: async () => assert.fail("protected job reached primary") }),
+      config: { triageOnly: true }, github: { async loadReviewContext() { assert.fail("protected job reached context"); } },
+      triageHandoff: durableTriageHandoff() };
+    await createService(options).tick();
+    assert.deepEqual((await store.read("pr-employee-state")).jobs, initial.jobs);
+  });
+}
+
+test("fallback success retains its model when the later durable handoff fails", async () => {
+  const item = pullRequest();
+  const store = new MemoryStore({ snapshot: snapshot([item]) });
+  const reviewer = routedTriageReviewer({ primary: async () => { throw Object.assign(new Error("Primary unavailable"), { code: "STRUCTURED_PROVIDER_UNAVAILABLE" }); },
+    fallback: async () => reviewResult({ workType: "triage_plan", reviewVerdict: "none", reviewBody: "", requiresApproval: false }) });
+  await createService({ store, reviewer, config: { triageOnly: true }, github: { async loadReviewContext() { return { ...item }; } },
+    triageHandoff: { async submit() { throw new Error("ledger unavailable"); } } }).tick();
+  const job = (await store.read("pr-employee-state")).jobs[0];
+  assert.equal(job.status, "retry_wait");
+  assert.equal(job.error, "ledger unavailable");
+  assert.equal(job.brain.provider, "ollama");
+  assert.equal(job.brain.fallbackFrom.provider, "codex-login-cli");
+  assert.deepEqual(job.analysisFailure, { phase: "handoff", code: "PR_EMPLOYEE_JOB_FAILED", modelFailure: false });
+});
+
+test("configuration fencing leaves a model-switch recovery blocked without consuming attempts", async () => {
+  const item = pullRequest();
+  const initial = exhaustedOllamaState(item);
+  const store = new MemoryStore({ snapshot: snapshot([item]), "pr-employee-state": initial });
+  const gate = readyGate();
+  await cutoverToVersion(gate, 2);
+  await assert.rejects(createService({ store, reviewer: routedTriageReviewer(), config: { triageOnly: true }, actionAdmissionGate: gate,
+    github: { async loadReviewContext() { assert.fail("fenced recovery reached context"); } },
+    triageHandoff: durableTriageHandoff() }).tick(), { code: "RUNTIME_RESTART_REQUIRED" });
+  assert.deepEqual((await store.read("pr-employee-state")).jobs, initial.jobs);
+});
+
+for (const [name, change] of [
+  ["Head", { headRefOid: HEAD_43 }],
+  ["full Git target", { gitTarget: { ...pullRequest().gitTarget, baseRefOid: "e".repeat(40) } }],
+  ["action", { nextAction: "rereview" }],
+  ["relation", { relation: "authored", nextAction: "fix_ci" }],
+]) {
+  test(`model activation supersedes obsolete ${name} instead of recovering the old failed request`, async () => {
+    const item = pullRequest();
+    const current = pullRequest(change);
+    const initial = exhaustedOllamaState(item);
+    const store = new MemoryStore({ snapshot: snapshot([current]), "pr-employee-state": initial });
+    const requests = [];
+    await createService({ store, reviewer: routedTriageReviewer(), config: { triageOnly: true },
+      github: { async loadReviewContext() { return { ...current }; } },
+      triageHandoff: durableTriageHandoff((request) => requests.push(request)) }).tick();
+    const old = (await store.read("pr-employee-state")).jobs.find((job) => job.id === initial.jobs[0].id);
+    assert.equal(old.status, "superseded");
+    assert.equal(old.attempts, 3);
+    assert.equal(old.analysisAttemptBudget, undefined);
+    assert.equal(requests.some((request) => request.requestKey === old.id), false);
+  });
+}
+
+test("PR patrol persists the actual fallback model and restart does not repeat completed analysis", async () => {
+  const item = pullRequest();
+  const store = new MemoryStore({ snapshot: snapshot([item]) });
+  let primaryCalls = 0; let fallbackCalls = 0; let handoffs = 0;
+  const reviewer = new RoutedPrEmployeeReviewer({
+    primaryBrain: { provider: "codex-login-cli", model: "gpt-5.6-luna", remoteData: { requirements: true, code: true, memory: false } },
+    router: { async generate() { primaryCalls += 1; throw Object.assign(new Error("Primary unavailable"), { code: "STRUCTURED_PROVIDER_UNAVAILABLE" }); } },
+    fallback: { provider: "ollama", model: "qwen3.5:9b", async analyze() {
+      fallbackCalls += 1;
+      return reviewResult({ workType: "triage_plan", reviewVerdict: "none", reviewBody: "", requiresApproval: false });
+    } },
+  });
+  const options = { store, reviewer, config: { triageOnly: true },
+    github: { async loadReviewContext() { return { ...item }; } },
+    triageHandoff: durableTriageHandoff(() => { handoffs += 1; }) };
+  await createService(options).tick();
+  const state = await store.read("pr-employee-state");
+  assert.equal(state.jobs[0].status, "ready");
+  assert.deepEqual(state.jobs[0].brain, { provider: "ollama", model: "qwen3.5:9b", fallbackFrom: {
+    provider: "codex-login-cli", model: "gpt-5.6-luna", reason: "STRUCTURED_PROVIDER_UNAVAILABLE" } });
+  await createService(options).tick();
+  assert.deepEqual([primaryCalls, fallbackCalls, handoffs], [1, 1, 1]);
+});
 
 test("configuration-first admission creates no legacy PR employee job", async () => {
   const gate = readyGate();
