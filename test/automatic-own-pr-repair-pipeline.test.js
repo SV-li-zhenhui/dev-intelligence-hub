@@ -9,8 +9,11 @@ import { createChangePackage } from "../src/domain/change-package-contract.js";
 import { CODE_JOB_ACTIONS_BY_OPERATION, codeJobIdForGrant, createCodeJobGrant } from "../src/domain/code-job-contract.js";
 import { createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { createControlledCommitEvidence, createControlledCommitMessage } from "../src/domain/controlled-commit-evidence.js";
+import { createChangePackageControlledCommitReceipt } from "../src/domain/change-package-controlled-commit.js";
+import { createPullRequestExternalActionConfirmationPlan } from "../src/domain/pull-request-external-action.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { AutomaticOwnPrRepair } from "../src/services/automatic-own-pr-repair.js";
+import { HistoricalControlledCommitReader } from "../src/services/historical-controlled-commit-reader.js";
 import { CodeActionProposalHandler } from "../src/services/code-action-proposal-handler.js";
 import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
 import { OwnerWorkRequestService } from "../src/services/owner-work-request-service.js";
@@ -207,6 +210,8 @@ async function fixture({ enabled = true, pushOutcome = "applied", store = new Me
       github: { async readOwnPullRequestFeedback() { return clone(facts); } }, confirmations: confirmationPort,
       codeJobReader: { async getDetail({ jobId }) { return clone(details.get(jobId) ?? null); } },
       controlledCommitReader: { async verify({ evidenceId }) { return clone(verified.get(evidenceId)); } },
+      historicalControlledCommitReader: new HistoricalControlledCommitReader({ store,
+        controlledCommitReader: { async verify({ evidenceId }) { return clone(verified.get(evidenceId)); } } }),
       grantVerifier: { async verify(value) {
         if (!grantCurrent) throw Object.assign(new Error("revoked grant"), { code: "INVALID_CODE_JOB_AUTHORITY" });
         return clone(value);
@@ -229,7 +234,7 @@ async function fixture({ enabled = true, pushOutcome = "applied", store = new Me
     });
   }
   return {
-    store, binding, proposal, grant, config, item, facts, context, jobs, pushes, ownerWorkRequests, reviewLedger,
+    store, binding, proposal, grant, config, item, facts, context, jobs, pushes, ownerWorkRequests, reviewLedger, details, verified,
     get service() { return service; }, get queue() { return queue; },
     get codeJobApprovalCount() { return codeJobApprovalCount; },
     async deliver() { return handler().handle({ proposal, status: "pending_delivery", attempt: 1, downstreamRef: null }); },
@@ -633,6 +638,211 @@ test("legacy publication only recovers review for the exact verified live Head a
   assert.equal(recovered.published[1].reviewDelivery.status, "completed");
   assert.equal((await f.ownerWorkRequests.list()).items.length, 1);
   assert.equal(f.pushes.length, 1);
+});
+
+async function historicalOwnerPublicationFixture({ store = new MemoryStore() } = {}) {
+  const f = await fixture({ store });
+  await f.deliver();
+  const evidence = f.completeJob();
+  const grant = f.grant;
+  const pushProposal = normalizeBoundWorkProposal({
+    proposalId: "old-owner-repair-push", policyVersion: grant.policyVersion,
+    kind: "github_pull_request_action_proposal", requestedBy: grant.requestedBy, source: grant.source,
+    binding: { eventId: grant.source.eventId, subject: grant.subject,
+      repository: grant.repository, pullRequestNumber: grant.inputBinding.pullRequestNumber,
+      headRefOid: grant.inputBinding.headRefOid, inputBinding: grant.inputBinding },
+    payload: { action: { type: "push", controlledCommitEvidence: evidence },
+      summary: "Old repair push", reason: "Owner sealed this historical attempt", evidence: [] },
+  });
+  const sealed = await f.queue.enqueue(createPullRequestExternalActionConfirmationPlan(pushProposal,
+    { actorAccountId: f.config.githubActions.actorAccountId }));
+  await f.queue.reject(sealed.id, { requestId: "seal-old-publication",
+    expectedQueueRevision: sealed.queueRevision, expectedItemRevision: sealed.itemRevision,
+    displayedPayloadDigest: sealed.displayedPayloadDigest, approvalBindingDigest: sealed.approvalBindingDigest,
+    reason: "Do not retry the old publication" });
+  const state = await f.store.read(STATE_KEY);
+  state.repairs[0].status = "failed";
+  state.repairs[0].pushConfirmationId = sealed.id;
+  delete state.repairs[0].feedbackSnapshotId;
+  delete state.repairs[0].feedbackSnapshotArchive;
+  state.feedbackSnapshots = [];
+  await f.store.write(STATE_KEY, state);
+  await f.service.recover();
+  const publication = { repository: f.binding.repository, number: f.binding.pullRequestNumber,
+    feedbackDigest: FEEDBACK_DIGEST, commitOid: evidence.commit.oid,
+    confirmationId: "owner-publication-12345678-1234-4123-8123-123456789abc" };
+  await f.service.recordPublished(publication);
+  const request = { eventId: `code-job-change-package-event-${"d".repeat(64)}`,
+    eventDigest: "d".repeat(64), packageId: evidence.package.packageId,
+    packageDigest: evidence.package.packageDigest, executionSource: evidence.executionSource,
+    recordedAt: evidence.createdAt };
+  const receipt = createChangePackageControlledCommitReceipt(request, evidence);
+  await f.store.write("change-package-controlled-commits", { schemaVersion: 1, revision: 1,
+    deliveries: [{ request, status: "committed", evidenceId: evidence.evidenceId, receipt }] });
+  f.facts.headRefOid = evidence.commit.oid;
+  await f.restart();
+  return { f, evidence, publication, request, receipt, sealed,
+    originalRepairs: clone((await f.store.read(STATE_KEY)).repairs),
+    originalQueue: clone(await f.store.read("confirmation-queue")) };
+}
+
+test("disk-backed historical owner publication recovers internal review without retrying a sealed push", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "owner-publication-review-"));
+  t.after(async () => { await rm(directory, { recursive: true, force: true }); });
+  const { f, evidence, publication, receipt, originalRepairs, originalQueue } =
+    await historicalOwnerPublicationFixture({ store: new StateStore(directory) });
+  const result = await f.service.runCycle();
+  assert.equal(result.reviewDelivered, 1, JSON.stringify(result));
+  const state = await f.store.read(STATE_KEY);
+  assert.equal(state.published[0].publicationProvenance.kind, "observed_owner_publication");
+  assert.equal(state.published[0].publicationProvenance.publicationId, publication.confirmationId);
+  assert.deepEqual(state.published[0].publicationProvenance.controlledCommitReceipt, receipt);
+  assert.equal(state.published[0].reviewDelivery.status, "completed");
+  assert.deepEqual(state.repairs, originalRepairs);
+  assert.deepEqual(await f.store.read("confirmation-queue"), originalQueue);
+  assert.equal(f.pushes.length, 0);
+  const accepted = (await f.ownerWorkRequests.list()).items;
+  assert.equal(accepted.length, 1);
+  assert.equal(accepted[0].assignment.target.id, "pr-engineer");
+  assert.equal(accepted[0].request.internalReview.controlledCommitEvidenceId, evidence.evidenceId);
+  await f.restart();
+  await f.service.runCycle();
+  assert.deepEqual((await f.ownerWorkRequests.list()).items, accepted);
+  const current = await f.reviewLedger.readItemForReconciliation({ itemId: accepted[0].workItemId });
+  f.config.githubActions.automaticOwnPrRepair = false;
+  const reader = new OriginalRepairFeedbackReader({ store: new StateStore(directory), executionContextReader: f.reviewLedger });
+  const descriptor = await reader.readBinding({ inputBinding: currentWorkItemExecutionBinding(current),
+    internalReview: accepted[0].request.internalReview });
+  const snapshot = await reader.read({ ...descriptor, repository: f.binding.repository, number: f.binding.pullRequestNumber });
+  assert.deepEqual(snapshot.feedback, ORIGINAL_FEEDBACK);
+  assert.equal(snapshot.originalHeadRefOid, f.binding.headRefOid);
+  assert.equal(snapshot.provenance.observedHeadRefOid, evidence.commit.oid);
+});
+
+for (const failure of ["publication-before-write", "publication-lost-ack", "intake-lost-ack"]) {
+  test(`historical owner publication resumes ${failure} with one internal intake and preserved seals`, async () => {
+    const { f, originalQueue, originalRepairs } = await historicalOwnerPublicationFixture();
+    const write = f.store.write.bind(f.store);
+    let armed = true;
+    if (failure === "intake-lost-ack") f.loseReviewAcknowledgement();
+    else f.store.write = async (key, value) => {
+      if (armed && key === STATE_KEY && value.published[0].publicationProvenance) {
+        armed = false;
+        const row = value.published[0];
+        assert.equal(row.reviewDelivery.status, "pending", "provenance and delivery intent commit together");
+        assert.ok(await f.store.read(originalRepairFeedbackArchiveKey(row.feedbackSnapshotId)), "the original body must already be durable");
+        if (failure === "publication-before-write") throw new Error(failure);
+        await write(key, value);
+        throw new Error(failure);
+      }
+      return write(key, value);
+    };
+    const first = await f.service.runCycle();
+    assert.equal(first.reviewPending, 1);
+    const beforeRestart = (await f.ownerWorkRequests.list()).items;
+    assert.equal(beforeRestart.length, failure === "intake-lost-ack" ? 1 : 0);
+    await f.restart();
+    await f.ownerWorkRequests.recover();
+    await f.service.runCycle();
+    await f.service.runCycle();
+    const state = await f.store.read(STATE_KEY);
+    assert.equal(state.published[0].reviewDelivery.status, "completed");
+    const requests = (await f.ownerWorkRequests.list()).items;
+    assert.equal(requests.length, 1);
+    if (beforeRestart.length) assert.equal(requests[0].workItemId, beforeRestart[0].workItemId);
+    assert.deepEqual(state.repairs, originalRepairs);
+    assert.deepEqual(await f.store.read("confirmation-queue"), originalQueue);
+    assert.equal(f.pushes.length, 0);
+  });
+}
+
+for (const [name, drift] of [
+  ["current author changed", async ({ f }) => { f.facts.author = "another-author"; }],
+  ["current Head changed", async ({ f }) => { f.facts.headRefOid = "8".repeat(40); }],
+  ["committed delivery missing", async ({ f }) => {
+    await f.store.write("change-package-controlled-commits", { schemaVersion: 1, revision: 0, deliveries: [] });
+  }],
+  ["committed delivery ambiguous", async ({ f }) => {
+    const evidence = controlledCommit(f.grant, { modified: [{ path: "src/value.js", beforeSha256: "f".repeat(64), content: Buffer.from("other fix\n") }] });
+    const request = { eventId: `code-job-change-package-event-${"e".repeat(64)}`, eventDigest: "e".repeat(64),
+      packageId: evidence.package.packageId, packageDigest: evidence.package.packageDigest,
+      executionSource: evidence.executionSource, recordedAt: evidence.createdAt };
+    const state = await f.store.read("change-package-controlled-commits");
+    state.deliveries.push({ request, status: "committed", evidenceId: evidence.evidenceId,
+      receipt: createChangePackageControlledCommitReceipt(request, evidence) });
+    state.revision += 1;
+    await f.store.write("change-package-controlled-commits", state);
+  }],
+  ["package receipt changed", async ({ f }) => {
+    const state = await f.store.read("change-package-controlled-commits");
+    state.deliveries[0].receipt.packageId = `change-package-${"f".repeat(64)}`;
+    await f.store.write("change-package-controlled-commits", state);
+  }],
+  ["original source binding changed", async ({ f }) => {
+    const state = await f.store.read("change-package-controlled-commits");
+    state.deliveries[0].request.executionSource.inputBinding.inputRevision += 1;
+    await f.store.write("change-package-controlled-commits", state);
+  }],
+  ["sealed evidence missing", async ({ f, evidence }) => { f.verified.delete(evidence.evidenceId); }],
+  ["sealed evidence belongs to another job", async ({ f, evidence }) => {
+    f.verified.set(evidence.evidenceId, controlledCommit(f.grant, {
+      job: { id: "code-job-other", revision: 7, recordDigest: "9".repeat(64) },
+    }));
+  }],
+  ["job history changed", async ({ f }) => { f.details.get(codeJobIdForGrant(f.grant)).job.jobId = "code-job-other"; }],
+  ["job status unknown", async ({ f }) => { f.details.get(codeJobIdForGrant(f.grant)).job.status = "unknown"; }],
+  ["job Head binding changed", async ({ f }) => { f.details.get(codeJobIdForGrant(f.grant)).job.inputBinding.inputRevision += 1; }],
+  ["original feedback changed", async ({ f }) => {
+    f.service.historicalRepairFeedbackReader = { async read({ inputBinding, feedbackDigest }) {
+      return { context: { schemaVersion: 1, headRefOid: inputBinding.headRefOid, reviewFeedbackDigest: feedbackDigest,
+        feedback: { changeRequests: [{ ...ORIGINAL_FEEDBACK.changeRequests[0], body: "another defect" }], threads: [] } },
+      provenance: { kind: "github_digest_matched_feedback", observedHeadRefOid: f.facts.headRefOid, observedAt: CREATED_AT } };
+    } };
+  }],
+  ["repair history missing", async ({ f }) => {
+    const state = await f.store.read(STATE_KEY); state.repairs = []; await f.store.write(STATE_KEY, state); await f.service.recover();
+  }],
+  ["repair history ambiguous", async ({ f }) => {
+    const state = await f.store.read(STATE_KEY); state.repairs.push({ ...state.repairs[0], jobId: "code-job-another" });
+    await f.store.write(STATE_KEY, state); await f.service.recover();
+  }],
+  ["unknown publication source", async ({ f }) => {
+    const state = await f.store.read(STATE_KEY); state.published[0].confirmationId = "unrecognized-offline-record";
+    await f.store.write(STATE_KEY, state); await f.service.recover();
+  }],
+  ["historical reader unavailable", async ({ f }) => { f.service.historicalControlledCommitReader = null; }],
+]) {
+  test(`historical owner review fails closed when ${name}`, async () => {
+    const scenario = await historicalOwnerPublicationFixture();
+    const { f } = scenario;
+    await drift(scenario);
+    const stateBefore = clone(await f.store.read(STATE_KEY));
+    await f.service.runCycle();
+    const stateAfter = await f.store.read(STATE_KEY);
+    assert.deepEqual(stateAfter, stateBefore);
+    assert.deepEqual(await f.store.read("confirmation-queue"), scenario.originalQueue);
+    assert.equal((await f.ownerWorkRequests.list()).items.length, 0);
+    assert.equal(f.pushes.length, 0);
+  });
+}
+
+test("persisted historical owner provenance rejects drift from its repair and feedback archive", async () => {
+  const { f } = await historicalOwnerPublicationFixture();
+  await f.service.runCycle();
+  const valid = await f.store.read(STATE_KEY);
+  for (const change of [
+    (state) => { state.published[0].publicationProvenance.inputBinding.inputRevision += 1; },
+    (state) => { state.published[0].publicationProvenance.jobId = "code-job-other"; },
+    (state) => { state.published[0].publicationProvenance.controlledCommitReceipt.evidenceId = `controlled-git-commit-${"a".repeat(64)}`; },
+    (state) => { state.repairs[0].feedbackDigest = "a".repeat(64); },
+  ]) {
+    const corrupt = clone(valid); change(corrupt);
+    await f.store.write(STATE_KEY, corrupt);
+    await assert.rejects(f.service.recover());
+    assert.deepEqual(await f.store.read(STATE_KEY), corrupt, "recovery cannot rewrite corrupt provenance");
+  }
+  await f.store.write(STATE_KEY, valid);
+  await f.service.recover();
 });
 
 test("disk-backed repair delivery resumes a lost acknowledgement through durable normal request intake", async (t) => {

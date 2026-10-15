@@ -24,6 +24,7 @@ import { ReviewHandoffReconciler } from "../src/services/review-handoff-reconcil
 import { createGitHubActionExecutor } from "../src/adapters/github-action-adapter.js";
 import { githubCredentialSourceError } from "../src/lib/github-credential-source.js";
 import { ManagedProcessError } from "../src/lib/managed-process.js";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { createSafeDisabledConfiguration } from "../src/lib/config.js";
 import { ConfigurationStore } from "../src/services/configuration-store.js";
 import {
@@ -7917,6 +7918,188 @@ test("shutdown drains the admitted memory projection port then stops its cycle",
   await stopping;
   assert.equal(laterSteps, 0);
   await Promise.allSettled([backgroundWork.initialRefresh]);
+});
+
+async function configurationRestartShutdownRace({
+  transformRejection = (error) => error,
+  additionalStage = async () => {},
+  settleCutover = (control) => control.commit({
+    version: 40,
+    configurationDigest: "b".repeat(64),
+  }),
+  close = async () => {},
+} = {}) {
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective({ version: 39, configurationDigest: "a".repeat(64) });
+  const noOpCycle = { async runCycle() {} };
+  const proposalStarted = deferred();
+  const releaseProposal = deferred();
+  let racing = false;
+  let claimExecutions = 0;
+  let applicationCloses = 0;
+  let leaseCloses = 0;
+  let stopping;
+  let statusBeforeStop;
+  const reportedErrors = [];
+  const coordinator = new WorkCoordinationService({
+    ledger: { async intake() {} },
+    proposalRunner: {
+      async runCycle() {
+        if (racing) {
+          proposalStarted.resolve();
+          await releaseProposal.promise;
+        }
+        try {
+          return await gate.run(() => { claimExecutions += 1; });
+        } catch (error) {
+          throw transformRejection(error);
+        }
+      },
+    },
+    proposalResultReconciler: {
+      async runCycle() { if (racing) await additionalStage(gate); },
+    },
+    attentionResultReconciler: noOpCycle,
+    conditionWaker: noOpCycle,
+    workLoop: noOpCycle,
+    dispatcher: { async dispatchPending() {} },
+  });
+  const application = startupApplication({
+    async close() { applicationCloses += 1; await close(); },
+  });
+  let server;
+  let backgroundWork;
+  application.workCoordination = {
+    intake: (options) => coordinator.intake(options),
+    async runCycle(options) {
+      try {
+        return await coordinator.runCycle(options);
+      } catch (error) {
+        if (racing) {
+          // Shutdown may resume between the failed coordination promise and
+          // the background task's rejection/finally handlers.
+          queueMicrotask(() => {
+            statusBeforeStop = backgroundWork.drainStatus();
+            stopping = server.shutdown().then(
+              () => ({ succeeded: true }),
+              (failure) => ({ succeeded: false, failure }),
+            );
+          });
+        }
+        throw error;
+      }
+    },
+  };
+  backgroundWork = startApplicationBackgroundWork(application, {
+    drainTimeoutMs: 500,
+    reportError(error) { reportedErrors.push(error); },
+    setIntervalFn() { return { unref() {} }; },
+    clearIntervalFn() {},
+  });
+  await backgroundWork.initialRefresh;
+  server = createDashboardServer(application, {
+    backgroundWork,
+    shutdownDrainTimeoutMs: 1_000,
+    writerLease: {
+      async acquire() {},
+      async close() { leaseCloses += 1; },
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    racing = true;
+    const cycling = backgroundWork.signalAgency().then(
+      () => assert.fail("the old configuration must reject the cycle"),
+      (error) => error,
+    );
+    await proposalStarted.promise;
+    await gate.cutover(settleCutover);
+    releaseProposal.resolve();
+    const cycleFailure = await cycling;
+    assert.ok(stopping, "shutdown must race the tracked rejection");
+    const shutdown = await stopping;
+    assert.equal(statusBeforeStop.activeTaskCount, 1);
+    assert.equal(claimExecutions, 1, "cutover must prevent another proposal claim");
+    assert.deepEqual(backgroundWork.drainStatus().activeParticipants, []);
+    assert.equal(backgroundWork.drainStatus().activeTaskCount, 0);
+    assert.deepEqual(reportedErrors, [cycleFailure]);
+    return { shutdown, cycleFailure, applicationCloses, leaseCloses };
+  } finally {
+    releaseProposal.resolve();
+    await Promise.allSettled([backgroundWork.stop(), server.shutdown()]);
+  }
+}
+
+test("shutdown drains a configuration cutover admission rejection racing task settlement", async () => {
+  const result = await configurationRestartShutdownRace();
+  assert.equal(result.cycleFailure.code, "WORK_COORDINATION_STAGE_FAILED");
+  assert.equal(result.cycleFailure.cause.code, "RUNTIME_RESTART_REQUIRED");
+  assert.deepEqual(result.shutdown, { succeeded: true });
+  assert.equal(result.applicationCloses, 1);
+  assert.equal(result.leaseCloses, 1);
+});
+
+test("shutdown drains an aggregate containing only real configuration restart rejections", async () => {
+  const result = await configurationRestartShutdownRace({
+    additionalStage: (gate) => gate.run(() => assert.fail("must not be admitted")),
+  });
+  assert.ok(result.cycleFailure instanceof AggregateError);
+  assert.equal(result.cycleFailure.errors.length, 2);
+  assert.deepEqual(result.shutdown, { succeeded: true });
+  assert.equal(result.applicationCloses, 1);
+  assert.equal(result.leaseCloses, 1);
+});
+
+test("shutdown retains non-admission failures alongside a configuration cutover", async (t) => {
+  for (const [name, options] of [
+    ["a plain error with the same code", {
+      transformRejection: () => Object.assign(new Error("ordinary failure"), {
+        code: "RUNTIME_RESTART_REQUIRED",
+      }),
+    }],
+    ["an aggregate with a real I/O failure", {
+      additionalStage: async () => { throw new Error("durable append failed"); },
+    }],
+    ["an aggregate with an unknown external write", {
+      additionalStage: async () => {
+        throw Object.assign(new Error("external write was not confirmed"), {
+          code: "EXTERNAL_ACTION_UNKNOWN",
+        });
+      },
+    }],
+    ["a foreign aggregate wrapper", {
+      transformRejection: (error) => new AggregateError([error], "foreign failure"),
+    }],
+    ["a typed rejection with another failure cause", {
+      transformRejection: (error) => Object.assign(error, {
+        cause: new Error("durable runtime failed"),
+      }),
+    }],
+    ["an unknown configuration state", {
+      settleCutover: (control) => control.markUnknown(),
+    }],
+  ]) {
+    await t.test(name, async () => {
+      const result = await configurationRestartShutdownRace(options);
+      assert.equal(result.shutdown.succeeded, false);
+      assert.equal(result.shutdown.failure, result.cycleFailure);
+      assert.equal(result.applicationCloses, 0);
+      assert.equal(result.leaseCloses, 0);
+    });
+  }
+});
+
+test("a pure configuration restart rejection does not suppress runtime close failure", async () => {
+  const failure = Object.assign(new Error("native termination is unconfirmed"), {
+    code: "NATIVE_CODEX_REAP_UNCONFIRMED",
+  });
+  const result = await configurationRestartShutdownRace({
+    close: async () => { throw failure; },
+  });
+  assert.equal(result.shutdown.succeeded, false);
+  assert.equal(result.shutdown.failure, failure);
+  assert.equal(result.applicationCloses, 1);
+  assert.equal(result.leaseCloses, 0);
 });
 
 test("shutdown preserves a real memory projection failure after abort", async () => {

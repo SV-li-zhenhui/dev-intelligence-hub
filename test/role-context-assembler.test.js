@@ -736,6 +736,7 @@ test("a PR source root binds context and facts to its active Head revision", asy
   const advanced = appendPullRequestWorkSource(
     initial.source,
     pullRequestAssignment(2, eventB),
+    { attemptAtActivation: 0 },
   );
   fixture.item = {
     ...fixture.item,
@@ -925,6 +926,7 @@ test("a PR graph child gives its brain the inherited exact Head binding", async 
   const advanced = appendPullRequestWorkSource(
     initial.source,
     pullRequestAssignment(2, eventB),
+    { attemptAtActivation: 0 },
   );
   const sourceBinding = currentWorkItemInputBinding({
     itemId: "pr-source-root",

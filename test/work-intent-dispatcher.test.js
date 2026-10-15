@@ -1874,6 +1874,7 @@ test("dispatcher binds a PR intent to the active Head instead of its origin even
   pair.item.source = appendPullRequestWorkSource(
     created.source,
     prSourceEnvelope(2, headB, "workflow-assignment-head-b"),
+    { attemptAtActivation: 0 },
   ).source;
 
   const contexts = [];

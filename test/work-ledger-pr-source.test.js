@@ -3,8 +3,8 @@ import test from "node:test";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { createPullRequestExecutionBinding } from "../src/domain/pull-request-execution-binding.js";
 import {
-  activatePendingPullRequestWorkSource,
-  appendPullRequestWorkSource,
+  activatePendingPullRequestWorkSource as activatePendingPullRequestWorkSourceWithCounter,
+  appendPullRequestWorkSource as appendPullRequestWorkSourceWithCounter,
   createPullRequestWorkSource,
   currentWorkItemEvent,
   currentWorkItemInputBinding,
@@ -14,6 +14,13 @@ import {
   verifyPullRequestExecutionBinding,
   validatePullRequestSourceTransition,
 } from "../src/services/work-ledger-pr-source.js";
+
+// These source-only fixtures have no claims; production passes the owning
+// item's exact counter at its validated activation boundary.
+const appendPullRequestWorkSource = (source, envelope, options = {}) =>
+  appendPullRequestWorkSourceWithCounter(source, envelope, { attemptAtActivation: 0, ...options });
+const activatePendingPullRequestWorkSource = (source, options = {}) =>
+  activatePendingPullRequestWorkSourceWithCounter(source, { attemptAtActivation: 0, ...options });
 
 const HEAD_A = "a".repeat(40);
 const HEAD_B = "b".repeat(40);
@@ -74,6 +81,7 @@ function sourceItem(source) {
     itemId: "work-item-pr-42",
     source,
     sourceQuarantine: null,
+    attempt: 0,
   };
 }
 

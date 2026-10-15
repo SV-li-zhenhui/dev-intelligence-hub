@@ -501,6 +501,14 @@ memory projection. Manual and scheduled requests for the same independent role
 coalesce. Proposal execution, code jobs and publication still use their existing
 controlled stages; a staged modify proposal is not evidence that code has run.
 
+An already verified owner publication can recover internal review from its
+unique committed delivery, original job and sealed evidence. This does not retry
+an old rejected push. Missing proof is a pending review error. Retained completed
+Review receipts can settle historical source bindings without another GitHub POST.
+During managed shutdown, only typed, pure configuration-restart admission
+rejections are drained as completed fences; mixed failures and unconfirmed
+process shutdown still block restart.
+
 Native Codex availability admission does not enqueue a redundant login probe
 behind work already using the same native home. This keeps ordinary contention
 from becoming a pre-claim resolution timeout. Actual generations remain serialized

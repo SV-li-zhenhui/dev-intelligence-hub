@@ -224,11 +224,24 @@ readback precedes the hot-state update, so uncertain writes preserve the old
 inline copy. Schema 1 remains readable and restore validates every referenced
 archive before writing any migration. The reader works when repair automation is off.
 
+Historical owner publications use a separate observed-publication provenance,
+not a synthetic completed confirmation. A read-only committed-delivery lookup
+verifies the original job, sealed evidence and receipt before creating the same
+durable internal review delivery. Missing or ambiguous proof remains pending.
+
 Delivered Head-bound fact waits can be superseded when newer PR code arrives;
 explicit time waits and unknown side effects remain fenced. Lost Review
 references recover only an exactly bound historical confirmation. Completed
 receipts can settle a previously misclassified stale root without republishing
 the Review or changing its recorded history.
+Decision attempt budgets restart only when a proven Head actually becomes active,
+while the lifetime claim counter remains intact. The active source durably binds
+the offset to its activation and previous active revision; accepted pending Heads
+do not consume or replace it. Legacy offsets require retained activation and a
+side-effect-free timeline, then are sealed by a normal atomic claim. Automatic
+recovery of older false exhaustion still requires that timeline proof. Ignored scope
+reentries retain audit observations without mutating inactive terminal roots or
+blocking intake of later valid source facts.
 
 Human-only operations enter one durable confirmation queue. A request is bound
 to its revision, digest, actor, source provenance, and target identity. The UI

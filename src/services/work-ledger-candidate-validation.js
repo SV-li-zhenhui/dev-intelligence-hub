@@ -78,7 +78,7 @@ export function prepareWorkLedgerCandidate({
     );
   }
   try {
-    validatePullRequestSourceTransition(previousState.items, normalized.items);
+    validatePullRequestSourceTransition(previousState.items, normalized.items, previousState.timeline);
   } catch (error) {
     throw workLedgerError(
       "WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID",

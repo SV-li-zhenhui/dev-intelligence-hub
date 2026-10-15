@@ -27,6 +27,7 @@ function assignment(sequence, scope = "initial", head = HEAD) {
     occurredAt: `2026-10-15T01:0${sequence}:00.000Z`, source: { provider: "github", scopeId: scope },
     subject: { id: "github:pr:acme/repo#42", repository: "acme/repo", number: 42 },
     payload: { headRefOid: head, title: "Repair review", state: "open", gitTargetAvailable: true,
+      ...(head === HEAD ? {} : { changedFields: ["headRefOid"], previousHeadRefOid: HEAD }),
       gitTarget: { schemaVersion: 1, provider: "github", sourceAccountId: "review-account",
         baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "b".repeat(40),
         headRepository: "contributor/repo", headRefName: "fix/review", headRefOid: head } } });
@@ -35,7 +36,7 @@ function assignment(sequence, scope = "initial", head = HEAD) {
 }
 
 async function fixture({ outcome = "applied", transformPlan = (plan) => plan, downstream = false,
-  followupScope = "followup", leaveScope = false } = {}) {
+  followupScope = "followup", followupHead = HEAD, leaveScope = false, leaveScopeAfterResult = false } = {}) {
   const store = new MemoryStore();
   const records = [assignment(1)];
   const source = { async readAssignmentBatch({ afterSequence, limit }) {
@@ -82,23 +83,25 @@ async function fixture({ outcome = "applied", transformPlan = (plan) => plan, do
   await queue.approve(queued.id, { requestId: "approve-review-42", expectedQueueRevision: queued.queueRevision,
     expectedItemRevision: queued.itemRevision, displayedPayloadDigest: queued.displayedPayloadDigest,
     approvalBindingDigest: queued.approvalBindingDigest });
-  if (leaveScope) {
+  const leaveAutomaticScope = async () => {
     const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.left_scope",
       occurredAt: "2026-10-15T01:02:00.000Z", source: { provider: "github", scopeId: "initial" },
-      subject: records[0].event.subject, payload: { headRefOid: HEAD, state: "open" } });
+      subject: records[0].event.subject, payload: { ...records[0].event.payload, headRefOid: HEAD, state: "open" } });
     records.push({ sequence: 2, event, assignment: { assignmentId: "scope-exit-2", eventId: event.eventId,
       eventType: event.eventType, subject: event.subject, configVersion: 1, configDigest: "1".repeat(64),
       ruleId: PULL_REQUEST_SCOPE_LIFECYCLE_RULE_ID, target: PULL_REQUEST_SCOPE_LIFECYCLE_TARGET,
       priority: PULL_REQUEST_SCOPE_LIFECYCLE_PRIORITY, reason: PULL_REQUEST_SCOPE_LIFECYCLE_REASON, createdAt: event.occurredAt } });
     await service.intake();
-  }
+  };
+  if (leaveScope) await leaveAutomaticScope();
   const result = createWorkProposalResult({ proposal, sequence: 1, at: NOW, downstreamRef: downstream ? plan.id : null,
     transition: { status: "stale", summary: "Authority left scope before receipt recovery", evidence: downstream
       ? [`confirmation:${plan.id}`, "authorization_changed", "old_confirmation_status:completed"]
       : ["authorization_changed", `proposal:${proposal.proposalId}`] } });
   await service.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
   const staleHistory = (await service.listOutbox()).items[0];
-  records.push(assignment(records.length + 1, followupScope)); await service.intake();
+  if (leaveScopeAfterResult) await leaveAutomaticScope();
+  records.push(assignment(records.length + 1, followupScope, followupHead)); await service.intake();
   return { store, records, plan, proposal, reads, staleHistory,
     get service() { return service; }, get queue() { return queue; }, get executions() { return executions; },
     overrideRead(value) { overrideRead = value; },
@@ -190,14 +193,95 @@ test("completed Review proof recovers the stale proposal after automatic assignm
   assert.equal(f.executions, 1);
 });
 
-for (const [name, options] of [
+for (const downstream of [false, true]) test(`a completed Review on retained rev1 settles after same-Head scope rev2 became current (downstream=${downstream})`, async () => {
+  const f = await fixture({ downstream, leaveScopeAfterResult: true, followupScope: "initial", followupHead: "9".repeat(40) }); await f.restart();
+  const old = await f.service.readItemForReconciliation({ itemId: f.proposal.requestedBy.workItemId });
+  const sourceBefore = clone(old.source), decisionBefore = clone(old.decisionContext);
+  const byId = new Map((await f.service.listOutbox()).items.map((row) => [row.intentId, row]));
+  assert.equal(old.source.activeRevision, 2);
+  assert.equal(old.source.current.headRefOid, HEAD);
+  assert.equal(old.source.revisions[0].headRefOid, HEAD);
+  assert.notEqual(old.inputDigest, f.staleHistory.inputDigest);
+  assert.equal(old.source.revisions[0].inputDigest, f.staleHistory.inputDigest);
+  assert.ok(reviewConfirmationSettlementIds(old, byId).includes(f.plan.id), "retained rev1 identifies the completed confirmation");
+  const snapshots = await Promise.all(reviewConfirmationSettlementIds(old, byId).map((confirmationId) => f.queue.readSettlement({ confirmationId })));
+  assert.ok(createCompletedReviewConfirmationSettlement(old, byId, snapshots), "retained authority binds the exact completed receipt");
+  const result = await f.service.reconcilePullRequestSource(await f.command());
+  assert.equal(result.applied, true, JSON.stringify(result));
+  const settled = await f.service.readItemForReconciliation({ itemId: old.itemId });
+  assert.equal(settled.source.activeRevision, 3, "normal cutover activates only the newer pending input");
+  assert.equal(settled.source.pendingRevision, null);
+  assert.deepEqual(settled.source.current, sourceBefore.pending);
+  assert.deepEqual(settled.source.revisions, sourceBefore.revisions, "historical source authority remains append-only");
+  assert.deepEqual(settled.source.bindings, sourceBefore.bindings);
+  assert.equal(settled.decisionContext, null, "new input receives no stale decision authority");
+  const history = (await f.service.listTimeline({ itemId: old.itemId })).items;
+  assert.ok(history.some((entry) => entry.type === "proposal_result_applied" &&
+    entry.details.decision.contentDigest === decisionBefore.contentDigest), "terminal stale decision remains historical evidence");
+  assert.deepEqual((await f.service.listOutbox()).items[0], f.staleHistory);
+  assert.equal((await f.queue.get(f.plan.id)).status, "completed");
+  assert.equal(f.executions, 1);
+  await f.restart();
+  const repeat = await f.service.reconcilePullRequestSource(await f.command());
+  assert.equal(repeat.applied, false, JSON.stringify(repeat));
+  assert.equal(f.executions, 1, "restart and repeated cutover never republish a Review");
+});
+
+test("historical Review settlement requires every retained source and delivered proposal binding", async (t) => {
+  const f = await fixture({ leaveScopeAfterResult: true });
+  const item = await f.service.readItemForReconciliation({ itemId: f.proposal.requestedBy.workItemId });
+  const entries = (await f.service.listOutbox()).items;
+  const byId = new Map(entries.map((row) => [row.intentId, row]));
+  const snapshots = await Promise.all(reviewConfirmationSettlementIds(item, byId).map((confirmationId) => f.queue.readSettlement({ confirmationId })));
+  assert.ok(createCompletedReviewConfirmationSettlement(item, byId, snapshots));
+  const mismatches = [
+    ["missing revision", (row) => { row.source.revisions[0] = null; }],
+    ["unaccepted revision", (row) => { row.source.revisions[0].disposition = "ignored_stale"; }],
+    ["revision number", (row) => { row.source.revisions[0].revision = 3; }],
+    ["Head revision", (row) => { row.source.revisions[0].headRevision++; }],
+    ["Head", (row) => { row.source.revisions[0].headRefOid = "9".repeat(40); }],
+    ["event ID", (row) => { row.source.revisions[0].eventId = "other-event"; }],
+    ["event digest", (row) => { row.source.revisions[0].eventDigest = "9".repeat(64); }],
+    ["input digest", (row) => { row.source.revisions[0].inputDigest = "9".repeat(64); }],
+    ["work key", (row) => { row.source.workKey = "other-work-key"; }],
+    ["root ID", (row) => { row.itemId = "other-root"; }],
+    ["repository", (row) => { row.source.identity.repository = "other/repo"; }],
+    ["PR number", (row) => { row.source.identity.pullRequestNumber++; }],
+    ["missing retained assignment", (row) => { row.source.bindings = []; }],
+    ["retained assignment revision", (row) => { row.source.bindings[0].inputRevision = 3; }],
+    ["retained assignment event", (row) => { row.source.bindings[0].eventId = "other-event"; }],
+    ["quarantined source", (row) => { row.sourceQuarantine = { kind: "legacy_pull_request_source" }; }],
+    ["active external intent", (row) => { row.activeIntentId = "other-intent"; }],
+    ["waiting external", (row) => { row.status = "waiting_external"; }],
+    ["current role", (row) => { row.currentTarget.id = "developer"; }],
+    ["stable assignment", (row) => { row.assignmentId = "other-assignment"; }],
+    ["outbox role", (_row, outboxes) => { outboxes[0].requestedBy.roleId = "developer"; }],
+    ["outbox not delivered", (_row, outboxes) => { outboxes[0].status = "failed"; }],
+    ["non-review intent", (_row, outboxes) => { outboxes[0].intent.type = "propose_code_action"; }],
+    ["outbox input digest", (_row, outboxes) => { outboxes[0].inputDigest = "9".repeat(64); }],
+    ["outbox source binding", (_row, outboxes) => { outboxes[0].sourceBinding.inputRevision = 2; }],
+    ["proposal dispatch digest", (_row, outboxes) => { outboxes[0].dispatchBinding.bindingDigest = "9".repeat(64); }],
+    ["proposal digest", (_row, outboxes) => { outboxes[0].outcome.details.proposalDigest = "9".repeat(64); }],
+    ["result attestation", (_row, outboxes) => { outboxes[0].outcome.details.resultAttestation.decisionContentDigest = "9".repeat(64); }],
+  ];
+  for (const [name, mutate] of mismatches) await t.test(name, () => {
+    const changed = clone(item), outboxes = clone(entries); mutate(changed, outboxes);
+    const changedById = new Map(outboxes.map((row) => [row.intentId, row]));
+    assert.deepEqual(reviewConfirmationSettlementIds(changed, changedById), []);
+    assert.equal(createCompletedReviewConfirmationSettlement(changed, changedById, snapshots), null);
+  });
+});
+
+for (const historical of [false, true]) for (const [name, options] of [
   ["unknown", { outcome: "unknown" }],
   ["failed", { outcome: "absent" }],
   ["other actor", { transformPlan(plan) { plan.actor.accountId = "other-account"; plan.display.payload.actor.accountId = "other-account"; return plan; } }],
   ["other Head", { transformPlan(plan) { plan.target.version = "9".repeat(40); plan.display.payload.target.version = "9".repeat(40); return plan; } }],
 ]) {
-  test(`${name} Review confirmation cannot settle a stale proposal`, async () => {
-    const f = await fixture(options); const result = await f.service.reconcilePullRequestSource(await f.command());
+  test(`${name} Review confirmation cannot settle a stale proposal (historical=${historical})`, async () => {
+    const f = await fixture({ ...options, ...(historical ? { leaveScopeAfterResult: true,
+      followupScope: "initial", followupHead: "9".repeat(40) } : {}) });
+    const result = await f.service.reconcilePullRequestSource(await f.command());
     assert.equal(result.applied, false); assert.ok(result.blockers.length > 0); assert.equal(f.executions, 1);
   });
 }

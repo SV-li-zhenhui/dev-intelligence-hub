@@ -9,6 +9,7 @@ import { createPullRequestExternalActionConfirmationPlan } from "../domain/pull-
 import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
 import { normalizeOwnerWorkRequest } from "../domain/owner-work-request.js";
 import { internalRepairReviewRequestId, normalizeInternalReviewMetadata } from "../domain/internal-repair-review.js";
+import { isOwnerPublicationId, normalizeObservedOwnerPublication } from "../domain/observed-owner-publication.js";
 import { createOriginalRepairFeedbackSnapshot, normalizeOriginalRepairFeedbackSnapshot, normalizeOriginalRepairFeedbackArchiveReference,
   originalRepairFeedbackBinding, originalRepairFeedbackForRow } from "../domain/original-repair-feedback.js";
 import { persistOriginalRepairFeedbackArchives, planOriginalRepairFeedbackArchives, readOriginalRepairFeedbackSnapshot,
@@ -74,6 +75,15 @@ export function normalizeAutomaticOwnPrRepairState(value) {
     const snapshot = snapshotFor(row);
     if (row.feedbackSnapshotId !== undefined && (!snapshot || snapshot.repository !== row.repository ||
       snapshot.number !== row.number || snapshot.feedbackDigest !== row.feedbackDigest)) throw repairError("OWN_PR_REPAIR_STATE_INVALID", "修复发布原始反馈快照无效");
+    const provenance = row.publicationProvenance === undefined ? null : normalizeObservedOwnerPublication(row.publicationProvenance, row);
+    if (provenance) {
+      const repairs = value.repairs.filter((repair) => repair.jobId === provenance.jobId);
+      if (repairs.length !== 1 || repairs[0].feedbackDigest !== row.feedbackDigest ||
+          !samePullRequestExecutionBinding(repairs[0].inputBinding, provenance.inputBinding) ||
+          (snapshot && snapshot.originalHeadRefOid !== provenance.inputBinding.headRefOid)) {
+        throw repairError("OWN_PR_REPAIR_STATE_INVALID", "历史 owner 发布来源与原修复记录不匹配");
+      }
+    }
     if (row.reviewDelivery !== undefined) {
       const delivery = row.reviewDelivery;
       const request = normalizeOwnerWorkRequest(delivery.request);
@@ -81,6 +91,7 @@ export function normalizeAutomaticOwnPrRepairState(value) {
           request.pullRequest.number !== row.number || request.internalReview.headRefOid !== row.commitOid ||
           request.internalReview.publicationConfirmationId !== row.confirmationId ||
           request.internalReview.feedbackDigest !== row.feedbackDigest ||
+          (provenance && request.internalReview.controlledCommitEvidenceId !== provenance.controlledCommitReceipt.evidenceId) ||
           request.requestId !== internalRepairReviewRequestId({ repository: row.repository, number: row.number, ...request.internalReview }) ||
           !["pending", "completed", "stale"].includes(delivery.status) ||
           (delivery.status === "completed" && (typeof delivery.workItemId !== "string" || delivery.roleId !== "pr-engineer"))) {
@@ -102,7 +113,7 @@ export class AutomaticOwnPrRepair {
 
   constructor({ configurationReader, store, ledger, github, confirmations,
     codeJobReader = null, controlledCommitReader = null, objectSync = null, grantVerifier, ownerWorkRequests = null,
-    historicalRepairFeedbackReader = null, clock = () => new Date() }) {
+    historicalRepairFeedbackReader = null, historicalControlledCommitReader = null, clock = () => new Date() }) {
     if (typeof grantVerifier?.verify !== "function") throw new TypeError("Automatic own PR repair requires current grant verification");
     this.configurationReader = configurationReader;
     this.store = store;
@@ -115,6 +126,7 @@ export class AutomaticOwnPrRepair {
     this.grantVerifier = grantVerifier;
     this.ownerWorkRequests = ownerWorkRequests;
     this.historicalRepairFeedbackReader = historicalRepairFeedbackReader;
+    this.historicalControlledCommitReader = historicalControlledCommitReader;
     this.clock = clock;
   }
 
@@ -421,12 +433,14 @@ export class AutomaticOwnPrRepair {
   }
 
   async #legacyReviewDelivery(published) {
-    // An archived publication alone cannot resurrect old work. Only the exact
-    // live Head and completed controlled-push receipt can establish this intent.
+    // Queue publication and observed owner publication remain separate sources.
     if (!this.ownerWorkRequests || !this.controlledCommitReader || await this.#reviewCurrent(published)) return null;
     let push;
     try { push = await this.confirmations.get(published.confirmationId); }
-    catch (error) { if (error?.code === "CONFIRMATION_NOT_FOUND") return null; throw error; }
+    catch (error) {
+      if (error?.code !== "CONFIRMATION_NOT_FOUND") throw error;
+      return isOwnerPublicationId(published.confirmationId) ? this.#observedOwnerReviewDelivery(published) : null;
+    }
     const evidence = push?.display?.payload?.action?.controlledCommitEvidence;
     if (push?.status !== "completed" || push.kind !== "github.pull-request-push" ||
         evidence?.commit?.oid !== published.commitOid || evidence.executionSource?.kind !== "review_repair" ||
@@ -438,8 +452,73 @@ export class AutomaticOwnPrRepair {
     return this.#reviewDelivery(published, evidence);
   }
 
-  async #ensurePublishedSnapshot(published, evidence = null) {
-    if (published.feedbackSnapshotId) return published;
+  async #observedOwnerCommit(published) {
+    if (typeof this.historicalControlledCommitReader?.findCommitted !== "function" || !this.codeJobReader) {
+      throw repairError("OWN_PR_REPAIR_OWNER_PUBLICATION_UNAVAILABLE", "历史 owner 发布的只读来源尚不可用");
+    }
+    const repairs = this.#state.repairs.filter((row) => samePullRequest(row.inputBinding, published.repository, published.number) &&
+      row.feedbackDigest === published.feedbackDigest);
+    if (repairs.length !== 1 || this.#state.published.filter((row) => row.confirmationId === published.confirmationId).length !== 1) {
+      throw repairError("OWN_PR_REPAIR_OWNER_PUBLICATION_AMBIGUOUS", "历史 owner 发布没有唯一修复记录");
+    }
+    const repair = repairs[0];
+    const config = await this.#configuration();
+    if (!sameLogin(repair.inputBinding.gitTarget.sourceAccountId, config?.githubActions?.actorAccountId) ||
+        (published.feedbackFingerprints && repair.feedbackFingerprints &&
+          !isDeepStrictEqual(published.feedbackFingerprints, repair.feedbackFingerprints))) {
+      throw repairError("OWN_PR_REPAIR_COMMIT_INVALID", "历史修复作者或反馈绑定不匹配");
+    }
+    const committed = await this.historicalControlledCommitReader.findCommitted({ inputBinding: repair.inputBinding,
+      jobId: repair.jobId, commitOid: published.commitOid });
+    if (!committed) throw repairError("OWN_PR_REPAIR_OWNER_PUBLICATION_UNAVAILABLE", "历史 owner 发布缺少 committed delivery");
+    const evidence = committed.evidence;
+    const detail = await this.codeJobReader.getDetail({ jobId: repair.jobId });
+    const job = detail?.job;
+    const receipt = detail?.changePackage?.receipt?.controlledCommit;
+    if (job?.status !== "completed" || job.jobId !== repair.jobId ||
+        !samePullRequestExecutionBinding(job.inputBinding, repair.inputBinding) ||
+        !isDeepStrictEqual(job.executionSource, evidence.executionSource) ||
+        job.proposalId !== evidence.package.proposal.id || job.proposalContentDigest !== evidence.package.proposal.contentDigest ||
+        job.grantDigest !== evidence.package.grant.digest || job.workspaceId !== evidence.workspace.id ||
+        !Array.isArray(job.requiredProfiles) || job.requiredProfiles.length !== evidence.tests.profiles.length ||
+        !job.requiredProfiles.every((id) => evidence.tests.profiles.some((profile) => profile.id === id)) ||
+        receipt?.evidenceId !== evidence.evidenceId || receipt.evidenceDigest !== evidence.evidenceDigest || receipt.commitOid !== published.commitOid) {
+      throw repairError("OWN_PR_REPAIR_COMMIT_INVALID", "历史 owner 发布与原代码任务或测试证据不匹配");
+    }
+    return { ...committed, repair, actorAccountId: config.githubActions.actorAccountId };
+  }
+
+  async #observedOwnerReviewDelivery(published) {
+    const proof = await this.#observedOwnerCommit(published);
+    const publicationProvenance = normalizeObservedOwnerPublication({ schemaVersion: 1, kind: "observed_owner_publication",
+      publicationId: published.confirmationId, observedAt: new Date(this.clock()).toISOString(),
+      actorAccountId: proof.actorAccountId, jobId: proof.repair.jobId, inputBinding: proof.repair.inputBinding,
+      controlledCommitReceipt: proof.receipt }, published);
+    const reviewDelivery = this.#reviewDelivery(published, proof.evidence);
+    await this.#ensurePublishedSnapshot(published, proof.evidence, { publicationProvenance, reviewDelivery });
+    return reviewDelivery;
+  }
+
+  async #verifyObservedOwnerPublication(published) {
+    const provenance = normalizeObservedOwnerPublication(published.publicationProvenance, published);
+    const proof = await this.#observedOwnerCommit(published);
+    if (!isDeepStrictEqual(provenance.controlledCommitReceipt, proof.receipt) || provenance.jobId !== proof.repair.jobId ||
+        !samePullRequestExecutionBinding(provenance.inputBinding, proof.repair.inputBinding) ||
+        !sameLogin(provenance.actorAccountId, proof.actorAccountId)) {
+      throw repairError("OWN_PR_REPAIR_COMMIT_INVALID", "历史 owner 发布持久来源已变化");
+    }
+    return proof.evidence;
+  }
+
+  async #ensurePublishedSnapshot(published, evidence = null, publicationPatch = {}) {
+    if (published.feedbackSnapshotId) {
+      if (Object.keys(publicationPatch).length === 0) return published;
+      const updated = { ...published, ...publicationPatch };
+      await this.#save({ ...this.#state, published: this.#state.published.map((entry) =>
+        entry.confirmationId === published.confirmationId ? updated : entry) });
+      return this.#state.published.find((entry) => entry.confirmationId === published.confirmationId);
+    }
+    if (!evidence && published.publicationProvenance) evidence = await this.#verifyObservedOwnerPublication(published);
     if (!evidence) {
       const push = await this.confirmations.get(published.confirmationId);
       evidence = push?.display?.payload?.action?.controlledCommitEvidence;
@@ -464,7 +543,7 @@ export class AutomaticOwnPrRepair {
       }
       snapshot = createOriginalRepairFeedbackSnapshot({ repository: published.repository, number: published.number, ...historical });
     }
-    const updated = { ...published, feedbackSnapshotId: snapshot.snapshotId };
+    const updated = { ...published, ...publicationPatch, feedbackSnapshotId: snapshot.snapshotId };
     await this.#save({ ...this.#state, feedbackSnapshots: this.#state.feedbackSnapshots.some((entry) => entry.snapshotId === snapshot.snapshotId)
       ? this.#state.feedbackSnapshots : [...this.#state.feedbackSnapshots, snapshot],
       published: this.#state.published.map((entry) => entry.confirmationId === published.confirmationId ? updated : entry) });
@@ -502,13 +581,14 @@ export class AutomaticOwnPrRepair {
           const delivery = await this.#legacyReviewDelivery(published);
           if (!delivery) continue;
           published = this.#state.published.find((entry) => entry.confirmationId === published.confirmationId);
-          published = await this.#updateReview(published, delivery);
+          if (!published.reviewDelivery) published = await this.#updateReview(published, delivery);
         }
         const stale = await this.#reviewCurrent(published);
         if (stale) {
           await this.#updateReview(published, { ...published.reviewDelivery, status: "stale", reason: stale });
           result.reviewStale = (result.reviewStale ?? 0) + 1; continue;
         }
+        if (published.publicationProvenance) await this.#verifyObservedOwnerPublication(published);
         published = await this.#ensurePublishedSnapshot(published);
         if (typeof this.ownerWorkRequests?.submitInternalReview !== "function") {
           throw repairError("OWN_PR_REPAIR_REVIEW_NOT_READY", "内部复审入口尚未就绪");

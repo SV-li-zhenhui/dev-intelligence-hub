@@ -2,8 +2,9 @@ import { normalizeConfirmationPlan, normalizeConfirmationState } from "../domain
 import { createGitHubReviewProposalConfirmationPlan } from "../domain/github-review-proposal-confirmation.js";
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
 import { createWorkIntentDispatchBinding } from "../domain/work-intent-dispatch-binding.js";
-import { samePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
-import { currentWorkItemInputBinding, currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
+import { normalizePullRequestExecutionBinding, samePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
+import { currentWorkItemInputBinding, currentWorkItemExecutionBinding,
+  normalizePullRequestInputBinding } from "./work-ledger-pr-source.js";
 import { createWorkDecisionContext } from "./work-ledger-state.js";
 import { normalizeWorkResultAttestation } from "./work-ledger-result-attestation.js";
 import { ledgerDigest } from "./work-ledger-values.js";
@@ -23,6 +24,28 @@ export function isChangedReviewConfirmationDecision(decision) {
     ["completed", "executing", "failed", "stale"].some((status) => value.evidence[2] === `old_confirmation_status:${status}`);
 }
 
+function deliveredProposalBinding(item, outbox, proposal) {
+  const sourceBinding = normalizePullRequestInputBinding(outbox.sourceBinding);
+  const binding = normalizePullRequestExecutionBinding(proposal.binding.inputBinding);
+  if (binding.schemaVersion !== 2 || outbox.inputDigest !== sourceBinding.inputDigest ||
+      !Object.entries(sourceBinding).every(([key, value]) => binding[key] === value)) return null;
+  if (digest(sourceBinding) === digest(currentWorkItemInputBinding(item))) {
+    return samePullRequestExecutionBinding(binding, currentWorkItemExecutionBinding(item)) ? binding : null;
+  }
+  const source = item.source;
+  if (source?.kind !== "pull_request" || sourceBinding.rootItemId !== item.itemId ||
+      sourceBinding.workKey !== source.workKey || sourceBinding.inputRevision >= source.activeRevision ||
+      binding.repository !== source.identity.repository || binding.pullRequestNumber !== source.identity.pullRequestNumber) return null;
+  const revision = source.revisions[sourceBinding.inputRevision - 1];
+  if (revision?.disposition !== "accepted" ||
+      revision.revision !== sourceBinding.inputRevision || revision.headRevision !== sourceBinding.headRevision ||
+      revision.headRefOid !== sourceBinding.headRefOid || revision.eventId !== sourceBinding.eventId ||
+      revision.eventDigest !== sourceBinding.eventDigest || revision.inputDigest !== sourceBinding.inputDigest ||
+      !source.bindings.some((entry) => entry.inputRevision === revision.revision && entry.eventId === revision.eventId)) return null;
+  // Historical authority proves only the exact published receipt; it never authorizes execution.
+  return binding;
+}
+
 function matchingDeliveredProposal(item, outboxById) {
   if (item?.status !== "blocked" || item.activeIntentId !== null || item.sourceQuarantine != null ||
       !isChangedReviewConfirmationDecision(item.decisionContext)) return null;
@@ -31,16 +54,13 @@ function matchingDeliveredProposal(item, outboxById) {
     entry.outcome?.status === "delivered" && entry.outcome.details?.downstreamRef === item.decisionContext.referenceId);
   if (matches.length !== 1) return null;
   const outbox = matches[0];
-  if (outbox.inputDigest !== item.inputDigest ||
-      digest(outbox.sourceBinding) !== digest(currentWorkItemInputBinding(item))) return null;
   const bound = outbox.dispatchBinding?.boundIntent;
   if (bound?.intentId !== item.decisionContext.referenceId ||
       digest(createWorkIntentDispatchBinding(bound)) !== digest(outbox.dispatchBinding)) return null;
   const { intentId, ...content } = bound;
   const proposal = normalizeBoundWorkProposal({ proposalId: intentId, ...content });
-  const binding = currentWorkItemExecutionBinding(item);
-  if (proposal.kind !== "github_review_proposal" || binding?.schemaVersion !== 2 ||
-      !samePullRequestExecutionBinding(binding, proposal.binding.inputBinding) ||
+  const binding = deliveredProposalBinding(item, outbox, proposal);
+  if (proposal.kind !== "github_review_proposal" || binding === null ||
       proposal.requestedBy.workItemId !== item.itemId || proposal.requestedBy.roleId !== item.currentTarget?.id ||
       proposal.requestedBy.roleId !== outbox.requestedBy?.roleId ||
       proposal.source.assignmentId !== item.assignmentId || proposal.source.eventId !== binding.eventId ||

@@ -47,6 +47,8 @@ const SOURCE_KEYS = [
 const LEGACY_SOURCE_KEYS = SOURCE_KEYS.filter(
   (key) => !["authorityEpoch", "scope"].includes(key),
 );
+const BUDGET_SOURCE_KEYS = [...SOURCE_KEYS, "decisionBudget"];
+const DECISION_BUDGET_KEYS = ["headRefOid", "activationRevision", "previousActiveRevision", "attemptOffset"];
 const SCOPE_KEYS = [
   "kind",
   "active",
@@ -528,6 +530,8 @@ export function createPullRequestWorkSource(envelope) {
       pending: null,
       revisions: [revisionFrom(input, 1, 1, "accepted", null, false)],
       bindings: [bindingFrom(input, 1)],
+      decisionBudget: { headRefOid: input.headRefOid, activationRevision: 1,
+        previousActiveRevision: null, attemptOffset: 0 },
     },
   };
 }
@@ -593,6 +597,7 @@ export function appendPullRequestWorkSource(
     causalHeadRefOid,
     authorityEpochChanged = false,
     authorityFenceRecovery = false,
+    attemptAtActivation,
   } = {},
 ) {
   if (
@@ -690,8 +695,7 @@ export function appendPullRequestWorkSource(
   const headRevision = accepted && executionAuthorityChanged
     ? source.headRevision + 1
     : source.headRevision;
-  return {
-    source: {
+  const nextSource = {
       ...source,
       inputRevision: revision,
       activeRevision: accepted && activate ? revision : source.activeRevision,
@@ -716,7 +720,12 @@ export function appendPullRequestWorkSource(
         ),
       ],
       bindings: [...source.bindings, bindingFrom(input, revision)],
-    },
+    };
+  const activatedSource = accepted && activate
+    ? applyPullRequestDecisionBudgetAtActivation(source, nextSource, attemptAtActivation)
+    : nextSource;
+  return {
+    source: activatedSource,
     changed: true,
     disposition,
     headAdvanced: accepted && executionAuthorityChanged,
@@ -724,7 +733,7 @@ export function appendPullRequestWorkSource(
   };
 }
 
-export function applyPullRequestScopeLifecycle(value, envelope) {
+export function applyPullRequestScopeLifecycle(value, envelope, { attemptAtActivation } = {}) {
   const source = normalizePullRequestWorkSource(value);
   const input = normalizedEnvelope(envelope);
   if (input === null || !input.trustedLifecycle) {
@@ -738,6 +747,7 @@ export function applyPullRequestScopeLifecycle(value, envelope) {
   const appended = appendPullRequestWorkSource(source, envelope, {
     activate: true,
     authorityEpochChanged: authorityChanged,
+    attemptAtActivation,
   });
   if (!appended.changed) return appended;
   const appendedRevision = appended.source.revisions.at(-1);
@@ -1006,7 +1016,8 @@ function normalizeEventPointer(
 
 export function normalizePullRequestWorkSource(value) {
   const legacySource = hasExactLedgerKeys(value, LEGACY_SOURCE_KEYS);
-  if (!legacySource) exact(value, SOURCE_KEYS, "PR source");
+  const hasBudget = hasExactLedgerKeys(value, BUDGET_SOURCE_KEYS);
+  if (!legacySource && !hasBudget) exact(value, SOURCE_KEYS, "PR source");
   if (value.schemaVersion !== 1 || value.kind !== "pull_request") {
     throw invalid("PR source 版本或类型无效");
   }
@@ -1174,13 +1185,154 @@ export function normalizePullRequestWorkSource(value) {
   ) {
     throw invalid("PR pending input 没有分派来源");
   }
+  if (hasBudget) source.decisionBudget = normalizePullRequestDecisionBudget(value.decisionBudget, source);
   return source;
+}
+
+function normalizePullRequestDecisionBudget(value, source) {
+  exact(value, DECISION_BUDGET_KEYS, "PR decision budget");
+  const budget = { headRefOid: head(value.headRefOid, "decisionBudget.headRefOid"),
+    activationRevision: positiveInteger(value.activationRevision, "decisionBudget.activationRevision"),
+    previousActiveRevision: optionalPositiveInteger(value.previousActiveRevision, "decisionBudget.previousActiveRevision"),
+    attemptOffset: value.attemptOffset };
+  const activated = source.revisions[budget.activationRevision - 1];
+  const previous = budget.previousActiveRevision === null ? null : source.revisions[budget.previousActiveRevision - 1];
+  if (!Number.isSafeInteger(budget.attemptOffset) || budget.attemptOffset < 0 ||
+      budget.headRefOid !== source.current.headRefOid || budget.activationRevision > source.activeRevision ||
+      activated?.disposition !== "accepted" || activated.headRefOid !== budget.headRefOid ||
+      (previous === null ? budget.activationRevision !== 1 || budget.attemptOffset !== 0 :
+        previous?.disposition !== "accepted" || previous.revision >= budget.activationRevision || previous.headRefOid === budget.headRefOid)) {
+    throw invalid("PR decision budget activation 绑定无效");
+  }
+  return budget;
+}
+
+function applyPullRequestDecisionBudgetAtActivation(previousSource, nextSource, attemptAtActivation) {
+  if (previousSource.current.headRefOid === nextSource.current.headRefOid) return nextSource;
+  if (!Number.isSafeInteger(attemptAtActivation) || attemptAtActivation < 0) {
+    throw invalid("实际 PR Head 激活缺少可信领取计数");
+  }
+  return { ...nextSource, decisionBudget: {
+    headRefOid: nextSource.current.headRefOid,
+    activationRevision: nextSource.activeRevision,
+    previousActiveRevision: previousSource.activeRevision,
+    attemptOffset: attemptAtActivation,
+  } };
+}
+
+export function persistedPullRequestDecisionAttemptBudget(item) {
+  const budget = item?.source?.decisionBudget;
+  if (item?.kind !== "source_root" || item.source?.kind !== "pull_request" || !budget) return null;
+  return Object.freeze({ attempt: item.attempt - budget.attemptOffset, offset: budget.attemptOffset, decisionBudget: budget });
 }
 
 export function currentWorkItemEvent(item) {
   return item?.source?.kind === "pull_request"
     ? item.source.current.event
     : item?.event;
+}
+
+// Keep the lifetime claim counter intact; only a proven accepted Head change
+// opens a new decision budget. Metadata-only and authority updates do not.
+export function pullRequestDecisionAttemptBudget(item, timeline) {
+  const source = item?.source;
+  if (item?.kind !== "source_root" || source?.kind !== "pull_request" ||
+      !Array.isArray(timeline)) return null;
+  const headRefOid = source.current.headRefOid;
+  const accepted = source.revisions.filter((revision) =>
+    revision.disposition === "accepted" && revision.revision <= source.activeRevision);
+  if (!accepted.some(revision => revision.headRefOid !== headRefOid)) return null;
+  const ordered = timeline.filter((entry) => entry.itemId === item.itemId)
+    .toSorted((left, right) => left.sequence - right.sequence);
+  let actualActive = null;
+  let activation = null;
+  let previous = null;
+  for (const entry of ordered) {
+    if (!["pr_source_created", "pr_source_revised", "pr_source_activated"].includes(entry.type) ||
+        entry.details?.workKey !== source.workKey) continue;
+    const activeRevision = entry.details.activeRevision ?? (entry.type === "pr_source_created" ? entry.details.inputRevision : null);
+    const active = accepted.find(revision => revision.revision === activeRevision &&
+      revision.headRefOid === (entry.details.currentHeadRefOid ?? entry.details.headRefOid) &&
+      revision.headRefOid === entry.details.headRefOid &&
+      (entry.details.headRevision === undefined || revision.headRevision === entry.details.headRevision));
+    if (!active) continue;
+    if (actualActive !== null && active.headRefOid !== actualActive.headRefOid) {
+      previous = actualActive;
+      activation = entry;
+    }
+    actualActive = active;
+  }
+  if (!activation || actualActive?.headRefOid !== headRefOid || !previous || previous.headRefOid === headRefOid) return null;
+  if (activation.details.previousActiveRevision !== undefined && activation.details.previousActiveRevision !== previous.revision) return null;
+  let offset = activation.details.decisionAttemptOffset;
+  if (offset === undefined) {
+    const priorClaim = ordered.findLast((entry) => entry.sequence < activation.sequence && entry.type === "claimed");
+    const claimSource = accepted.find((revision) => revision.inputDigest === priorClaim?.details?.inputDigest);
+    const intervening = ordered.filter((entry) => entry.sequence > priorClaim?.sequence && entry.sequence < activation.sequence);
+    // Legacy activations did not record the counter. Recover it only from a
+    // retained old-Head claim followed by side-effect-free wait bookkeeping.
+    if (!priorClaim || claimSource?.headRefOid !== previous.headRefOid ||
+        intervening.some((entry) => ![
+          "intent_staged", "intent_claimed", "intent_bound", "intent_acknowledged",
+          "condition_satisfied", "intent_superseded", "pr_source_revised",
+        ].includes(entry.type) ||
+          (entry.type === "intent_staged" && entry.details?.intentType !== "wait_condition") ||
+          (entry.type === "intent_acknowledged" && (entry.details?.outcome !== "delivered" ||
+            entry.details.nextStatus !== "waiting_condition")))) return null;
+    offset = priorClaim.details.attempt;
+  } else if (activation.details.previousHeadRefOid !== previous.headRefOid) return null;
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > item.attempt) return null;
+  const decisionBudget = { headRefOid, activationRevision: activation.details.activeRevision,
+    previousActiveRevision: previous.revision, attemptOffset: offset };
+  if (source.decisionBudget && !isDeepStrictEqual(source.decisionBudget, decisionBudget)) return null;
+  return Object.freeze({ attempt: item.attempt - offset, offset, activation, decisionBudget,
+    events: ordered.filter((entry) => entry.sequence > activation.sequence) });
+}
+
+export function sealLegacyPullRequestDecisionBudget(item, timeline) {
+  if (item.source?.decisionBudget) return item.source;
+  const proof = pullRequestDecisionAttemptBudget(item, timeline);
+  return proof === null ? item.source : { ...item.source, decisionBudget: proof.decisionBudget };
+}
+
+export function isPullRequestDecisionBudgetRecoveryCandidate(item) {
+  return item.kind === "source_root" && item.source?.kind === "pull_request" &&
+      item.source.decisionBudget === undefined &&
+      item.status === "blocked" && item.statusReason === "decision_attempts_exhausted" &&
+      item.activeIntentId === null && item.decisionContext === null && item.sourceQuarantine === null &&
+      item.ownerId === null && item.leaseId === null && item.leaseUntil === null &&
+      item.source.pendingRevision === null && item.source.scope.active === true;
+}
+
+export function canRecoverPullRequestDecisionBudget(item, budget, maxAttempts) {
+  if (!budget || !Array.isArray(budget.events) || !budget.activation || budget.offset < 1 || budget.attempt >= maxAttempts ||
+      !isPullRequestDecisionBudgetRecoveryCandidate(item)) return false;
+  const latest = budget.events.findLast((entry) => entry.type !== "pr_source_revised");
+  if (latest?.type !== "transitioned" ||
+      latest.details?.fromStatus !== "working" || latest.details.toStatus !== "blocked" ||
+      latest.details.reason !== "decision_attempts_exhausted") return false;
+  const sourceTail = budget.events.filter((entry) => entry.sequence > latest.sequence);
+  if ((sourceTail.at(-1) ?? latest).at !== item.updatedAt || sourceTail.some((entry) =>
+    entry.type !== "pr_source_revised" || entry.details?.workKey !== item.source.workKey ||
+    !["accepted", "bound_existing_event"].includes(entry.details.disposition) ||
+    entry.details.pendingRevision !== null || entry.details.headRefOid !== item.source.current.headRefOid ||
+    !item.source.revisions.some((revision) => revision.disposition === "accepted" &&
+      revision.revision === entry.details.activeRevision && revision.revision <= item.source.activeRevision &&
+      revision.headRevision === entry.details.headRevision && revision.headRefOid === item.source.current.headRefOid)
+  ) || (sourceTail.length > 0 && sourceTail.at(-1).details.activeRevision !== item.source.activeRevision)) return false;
+  const claims = budget.events.filter((entry) => entry.type === "claimed");
+  if (claims.at(-1)?.details?.attempt !== item.attempt || claims.some((entry) =>
+    !item.source.revisions.some((revision) => revision.disposition === "accepted" &&
+      revision.revision <= item.source.activeRevision && revision.headRefOid === item.source.current.headRefOid &&
+      revision.inputDigest === entry.details?.inputDigest))) return false;
+  return budget.events.every((entry) =>
+    ["claimed", "retry_scheduled", "pr_source_revised"].includes(entry.type) ||
+    (entry.type === "transitioned" && (
+      (entry.details?.fromStatus === "working" && entry.details.toStatus === "blocked" &&
+        entry.details.reason === "decision_attempts_exhausted") ||
+      (entry.details?.fromStatus === "blocked" && entry.details.toStatus === "queued" &&
+        entry.details.reason === "pr_head_decision_budget_recovered")
+    )));
 }
 
 export function currentWorkItemInputBinding(item) {
@@ -1618,19 +1770,19 @@ export function verifyPullRequestExecutionBinding(state, value) {
   return Object.freeze(binding);
 }
 
-export function activatePendingPullRequestWorkSource(value) {
+export function activatePendingPullRequestWorkSource(value, { attemptAtActivation } = {}) {
   const source = normalizePullRequestWorkSource(value);
   if (source.pendingRevision === null) {
     return { source, changed: false };
   }
   return {
-    source: normalizePullRequestWorkSource({
+    source: normalizePullRequestWorkSource(applyPullRequestDecisionBudgetAtActivation(source, {
       ...source,
       activeRevision: source.pendingRevision,
       pendingRevision: null,
       current: source.pending,
       pending: null,
-    }),
+    }, attemptAtActivation)),
     changed: true,
   };
 }
@@ -1680,7 +1832,7 @@ function validPullRequestScopeTransition(previousSource, nextSource) {
   );
 }
 
-export function validatePullRequestSourceTransition(previousItems, nextItems) {
+export function validatePullRequestSourceTransition(previousItems, nextItems, previousTimeline = []) {
   const nextById = new Map(nextItems.map((item) => [item.itemId, item]));
   for (const previous of previousItems) {
     if (previous.source?.kind !== "pull_request") continue;
@@ -1690,8 +1842,23 @@ export function validatePullRequestSourceTransition(previousItems, nextItems) {
     }
     const previousSource = normalizePullRequestWorkSource(previous.source);
     const nextSource = normalizePullRequestWorkSource(next.source);
+    const beforeBudget = previousSource.decisionBudget;
+    const afterBudget = nextSource.decisionBudget;
+    const headChanged = previousSource.current.headRefOid !== nextSource.current.headRefOid;
+    let validBudget = isDeepStrictEqual(beforeBudget, afterBudget);
+    if (headChanged) {
+      validBudget = afterBudget !== undefined && afterBudget.activationRevision === nextSource.activeRevision &&
+        afterBudget.previousActiveRevision === previousSource.activeRevision && afterBudget.attemptOffset === previous.attempt;
+    } else if (beforeBudget === undefined && afterBudget !== undefined) {
+      const proof = pullRequestDecisionAttemptBudget(previous, previousTimeline);
+      validBudget = next.status === "working" && next.revision === previous.revision + 1 &&
+        next.attempt === previous.attempt + 1 && next.activeIntentId === null &&
+        ["queued", "retry_wait", "working"].includes(previous.status) && proof !== null &&
+        isDeepStrictEqual(afterBudget, proof.decisionBudget);
+    }
     if (
       previousSource.workKey !== nextSource.workKey ||
+      !validBudget ||
       nextSource.inputRevision < previousSource.inputRevision ||
       nextSource.activeRevision < previousSource.activeRevision ||
       nextSource.headRevision < previousSource.headRevision ||

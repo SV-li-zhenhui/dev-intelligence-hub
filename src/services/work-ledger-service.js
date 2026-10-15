@@ -209,6 +209,15 @@ function canRequeueAdvancedPullRequestRoot(root, nextSource) {
       root.statusReason === CROSS_ROOT_REPLACED_REASON);
 }
 
+function isIgnoredProtectedPullRequestReentry(root, envelope, observed) {
+  return ["completed", "superseded", "paused"].includes(root.status) &&
+    root.source.scope.active === false && envelope.event.eventType === "pull_request.created" &&
+    observed.disposition.startsWith("ignored_") && observed.authorityChanged !== true &&
+    observed.source.scope.active === false &&
+    observed.source.authorityEpoch === root.source.authorityEpoch &&
+    observed.source.activeRevision === root.source.activeRevision;
+}
+
 function fencedPullRequestRootPatch(root, disposition) {
   if (
     !PR_SOURCE_AUTHORITY_FENCE_DISPOSITIONS.has(disposition) ||
@@ -1787,6 +1796,30 @@ export class WorkLedgerService {
     };
     let received = 0;
     let deduplicated = 0;
+    const ignoreProtectedPullRequestReentry = (root, envelope, assignmentItem, disposition) => {
+      knownAssignments.set(assignmentItem.assignmentId, {
+        inputDigest: assignmentItem.inputDigest,
+        sourceSequence: assignmentItem.sourceSequence,
+      });
+      received += 1;
+      timelineEvents.push({
+        itemId: root.itemId,
+        type: "pr_source_ignored",
+        at: now,
+        actorId: "work-ledger-system",
+        details: {
+          workKey: root.source.workKey,
+          sourceSequence: envelope.sequence,
+          assignmentId: assignmentItem.assignmentId,
+          eventId: envelope.event.eventId,
+          eventDigest: envelope.event.contentDigest,
+          inputDigest: assignmentItem.inputDigest,
+          disposition,
+          observedHeadRefOid: envelope.event.payload.headRefOid,
+          scopeActive: root.source.scope.active,
+        },
+      });
+    };
     const latestIssueAssignmentByTarget = new Map();
     const latestIssueLifecycleBySubject = new Map();
     for (const envelope of batch.items) {
@@ -1905,7 +1938,11 @@ export class WorkLedgerService {
           continue;
         }
         if (root !== null) {
-          const applied = applyPullRequestScopeLifecycle(root.source, envelope);
+          const applied = applyPullRequestScopeLifecycle(root.source, envelope, { attemptAtActivation: root.attempt });
+          if (isIgnoredProtectedPullRequestReentry(root, envelope, applied)) {
+            ignoreProtectedPullRequestReentry(root, envelope, assignmentItem, applied.disposition);
+            continue;
+          }
           const active = applied.source.scope.active;
           let cutover = inspectPullRequestSourceCutover(
             root,
@@ -2202,6 +2239,9 @@ export class WorkLedgerService {
           },
         });
       } else {
+        const previousActiveHeadRefOid = root.source.current.headRefOid;
+        const previousActiveRevision = root.source.activeRevision;
+        const previousAttempt = root.attempt;
         const predecessor = pullRequestTrustedPredecessor(
           { items: [...itemsById.values()] },
           root,
@@ -2226,6 +2266,10 @@ export class WorkLedgerService {
               predecessor.trustedSourceRootItemId === root.itemId,
           },
         );
+        if (isIgnoredProtectedPullRequestReentry(root, envelope, appended)) {
+          ignoreProtectedPullRequestReentry(root, envelope, assignmentItem, appended.disposition);
+          continue;
+        }
         if (
           PR_SOURCE_AUTHORITY_FENCE_DISPOSITIONS.has(
             appended.disposition,
@@ -2423,6 +2467,7 @@ export class WorkLedgerService {
               rootByWorkKey.set(settled.source.workKey, settled);
               const activated = activatePendingPullRequestWorkSource(
                 appended.source,
+                { attemptAtActivation: root.attempt },
               );
               appended = {
                 ...appended,
@@ -2458,6 +2503,7 @@ export class WorkLedgerService {
               });
               const activated = activatePendingPullRequestWorkSource(
                 appended.source,
+                { attemptAtActivation: root.attempt },
               );
               appended = {
                 ...appended,
@@ -2533,6 +2579,11 @@ export class WorkLedgerService {
               .headRefOid,
             disposition,
             headAdvanced,
+            ...(appended.activeAdvanced && previousActiveHeadRefOid !== root.source.current.headRefOid ? {
+              previousHeadRefOid: previousActiveHeadRefOid,
+              previousActiveRevision,
+              decisionAttemptOffset: previousAttempt,
+            } : {}),
           },
         });
       }

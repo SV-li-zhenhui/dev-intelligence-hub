@@ -338,7 +338,8 @@ function definitiveBlockedSettlement(item, outboxById, timelineIndex, confirmati
   if (
     proposalProof !== null &&
     (item.statusReason === `proposal_${item.decisionContext.outcome}` ||
-      (item.statusReason === "pr_source_revised" && confirmationSettled) ||
+      (["pr_source_revised", "pr_source_left_scope_pending_settlement",
+        "pr_source_reentered_scope_pending_settlement"].includes(item.statusReason) && confirmationSettled) ||
       crossRootPullRequestCutoverPendingId(item) !== null)
   ) {
     return { proposalProof };
@@ -899,7 +900,7 @@ function planCrossRootPullRequestSourceReconciliation({
       },
     });
   }
-  const activated = activatePendingPullRequestWorkSource(root.source);
+  const activated = activatePendingPullRequestWorkSource(root.source, { attemptAtActivation: root.attempt });
   const next = {
     ...root,
     source: activated.source,
@@ -1042,7 +1043,7 @@ export function planPullRequestSourceReconciliation({
     now,
     timelineEvents,
   });
-  const activated = activatePendingPullRequestWorkSource(root.source);
+  const activated = activatePendingPullRequestWorkSource(root.source, { attemptAtActivation: root.attempt });
   const next = {
     ...locallySettledRoot,
     source: activated.source,
@@ -1067,6 +1068,11 @@ export function planPullRequestSourceReconciliation({
       activeRevision: next.source.activeRevision,
       headRevision: pendingHeadRevision,
       headRefOid: next.source.current.headRefOid,
+      ...(root.source.current.headRefOid === next.source.current.headRefOid ? {} : {
+        previousHeadRefOid: root.source.current.headRefOid,
+        previousActiveRevision: root.source.activeRevision,
+        decisionAttemptOffset: root.attempt,
+      }),
     },
   });
   if (!arePullRequestCutoverProofsRetained({

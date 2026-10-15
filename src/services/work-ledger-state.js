@@ -804,6 +804,9 @@ function normalizeItem(value, stateRevision, limits) {
   ) {
     throw corrupted("员工工作项状态损坏");
   }
+  if (source?.decisionBudget && source.decisionBudget.attemptOffset > value.attempt) {
+    throw corrupted("PR decision budget 超过累计领取计数");
+  }
   assertGraphTaskProvenance(
     value.kind,
     assignmentId,

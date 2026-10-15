@@ -7,6 +7,8 @@ import { createTaskRunSettler } from '../src/services/work-ledger-run-control.js
 import { WorkConditionWaker } from '../src/services/work-condition-waker.js';
 import { WorkflowFactSource } from '../src/services/workflow-fact-source.js';
 import { WorkCoordinationService } from '../src/services/work-coordination-service.js';
+import { ProactiveWorkLoop } from '../src/services/proactive-work-loop.js';
+import { prepareWorkLedgerCandidate } from '../src/services/work-ledger-candidate-validation.js';
 
 async function deliverHeadBoundWait(service, item, condition) {
   const workerId = 'employee-pr-engineer';
@@ -21,6 +23,530 @@ async function deliverHeadBoundWait(service, item, condition) {
     details: { conditionRef: `bound-${dispatch.intentId}`, downstreamRef: `bound-${dispatch.intentId}` } });
   return { item: result.item, intentId: dispatch.intentId };
 }
+
+function decisionBudgetLoop(fixture, { decide, assemble = async () => ({ context: {} }), maxAttempts = 3,
+  conditionForWait = () => ({ kind: 'workflow_fact', fact: 'ci-status', oneOf: ['SUCCESS'] }) } = {}) {
+  let waitTurn = 0;
+  return new ProactiveWorkLoop({
+    ledger: fixture.service,
+    clock: fixture.time.clock,
+    retryBaseMs: 1_000,
+    retryMaxMs: 8_000,
+    maxAttempts,
+    roleDirectory: { async resolve() { return {
+      roleId: 'pr-engineer', workerId: 'employee-pr-engineer', enabled: true, paused: false,
+      decide: decide ?? (async () => ({ schemaVersion: 1, confidence: 90, summary: 'Wait for CI',
+        intent: { ...waitIntent(conditionForWait(++waitTurn)), summary: `Wait for observation ${waitTurn}` } })),
+    }; } },
+    roleContextAssembler: { assemble },
+    orchestratorService: { async execute() { throw new Error('Unexpected orchestration'); } },
+  });
+}
+
+async function exhaustedOldHeadWaitsFixture({ fixtureOptions = {}, ...options } = {}) {
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })], ...fixtureOptions });
+  const loop = decisionBudgetLoop(fixture, options);
+  for (let turn = 0; turn < 3; turn += 1) {
+    const cycle = await loop.runCycle();
+    assert.equal(cycle.staged, 1, JSON.stringify(cycle));
+    const staged = (await fixture.service.listOutbox()).items.at(-1);
+    const item = (await fixture.service.listItems()).items[0];
+    const dispatch = await fixture.service.claimIntent({ intentId: staged.intentId, expectedRevision: staged.revision,
+      dispatcherId: 'work-intent-dispatcher', leaseDurationMs: 30_000 });
+    const result = await fixture.service.ackIntent({ intentId: dispatch.intentId, expectedRevision: dispatch.revision,
+      dispatchLeaseId: dispatch.dispatchLeaseId, itemExpectedRevision: item.revision,
+      outcome: 'delivered', nextStatus: 'waiting_condition', actorId: 'work-intent-dispatcher',
+      details: { conditionRef: `bound-${dispatch.intentId}`, downstreamRef: `bound-${dispatch.intentId}` } });
+    if (turn < 2) await fixture.service.wakeCondition({ itemId: result.item.itemId,
+      expectedRevision: result.item.revision, intentId: dispatch.intentId, actorId: 'work-condition-waker',
+      observation: { kind: 'workflow_fact', fact: 'ci-status', value: 'SUCCESS', observedAt: fixture.time.clock() } });
+  }
+  assert.equal((await fixture.service.listItems()).items[0].attempt, 3);
+  return fixture;
+}
+
+async function activateDecisionBudgetHead(fixture, headRefOid = PR_HEAD_B) {
+  fixture.source.records.push(prAssignment(2, { headRefOid, previousHeadRefOid: PR_HEAD_A,
+    changedFields: ['headRefOid'], occurredAt: '2026-08-02T01:05:00.000Z', gitFacts: prGitFacts(headRefOid) }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  const housekeeping = new WorkCoordinationService({ ledger: fixture.service, conditionWaker: { async runCycle() {} },
+    proposalResultReconciler: { async runCycle() {} }, attentionResultReconciler: { async runCycle() {} },
+    workLoop: { async runCycle() {} }, dispatcher: { async dispatchPending() {} } });
+  await housekeeping.runCycle({ includeWork: false });
+  return (await fixture.service.listItems()).items[0];
+}
+
+test('a new accepted PR Head gets a separate decision budget after three old-Head waits and restart', async () => {
+  const fixture = await exhaustedOldHeadWaitsFixture();
+  const historicalOutbox = (await fixture.service.listOutbox()).items;
+  const active = await activateDecisionBudgetHead(fixture);
+  assert.equal(active.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(active.attempt, 3, 'lifetime claim history remains intact');
+  const recovered = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  let modelCalls = 0;
+  const loop = decisionBudgetLoop(recovered, {
+    decide: async () => { modelCalls += 1; throw new Error('The model must not run without context'); },
+    assemble: async ({ item }) => {
+      assert.equal(item.source.current.headRefOid, PR_HEAD_B);
+      throw Object.assign(new Error('Current PR facts unavailable'), { code: 'ROLE_CONTEXT_PR_FACT_UNAVAILABLE' });
+    },
+  });
+  for (const [turn, status] of [[1, 'retry_wait'], [2, 'retry_wait'], [3, 'blocked']]) {
+    await loop.runCycle();
+    const item = (await recovered.service.listItems()).items[0];
+    assert.equal(item.attempt, 3 + turn);
+    assert.equal(item.status, status, `new Head decision attempt ${turn}`);
+    fixture.time.advance(8_000);
+  }
+  assert.equal(modelCalls, 0, 'context failure is not a completed model execution');
+  assert.deepEqual((await recovered.service.listOutbox()).items, historicalOutbox);
+  assert.equal((await recovered.service.listTimeline({ limit: 100 })).items.filter(e => e.type === 'claimed').length, 6);
+});
+
+test('a deferred Head activation starts its budget only after an explicit time wait is satisfied', async () => {
+  const fixture = await exhaustedOldHeadWaitsFixture({ conditionForWait: (turn) => turn === 3 ?
+    { kind: 'time', notBefore: '2026-08-02T02:01:00.000Z' } :
+    { kind: 'workflow_fact', fact: 'ci-status', oneOf: ['SUCCESS'] } });
+  const waiting = await activateDecisionBudgetHead(fixture);
+  assert.equal(waiting.status, 'waiting_condition');
+  assert.equal(waiting.source.current.headRefOid, PR_HEAD_A);
+  assert.equal(waiting.source.pending.headRefOid, PR_HEAD_B);
+  assert.equal((await decisionBudgetLoop(fixture, { assemble: unavailablePrContext }).runCycle()).claimed, 0);
+  fixture.time.advance(60_000);
+  await fixture.service.wakeCondition({ itemId: waiting.itemId, expectedRevision: waiting.revision,
+    intentId: waiting.activeIntentId, actorId: 'work-condition-waker',
+    observation: { kind: 'time', observedAt: fixture.time.clock() } });
+  const housekeeping = new WorkCoordinationService({ ledger: fixture.service, conditionWaker: { async runCycle() {} },
+    proposalResultReconciler: { async runCycle() {} }, attentionResultReconciler: { async runCycle() {} },
+    workLoop: { async runCycle() {} }, dispatcher: { async dispatchPending() {} } });
+  await housekeeping.runCycle({ includeWork: false });
+  const activation = (await fixture.service.listTimeline({ limit: 100 })).items.findLast(e => e.type === 'pr_source_activated');
+  assert.equal(activation.details.decisionAttemptOffset, 3);
+  assert.equal(activation.details.previousHeadRefOid, PR_HEAD_A);
+  const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  assert.equal((await decisionBudgetLoop(restarted, { assemble: unavailablePrContext }).runCycle()).retried, 1);
+  assert.equal((await restarted.service.listItems()).items[0].attempt, 4);
+});
+
+function unavailablePrContext() {
+  throw Object.assign(new Error('Current PR facts unavailable'), { code: 'ROLE_CONTEXT_PR_FACT_UNAVAILABLE' });
+}
+
+test('replaced pending Heads bind the decision budget to the actual A-to-C activation', async () => {
+  const fixture = await exhaustedOldHeadWaitsFixture({ conditionForWait: turn => turn === 3 ?
+    { kind: 'time', notBefore: '2026-08-02T02:01:00.000Z' } :
+    { kind: 'workflow_fact', fact: 'ci-status', oneOf: ['SUCCESS'] } });
+  await activateDecisionBudgetHead(fixture);
+  fixture.source.records.push(prAssignment(3, { headRefOid: PR_HEAD_C, previousHeadRefOid: PR_HEAD_B,
+    changedFields: ['headRefOid'], occurredAt: '2026-08-02T01:06:00.000Z', gitFacts: prGitFacts(PR_HEAD_C) }));
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+  const waiting = (await fixture.service.listItems()).items[0];
+  assert.equal(waiting.source.current.headRefOid, PR_HEAD_A);
+  assert.equal(waiting.source.pending.headRefOid, PR_HEAD_C);
+  assert.deepEqual(waiting.source.decisionBudget, { headRefOid: PR_HEAD_A, activationRevision: 1,
+    previousActiveRevision: null, attemptOffset: 0 }, 'pending replacement cannot reset the active budget');
+  fixture.time.advance(60_000);
+  await fixture.service.wakeCondition({ itemId: waiting.itemId, expectedRevision: waiting.revision,
+    intentId: waiting.activeIntentId, actorId: 'work-condition-waker', observation: { kind: 'time', observedAt: fixture.time.clock() } });
+  const housekeeping = new WorkCoordinationService({ ledger: fixture.service, conditionWaker: { async runCycle() {} },
+    proposalResultReconciler: { async runCycle() {} }, attentionResultReconciler: { async runCycle() {} },
+    workLoop: { async runCycle() {} }, dispatcher: { async dispatchPending() {} } });
+  await housekeeping.runCycle({ includeWork: false });
+  const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  const cycle = await decisionBudgetLoop(restarted, { assemble: unavailablePrContext }).runCycle();
+  assert.equal(cycle.retried, 1, 'first decision on actual activated C must retain its own budget');
+  const item = (await restarted.service.listItems()).items[0];
+  assert.equal(item.attempt, 4);
+  assert.equal(item.source.current.headRefOid, PR_HEAD_C);
+  assert.deepEqual(item.source.decisionBudget, { headRefOid: PR_HEAD_C, activationRevision: 3,
+    previousActiveRevision: 1, attemptOffset: 3 });
+});
+
+test('durable Head budget survives global timeline trim and restart before first and second failures', async () => {
+  const limits = { timelineLimit: 64 };
+  const fixture = await exhaustedOldHeadWaitsFixture({ fixtureOptions: { limits } });
+  await activateDecisionBudgetHead(fixture);
+  fixture.source.records.push(...Array.from({ length: 70 }, (_, index) => assignment(index + 3)));
+  fixture.source.highWatermark = 72;
+  await fixture.service.intake({ limit: 100 });
+  assert.equal((await fixture.service.listTimeline({ limit: 100 })).items.some(entry => entry.type === 'pr_source_activated' ||
+    entry.itemId === (fixture.store.stored().items[0].itemId)), false, 'activation and all old claims were trimmed');
+  for (const turn of [1, 2]) {
+    const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time, limits });
+    const cycle = await decisionBudgetLoop(restarted, { assemble: unavailablePrContext }).runCycle({ roleId: 'pr-engineer' });
+    assert.equal(cycle.retried, 1, `current Head failure ${turn} after trim`);
+    assert.equal((await restarted.service.listItems()).items.find(item => item.kind === 'source_root').attempt, 3 + turn);
+    fixture.time.advance(8_000);
+  }
+});
+
+test('a normal legacy claim seals its strictly proven budget before later timeline trim', async () => {
+  const limits = { timelineLimit: 64 };
+  const fixture = await exhaustedOldHeadWaitsFixture({ fixtureOptions: { limits } });
+  await activateDecisionBudgetHead(fixture);
+  const legacy = fixture.store.stored();
+  delete legacy.items[0].source.decisionBudget;
+  fixture.store.replaceStored(legacy);
+  const before = ledgerDigest(legacy.items[0]);
+  let restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time, limits });
+  assert.equal(ledgerDigest((await restarted.service.listItems()).items[0]), before, 'reading old source adds no field');
+  assert.equal((await restarted.service.listItems()).items[0].source.decisionBudget, undefined);
+  assert.equal((await decisionBudgetLoop(restarted, { assemble: unavailablePrContext }).runCycle()).retried, 1);
+  const claimed = (await restarted.service.listItems()).items[0];
+  assert.equal(claimed.attempt, 4);
+  assert.equal(claimed.source.decisionBudget.attemptOffset, 3);
+  fixture.source.records.push(...Array.from({ length: 70 }, (_, index) => assignment(index + 3)));
+  fixture.source.highWatermark = 72;
+  await restarted.service.intake({ limit: 100 });
+  fixture.time.advance(8_000);
+  restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time, limits });
+  assert.equal((await decisionBudgetLoop(restarted, { assemble: unavailablePrContext }).runCycle({ roleId: 'pr-engineer' })).retried, 1);
+  const current = (await restarted.service.listItems()).items.find(item => item.kind === 'source_root');
+  assert.equal(current.attempt, 5);
+  assert.deepEqual(current.source.decisionBudget, claimed.source.decisionBudget);
+});
+
+test('a legacy normal claim without retained activation proof never guesses an offset', async () => {
+  const limits = { timelineLimit: 64 };
+  const fixture = await exhaustedOldHeadWaitsFixture({ fixtureOptions: { limits } });
+  await activateDecisionBudgetHead(fixture);
+  const legacy = fixture.store.stored();
+  delete legacy.items[0].source.decisionBudget;
+  fixture.store.replaceStored(legacy);
+  const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time, limits });
+  fixture.source.records.push(...Array.from({ length: 70 }, (_, index) => assignment(index + 3)));
+  fixture.source.highWatermark = 72;
+  await restarted.service.intake({ limit: 100 });
+  assert.equal((await decisionBudgetLoop(restarted, { assemble: unavailablePrContext }).runCycle({ roleId: 'pr-engineer' })).blocked, 1);
+  const item = (await restarted.service.listItems()).items.find(item => item.kind === 'source_root');
+  assert.equal(item.attempt, 4);
+  assert.equal(item.source.decisionBudget, undefined);
+});
+
+test('a same-Head base update preserves the durable budget and its activation binding', async () => {
+  const fixture = await exhaustedOldHeadWaitsFixture();
+  const active = await activateDecisionBudgetHead(fixture);
+  fixture.source.records.push(prAssignment(3, { headRefOid: PR_HEAD_B, changedFields: ['gitTarget'],
+    occurredAt: '2026-08-02T01:06:00.000Z', gitFacts: prGitFacts(PR_HEAD_B, { baseRefOid: 'e'.repeat(40) }) }));
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+  const updated = (await fixture.service.listItems()).items[0];
+  assert.equal(updated.source.activeRevision, 3);
+  assert.deepEqual(updated.source.decisionBudget, active.source.decisionBudget);
+});
+
+test('a durable genuine exhaustion remains blocked when maxAttempts later increases', async () => {
+  const fixture = await exhaustedOldHeadWaitsFixture();
+  await activateDecisionBudgetHead(fixture);
+  const loop = decisionBudgetLoop(fixture, { assemble: unavailablePrContext });
+  for (let turn = 0; turn < 3; turn += 1) {
+    await loop.runCycle();
+    fixture.time.advance(8_000);
+  }
+  const item = (await fixture.service.listItems()).items[0];
+  assert.equal(item.statusReason, 'decision_attempts_exhausted');
+  assert.equal(item.attempt, 6);
+  const durableBudget = persistedPullRequestDecisionAttemptBudget(item);
+  assert.equal(canRecoverPullRequestDecisionBudget(item, durableBudget, 4), false);
+  const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  assert.equal((await decisionBudgetLoop(restarted, { maxAttempts: 4, assemble: unavailablePrContext }).runCycle()).claimed, 0);
+  assert.deepEqual((await restarted.service.listItems()).items[0], item);
+});
+
+test('cross-root activation uses the receiving root counter and retains the predecessor budget', async () => {
+  const fixture = await exhaustedOldHeadWaitsFixture();
+  const predecessor = (await fixture.service.listItems()).items[0];
+  fixture.source.records.push(ownerRequestedPrAssignment(2, { headRefOid: PR_HEAD_B,
+    gitFacts: prGitFacts(PR_HEAD_B), occurredAt: '2026-08-02T01:10:00.000Z' }));
+  fixture.source.highWatermark = 2;
+  assert.equal((await fixture.service.intake()).error, undefined);
+  const items = (await fixture.service.listItems()).items;
+  const receiver = items.find(item => item.itemId !== predecessor.itemId);
+  assert.equal(receiver.attempt, 0);
+  assert.equal(receiver.source.decisionBudget.attemptOffset, 0);
+  assert.deepEqual(items.find(item => item.itemId === predecessor.itemId).source.decisionBudget, predecessor.source.decisionBudget);
+  assert.equal((await decisionBudgetLoop(fixture, { assemble: unavailablePrContext }).runCycle()).retried, 1);
+});
+
+for (const change of ['offset', 'delete', 'over-attempt', 'wrong-head', 'wrong-predecessor']) {
+  test(`durable budget validation rejects ${change} without writing`, async () => {
+    const fixture = await exhaustedOldHeadWaitsFixture();
+    await activateDecisionBudgetHead(fixture);
+    const previous = fixture.store.stored();
+    const candidate = clone(previous);
+    candidate.revision += 1;
+    const item = candidate.items[0];
+    item.revision += 1;
+    if (change === 'delete') delete item.source.decisionBudget;
+    else if (change === 'offset') item.source.decisionBudget.attemptOffset = 2;
+    else if (change === 'over-attempt') item.source.decisionBudget.attemptOffset = 4;
+    else if (change === 'wrong-head') item.source.decisionBudget.headRefOid = PR_HEAD_A;
+    else item.source.decisionBudget.previousActiveRevision = item.source.activeRevision;
+    const writes = fixture.store.writes.length;
+    assert.throws(() => prepareWorkLedgerCandidate({ previousState: previous, candidate,
+      limits: normalizeWorkLedgerLimits(), appendGraphMemory: false }), error =>
+      ['WORK_LEDGER_STATE_CORRUPTED', 'WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID'].includes(error.code));
+    assert.equal(fixture.store.writes.length, writes);
+    assert.deepEqual(fixture.store.stored(), previous);
+  });
+}
+
+async function legacyActivatedDecisionBlockFixture() {
+  const fixture = await exhaustedOldHeadWaitsFixture();
+  await activateDecisionBudgetHead(fixture);
+  let claimed = (await fixture.service.listItems()).items[0];
+  claimed = await fixture.service.claim({ itemId: claimed.itemId, expectedRevision: claimed.revision,
+    workerId: 'employee-pr-engineer', leaseDurationMs: 30_000 });
+  await fixture.service.transition({ itemId: claimed.itemId, expectedRevision: claimed.revision,
+    leaseId: claimed.leaseId, actorId: 'employee-pr-engineer', toStatus: 'blocked',
+    reason: 'decision_attempts_exhausted', details: { code: 'ROLE_CONTEXT_PR_FACT_UNAVAILABLE' } });
+  const legacy = fixture.store.stored();
+  delete legacy.items[0].source.decisionBudget;
+  for (const entry of legacy.timeline) {
+    delete entry.details.decisionAttemptOffset;
+    delete entry.details.previousHeadRefOid;
+    delete entry.details.previousActiveRevision;
+    const { timelineId: _timelineId, contentDigest: _digest, ...content } = entry;
+    entry.contentDigest = ledgerDigest(content);
+    entry.timelineId = `work-timeline-${entry.contentDigest}`;
+  }
+  fixture.store.replaceStored(legacy);
+  fixture.service = (await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time })).service;
+  // The real claim and failure transition reproduce the deployed legacy state;
+  // only the newly introduced metadata is removed from this historical fixture.
+  const blocked = (await fixture.service.listItems()).items[0];
+  assert.equal(blocked.statusReason, 'decision_attempts_exhausted');
+  assert.equal(blocked.attempt, 4);
+  return fixture;
+}
+
+test('a legacy activated Head block recovers automatically once and keeps genuine same-Head exhaustion blocked after restart', async () => {
+  const fixture = await legacyActivatedDecisionBlockFixture();
+  const outbox = (await fixture.service.listOutbox()).items;
+  let restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  let modelCalls = 0;
+  const options = { assemble: unavailablePrContext, decide: async () => { modelCalls += 1; } };
+  const recovered = await decisionBudgetLoop(restarted, options).runCycle();
+  assert.equal(recovered.retried, 1);
+  assert.equal(recovered.claimed, 1);
+  assert.equal((await restarted.service.listItems()).items[0].attempt, 5);
+  assert.equal((await restarted.service.listItems()).items[0].status, 'retry_wait');
+  fixture.time.advance(8_000);
+  restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  const loop = decisionBudgetLoop(restarted, options);
+  assert.equal((await loop.runCycle()).blocked, 1);
+  const genuinelyExhausted = (await restarted.service.listItems()).items[0];
+  assert.equal(genuinelyExhausted.attempt, 6);
+  assert.equal((await loop.runCycle()).claimed, 0);
+  assert.deepEqual((await restarted.service.listItems()).items[0], genuinelyExhausted);
+  assert.equal(modelCalls, 0);
+  assert.deepEqual((await restarted.service.listOutbox()).items, outbox);
+  assert.equal((await restarted.service.listTimeline({ limit: 100 })).items.filter(entry =>
+    entry.type === 'transitioned' && entry.details.reason === 'pr_head_decision_budget_recovered').length, 1);
+});
+
+for (const update of ['live-base', 'bound-existing-event']) {
+  test(`legacy Head-budget recovery composes with automatic intake of ${update} facts`, async () => {
+    const fixture = await legacyActivatedDecisionBlockFixture();
+    const originalOutbox = (await fixture.service.listOutbox()).items;
+    fixture.time.advance(1_000);
+    const record = update === 'live-base' ? prAssignment(3, {
+      headRefOid: PR_HEAD_B, changedFields: ['gitTarget'], occurredAt: '2026-08-02T01:06:00.000Z',
+      gitFacts: prGitFacts(PR_HEAD_B, { baseRefOid: 'e'.repeat(40) }),
+    }) : { ...clone(fixture.source.records[1]), sequence: 3,
+      assignment: { ...clone(fixture.source.records[1].assignment), assignmentId: 'new-binding-for-current-event' } };
+    fixture.source.records.push(record);
+    fixture.source.highWatermark = 3;
+    const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+    const loop = decisionBudgetLoop(restarted, { assemble: async ({ item }) => {
+      assert.equal(item.source.current.headRefOid, PR_HEAD_B);
+      if (update === 'live-base') assert.equal(item.source.current.event.payload.gitTarget.baseRefOid, 'e'.repeat(40));
+      return unavailablePrContext();
+    } });
+    const cycle = await loop.runCycle();
+    assert.equal(cycle.intake.cursor, 3);
+    assert.equal(cycle.retried, 1, JSON.stringify(cycle));
+    const item = (await restarted.service.listItems()).items[0];
+    assert.equal(item.attempt, 5);
+    assert.equal(item.status, 'retry_wait');
+    assert.deepEqual((await restarted.service.listOutbox()).items, originalOutbox);
+  });
+}
+
+for (const protection of ['paused', 'cancelled', 'waiting_condition', 'waiting_external',
+  'active_intent', 'unknown_action', 'missing_proof', 'stale_activation', 'same_head']) {
+  test(`automatic Head-budget recovery preserves ${protection} work`, async () => {
+    const fixture = await legacyActivatedDecisionBlockFixture();
+    const durable = fixture.store.stored();
+    const item = durable.items[0];
+    if (['paused', 'cancelled', 'waiting_condition', 'waiting_external'].includes(protection)) {
+      item.status = protection;
+      item.statusReason = `protected-${protection}`;
+    } else if (protection === 'active_intent') {
+      item.activeIntentId = durable.outbox.at(-1).intentId;
+    } else if (protection === 'missing_proof') {
+      durable.timeline = durable.timeline.filter(entry => entry.type !== 'claimed' || entry.details.attempt > 3);
+      // Retention removes a prefix, never holes; retain only the activation and
+      // subsequent events so an absent historical counter cannot be guessed.
+      const activation = durable.timeline.findLast(entry => entry.type === 'pr_source_revised');
+      durable.timeline = durable.timeline.filter(entry => entry.sequence >= activation.sequence);
+      durable.timelineStartSequence = durable.timeline[0].sequence;
+    } else if (protection === 'stale_activation') {
+      const activation = durable.timeline.findLast(entry => entry.type === 'pr_source_revised');
+      activation.details.headRefOid = PR_HEAD_C;
+      const { timelineId: _id, contentDigest: _digest, ...content } = activation;
+      activation.contentDigest = ledgerDigest(content);
+      activation.timelineId = `work-timeline-${activation.contentDigest}`;
+    } else if (protection === 'unknown_action') {
+      const appended = appendWorkLedgerTimeline(durable, [{ itemId: item.itemId, type: 'intent_staged',
+        at: fixture.time.clock(), actorId: 'employee-pr-engineer', details: { intentId: 'unknown-external-action' } }],
+      normalizeWorkLedgerLimits().timelineLimit);
+      durable.timeline = appended.timeline;
+      durable.timelineStartSequence = appended.timelineStartSequence;
+      durable.nextTimelineSequence = appended.nextTimelineSequence;
+    } else {
+      // No accepted Head boundary exists in this legacy source history.
+      item.source.revisions = item.source.revisions.map(revision => ({ ...revision, headRefOid: PR_HEAD_B }));
+    }
+    fixture.store.replaceStored(durable);
+    // Boundary fixtures that would violate persisted schema are tested at the
+    // recovery predicate below; never weaken production state validation.
+    if (['active_intent', 'same_head'].includes(protection)) {
+      const budget = pullRequestDecisionAttemptBudget(item, durable.timeline);
+      assert.equal(canRecoverPullRequestDecisionBudget(item, budget, 3), false);
+      return;
+    }
+    const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+    const before = (await restarted.service.listItems()).items[0];
+    const cycle = await decisionBudgetLoop(restarted, { assemble: unavailablePrContext }).runCycle();
+    assert.equal(cycle.claimed, 0);
+    assert.deepEqual((await restarted.service.listItems()).items[0], before);
+  });
+}
+
+async function completedInactivePrFixture() {
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  await fixture.service.intake();
+  let root = (await fixture.service.listItems()).items[0];
+  root = await fixture.service.claim({ itemId: root.itemId, expectedRevision: root.revision,
+    workerId: 'employee-pr-engineer', leaseDurationMs: 30_000 });
+  const staged = await fixture.service.stageIntent({ itemId: root.itemId, expectedRevision: root.revision,
+    leaseId: root.leaseId, actorId: 'employee-pr-engineer', roleId: 'pr-engineer', intent: reviewIntent() });
+  const claimed = await fixture.service.claimIntent({ intentId: staged.outbox.intentId, expectedRevision: staged.outbox.revision,
+    dispatcherId: 'work-intent-dispatcher', leaseDurationMs: 30_000 });
+  const sealed = await fixture.service.bindIntent({ intentId: claimed.intentId, expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision, dispatcherId: claimed.dispatcherId, dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent: boundReviewIntent(staged.item, { requestedBy: { roleId: 'pr-engineer', workItemId: staged.item.itemId },
+      binding: { repository: 'acme/repo', pullRequestNumber: 42 } }) });
+  const left = prAssignment(2, { eventType: 'pull_request.left_scope', occurredAt: '2026-08-02T01:05:00.000Z',
+    gitFacts: prGitFacts(PR_HEAD_A) }).event;
+  fixture.source.records.push(prScopeLifecycleAssignment(2, left));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  root = (await fixture.service.listItems()).items[0];
+  await fixture.service.ackIntent({ intentId: sealed.intentId, expectedRevision: sealed.revision,
+    itemExpectedRevision: root.revision, dispatchLeaseId: sealed.dispatchLeaseId, actorId: 'work-intent-dispatcher',
+    outcome: 'delivered', nextStatus: 'completed', details: { downstreamRef: 'sealed-before-left-scope' } });
+  fixture.source.records.push(prAssignment(3, { pullRequestNumber: 43, headRefOid: PR_HEAD_C, gitFacts: prGitFacts(PR_HEAD_C) }));
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+  return fixture;
+}
+
+for (const limit of [1, 2, 100]) {
+  test(`ignored scope reentry preserves a completed inactive PR and cannot poison intake (limit ${limit})`, async () => {
+    const fixture = await completedInactivePrFixture();
+    const before = (await fixture.service.listItems()).items.find(item => item.source.identity.pullRequestNumber === 42);
+    assert.equal(before.status, 'completed');
+    assert.equal(before.source.scope.active, false);
+    const outbox = (await fixture.service.listOutbox()).items;
+    const changed = prAssignment(5, { eventType: 'pull_request.created', headRefOid: PR_HEAD_B,
+      occurredAt: '2026-08-02T01:10:00.000Z', gitFacts: prGitFacts(PR_HEAD_B) });
+    fixture.source.records.push(prScopeLifecycleAssignment(4, changed.event), changed,
+      prAssignment(6, { pullRequestNumber: 43, headRefOid: PR_HEAD_C, changedFields: ['gitTarget'],
+        occurredAt: '2026-08-02T01:11:00.000Z', gitFacts: prGitFacts(PR_HEAD_C, { baseRefOid: 'e'.repeat(40) }) }));
+    fixture.source.highWatermark = 6;
+    const feed = clone(fixture.source.records);
+    for (let step = 0; step < 3; step += 1) {
+      const result = await fixture.service.intake({ limit });
+      assert.equal(result.error, undefined, JSON.stringify(result));
+      if (result.cursor === 6) break;
+    }
+    assert.equal((await fixture.service.getSummary()).intakeCursor, 6);
+    const items = (await fixture.service.listItems()).items;
+    assert.deepEqual(items.find(item => item.itemId === before.itemId), before);
+    assert.equal(items.find(item => item.source.identity.pullRequestNumber === 43).source.current.event.payload.gitTarget.baseRefOid,
+      'e'.repeat(40), 'a later legitimate PR update must not be stuck behind a rejected observation');
+    assert.deepEqual((await fixture.service.listOutbox()).items, outbox);
+    assert.deepEqual(fixture.source.records, feed);
+    const audit = (await fixture.service.listTimeline({ limit: 100 })).items.filter(entry =>
+      entry.itemId === before.itemId && entry.type === 'pr_source_ignored' && [4, 5].includes(entry.details.sourceSequence));
+    assert.equal(audit.length, 2);
+    assert.ok(audit.every(entry => entry.details.disposition === 'ignored_unproven_head'));
+    const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+    assert.equal((await restarted.service.intake({ limit })).received, 0);
+    assert.deepEqual((await restarted.service.listItems()).items, items);
+  });
+}
+
+test('accepted scope reentry and a later proven Head update retain normal authority rules', async () => {
+  const fixture = await completedInactivePrFixture();
+  const before = (await fixture.service.listItems()).items.find(item => item.source.identity.pullRequestNumber === 42);
+  const outbox = (await fixture.service.listOutbox()).items;
+  const created = prAssignment(5, { eventType: 'pull_request.created', headRefOid: PR_HEAD_A,
+    occurredAt: '2026-08-02T01:10:00.000Z', gitFacts: prGitFacts(PR_HEAD_A) });
+  fixture.source.records.push(prScopeLifecycleAssignment(4, created.event), created);
+  fixture.source.highWatermark = 5;
+  assert.equal((await fixture.service.intake({ limit: 100 })).error, undefined);
+  let active = (await fixture.service.listItems()).items.find(item => item.itemId === before.itemId);
+  assert.equal(active.status, 'queued');
+  assert.equal(active.source.scope.active, true);
+  assert.equal(active.source.current.headRefOid, PR_HEAD_A);
+  assert.equal(active.attempt, before.attempt);
+  assert.deepEqual((await fixture.service.listOutbox()).items, outbox);
+  fixture.source.records.push(prAssignment(6, { headRefOid: PR_HEAD_B, previousHeadRefOid: PR_HEAD_A,
+    changedFields: ['headRefOid'], occurredAt: '2026-08-02T01:11:00.000Z', gitFacts: prGitFacts(PR_HEAD_B) }));
+  fixture.source.highWatermark = 6;
+  assert.equal((await fixture.service.intake()).error, undefined);
+  active = (await fixture.service.listItems()).items.find(item => item.itemId === before.itemId);
+  assert.equal(active.source.current.headRefOid, PR_HEAD_B);
+  const budget = pullRequestDecisionAttemptBudget(active, (await fixture.service.listTimeline({ limit: 100 })).items);
+  assert.equal(budget.attempt, 0);
+  assert.equal(budget.offset, before.attempt);
+});
+
+test('a cancelled inactive PR ignores both unproven reentry routes without poisoning intake', async () => {
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  await fixture.service.intake();
+  const left = prAssignment(2, { eventType: 'pull_request.left_scope', occurredAt: '2026-08-02T01:05:00.000Z',
+    gitFacts: prGitFacts(PR_HEAD_A) }).event;
+  fixture.source.records.push(prScopeLifecycleAssignment(2, left));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  let root = (await fixture.service.listItems()).items[0];
+  assert.equal(root.source.scope.active, false);
+  await fixture.service.cancelGraphTask({ itemId: root.itemId, expectedRevision: root.revision,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    actorId: 'owner-task-control', reason: 'Owner repaired this PR' });
+  root = (await fixture.service.listItems()).items[0];
+  assert.equal(root.status, 'cancelled');
+  const created = prAssignment(4, { eventType: 'pull_request.created', headRefOid: PR_HEAD_B,
+    occurredAt: '2026-08-02T01:10:00.000Z', gitFacts: prGitFacts(PR_HEAD_B) });
+  fixture.source.records.push(prScopeLifecycleAssignment(3, created.event), created, assignment(5));
+  fixture.source.highWatermark = 5;
+  const intake = await fixture.service.intake({ limit: 100 });
+  assert.equal(intake.error, undefined);
+  assert.equal(intake.cursor, 5);
+  assert.deepEqual((await fixture.service.listItems()).items.find(item => item.itemId === root.itemId), root);
+  const audit = (await fixture.service.listTimeline({ limit: 100 })).items.filter(entry =>
+    entry.type === 'pr_source_ignored' && entry.details.disposition === 'ignored_cancelled_source');
+  assert.equal(audit.length, 2);
+  const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  assert.equal((await restarted.service.intake()).received, 0);
+  assert.deepEqual((await restarted.service.listItems()).items.find(item => item.itemId === root.itemId), root);
+});
 
 test('a new PR Head supersedes an obsolete delivered condition and remains wakeable after recovery', async () => {
   const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
@@ -293,6 +819,7 @@ import {
   WORK_LEDGER_STATE_SCHEMA_VERSION,
 } from "../src/services/work-ledger-state.js";
 import { ledgerDigest } from "../src/services/work-ledger-values.js";
+import { pullRequestDecisionAttemptBudget, canRecoverPullRequestDecisionBudget, persistedPullRequestDecisionAttemptBudget } from "../src/services/work-ledger-pr-source.js";
 import { validateWorkLedgerGraphTransition } from "../src/services/work-ledger-graph.js";
 import {
   migrateWorkGraphMemoryProjection,
@@ -8932,7 +9459,7 @@ test("schema v8 PR history uses independent source-root byte budgets", async () 
     records[0].event.occurredAt,
   );
   for (const record of records.slice(1)) {
-    const appended = appendPullRequestWorkSource(root.source, record);
+    const appended = appendPullRequestWorkSource(root.source, record, { attemptAtActivation: root.attempt });
     root.source = appended.source;
     root.inputDigest = appended.source.current.inputDigest;
     root.updatedAt = record.event.occurredAt;
@@ -13092,7 +13619,7 @@ test("a same-Head PR fact update does not strand an answered user question", asy
   const candidate = structuredClone(stored);
   candidate.revision += 1;
   const revised = candidate.items.find(({ itemId }) => itemId === waiting.itemId);
-  const appended = appendPullRequestWorkSource(revised.source, updatedAssignment);
+  const appended = appendPullRequestWorkSource(revised.source, updatedAssignment, { attemptAtActivation: revised.attempt });
   assert.equal(appended.activeAdvanced, true);
   revised.source = appended.source;
   revised.inputDigest = appended.source.current.inputDigest;
@@ -13164,7 +13691,7 @@ test("an answered question for an old PR Head cannot settle the new Head", async
     previousHeadRefOid: PR_HEAD_A,
     changedFields: ["headRefOid"],
     gitFacts: prGitFacts(PR_HEAD_B),
-  }));
+  }), { attemptAtActivation: item.attempt });
   assert.equal(appended.activeAdvanced, true);
   item.source = appended.source;
   item.inputDigest = appended.source.current.inputDigest;

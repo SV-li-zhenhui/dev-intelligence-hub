@@ -31,6 +31,7 @@ import {
   normalizeUnifiedDeferredOptions,
 } from "./domain/attention-deferred-contract.js";
 import { canonicalJsonDigest } from "./lib/canonical-json-digest.js";
+import { ActionAdmissionGateError } from "./lib/action-admission-gate.js";
 import { createApplicationWriterLease } from "./lib/application-writer-lease.js";
 import { projectRoot } from "./lib/config.js";
 import {
@@ -3957,6 +3958,59 @@ function shutdownAbort() {
   });
 }
 
+function isPureConfigurationRestartRejection(error, seen = new Set()) {
+  // A completed admission rejection must not block the restart that opens
+  // admission. Every error leaf must still be a known, side-effect-free fence.
+  try {
+    return hasOnlyConfigurationRestartRejections(error, seen);
+  } catch {
+    return false;
+  }
+}
+
+function hasOnlyConfigurationRestartRejections(error, seen) {
+  if (!(error instanceof Error) || seen.has(error) || seen.size >= 64) return false;
+  seen.add(error);
+  const fields = Object.getOwnPropertyDescriptors(error);
+  const value = (key) => fields[key]?.value;
+  const hasOnlyFields = (allowed) => Reflect.ownKeys(fields)
+    .every((key) => allowed.includes(key) &&
+      (key === "stack" || Object.hasOwn(fields[key], "value")));
+  const prototype = Object.getPrototypeOf(error);
+  if (prototype === ActionAdmissionGateError.prototype) {
+    return value("code") === "RUNTIME_RESTART_REQUIRED" &&
+      value("statusCode") === 409 &&
+      hasOnlyFields(["stack", "message", "name", "code", "statusCode"]);
+  }
+  if (prototype === Error.prototype) {
+    const causeCodes = value("causeCodes");
+    const causeDetails = value("causeDetails");
+    const stage = value("stage");
+    return value("code") === "WORK_COORDINATION_STAGE_FAILED" &&
+      typeof stage === "string" && /^[a-z][a-z_]{0,63}$/u.test(stage) &&
+      value("message") === `员工主动循环阶段失败: ${stage} [RUNTIME_RESTART_REQUIRED]` &&
+      Array.isArray(causeCodes) && causeCodes.length === 1 &&
+      Object.getOwnPropertyDescriptor(causeCodes, "0")?.value === "RUNTIME_RESTART_REQUIRED" &&
+      Array.isArray(causeDetails) && causeDetails.length === 0 &&
+      hasOnlyFields(["stack", "message", "cause", "code", "stage", "causeCodes", "causeDetails", "result"]) &&
+      isPureConfigurationRestartRejection(value("cause"), seen);
+  }
+  if (prototype !== AggregateError.prototype ||
+      !hasOnlyFields(["stack", "message", "errors", "result"])) return false;
+  const message = value("message");
+  const errors = value("errors");
+  if (typeof message !== "string" ||
+      !(message.startsWith("员工主动循环有多个阶段失败: ") ||
+        message.startsWith("员工主动循环、旧岗位巡查或记忆投影失败: ")) ||
+      !Array.isArray(errors) || errors.length === 0 || errors.length > 64) return false;
+  for (let index = 0; index < errors.length; index += 1) {
+    const entry = Object.getOwnPropertyDescriptor(errors, String(index));
+    if (!entry || !Object.hasOwn(entry, "value") ||
+        !isPureConfigurationRestartRejection(entry.value, seen)) return false;
+  }
+  return true;
+}
+
 function backgroundOperationOptions(input, signal) {
   const options = { ...input };
   Object.defineProperty(options, "signal", {
@@ -4628,7 +4682,8 @@ export function startApplicationBackgroundWork(
       const failures = results
         .filter((result) =>
           result.status === "rejected" &&
-          result.reason !== workController.signal.reason
+          result.reason !== workController.signal.reason &&
+          !isPureConfigurationRestartRejection(result.reason)
         )
         .map((result) => result.reason);
       if (failures.length === 1) throw failures[0];

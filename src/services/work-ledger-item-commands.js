@@ -25,6 +25,7 @@ import {
   LEGACY_PR_SOURCE_CUTOVER_REASON,
   LEGACY_PR_SOURCE_QUARANTINE_KIND,
   pullRequestHeadAdmission,
+  sealLegacyPullRequestDecisionBudget,
 } from "./work-ledger-pr-source.js";
 
 const MIN_LEASE_MS = 1_000;
@@ -139,6 +140,7 @@ export function planWorkItemClaim({ state, input, clock, newLeaseId }) {
   const leaseUntil = new Date(Date.parse(now) + duration).toISOString();
   const itemResult = {
     ...item,
+    source: sealLegacyPullRequestDecisionBudget(item, state.timeline),
     status: "working",
     revision: item.revision + 1,
     ownerId,

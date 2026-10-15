@@ -8,6 +8,7 @@ import { GitHubAdapter } from "./adapters/github-adapter.js";
 import { createProductionSupervisedCliBrainProvider } from "./adapters/supervised-cli-brain-provider.js";
 import { AutomaticReviewPublisher } from "./services/automatic-review-publisher.js";
 import { AutomaticOwnPrRepair } from "./services/automatic-own-pr-repair.js";
+import { HistoricalControlledCommitReader } from "./services/historical-controlled-commit-reader.js";
 import { ReviewRepairContextReader, normalizeReviewRepairFeedbackContext } from "./services/review-repair-context-reader.js";
 import { OriginalRepairFeedbackReader } from "./services/original-repair-feedback-reader.js";
 import { OwnPrRepairObjectSync } from "./adapters/own-pr-repair-object-sync.js";
@@ -1977,6 +1978,9 @@ export async function createApplication({
         configurationReader: configurationRuntime.reader, store, ledger: workLedgerRuntime,
         github, confirmations: Object.freeze({ ...confirmationRuntime.producerQueue, ...confirmationRuntime.queue }), codeJobReader,
         controlledCommitReader: codeExecutorRuntime.controlledCommitBuilder,
+        historicalControlledCommitReader: new HistoricalControlledCommitReader({
+          store, controlledCommitReader: codeExecutorRuntime.controlledCommitBuilder,
+        }),
         grantVerifier: activeCodeJobOptions.grantVerifier,
         historicalRepairFeedbackReader: Object.freeze({
           async read({ inputBinding, feedbackDigest }) {

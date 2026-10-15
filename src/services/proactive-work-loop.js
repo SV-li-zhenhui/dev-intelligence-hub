@@ -11,7 +11,14 @@ import {
   WORK_COORDINATION_EVIDENCE_MUTATION_MARGIN_MS,
   WORK_COORDINATION_EVIDENCE_VERIFICATION_TARGET_MS,
 } from "./work-coordination-timing.js";
-import { currentWorkItemEvent, currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
+import {
+  canRecoverPullRequestDecisionBudget,
+  currentWorkItemEvent,
+  currentWorkItemExecutionBinding,
+  isPullRequestDecisionBudgetRecoveryCandidate,
+  pullRequestDecisionAttemptBudget,
+  persistedPullRequestDecisionAttemptBudget,
+} from "./work-ledger-pr-source.js";
 import { isPreWriteGraphRevisionConflict } from "./work-ledger-graph-command-support.js";
 
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
@@ -724,6 +731,10 @@ export class ProactiveWorkLoop {
       "readItemForReconciliation",
       "ledger.readItemForReconciliation",
     );
+    this.listTimeline = optionalPortMethod(ledger, "listTimeline", "ledger.listTimeline");
+    this.verifyPullRequestExecutionBinding = optionalPortMethod(
+      ledger, "verifyPullRequestExecutionBinding", "ledger.verifyPullRequestExecutionBinding",
+    );
     this.listClaimCandidates = optionalPortMethod(
       ledger,
       "listClaimCandidates",
@@ -854,6 +865,7 @@ export class ProactiveWorkLoop {
       options.signal,
     );
     throwIfLoopAborted(options.signal);
+    await this.#recoverOldHeadDecisionExhaustion(options);
     const candidateAt = normalizeLoopClock(this.clock);
     const candidateWindow = await this.#listCandidateWindow(
       options,
@@ -1858,6 +1870,71 @@ export class ProactiveWorkLoop {
     }
   }
 
+  async #readDecisionBudget(item, signal) {
+    if (this.listTimeline === null || item.kind !== "source_root" ||
+        item.source?.kind !== "pull_request") return null;
+    if (!item.source.revisions.some((revision) => revision.disposition === "accepted" &&
+      revision.revision <= item.source.activeRevision && revision.headRefOid !== item.source.current.headRefOid)) return null;
+    const timeline = [];
+    let cursor = null;
+    try {
+      for (let page = 0; page < MAX_PAGE_COUNT; page += 1) {
+        throwIfLoopAborted(signal);
+        const result = await this.listTimeline({ itemId: item.itemId, order: "newest", limit: PAGE_SIZE,
+          ...(cursor === null ? {} : { cursor }) });
+        throwIfLoopAborted(signal);
+        timeline.push(...result.items);
+        const budget = pullRequestDecisionAttemptBudget(item, timeline);
+        if (budget !== null || !result.nextCursor) return budget;
+        if (result.nextCursor === cursor) return null;
+        cursor = result.nextCursor;
+      }
+    } catch {
+      throwIfLoopAborted(signal);
+    }
+    return null;
+  }
+
+  async #recoverOldHeadDecisionExhaustion(options) {
+    if (this.listTimeline === null || this.verifyPullRequestExecutionBinding === null) return;
+    const blocked = [];
+    let cursor = null;
+    for (let page = 0; page < MAX_PAGE_COUNT; page += 1) {
+      throwIfLoopAborted(options.signal);
+      const result = await this.ledger.listItems({ status: "blocked", limit: PAGE_SIZE,
+        ...(cursor === null ? {} : { cursor }) });
+      throwIfLoopAborted(options.signal);
+      blocked.push(...result.items.filter((item) => item.statusReason === "decision_attempts_exhausted" &&
+        (options.roleId === null || item.currentTarget?.id === options.roleId)));
+      if (!result.nextCursor) break;
+      if (result.nextCursor === cursor) return;
+      cursor = result.nextCursor;
+    }
+    let recovered = 0;
+    for (const item of blocked) {
+      if (recovered >= options.workLimit) break;
+      if (!isPullRequestDecisionBudgetRecoveryCandidate(item)) continue;
+      const budget = await this.#readDecisionBudget(item, options.signal);
+      if (!canRecoverPullRequestDecisionBudget(item, budget, this.maxAttempts)) continue;
+      const binding = currentWorkItemExecutionBinding(item);
+      if (binding === null) continue;
+      try {
+        await this.verifyPullRequestExecutionBinding(binding);
+        throwIfLoopAborted(options.signal);
+        await this.ledger.transition({ itemId: item.itemId, expectedRevision: item.revision,
+          leaseId: null, actorId: "work-ledger-system", toStatus: "queued",
+          reason: "pr_head_decision_budget_recovered",
+          details: { evidenceRefs: [`timeline:${budget.activation.timelineId}`] } });
+        recovered += 1;
+      } catch (error) {
+        throwIfLoopAborted(options.signal);
+        if (RUNTIME_ADMISSION_ERROR_CODES.has(stableFailureCode(error))) throw error;
+        // Changed authority or a competing worker must be reconciled from a
+        // fresh snapshot on the next cycle, without replaying any action.
+      }
+    }
+  }
+
   async #recordFailure(
     item,
     actorId,
@@ -1869,19 +1946,21 @@ export class ProactiveWorkLoop {
     if (error instanceof TaskRunControlError) return {status:error.code === 'TASK_RUN_CANCELLED' ? 'cancelled' : error.code === 'TASK_RUN_CONTROL_PENDING' ? 'control_pending' : 'paused',workerId:actorId,code:error.code};
     const code = stableFailureCode(error);
     const contention = isContextContention(error);
+    const budget = contention ? null : persistedPullRequestDecisionAttemptBudget(item);
+    const attempt = budget?.attempt ?? item.attempt;
     const input = {
       itemId: item.itemId,
       expectedRevision: item.revision,
       leaseId: item.leaseId,
       actorId,
       reason:
-        contention ? "context_changed" : item.attempt >= this.maxAttempts
+        contention ? "context_changed" : attempt >= this.maxAttempts
           ? reasons.exhausted
           : reasons.retry,
     };
     try {
       throwIfLoopAborted(options.signal);
-      if (!contention && item.attempt >= this.maxAttempts) {
+      if (!contention && attempt >= this.maxAttempts) {
         await this.ledger.transition({
           ...input,
           toStatus: "blocked",
@@ -1890,7 +1969,7 @@ export class ProactiveWorkLoop {
         throwIfLoopAborted(options.signal);
         return { status: "blocked", workerId: actorId, code };
       }
-      const exponent = contention ? 0 : Math.min(item.attempt - 1, 30);
+      const exponent = contention ? 0 : Math.min(Math.max(attempt - 1, 0), 30);
       const delay = Math.min(
         this.retryMaxMs,
         this.retryBaseMs * 2 ** exponent,
