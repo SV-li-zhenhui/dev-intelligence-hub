@@ -199,7 +199,7 @@ test("Windows controlled commit evidence preserves native test identity and bind
   const profile = passedProfile("windows-tests", WORKSPACE_REVISION);
   delete profile.imageId;
   Object.assign(profile, { runtimeIdentity: { schemaVersion: 1, kind: "windows-process", executionId: "session-1-attempt-2", actionId: profile.actionId,
-    pid: 4567, processStartTimeUtcTicks: "639013000000000000", executableSha256: "d".repeat(64) }, assetVersion: 2, verificationKind: "test" });
+    pid: 4567, processStartTimeUtcTicks: String(639013000000000000n), executableSha256: "d".repeat(64) }, assetVersion: 2, verificationKind: "test" });
   const manifest = manifestFor(source, { passedProfiles: [profile] });
   const evidence = createControlledCommitEvidence(evidenceInput({ source, manifest }));
   assert.equal(evidence.schemaVersion, 2);

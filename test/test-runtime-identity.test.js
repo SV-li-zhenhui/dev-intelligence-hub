@@ -3,7 +3,7 @@ import test from "node:test";
 import { executionIdentityFields, isExecutionIdentityProof, isWindowsRuntimeIdentity, WINDOWS_REGISTRY_READ_CAPABILITY_SID } from "../src/domain/test-runtime-identity.js";
 
 const identity = { schemaVersion: 1, kind: "windows-process", executionId: "session-one", actionId: "action-one",
-  pid: 1234, processStartTimeUtcTicks: "639013000000000000", executableSha256: "a".repeat(64) };
+  pid: 1234, processStartTimeUtcTicks: String(639013000000000000n), executableSha256: "a".repeat(64) };
 
 test("native execution identity requires exact data fields and typed IDs", () => {
   assert.equal(isWindowsRuntimeIdentity(identity), true);

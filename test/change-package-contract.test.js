@@ -70,7 +70,7 @@ test("Windows package proof retains native process identity and rejects mixed id
   const profile = value.passedProfiles[0];
   delete profile.imageId;
   Object.assign(profile, { runtimeIdentity: { schemaVersion: 1, kind: "windows-process", executionId: "session-1-attempt-2", actionId: profile.actionId,
-    pid: 3456, processStartTimeUtcTicks: "639013000000000000", executableSha256: SHA_D }, assetVersion: 3, verificationKind: "test" });
+    pid: 3456, processStartTimeUtcTicks: String(639013000000000000n), executableSha256: SHA_D }, assetVersion: 3, verificationKind: "test" });
   const { manifest } = createChangePackage(value);
   assert.equal(manifest.schemaVersion, 2);
   assert.deepEqual(normalizeChangePackageManifest(manifest), manifest);

@@ -32,7 +32,7 @@
   子用例）。Claude 交叉审查连接失败，已由本地独立反例审查补位，
   不声称完成跨模型代码审查。
 - 审查产物位于
-  `C:/Users/SVision/AppData/Local/Temp/compound-engineering-SVision/ce-code-review/20261015-162329-41549bd6/`。
+  本机临时目录的 `ce-code-review/20261015-162329-41549bd6/`，不随源码分发。
   提示断言和预构造 handoff 只验证提示契约及内部路由，不能代替真实模型
   识别用户已有修复的业务验收。
 

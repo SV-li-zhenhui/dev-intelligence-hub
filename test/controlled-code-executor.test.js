@@ -169,7 +169,7 @@ function windowsProfileResult(profile, request, overrides = {}) {
   return { ...result, profileFingerprint: digestValue(profile), workspaceRevision: request.workspaceRevision,
     assetVersion: profile.asset.version, verificationKind: profile.kind === "windows-test" ? "test" : "build",
     runtimeIdentity: { schemaVersion: 1, kind: "windows-process", executionId: request.executionId,
-      actionId: request.actionId, pid: 4321, processStartTimeUtcTicks: "639013000000000000", executableSha256: profile.nodeSha256 }, ...overrides };
+      actionId: request.actionId, pid: 4321, processStartTimeUtcTicks: String(639013000000000000n), executableSha256: profile.nodeSha256 }, ...overrides };
 }
 
 test("Windows test proofs complete, survive restart, and retain native identity without image IDs", async (t) => {

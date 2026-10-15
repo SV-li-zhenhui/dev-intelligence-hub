@@ -193,12 +193,12 @@ test("Windows cleanup fences a reused live PID and never terminates the unrelate
   const calls = [];
   const runner = new WindowsFixedTestRunner({ ...setup.options, processRunner: { run: async (request) => {
     calls.push(request);
-    return { exitCode: 0, stdout: JSON.stringify({ pid: 4321, processStartTimeUtcTicks: "639013000000000001", executableSha256: "a".repeat(64) }) };
+    return { exitCode: 0, stdout: JSON.stringify({ pid: 4321, processStartTimeUtcTicks: String(639013000000000001n), executableSha256: "a".repeat(64) }) };
   } } });
   const directory = runner.executionDirectory("run-one", "action-one");
   await mkdir(directory, { recursive: true });
   const lease = { schemaVersion: 1, state: "running", executionId: "run-one", actionId: "action-one",
-    launcher: { pid: 4321, processStartTimeUtcTicks: "639013000000000000", executableSha256: "a".repeat(64) } };
+    launcher: { pid: 4321, processStartTimeUtcTicks: String(639013000000000000n), executableSha256: "a".repeat(64) } };
   await writeFile(path.join(directory, "lease.json"), JSON.stringify(lease));
   await assert.rejects(runner.cleanup({ executionId: "run-one", actionId: "action-one" }), { code: "SANDBOX_CLEANUP_FAILED" });
   assert.equal(calls.some((request) => request.command.endsWith("taskkill.exe")), false);
