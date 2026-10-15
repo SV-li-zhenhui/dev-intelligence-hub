@@ -563,6 +563,42 @@ function isStalePullRequestFactContext(error) {
   }
 }
 
+function isInitialInternalReviewFactBlock(item) {
+  const source = item.source;
+  const event = currentWorkItemEvent(item);
+  return item.kind === "source_root" && source?.kind === "pull_request" &&
+    item.currentTarget?.type === "role" && item.currentTarget.id === "pr-engineer" &&
+    item.status === "blocked" && item.statusReason === "decision_attempts_exhausted" &&
+    item.activeIntentId === null && item.decisionContext === null && item.sourceQuarantine === null &&
+    item.ownerId === null && item.leaseId === null && item.leaseUntil === null &&
+    source.scope.kind === "internal_review" && source.scope.active === true &&
+    source.pendingRevision === null && source.activeRevision === 1 && source.revisions.length === 1 &&
+    event?.eventType === "pull_request.internal_review_requested" && event.source.provider === "internal-review-repair" &&
+    Number.isSafeInteger(item.attempt) && item.attempt > 0 && item.attempt <= 100;
+}
+
+function completeInternalReviewFactFailureHistory(item, timeline) {
+  const events = [...timeline].sort((left, right) => left.sequence - right.sequence);
+  const creation = events[0];
+  if (events.length !== 1 + item.attempt * 2 || creation?.type !== "pr_source_created" ||
+      creation.at !== item.createdAt || creation.details?.workKey !== item.source.workKey ||
+      creation.details.headRefOid !== item.source.current.headRefOid || creation.details.inputRevision !== 1 ||
+      events.at(-1).at !== item.updatedAt || new Set(events.map(entry => entry.sequence)).size !== events.length) return false;
+  for (let attempt = 1; attempt <= item.attempt; attempt += 1) {
+    const claimed = events[attempt * 2 - 1];
+    const failed = events[attempt * 2];
+    if (claimed.type !== "claimed" || claimed.details?.attempt !== attempt || claimed.details.inputDigest !== item.inputDigest ||
+        failed.actorId !== claimed.actorId || failed.details?.fromStatus !== "working") return false;
+    if (attempt === item.attempt) {
+      if (failed.type !== "transitioned" || failed.details.toStatus !== "blocked" ||
+          failed.details.reason !== "decision_attempts_exhausted" ||
+          failed.details.context?.code !== "ROLE_CONTEXT_PR_FACT_UNAVAILABLE") return false;
+    } else if (failed.type !== "retry_scheduled" || failed.details.reason !== "decision_failed" ||
+        failed.details.code !== "ROLE_CONTEXT_PR_FACT_UNAVAILABLE") return false;
+  }
+  return true;
+}
+
 function ownerBrainAttentionDecision(error, roleId) {
   const code = stableFailureCode(error);
   const attention = brainFailureOwnerAttention(code);
@@ -1913,6 +1949,10 @@ export class ProactiveWorkLoop {
     let recovered = 0;
     for (const item of blocked) {
       if (recovered >= options.workLimit) break;
+      if (isInitialInternalReviewFactBlock(item)) {
+        if (await this.#recoverInternalReviewFactBlock(item, options)) recovered += 1;
+        continue;
+      }
       if (!isPullRequestDecisionBudgetRecoveryCandidate(item)) continue;
       const budget = await this.#readDecisionBudget(item, options.signal);
       if (!canRecoverPullRequestDecisionBudget(item, budget, this.maxAttempts)) continue;
@@ -1932,6 +1972,46 @@ export class ProactiveWorkLoop {
         // Changed authority or a competing worker must be reconciled from a
         // fresh snapshot on the next cycle, without replaying any action.
       }
+    }
+  }
+
+  async #recoverInternalReviewFactBlock(item, options) {
+    if (this.roleContextAssembler === null) return false;
+    const timeline = [];
+    let cursor = null;
+    try {
+      for (let page = 0; page < MAX_PAGE_COUNT; page += 1) {
+        throwIfLoopAborted(options.signal);
+        const result = await this.listTimeline({ itemId: item.itemId, order: "newest", limit: PAGE_SIZE,
+          ...(cursor === null ? {} : { cursor }) });
+        timeline.push(...result.items);
+        if (timeline.length > 1 + item.attempt * 2) return false;
+        if (!result.nextCursor) break;
+        if (result.nextCursor === cursor || page === MAX_PAGE_COUNT - 1) return false;
+        cursor = result.nextCursor;
+      }
+      if (!completeInternalReviewFactFailureHistory(item, timeline)) return false;
+      const binding = currentWorkItemExecutionBinding(item);
+      if (binding?.schemaVersion !== 2) return false;
+      await this.verifyPullRequestExecutionBinding(binding);
+      const packet = await this.#assembleContext(item, { roleId: "pr-engineer" }, options);
+      const feedback = packet?.context?.code?.originalRepairFeedback;
+      const metadata = currentWorkItemEvent(item).payload.internalReview;
+      if (!packet?.context?.code?.pullRequest?.reviewMaterial ||
+          feedback?.reviewHeadRefOid !== binding.headRefOid || feedback.feedbackDigest !== metadata.feedbackDigest) return false;
+      throwIfLoopAborted(options.signal);
+      await this.verifyPullRequestExecutionBinding(binding);
+      // Preserve the sealed Head budget and lifetime attempts. This narrow
+      // recovery grants one normal claim; its own timeline event prevents a
+      // second recovery even when that subsequent model attempt fails.
+      await this.ledger.transition({ itemId: item.itemId, expectedRevision: item.revision,
+        leaseId: null, actorId: "work-ledger-system", toStatus: "queued", reason: "internal_review_facts_recovered",
+        details: { evidenceRefs: [`original-feedback:${feedback.snapshotId}`, `head:${binding.headRefOid}`] } });
+      return true;
+    } catch (error) {
+      throwIfLoopAborted(options.signal);
+      if (RUNTIME_ADMISSION_ERROR_CODES.has(stableFailureCode(error))) throw error;
+      return false;
     }
   }
 

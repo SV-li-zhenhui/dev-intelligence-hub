@@ -23,6 +23,7 @@ function identityFixture({
   headRefOid = HEAD_OID,
   inputRevision = 4,
   ownerRequested = false,
+  internalReview = false,
 } = {}) {
   const gitTarget = {
     schemaVersion: 1,
@@ -37,11 +38,11 @@ function identityFixture({
   };
   const event = normalizeWorkflowEvent({
     schemaVersion: 1,
-    eventType: ownerRequested
+    eventType: internalReview ? "pull_request.internal_review_requested" : ownerRequested
       ? "pull_request.owner_requested"
       : "pull_request.observed",
     occurredAt: "2026-08-08T01:00:00.000Z",
-    source: ownerRequested
+    source: internalReview ? { provider: "internal-review-repair", scopeId: "internal-review:12345678-1234-4123-8123-123456789abc" } : ownerRequested
       ? {
           provider: "local-owner",
           scopeId: "owner-request:12345678-1234-4123-8123-123456789abc",
@@ -56,6 +57,10 @@ function identityFixture({
       headRefOid,
       gitTargetAvailable: true,
       gitTarget,
+      ...(internalReview ? { workType: "pull_request", state: "open", internalReview: {
+        kind: "own_pr_repair", headRefOid, feedbackDigest: SHA256,
+        publicationConfirmationId: "owner-publication-1", controlledCommitEvidenceId: "controlled-commit-1",
+      } } : {}),
     },
   });
   const sourceBinding = {
@@ -232,6 +237,17 @@ test("an owner-requested PR reads facts from its bound GitHub account", () => {
     }),
     true,
   );
+});
+
+test("a typed internal repair review reads facts from its exact GitHub account and Head", () => {
+  const requested = identityFixture({ internalReview: true });
+  assert.deepEqual(requested.identity.source, { provider: "github", scopeId: "github-account:runtime-user" });
+  assert.equal(pullRequestReadFactsMatchExecution(factsFixture(requested.identity), {
+    executionBinding: requested.executionBinding, event: requested.event,
+  }), true);
+  const stale = identityFixture({ internalReview: true, headRefOid: "d".repeat(40) });
+  assert.equal(samePullRequestReadIdentity(requested.identity, stale.identity), false);
+  assert.throws(() => createPullRequestReadIdentity({ executionBinding: requested.executionBinding, event: stale.event }));
 });
 
 test("an execution binding cannot be paired with another event provenance", () => {

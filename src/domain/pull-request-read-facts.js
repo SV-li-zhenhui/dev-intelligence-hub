@@ -471,8 +471,8 @@ export function createPullRequestReadIdentity(value) {
   }
   const source = event.source.provider === "github"
     ? event.source
-    : event.source.provider === "local-owner" &&
-        event.eventType === "pull_request.owner_requested" &&
+    : ((event.source.provider === "local-owner" && event.eventType === "pull_request.owner_requested") ||
+        (event.source.provider === "internal-review-repair" && event.eventType === "pull_request.internal_review_requested")) &&
         binding.gitTarget.provider === "github"
       ? {
           provider: "github",

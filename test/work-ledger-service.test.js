@@ -9,6 +9,245 @@ import { WorkflowFactSource } from '../src/services/workflow-fact-source.js';
 import { WorkCoordinationService } from '../src/services/work-coordination-service.js';
 import { ProactiveWorkLoop } from '../src/services/proactive-work-loop.js';
 import { prepareWorkLedgerCandidate } from '../src/services/work-ledger-candidate-validation.js';
+import { RoleContextAssembler } from '../src/services/role-context-assembler.js';
+import { createPullRequestReadIdentity } from '../src/domain/pull-request-read-facts.js';
+import { createOriginalRepairFeedbackSnapshot } from '../src/domain/original-repair-feedback.js';
+import { ownReviewFeedbackDigest } from '../src/adapters/github-own-review-feedback.js';
+import { internalRepairReviewRequestId } from '../src/domain/internal-repair-review.js';
+import { OriginalRepairFeedbackReader } from '../src/services/original-repair-feedback-reader.js';
+
+async function exhaustedInternalReviewFactsFixture({ attempts = 3 } = {}) {
+  const feedback = { changeRequests: [{ id: 'review-1', author: 'reviewer', body: 'Preserve both eyes after a failed load' }], threads: [] };
+  const snapshot = createOriginalRepairFeedbackSnapshot({ repository: 'acme/repo', number: 42,
+    context: { schemaVersion: 1, headRefOid: PR_HEAD_A, reviewFeedbackDigest: ownReviewFeedbackDigest(feedback), feedback },
+    provenance: { kind: 'captured_before_repair', observedHeadRefOid: PR_HEAD_A, observedAt: '2026-08-02T01:00:00.000Z' } });
+  const metadata = { kind: 'own_pr_repair', headRefOid: PR_HEAD_B, feedbackDigest: snapshot.feedbackDigest,
+    publicationConfirmationId: 'owner-publication-1', controlledCommitEvidenceId: 'controlled-commit-1' };
+  const request = { schemaVersion: 7, requestId: internalRepairReviewRequestId({ repository: 'acme/repo', number: 42, ...metadata }),
+    workType: 'pull_request', priority: 'high', title: 'Review the existing repair', description: 'Assess every original request against the current Head',
+    acceptanceCriteria: ['Read every original request'], pullRequest: { repository: 'acme/repo', number: 42 }, internalReview: metadata };
+  const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: 'pull_request.internal_review_requested',
+    occurredAt: '2026-08-02T01:01:00.000Z', source: { provider: 'internal-review-repair', scopeId: `internal-review:${request.requestId}` },
+    subject: { id: 'github:pr:acme/repo#42', repository: 'acme/repo', number: 42 },
+    payload: { title: request.title, workType: 'pull_request', state: 'open', headRefOid: PR_HEAD_B,
+      ...prGitFacts(PR_HEAD_B), internalReview: metadata } });
+  const record = { sequence: 1, event, assignment: { assignmentId: 'workflow-assignment-internal-review', eventId: event.eventId,
+    target: { type: 'role', id: 'pr-engineer' }, reason: 'internal-review', createdAt: event.occurredAt } };
+  const fixture = await createFixture({ records: [record] });
+  for (let turn = 0; turn < attempts; turn += 1) {
+    await decisionBudgetLoop(fixture, { maxAttempts: attempts, assemble: unavailablePrContext, decide: async () => assert.fail('Facts must precede model work') }).runCycle();
+    fixture.time.advance(8_000);
+  }
+  const item = (await fixture.service.listItems()).items[0];
+  assert.equal(item.statusReason, 'decision_attempts_exhausted');
+  const feedbackState = { schemaVersion: 1, feedbackSnapshots: [snapshot], repairs: [], published: [{
+    repository: 'acme/repo', number: 42, feedbackDigest: snapshot.feedbackDigest, commitOid: PR_HEAD_B,
+    confirmationId: metadata.publicationConfirmationId, feedbackSnapshotId: snapshot.snapshotId,
+    reviewDelivery: { status: 'completed', request, workItemId: item.itemId, roleId: 'pr-engineer' },
+  }] };
+  return { ...fixture, snapshot, metadata, feedbackState };
+}
+
+function internalReviewContextAssembler(fixture, { missingFeedback = false, staleFacts = false } = {}) {
+  const facts = new WorkflowFactSource({ store: { async read() { return {}; } }, clock: fixture.time.clock,
+    pullRequestFacts: { async context(input) {
+      const identity = createPullRequestReadIdentity(input);
+      return { schemaVersion: 1, identityDigest: identity.identityDigest, contentDigest: 'a'.repeat(64), observedAt: fixture.time.clock(),
+        summary: {}, comments: [], reviews: [], reviewThreads: [], checks: [], contextTruncated: false,
+        reviewMaterial: { schemaVersion: 1, gitTarget: { ...input.executionBinding.gitTarget, ...(staleFacts ? { headRefOid: PR_HEAD_A } : {}) },
+          additions: 0, deletions: 0, changedFiles: 0, files: [], filesTruncated: false, patch: '', patchTruncated: false } };
+    } } });
+  return new RoleContextAssembler({ graphReader: { getSnapshot: () => fixture.service.getGraphSnapshot() },
+    pullRequestContextReader: facts.pullRequestTaskContextReader(),
+    originalRepairFeedbackReader: new OriginalRepairFeedbackReader({ executionContextReader: fixture.service,
+      store: { async read() { return missingFeedback ? { schemaVersion: 1, repairs: [], published: [] } : clone(fixture.feedbackState); } } }),
+  });
+}
+
+test('internal review fact recovery assembles exact live context and the complete original feedback before one normal claim', async () => {
+  const fixture = await exhaustedInternalReviewFactsFixture();
+  const before = (await fixture.service.listItems()).items[0];
+  fixture.service = (await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time })).service;
+  const assembler = internalReviewContextAssembler(fixture);
+  let modelCalls = 0;
+  const cycle = await decisionBudgetLoop(fixture, { assemble: (input) => assembler.assemble(input), decide: async ({ context }) => {
+    modelCalls += 1;
+    assert.equal(context.code.originalRepairFeedback.snapshotId, fixture.snapshot.snapshotId);
+    assert.equal(context.code.pullRequest.reviewMaterial.gitTarget.headRefOid, PR_HEAD_B);
+    return { schemaVersion: 1, confidence: 90, summary: 'Internal review complete', intent: {
+      schemaVersion: 1, type: 'complete', summary: 'Reviewed existing repair', reason: 'All original requests assessed', outcome: 'done', evidence: [] } };
+  } }).runCycle();
+  assert.equal(cycle.claimed, 1);
+  assert.equal(cycle.staged, 1);
+  assert.equal(modelCalls, 1);
+  const after = (await fixture.service.listItems()).items[0];
+  assert.equal(after.attempt, before.attempt + 1);
+  assert.deepEqual(after.source.decisionBudget, before.source.decisionBudget);
+  const recovery = (await fixture.service.listTimeline({ itemId: before.itemId, limit: 100 })).items.filter(entry =>
+    entry.type === 'transitioned' && entry.details.reason === 'internal_review_facts_recovered');
+  assert.equal(recovery.length, 1);
+});
+
+test('internal review fact recovery cannot repeat after a real model failure and restart', async () => {
+  const fixture = await exhaustedInternalReviewFactsFixture();
+  const assembler = internalReviewContextAssembler(fixture);
+  let modelCalls = 0;
+  const options = { assemble: (input) => assembler.assemble(input), decide: async () => { modelCalls += 1; throw new Error('Model failed after valid context'); } };
+  assert.equal((await decisionBudgetLoop(fixture, options).runCycle()).blocked, 1);
+  const blocked = (await fixture.service.listItems()).items[0];
+  assert.equal(blocked.attempt, 4);
+  fixture.service = (await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time })).service;
+  assert.equal((await decisionBudgetLoop(fixture, options).runCycle()).claimed, 0);
+  assert.deepEqual((await fixture.service.listItems()).items[0], blocked);
+  assert.equal(modelCalls, 1);
+});
+
+test('internal review fact recovery preserves a competing revision committed while context assembly awaits', async () => {
+  const fixture = await exhaustedInternalReviewFactsFixture();
+  const assembler = internalReviewContextAssembler(fixture);
+  const entered = deferred(), finish = deferred();
+  const cycle = decisionBudgetLoop(fixture, { assemble: async input => {
+    const packet = await assembler.assemble(input);
+    entered.resolve();
+    await finish.promise;
+    return packet;
+  }, decide: async () => assert.fail('A competing block must not be claimed') }).runCycle();
+  await entered.promise;
+  const before = (await fixture.service.listItems()).items[0];
+  const queued = await fixture.service.transition({ itemId: before.itemId, expectedRevision: before.revision,
+    leaseId: null, actorId: 'owner-task-control', toStatus: 'queued', reason: 'owner-reconsidered-work' });
+  const competing = await fixture.service.transition({ itemId: queued.itemId, expectedRevision: queued.revision,
+    leaseId: null, actorId: 'owner-task-control', toStatus: 'blocked', reason: 'owner-kept-work-blocked' });
+  const writes = fixture.store.writes.length;
+  finish.resolve();
+  assert.equal((await cycle).claimed, 0);
+  assert.deepEqual((await fixture.service.listItems()).items[0], competing);
+  assert.equal(fixture.store.writes.length, writes);
+  assert.equal((await fixture.service.listTimeline({ itemId: before.itemId, limit: 100 })).items.some(entry =>
+    entry.details.reason === 'internal_review_facts_recovered'), false);
+});
+
+test('internal review fact recovery does not queue after the second execution authority check fails', async () => {
+  const fixture = await exhaustedInternalReviewFactsFixture();
+  const before = (await fixture.service.listItems()).items[0];
+  const verify = fixture.service.verifyPullRequestExecutionBinding.bind(fixture.service);
+  let checks = 0;
+  fixture.service.verifyPullRequestExecutionBinding = async input => {
+    checks += 1;
+    if (checks === 2) throw Object.assign(new Error('Authority changed during context read'), { code: 'WORK_LEDGER_PR_EXECUTION_BINDING_STALE' });
+    return verify(input);
+  };
+  const assembler = internalReviewContextAssembler(fixture);
+  const writes = fixture.store.writes.length;
+  const cycle = await decisionBudgetLoop(fixture, { assemble: input => assembler.assemble(input), decide: async () => assert.fail('Authority is no longer current') }).runCycle();
+  assert.equal(checks, 2);
+  assert.equal(cycle.claimed, 0);
+  assert.deepEqual((await fixture.service.listItems()).items[0], before);
+  assert.equal(fixture.store.writes.length, writes);
+});
+
+test('internal review fact recovery reads a valid multi-page history and recovers exactly once', async () => {
+  const fixture = await exhaustedInternalReviewFactsFixture({ attempts: 51 });
+  const timeline = fixture.service.listTimeline.bind(fixture.service);
+  const pages = [];
+  fixture.service.listTimeline = async input => {
+    const result = await timeline(input);
+    pages.push({ cursor: input.cursor ?? null, size: result.items.length, nextCursor: result.nextCursor });
+    return result;
+  };
+  const assembler = internalReviewContextAssembler(fixture);
+  const options = { assemble: input => assembler.assemble(input), decide: async () => { throw new Error('Real model failure after recovered context'); } };
+  assert.equal((await decisionBudgetLoop(fixture, options).runCycle()).blocked, 1);
+  assert.deepEqual(pages.map(page => page.size), [100, 3]);
+  assert.equal(pages[1].cursor, pages[0].nextCursor);
+  assert.equal(pages[1].nextCursor, null);
+  const blocked = (await fixture.service.listItems()).items[0];
+  assert.equal(blocked.attempt, 52);
+  assert.equal((await decisionBudgetLoop(fixture, options).runCycle()).claimed, 0);
+  assert.deepEqual((await fixture.service.listItems()).items[0], blocked);
+  assert.equal((await timeline({ itemId: blocked.itemId, limit: 100, order: 'newest' })).items.filter(entry =>
+    entry.details.reason === 'internal_review_facts_recovered').length, 1);
+});
+
+for (const failure of ['later-page failure', 'repeated cursor']) {
+  test(`internal review fact recovery preserves blocked state on ${failure}`, async () => {
+    const fixture = await exhaustedInternalReviewFactsFixture();
+    const before = (await fixture.service.listItems()).items[0];
+    const timeline = fixture.service.listTimeline.bind(fixture.service);
+    let reads = 0;
+    fixture.service.listTimeline = async input => {
+      reads += 1;
+      if (reads === 2 && failure === 'later-page failure') throw new Error('Timeline page unavailable');
+      const result = await timeline({ ...input, limit: 2 });
+      if (reads === 2) result.nextCursor = input.cursor;
+      return result;
+    };
+    const writes = fixture.store.writes.length;
+    const cycle = await decisionBudgetLoop(fixture, { assemble: async () => assert.fail('Incomplete history must fail before context read'),
+      decide: async () => assert.fail('Incomplete history must not reach the model') }).runCycle();
+    assert.equal(reads, 2);
+    assert.equal(cycle.claimed, 0);
+    assert.deepEqual((await fixture.service.listItems()).items[0], before);
+    assert.equal(fixture.store.writes.length, writes);
+  });
+}
+
+test('internal review fact recovery stops paging once history exceeds every possible valid event count', async () => {
+  const fixture = await exhaustedInternalReviewFactsFixture();
+  let item = (await fixture.service.listItems()).items[0];
+  for (let turn = 0; turn < 10; turn += 1) {
+    item = await fixture.service.transition({ itemId: item.itemId, expectedRevision: item.revision, leaseId: null,
+      actorId: 'owner-task-control', toStatus: 'queued', reason: 'owner-reconsidered-work' });
+    item = await fixture.service.transition({ itemId: item.itemId, expectedRevision: item.revision, leaseId: null,
+      actorId: 'owner-task-control', toStatus: 'blocked', reason: 'decision_attempts_exhausted', details: { code: 'ROLE_CONTEXT_PR_FACT_UNAVAILABLE' } });
+  }
+  const timeline = fixture.service.listTimeline.bind(fixture.service);
+  let reads = 0;
+  fixture.service.listTimeline = async input => { reads += 1; return timeline({ ...input, limit: 2 }); };
+  const writes = fixture.store.writes.length;
+  const cycle = await decisionBudgetLoop(fixture, { assemble: async () => assert.fail('Extra history cannot qualify'), decide: async () => assert.fail('Must stay blocked') }).runCycle();
+  assert.equal(reads, 4, 'stop only after eight entries exceed the seven possible valid entries');
+  assert.equal(cycle.claimed, 0);
+  assert.deepEqual((await fixture.service.listItems()).items[0], item);
+  assert.equal(fixture.store.writes.length, writes);
+});
+
+for (const variant of ['missingFeedback', 'staleFacts', 'missingHistory', 'unknownFailure', 'paused', 'existingAction']) {
+  test(`internal review fact recovery preserves ${variant} blocks without claiming or writing`, async () => {
+    const fixture = await exhaustedInternalReviewFactsFixture();
+    const state = fixture.store.stored();
+    if (variant === 'missingHistory') {
+      const creation = state.timeline.find(entry => entry.type === 'pr_source_created');
+      state.timeline = state.timeline.filter(entry => entry.sequence > creation.sequence);
+      state.timelineStartSequence = state.timeline[0].sequence;
+    }
+    if (variant === 'unknownFailure') {
+      const entry = state.timeline.find(entry => entry.type === 'retry_scheduled');
+      entry.details.code = 'ROLE_DECISION_FAILED';
+      const { timelineId: _id, contentDigest: _digest, ...content } = entry;
+      entry.contentDigest = ledgerDigest(content); entry.timelineId = `work-timeline-${entry.contentDigest}`;
+    }
+    if (variant === 'paused') { state.items[0].status = 'paused'; state.items[0].statusReason = 'owner_task_run_pause'; }
+    if (variant === 'existingAction') {
+      // No fabricated context is persisted: an existing delivered action is a
+      // different history and cannot qualify for this pre-model recovery.
+      const entry = clone(state.timeline.find(entry => entry.type === 'retry_scheduled'));
+      entry.type = 'intent_staged'; entry.sequence = state.nextTimelineSequence++; entry.at = state.items[0].updatedAt;
+      entry.details = { intentId: 'unknown-action' };
+      const { timelineId: _id, contentDigest: _digest, ...content } = entry;
+      entry.contentDigest = ledgerDigest(content); entry.timelineId = `work-timeline-${entry.contentDigest}`; state.timeline.push(entry);
+    }
+    fixture.store.replaceStored(state);
+    fixture.service = (await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time })).service;
+    const before = (await fixture.service.listItems()).items[0];
+    const writes = fixture.store.writes.length;
+    const assembler = internalReviewContextAssembler(fixture, { [variant]: true });
+    const cycle = await decisionBudgetLoop(fixture, { assemble: input => assembler.assemble(input), decide: async () => assert.fail('Must remain blocked') }).runCycle();
+    assert.equal(cycle.claimed, 0);
+    assert.deepEqual((await fixture.service.listItems()).items[0], before);
+    assert.equal(fixture.store.writes.length, writes);
+  });
+}
 
 async function deliverHeadBoundWait(service, item, condition) {
   const workerId = 'employee-pr-engineer';
