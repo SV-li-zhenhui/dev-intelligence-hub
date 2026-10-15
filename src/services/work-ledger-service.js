@@ -2,7 +2,9 @@ import { scheduler } from "node:timers/promises";
 import { planWorkItemRunControl } from './work-ledger-run-control.js';
 import {
   createRevokedCodeConfirmationSettlement,
-  isRevokedCodeConfirmationDecision,
+  completedCodeConfirmationForSettlement,
+  createCompletedCodeConfirmationSettlement,
+  isChangedCodeConfirmationDecision,
 } from "./work-ledger-code-confirmation-settlement.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 import {
@@ -567,6 +569,7 @@ export class WorkLedgerService {
     postCommitYield = DEFAULT_POST_COMMIT_YIELD,
     candidateProcessor = createLocalWorkLedgerCandidateProcessor(),
     confirmationSettlementReader = null,
+    obsoleteCodeJobSettler = null,
   } = {}) {
     if (
       !store ||
@@ -597,6 +600,9 @@ export class WorkLedgerService {
       typeof confirmationSettlementReader?.read !== "function") {
       throw new TypeError("confirmationSettlementReader must provide read");
     }
+    if (obsoleteCodeJobSettler !== null && typeof obsoleteCodeJobSettler?.settle !== "function") {
+      throw new TypeError("obsoleteCodeJobSettler must provide settle");
+    }
     if (
       !candidateProcessor ||
       typeof candidateProcessor.prepare !== "function" ||
@@ -617,6 +623,7 @@ export class WorkLedgerService {
     this.postCommitYield = postCommitYield;
     this.candidateProcessor = candidateProcessor;
     this.confirmationSettlementReader = confirmationSettlementReader;
+    this.obsoleteCodeJobSettler = obsoleteCodeJobSettler;
     this.limits = normalizeWorkLedgerLimits(limits);
     this.state = emptyWorkLedgerState();
     this.durableContentVersion = undefined;
@@ -1256,7 +1263,7 @@ export class WorkLedgerService {
   async reconcilePullRequestSource(input = {}) {
     this.#assertReady();
     const command = normalizePullRequestSourceReconciliationCommand(input);
-    const confirmationSettlements = await this.#readConfirmationSettlements([command.itemId]);
+    const confirmationSettlements = await this.#readConfirmationSettlements([command], command.expectedGraphRevision);
     return this.#executeCommand((options) => planPullRequestSourceReconciliation({
       ...options, confirmationSettlements,
     }), command);
@@ -1284,7 +1291,10 @@ export class WorkLedgerService {
         "PR 来源批量对账请求无效",
       );
     }
-    const confirmationSettlements = await this.#readConfirmationSettlements(input.items.map(({ itemId }) => itemId));
+    const commands = input.items.map((item) => normalizePullRequestSourceReconciliationCommand({
+      ...item, expectedGraphRevision: input.expectedGraphRevision,
+    }));
+    const confirmationSettlements = await this.#readConfirmationSettlements(commands, input.expectedGraphRevision);
     return this.#writeTransaction(async () => {
       if (this.state.revision !== input.expectedGraphRevision) {
         throw workLedgerError(
@@ -1333,22 +1343,30 @@ export class WorkLedgerService {
     });
   }
 
-  async #readConfirmationSettlements(itemIds) {
+  async #readConfirmationSettlements(commands, expectedGraphRevision) {
     if (this.confirmationSettlementReader === null) return null;
     if (!this.state.items.some((item) => item.status === "blocked" &&
-      item.activeIntentId === null && isRevokedCodeConfirmationDecision(item.decisionContext))) return null;
+      item.activeIntentId === null && isChangedCodeConfirmationDecision(item.decisionContext))) return null;
     // Never hold the ledger lease while entering the confirmation queue: its
     // executor can call back into this ledger when verifying code authority.
     const snapshot = await this.#writeTransaction(() => {
+      if (this.state.revision !== expectedGraphRevision) {
+        throw workLedgerError("WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT", "PR 来源对账的台账版本已变化", 409);
+      }
       const itemsById = new Map(this.state.items.map((item) => [item.itemId, item]));
       const candidates = new Map();
       const eligible = this.state.items.filter((item) => item.status === "blocked" &&
-        item.activeIntentId === null && isRevokedCodeConfirmationDecision(item.decisionContext))
+        item.activeIntentId === null && isChangedCodeConfirmationDecision(item.decisionContext))
         .map((item) => ({ item, binding: currentWorkItemInputBinding(item) }));
-      for (const itemId of itemIds) {
-        const root = itemsById.get(itemId);
+      for (const command of commands) {
+        const root = itemsById.get(command.itemId);
         if (root?.source?.kind !== "pull_request") continue;
+        if (root.revision !== command.expectedRevision ||
+          (root.source.pendingRevision ?? root.source.activeRevision) !== command.expectedPendingRevision) {
+          throw workLedgerError("WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT", "PR 来源对账的工作项版本已变化", 409);
+        }
         const predecessorId = crossRootPullRequestCutoverPredecessorId(root);
+        if (root.source.pendingRevision === null && predecessorId === null) continue;
         const participantRoot = predecessorId === null ? root : itemsById.get(predecessorId);
         if (participantRoot === undefined) continue;
         const active = currentWorkItemInputBinding(participantRoot);
@@ -1369,12 +1387,27 @@ export class WorkLedgerService {
       const confirmation = await this.confirmationSettlementReader.read({
         confirmationId: item.decisionContext.value.downstreamRef,
       });
-      const proof = createRevokedCodeConfirmationSettlement(item, outboxById, confirmation);
+      let proof = createRevokedCodeConfirmationSettlement(item, outboxById, confirmation);
+      if (proof === null && this.obsoleteCodeJobSettler !== null) {
+        const completed = completedCodeConfirmationForSettlement(item, outboxById, confirmation);
+        if (completed !== null) {
+          const job = await this.obsoleteCodeJobSettler.settle({ grant: completed.grant, receipt: completed.receipt }, {
+            admitCancellation: (operation) => this.#writeTransaction(() => {
+              if (this.state.revision !== expectedGraphRevision) {
+                throw workLedgerError("WORK_LEDGER_STATE_REVISION_CONFLICT", "PR 来源在取消入场前已变化", 409);
+              }
+              // Enqueue under the source fence, then await outside the ledger
+              // lease: cancellation can itself need the ledger/session queues.
+              return { operation: operation() };
+            }),
+          });
+          proof = createCompletedCodeConfirmationSettlement(item, outboxById, confirmation, job);
+        }
+      }
       if (proof !== null) proofs.set(item.itemId, proof);
     }
-    // A normalized authorization-revoked stale confirmation is terminal: the
-    // queue cannot approve/retry it. Its explicit no-execution proof remains
-    // valid while we reacquire the ledger lease for the normal CAS transaction.
+    // Revoked unstarted confirmations and terminal code jobs cannot resume.
+    // Their settlement remains valid while we reacquire the ledger lease.
     // The planner re-reads durable state and checks its normal graph/item CAS;
     // each opaque proof additionally binds the captured item and outbox versions.
     return proofs;

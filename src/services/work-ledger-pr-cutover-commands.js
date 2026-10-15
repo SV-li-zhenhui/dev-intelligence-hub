@@ -1,5 +1,5 @@
 import { assertExpectedWorkGraphRevision } from "./work-ledger-graph-command-support.js";
-import { hasRevokedCodeConfirmationSettlement } from "./work-ledger-code-confirmation-settlement.js";
+import { hasCodeConfirmationSettlement } from "./work-ledger-code-confirmation-settlement.js";
 import { requireWorkLedgerItem } from "./work-ledger-item-commands.js";
 import {
   activatePendingPullRequestWorkSource,
@@ -280,13 +280,13 @@ function isCodeProposalStoppedBeforeConfirmation(decision) {
     value.evidence[1] === `proposal:${decision.referenceId}`;
 }
 
-function latestSettledProposalProof(item, timelineIndex, revokedConfirmationSettled) {
+function latestSettledProposalProof(item, timelineIndex, codeConfirmationSettled) {
   if (
     item.decisionContext?.source !== "proposal" ||
     (item.decisionContext?.outcome !== "rejected" &&
       !isExpiredCodeConfirmation(item.decisionContext) &&
       !isCodeProposalStoppedBeforeConfirmation(item.decisionContext) &&
-      !revokedConfirmationSettled) ||
+      !codeConfirmationSettled) ||
     typeof item.decisionContext.contentDigest !== "string"
   ) {
     return null;
@@ -329,14 +329,14 @@ function definitiveBlockedSettlement(item, outboxById, timelineIndex, confirmati
   ) {
     return { proposalProof: null };
   }
-  const revokedConfirmationSettled = hasRevokedCodeConfirmationSettlement(
+  const codeConfirmationSettled = hasCodeConfirmationSettlement(
     item, outboxById, confirmationSettlements?.get(item.itemId),
   );
-  const proposalProof = latestSettledProposalProof(item, timelineIndex, revokedConfirmationSettled);
+  const proposalProof = latestSettledProposalProof(item, timelineIndex, codeConfirmationSettled);
   if (
     proposalProof !== null &&
     (item.statusReason === `proposal_${item.decisionContext.outcome}` ||
-      (item.statusReason === "pr_source_revised" && revokedConfirmationSettled) ||
+      (item.statusReason === "pr_source_revised" && codeConfirmationSettled) ||
       crossRootPullRequestCutoverPendingId(item) !== null)
   ) {
     return { proposalProof };

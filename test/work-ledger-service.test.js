@@ -1,3 +1,4 @@
+import { digestValue } from "../src/domain/code-executor-contract.js";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
@@ -123,6 +124,10 @@ import { createCodeJobGrant, CODE_JOB_ACTIONS_BY_OPERATION } from "../src/domain
 import { createCodeActionProposalConfirmationPlan } from "../src/domain/code-action-proposal-confirmation.js";
 import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
 import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
+import { CodeJobStore } from "../src/services/code-job-store.js";
+import { CodeJobApprovalExecutor } from "../src/services/code-job-approval-executor.js";
+import { OperationQueue } from "../src/lib/operation-queue.js";
+import { ObsoleteCodeJobSettler } from "../src/services/obsolete-code-job-settler.js";
 import {
   createLocalWorkLedgerCandidateProcessor,
   createWorkerWorkLedgerCandidateProcessor,
@@ -2980,7 +2985,7 @@ test("same-root cutover releases durably rejected attention", async () => {
   assert.equal(root.source.pendingRevision, null);
 });
 
-async function revokedCodeConfirmationFixture({ executed = false } = {}) {
+async function revokedCodeConfirmationFixture({ executed = false, createdJob = false, observedConfirmationStatus = null } = {}) {
   let overrideSnapshot;
   let confirmationQueue;
   const reads = [];
@@ -3053,14 +3058,21 @@ async function revokedCodeConfirmationFixture({ executed = false } = {}) {
   const plan = normalizeConfirmationPlan(createCodeActionProposalConfirmationPlan(proposal, {
     grant, allowedOperationsByRole: { developer: ["modify"] },
   }));
+  const jobs = new CodeJobStore({
+    store: fixture.store, exclusiveLease: new ExclusiveLease(), clock: () => new Date(fixture.time.clock()),
+    operationQueue: new OperationQueue(),
+  });
+  await jobs.recover();
   confirmationQueue = new ConfirmationQueue({
     store: fixture.store, exclusiveLease: new ExclusiveLease(), clock: () => new Date(fixture.time.clock()),
-    executor: { execute: async () => ({ status: "stale" }), reconcile: async () => ({ status: "unknown" }) },
+    executor: createdJob
+      ? new CodeJobApprovalExecutor({ codeJobStore: jobs, grantVerifier: { verify: async (value) => value } })
+      : { execute: async () => ({ status: "stale" }), reconcile: async () => ({ status: "unknown" }) },
   });
   await confirmationQueue.recover();
   const { displayedPayloadDigest: _display, approvalBindingDigest: _binding, ...queuePlan } = plan;
   const queued = await confirmationQueue.enqueue(queuePlan);
-  if (executed) {
+  if (executed || createdJob) {
     await confirmationQueue.approve(queued.id, {
       requestId: "request-executed-stale", expectedQueueRevision: queued.queueRevision,
       expectedItemRevision: queued.itemRevision, displayedPayloadDigest: queued.displayedPayloadDigest,
@@ -3072,17 +3084,24 @@ async function revokedCodeConfirmationFixture({ executed = false } = {}) {
       reason: "authorization_changed",
     });
   }
+  if (createdJob) {
+    const job = (await jobs.list()).items[0];
+    await jobs.pause({ jobId: job.jobId, expectedRevision: job.revision,
+      reason: "等待人工处理（CODE_BRAIN_RESPONSE_INVALID）" });
+  }
   const snapshot = await confirmationQueue.readSettlement({ confirmationId: queued.id });
   const result = createWorkProposalResult({
     proposal, sequence: 1, at: fixture.time.clock(), downstreamRef: plan.id,
     transition: { status: "stale", summary: "旧确认已安全撤销", evidence: [
-      `confirmation:${plan.id}`, "authorization_changed", "old_confirmation_status:stale",
+      `confirmation:${plan.id}`, "authorization_changed", `old_confirmation_status:${observedConfirmationStatus ?? (createdJob ? "completed" : "stale")}`,
     ] },
   });
   await fixture.service.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1,
     oldestAvailableSequence: 1 });
   const update = authoredReviewRepairAssignment(2, {
     occurredAt: "2026-08-02T01:15:00.000Z", ciStatus: "SUCCESS", title: "Updated PR facts",
+    ...(createdJob ? { headRefOid: PR_HEAD_B, previousHeadRefOid: PR_HEAD_A,
+      changedFields: ["headRefOid"] } : {}),
   });
   update.assignment.target = record.assignment.target;
   fixture.source.records.push(update);
@@ -3093,16 +3112,18 @@ async function revokedCodeConfirmationFixture({ executed = false } = {}) {
   assert.notEqual(item.source.pendingRevision, null);
   // Reproduce the retained state from earlier source intake: only the reason
   // was replaced; the proposal decision and its latest result remain intact.
-  const durable = fixture.store.stored();
-  durable.items.find(({ itemId }) => itemId === item.itemId).statusReason = "pr_source_revised";
-  fixture.store.replaceStored(durable);
+  if (!createdJob) {
+    const durable = fixture.store.stored();
+    durable.items.find(({ itemId }) => itemId === item.itemId).statusReason = "pr_source_revised";
+    fixture.store.replaceStored(durable);
+  }
   fixture.service = new WorkLedgerService({
     store: fixture.store, assignmentSource: fixture.source, exclusiveLease: fixture.lease,
     clock: fixture.time.clock, idFactory: incrementingIds(), confirmationSettlementReader,
   });
   await fixture.service.recover();
   item = (await fixture.service.listItems()).items[0];
-  return { ...fixture, item, proposal, plan, snapshot, reads, confirmationQueue,
+  return { ...fixture, item, proposal, plan, snapshot, reads, confirmationQueue, jobs,
     replaceSnapshot: (next) => { overrideSnapshot = next; },
     command: {
       itemId: item.itemId, expectedRevision: item.revision,
@@ -3111,6 +3132,119 @@ async function revokedCodeConfirmationFixture({ executed = false } = {}) {
     },
   };
 }
+
+test("a paused old-Head code job is settled after restart and the updated PR becomes claimable", async () => {
+  const fixture = await revokedCodeConfirmationFixture({ createdJob: true });
+  const oldJob = (await fixture.jobs.list()).items[0];
+  assert.equal(oldJob.status, "paused");
+  let cancellations = 0;
+  fixture.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({
+    codeJobReader: { get: (id) => fixture.jobs.get(id) },
+    codeJobControl: {
+      cancel: async (request) => {
+        // The callback must run outside the ledger transaction.
+        await fixture.service.getSummary();
+        cancellations += 1;
+        return fixture.jobs.cancel(request);
+      },
+    },
+  });
+  const result = await fixture.service.reconcilePullRequestSource(fixture.command);
+  assert.equal(result.applied, true, "a settled old job must not permanently fence the next Head");
+  const next = await fixture.service.readItemForReconciliation({ itemId: fixture.item.itemId });
+  assert.equal(next.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(next.source.pendingRevision, null);
+  assert.equal(next.status, "queued");
+  assert.equal((await fixture.jobs.get(oldJob.jobId)).status, "cancelled");
+  assert.equal((await fixture.confirmationQueue.get(fixture.plan.id)).status, "completed");
+  assert.equal(cancellations, 1);
+  const claimed = await fixture.service.claim({ itemId: next.itemId, expectedRevision: next.revision,
+    workerId: "employee-developer", leaseDurationMs: 30_000 });
+  assert.equal(claimed.status, "working");
+});
+
+for (const status of ["failed", "cancelled", "fenced"]) {
+  test(`an already ${status} old-Head job preserves its terminal result during PR source recovery`, async () => {
+    const fixture = await revokedCodeConfirmationFixture({ createdJob: true });
+    const job = (await fixture.jobs.list()).items[0];
+    const request = { jobId: job.jobId, expectedRevision: job.revision };
+    if (status === "cancelled") await fixture.jobs.cancel({ ...request, reason: "Owner cancelled" });
+    else await fixture.jobs[status === "failed" ? "fail" : "fence"]({ ...request, result: { code: "OLD_JOB_STOPPED" } });
+    const before = await fixture.jobs.get(job.jobId);
+    fixture.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({
+      codeJobReader: fixture.jobs,
+      codeJobControl: { cancel: async () => { assert.fail("a terminal job must not be cancelled again"); } },
+    });
+    const result = await fixture.service.reconcilePullRequestSource(fixture.command);
+    assert.equal(result.applied, status !== "fenced");
+    assert.deepEqual(await fixture.jobs.get(job.jobId), before);
+  });
+}
+
+test("an admitted old-Head job keeps the next Head fenced until cancellation is settled", async () => {
+  const fixture = await revokedCodeConfirmationFixture({ createdJob: true });
+  let job = (await fixture.jobs.list()).items[0];
+  await fixture.jobs.resume({ jobId: job.jobId, expectedRevision: job.revision });
+  job = await fixture.jobs.get(job.jobId);
+  await fixture.jobs.claimStarting({ jobId: job.jobId, expectedRevision: job.revision });
+  let cancellations = 0;
+  fixture.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({
+    codeJobReader: fixture.jobs,
+    codeJobControl: { cancel: async (request) => { cancellations += 1; return fixture.jobs.cancel(request); } },
+  });
+  for (let cycle = 0; cycle < 2; cycle += 1) {
+    const result = await fixture.service.reconcilePullRequestSource(fixture.command);
+    assert.equal(result.applied, false);
+    assert.equal((await fixture.jobs.get(job.jobId)).status, "cancelling");
+    const root = await fixture.service.readItemForReconciliation({ itemId: fixture.item.itemId });
+    assert.equal(root.source.current.headRefOid, PR_HEAD_A);
+    assert.notEqual(root.source.pendingRevision, null);
+  }
+  assert.equal(cancellations, 1);
+});
+
+test("stale PR source reconciliation commands cannot cancel an old code job", async () => {
+  const fixture = await revokedCodeConfirmationFixture({ createdJob: true });
+  fixture.service.obsoleteCodeJobSettler = {
+    settle: async () => { assert.fail("stale command must be rejected before cancellation"); },
+  };
+  for (const field of ["expectedGraphRevision", "expectedRevision", "expectedPendingRevision"]) {
+    await assert.rejects(fixture.service.reconcilePullRequestSource({
+      ...fixture.command, [field]: fixture.command[field] + 1,
+    }), (error) => error.code === "WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT");
+  }
+});
+
+test("mismatched executed confirmations and code jobs cannot release a pending PR Head", async (t) => {
+  for (const variant of ["receipt", "grant", "job", "createdAt", "missing"]) await t.test(variant, async () => {
+    const fixture = await revokedCodeConfirmationFixture({ createdJob: true });
+    const original = (await fixture.jobs.list()).items[0];
+    if (variant === "receipt" || variant === "grant") {
+      const snapshot = clone(fixture.snapshot);
+      if (variant === "receipt") snapshot.item.receipt.id = "code-job-other";
+      else snapshot.item.action.grant.brainDigest = "e".repeat(64);
+      fixture.replaceSnapshot(snapshot);
+    }
+    fixture.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({
+      codeJobReader: { get: async (id) => {
+        const job = await fixture.jobs.get(id);
+        if (variant === "missing") return null;
+        if (variant === "job") return { ...job, grantDigest: "e".repeat(64) };
+        if (variant === "createdAt") return { ...job, createdAt: "2026-08-02T01:00:00.000Z" };
+        return job;
+      } },
+      codeJobControl: { cancel: async () => { assert.fail("unbound evidence cannot cancel a job"); } },
+    });
+    try {
+      const result = await fixture.service.reconcilePullRequestSource(fixture.command);
+      assert.equal(result.applied, false);
+    } catch (error) {
+      assert.equal(error.code, "INVALID_CODE_JOB_RESULT");
+    }
+    assert.deepEqual(await fixture.jobs.get(original.jobId), original);
+    assert.notEqual((await fixture.service.readItemForReconciliation({ itemId: fixture.item.itemId })).source.pendingRevision, null);
+  });
+});
 
 test("PR source reconciliation settles an unstarted revoked code confirmation after source revision replaced its reason", async () => {
   const fixture = await revokedCodeConfirmationFixture();
@@ -14646,4 +14780,92 @@ test("an unmatched condition observation writes nothing", async () => {
   );
   assert.equal(fixture.store.writes.length, writesBefore);
   assert.equal((await fixture.service.listItems()).items[0].status, "waiting_condition");
+});
+
+for (const priorStatus of ["executing", "failed"]) {
+  test(`a later completed creation confirmation recovers after an earlier ${priorStatus} observation`, async () => {
+    const fixture = await revokedCodeConfirmationFixture({ createdJob: true, observedConfirmationStatus: priorStatus });
+    fixture.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader: fixture.jobs, codeJobControl: fixture.jobs });
+    const result = await fixture.service.reconcilePullRequestSource(fixture.command);
+    assert.equal(result.applied, true, "current completed evidence must settle an earlier nonterminal observation");
+    const root = await fixture.service.readItemForReconciliation({ itemId: fixture.item.itemId });
+    assert.equal(root.source.current.headRefOid, PR_HEAD_B);
+    assert.equal(root.status, "queued");
+  });
+}
+
+test("a changed ledger during executed-confirmation reading cannot cancel the obsolete job", async () => {
+  const fixture = await revokedCodeConfirmationFixture({ createdJob: true });
+  const read = fixture.service.confirmationSettlementReader.read.bind(fixture.service.confirmationSettlementReader);
+  fixture.service.confirmationSettlementReader = { read: async (input) => {
+    const snapshot = await read(input);
+    fixture.source.records.push(assignment(3));
+    fixture.source.highWatermark = 3;
+    await fixture.service.intake();
+    return snapshot;
+  } };
+  let cancellations = 0;
+  fixture.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({
+    codeJobReader: fixture.jobs,
+    codeJobControl: { cancel: async (request) => { cancellations += 1; return fixture.jobs.cancel(request); } },
+  });
+  await assert.rejects(fixture.service.reconcilePullRequestSource(fixture.command),
+    (error) => error.code === "WORK_LEDGER_STATE_REVISION_CONFLICT");
+  assert.equal(cancellations, 0, "a stale asynchronous read must be rejected before requesting cancellation");
+  assert.equal((await fixture.jobs.list()).items[0].status, "paused");
+});
+
+test("restart during old-job cancellation preserves the fence until a trusted receipt makes the new Head claimable", async () => {
+  const fixture = await revokedCodeConfirmationFixture({ createdJob: true });
+  let job = (await fixture.jobs.list()).items[0];
+  await fixture.jobs.resume({ jobId: job.jobId, expectedRevision: job.revision });
+  job = await fixture.jobs.get(job.jobId);
+  await fixture.jobs.claimStarting({ jobId: job.jobId, expectedRevision: job.revision });
+  fixture.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader: fixture.jobs, codeJobControl: fixture.jobs });
+  assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, false);
+  const jobs = new CodeJobStore({ store: fixture.store, exclusiveLease: new ExclusiveLease(),
+    operationQueue: new OperationQueue(), clock: () => new Date(fixture.time.clock()) });
+  await jobs.recover();
+  const service = new WorkLedgerService({ store: fixture.store, assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(), clock: fixture.time.clock, idFactory: incrementingIds(),
+    confirmationSettlementReader: fixture.service.confirmationSettlementReader,
+    obsoleteCodeJobSettler: new ObsoleteCodeJobSettler({ codeJobReader: jobs, codeJobControl: jobs }),
+  });
+  await service.recover();
+  assert.equal((await service.reconcilePullRequestSource(fixture.command)).applied, false);
+  const cancelling = await jobs.getForWorker(job.jobId);
+  assert.equal(cancelling.status, "cancelling");
+  // The executor test separately proves production receipt generation and cleanup.
+  const content = { schemaVersion: 1, kind: "controlled_execution_absent", sessionId: job.jobId,
+    cancellationDigest: cancelling.execution.result.detailDigest,
+    sourceRevision: null, trustedWorkspaceRevision: null, actionResolution: null,
+    sandboxCleanupConfirmed: true, discardedAttempts: [], settledAt: fixture.time.clock() };
+  await jobs.finalizeCancellation({ jobId: job.jobId, expectedRevision: cancelling.revision,
+    settlement: { ...content, proofDigest: digestValue(content) } });
+  assert.equal((await service.reconcilePullRequestSource(fixture.command)).applied, true);
+  const root = await service.readItemForReconciliation({ itemId: fixture.item.itemId });
+  assert.equal(root.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(root.source.pendingRevision, null);
+  assert.equal((await service.claim({ itemId: root.itemId, expectedRevision: root.revision,
+    workerId: "employee-developer", leaseDurationMs: 30000 })).status, "working");
+  assert.equal((await jobs.list()).items.length, 1);
+});
+
+test("a changed ledger during code-job reading cannot admit obsolete cancellation", async () => {
+  const fixture = await revokedCodeConfirmationFixture({ createdJob: true });
+  let cancellations = 0;
+  fixture.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({
+    codeJobReader: { get: async (id) => {
+      const job = await fixture.jobs.get(id);
+      fixture.source.records.push(assignment(3));
+      fixture.source.highWatermark = 3;
+      await fixture.service.intake();
+      return job;
+    } },
+    codeJobControl: { cancel: async (request) => { cancellations += 1; return fixture.jobs.cancel(request); } },
+  });
+  await assert.rejects(fixture.service.reconcilePullRequestSource(fixture.command),
+    (error) => error.code === "WORK_LEDGER_STATE_REVISION_CONFLICT");
+  assert.equal(cancellations, 0);
+  assert.equal((await fixture.jobs.list()).items[0].status, "paused");
 });

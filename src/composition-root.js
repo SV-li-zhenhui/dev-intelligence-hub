@@ -57,6 +57,7 @@ import {
   readConfiguredConstructionCleanup,
 } from "./services/configured-workforce.js";
 import { CodeJobMemoryProjector } from "./services/code-job-memory-projector.js";
+import { ObsoleteCodeJobSettler } from "./services/obsolete-code-job-settler.js";
 import { CodeJobEvidenceReader } from "./services/code-job-evidence-reader.js";
 import { ChangePackageApplicationResultReconciler } from "./services/change-package-application-result-reconciler.js";
 import { MemoryProjector } from "./services/memory-projector.js";
@@ -1051,6 +1052,7 @@ export async function createApplication({
   let pullRequestExternalActionExecutor = null;
   let pullRequestExternalActionExecutorOwned = false;
   let codeJobReader = null;
+  let obsoleteCodeJobSettler = null;
   let inputAuthorityVerifier = null;
   let codeJobDeliveryEvidenceReader = null;
   let codeJobControl = null;
@@ -1340,6 +1342,9 @@ export async function createApplication({
           operationQueue: new OperationQueue(),
           confirmationSettlementReader: Object.freeze({
             read: (input) => confirmationRuntime?.confirmationSettlementReader?.read(input) ?? null,
+          }),
+          obsoleteCodeJobSettler: Object.freeze({
+            settle: (input, options) => obsoleteCodeJobSettler?.settle(input, options) ?? null,
           }),
           ...(ordinaryActionAdmissionGate === null
             ? {}
@@ -1714,6 +1719,7 @@ export async function createApplication({
         ["pause", "resume", "cancel"],
         "codeJobRuntime.control",
       );
+      obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader, codeJobControl });
       if (codeJobChangePackageDeliveryEnabled) {
         codeJobEvidenceReader = frozenPort(
           codeJobEvidenceReaderFactory({

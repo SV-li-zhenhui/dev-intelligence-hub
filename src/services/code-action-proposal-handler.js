@@ -4,7 +4,6 @@ import {
 } from "../domain/code-job-contract.js";
 import {
   isActiveCodeJobBrowserStatus,
-  normalizeCodeJobBrowserProjection,
 } from "../domain/code-job-browser-projection.js";
 import { normalizeConfirmationPlan } from "../domain/confirmation-contract.js";
 import {
@@ -23,6 +22,7 @@ import {
   workProposalDataEntries,
   workProposalError,
 } from "../domain/work-proposal-contract.js";
+import { normalizeCodeJobConfirmationResult } from "./code-job-confirmation-result.js";
 import { WorkProposalRunnerService } from "./work-proposal-runner.js";
 
 const FAILURE_CODE = /^[A-Z][A-Z0-9_]{0,127}$/;
@@ -455,50 +455,6 @@ function confirmationFailureTransition(item, clock, pollIntervalMs) {
   );
 }
 
-function normalizeCodeJobProjection(value, grant, receipt) {
-  const error = invalidJob();
-  const job = normalizeCodeJobBrowserProjection(value, error);
-  const expectedJobId = codeJobIdForGrant(grant);
-  const expected = {
-    requestedBy: grant.requestedBy,
-    subject: grant.subject,
-    ...(Object.hasOwn(grant, "inputBinding")
-      ? { inputBinding: grant.inputBinding }
-      : {}),
-    ...(Object.hasOwn(grant, "executionSource")
-      ? { executionSource: grant.executionSource }
-      : {}),
-    acceptanceCriteria: grant.acceptanceCriteria,
-    evidence: grant.evidence,
-    allowedActions: grant.allowedActions,
-    writablePaths: grant.writablePaths,
-    requiredProfiles: grant.requiredProfiles.map(({ id }) => id),
-  };
-  const actual = Object.fromEntries(
-    Object.keys(expected).map((key) => [key, job[key]]),
-  );
-  if (
-    job.jobId !== expectedJobId ||
-    receipt.id !== expectedJobId ||
-    job.proposalId !== grant.proposalId ||
-    normalizeWorkProposalDigest(job.proposalContentDigest, error) !==
-      grant.contentDigest ||
-    normalizeWorkProposalDigest(job.grantDigest, error) !== grant.grantDigest ||
-    job.repository !== grant.repository ||
-    job.workspaceId !== grant.workspaceId ||
-    job.operation !== grant.operation ||
-    job.objective !== grant.objective ||
-    job.summary !== grant.summary ||
-    job.reason !== grant.reason ||
-    !sameValue(actual, expected) ||
-    job.createdAt !== receipt.createdAt ||
-    (job.pendingActionType !== null &&
-      !grant.allowedActions.includes(job.pendingActionType))
-  ) {
-    throw error;
-  }
-  return job;
-}
 
 function factoryOptions(value = {}) {
   if (
@@ -787,7 +743,7 @@ export class CodeActionProposalHandler {
       id: jobId,
       createdAt: receipt.createdAt ?? value.createdAt,
     };
-    const job = normalizeCodeJobProjection(value, grant, effectiveReceipt);
+    const job = normalizeCodeJobConfirmationResult(value, grant, effectiveReceipt);
     if (
       isActiveCodeJobBrowserStatus(job.status) ||
       job.memoryProjection === null

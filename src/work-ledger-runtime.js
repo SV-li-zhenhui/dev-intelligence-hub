@@ -109,6 +109,7 @@ export async function createWorkLedgerRuntime({
   limits,
   postCommitYield,
   confirmationSettlementReader,
+  obsoleteCodeJobSettler,
   createCandidateProcessor = createWorkerWorkLedgerCandidateProcessor,
   createGuard = (options) => new ProcessExclusiveGuard(options),
 } = {}) {
@@ -185,6 +186,7 @@ export async function createWorkLedgerRuntime({
       ...(limits ? { limits } : {}),
       ...(postCommitYield === undefined ? {} : { postCommitYield }),
       ...(confirmationSettlementReader === undefined ? {} : { confirmationSettlementReader }),
+      ...(obsoleteCodeJobSettler === undefined ? {} : { obsoleteCodeJobSettler }),
     });
     await service.recover();
     const graph = new WorkGraphStore({ ledger: service });

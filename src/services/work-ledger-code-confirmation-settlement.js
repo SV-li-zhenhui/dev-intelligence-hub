@@ -6,12 +6,14 @@ import { createCodeActionProposalConfirmationPlan } from "../domain/code-action-
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
 import { currentWorkItemInputBinding } from "./work-ledger-pr-source.js";
 import { ledgerDigest } from "./work-ledger-values.js";
+import { normalizeCodeJobConfirmationResult } from "./code-job-confirmation-result.js";
+import { codeJobIdForGrant } from "../domain/code-job-contract.js";
 
 // Only server-side confirmation reads can mint these ephemeral capabilities.
 // A public reconciliation command cannot supply a JSON flag as settlement proof.
 const settlements = new WeakMap();
 
-export function isRevokedCodeConfirmationDecision(decision) {
+export function isChangedCodeConfirmationDecision(decision) {
   const value = decision?.value;
   return decision?.source === "proposal" && decision.outcome === "stale" &&
     typeof decision.referenceId === "string" &&
@@ -21,7 +23,12 @@ export function isRevokedCodeConfirmationDecision(decision) {
     Array.isArray(value.evidence) && value.evidence.length === 3 &&
     value.evidence[0] === `confirmation:${value.downstreamRef}` &&
     value.evidence[1] === "authorization_changed" &&
-    value.evidence[2] === "old_confirmation_status:stale";
+    ["old_confirmation_status:stale", "old_confirmation_status:completed", "old_confirmation_status:executing", "old_confirmation_status:failed"].includes(value.evidence[2]);
+}
+
+export function isRevokedCodeConfirmationDecision(decision) {
+  return isChangedCodeConfirmationDecision(decision) &&
+    decision.value.evidence[2] === "old_confirmation_status:stale";
 }
 
 function digest(value) {
@@ -52,6 +59,60 @@ function matchingDeliveredProposal(item, outboxById) {
   return { proposal, outbox };
 }
 
+function createSettlement(item, outbox) {
+  const proof = Object.freeze({});
+  settlements.set(proof, {
+    itemId: item.itemId, itemRevision: item.revision, inputDigest: item.inputDigest,
+    decisionDigest: item.decisionContext.contentDigest,
+    intentId: outbox.intentId, outboxDigest: digest(outbox),
+  });
+  return proof;
+}
+
+function matchingHistoricalConfirmation(item, outboxById, confirmation) {
+  const delivered = matchingDeliveredProposal(item, outboxById);
+  if (delivered === null) return null;
+  const { proposal, outbox } = delivered;
+  const expected = normalizeConfirmationPlan(createCodeActionProposalConfirmationPlan(proposal, {
+    grant: confirmation.action.grant,
+    // Rebuilding a historical binding does not grant new execution authority.
+    allowedOperationsByRole: { [proposal.requestedBy.roleId]: [proposal.payload.operation] },
+  }));
+  const actual = Object.fromEntries(Object.keys(expected).map((key) => [key, confirmation[key]]));
+  return digest(expected) === digest(actual) ? { grant: expected.action.grant, outbox } : null;
+}
+
+export function completedCodeConfirmationForSettlement(item, outboxById, snapshot) {
+  if (item?.status !== "blocked" || item.activeIntentId !== null || item.sourceQuarantine != null ||
+    !isChangedCodeConfirmationDecision(item.decisionContext) ||
+    snapshot == null) return null;
+  try {
+    const confirmation = normalizeConfirmationState({
+      schemaVersion: 1, revision: snapshot.queueRevision, items: [snapshot.item],
+    }).items[0];
+    if (confirmation.id !== item.decisionContext.value.downstreamRef ||
+      confirmation.kind !== "local.code-job-create" || confirmation.status !== "completed") return null;
+    const historical = matchingHistoricalConfirmation(item, outboxById, confirmation);
+    if (historical === null || confirmation.receipt.id !== codeJobIdForGrant(historical.grant)) return null;
+    return { ...historical, receipt: confirmation.receipt };
+  } catch {
+    return null;
+  }
+}
+
+export function createCompletedCodeConfirmationSettlement(item, outboxById, snapshot, value) {
+  const completed = completedCodeConfirmationForSettlement(item, outboxById, snapshot);
+  if (completed === null || value == null) return null;
+  try {
+    const job = normalizeCodeJobConfirmationResult(value, completed.grant, completed.receipt);
+    if (!["completed", "failed", "cancelled"].includes(job.status) ||
+      job.terminalResult?.kind !== job.status || job.pendingActionType !== null || job.uncertainty !== null) return null;
+    return createSettlement(item, completed.outbox);
+  } catch {
+    return null;
+  }
+}
+
 export function createRevokedCodeConfirmationSettlement(item, outboxById, snapshot) {
   if (item?.status !== "blocked" || item.activeIntentId !== null ||
     item.sourceQuarantine != null ||
@@ -67,30 +128,15 @@ export function createRevokedCodeConfirmationSettlement(item, outboxById, snapsh
       confirmation.invalidation?.reason !== "authorization_changed" ||
       digest(confirmation.invalidation.requestedBy) !== digest(confirmation.requestedBy) ||
       confirmation.invalidation.approvalBindingDigest !== confirmation.approvalBindingDigest) return null;
-    const delivered = matchingDeliveredProposal(item, outboxById);
-    if (delivered === null) return null;
-    const { proposal, outbox } = delivered;
-    const expected = normalizeConfirmationPlan(createCodeActionProposalConfirmationPlan(proposal, {
-      grant: confirmation.action.grant,
-      // Rebuilding a historical binding does not grant any new execution authority.
-      allowedOperationsByRole: { [proposal.requestedBy.roleId]: [proposal.payload.operation] },
-    }));
-    const actual = Object.fromEntries(Object.keys(expected).map((key) => [key, confirmation[key]]));
-    if (digest(expected) !== digest(actual)) return null;
-    const proof = Object.freeze({});
-    settlements.set(proof, {
-      itemId: item.itemId, itemRevision: item.revision, inputDigest: item.inputDigest,
-      decisionDigest: item.decisionContext.contentDigest,
-      intentId: outbox.intentId, outboxDigest: digest(outbox),
-    });
-    return proof;
+    const historical = matchingHistoricalConfirmation(item, outboxById, confirmation);
+    return historical === null ? null : createSettlement(item, historical.outbox);
   } catch {
     // Missing, malformed, mismatched or executed confirmations never release work.
     return null;
   }
 }
 
-export function hasRevokedCodeConfirmationSettlement(item, outboxById, proof) {
+export function hasCodeConfirmationSettlement(item, outboxById, proof) {
   const stored = proof && settlements.get(proof);
   const outbox = stored && outboxById.get(stored.intentId);
   return Boolean(stored && stored.itemId === item.itemId &&
