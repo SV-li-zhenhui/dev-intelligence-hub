@@ -51,6 +51,88 @@ test('a cancelled PR predecessor stays unchanged without rejecting unrelated int
   assert.deepEqual((await fixture.service.listItems()).items.find(item => item.itemId === root.itemId), cancelled);
 });
 
+for (const recoveredPending of [false, true]) {
+  test(`a fresh owner PR request can replace a cancelled task without rewriting it (${recoveredPending ? "recovered pending" : "new intake"})`, async () => {
+    const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+    await fixture.service.intake();
+    const original = (await fixture.service.listItems()).items[0];
+    await fixture.service.cancelGraphTask({
+      itemId: original.itemId, expectedRevision: original.revision,
+      expectedGraphRevision: (await fixture.service.getSummary()).revision,
+      actorId: "employee-orchestrator", reason: "owner-repaired-this-round",
+    });
+    const cancelled = (await fixture.service.listItems()).items[0];
+    const request = ownerRequestedPrAssignment(2, {
+      occurredAt: "2026-08-02T02:10:00.000Z", headRefOid: PR_HEAD_B,
+      gitFacts: prGitFacts(PR_HEAD_B),
+    });
+    request.assignment.target = { type: "role", id: "developer" };
+    fixture.source.records.push(request);
+    fixture.source.highWatermark = 2;
+    await fixture.service.intake();
+    let active = (await fixture.service.listItems()).items.find(item => item.itemId !== cancelled.itemId);
+    let service = fixture.service;
+    if (recoveredPending) {
+      // The deployed predecessor version has already stored this request as blocked.
+      await service.transition({
+        itemId: active.itemId, expectedRevision: active.revision, leaseId: null,
+        actorId: "work-ledger-system", toStatus: "blocked",
+        reason: `pr_source_cross_root_cutover_pending:${cancelled.itemId}`,
+      });
+      service = new WorkLedgerService({
+        store: fixture.store, assignmentSource: fixture.source,
+        exclusiveLease: new ExclusiveLease(), clock: fixture.time.clock, idFactory: incrementingIds(),
+      });
+      await service.recover();
+      active = (await service.listItems()).items.find(item => item.itemId === active.itemId);
+      const result = await service.reconcilePullRequestSource({
+        itemId: active.itemId, expectedRevision: active.revision,
+        expectedGraphRevision: (await service.getSummary()).revision,
+        expectedPendingRevision: active.source.activeRevision,
+      });
+      assert.equal(result.applied, true);
+      active = (await service.listItems()).items.find(item => item.itemId === active.itemId);
+    }
+    assert.equal(active.status, "queued");
+    assert.equal(active.currentTarget.id, "developer");
+    assert.equal(active.source.current.headRefOid, PR_HEAD_B);
+    assert.deepEqual((await service.listItems()).items.find(item => item.itemId === cancelled.itemId), cancelled);
+    const binding = prExecutionBinding(active);
+    assert.deepEqual(await service.verifyPullRequestExecutionBinding(binding), binding);
+    const claimed = await service.claim({
+      itemId: active.itemId, expectedRevision: active.revision,
+      workerId: "employee-developer", leaseDurationMs: 30_000,
+    });
+    assert.equal(claimed.status, "working");
+    assert.equal(claimed.source.current.headRefOid, PR_HEAD_B);
+  });
+}
+
+test("an owner request predating cancellation cannot reopen cancelled PR work", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  await fixture.service.intake();
+  const original = (await fixture.service.listItems()).items[0];
+  await fixture.service.cancelGraphTask({
+    itemId: original.itemId, expectedRevision: original.revision,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    actorId: "employee-orchestrator", reason: "owner-repaired-this-round",
+  });
+  const cancelled = (await fixture.service.listItems()).items[0];
+  fixture.source.records.push(ownerRequestedPrAssignment(2));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  const pending = (await fixture.service.listItems()).items.find(item => item.itemId !== cancelled.itemId);
+  assert.equal(pending.status, "blocked");
+  const result = await fixture.service.reconcilePullRequestSource({
+    itemId: pending.itemId, expectedRevision: pending.revision,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    expectedPendingRevision: pending.source.activeRevision,
+  });
+  assert.equal(result.applied, false);
+  assert.equal(result.blockers[0].status, "cancelled");
+  assert.deepEqual((await fixture.service.listItems()).items.find(item => item.itemId === cancelled.itemId), cancelled);
+});
+
 test('real ledger settles a pause after model failure, restores the same item, and cancels safely',async()=>{
   const {service}=await createFixture({records:[issueAssignment(1)]});
   await service.intake();

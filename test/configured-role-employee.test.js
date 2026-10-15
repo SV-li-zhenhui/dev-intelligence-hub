@@ -272,6 +272,10 @@ test("RoleDecisionEngine classifies context, routes the configured brain, and no
   assert.match(calls[0].messages[0].content, /untrusted|不可信/i);
   assert.match(
     calls[0].messages[0].content,
+    /PR development.*owner_requested.*latest.*Head.*existing.*fix.*handoff.*pr-review.*without.*owner.*confirmation/i,
+  );
+  assert.match(
+    calls[0].messages[0].content,
     /modify produces change-package.*verify produces test-report/i,
   );
   assert.match(

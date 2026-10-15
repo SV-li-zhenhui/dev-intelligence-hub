@@ -380,11 +380,23 @@ function unstartedIntent(item, outboxById) {
   return null;
 }
 
+function ownerRequestedAfterCancellation(replacementRoot, predecessor) {
+  const event = replacementRoot?.event;
+  return predecessor.status === "cancelled" &&
+    predecessor.activeIntentId === null &&
+    replacementRoot?.source?.scope?.kind === "owner_requested" &&
+    replacementRoot.source.scope.active === true &&
+    samePullRequestSubject(predecessor, replacementRoot) &&
+    event?.eventType === "pull_request.owner_requested" &&
+    event.source?.provider === "local-owner" &&
+    Date.parse(event.occurredAt) > Date.parse(predecessor.updatedAt);
+}
+
 export function inspectPullRequestSourceCutover(
   root,
   items,
   outboxById,
-  { forceHeadChanged = false, timelineIndex = null, confirmationSettlements = null } = {},
+  { forceHeadChanged = false, timelineIndex = null, confirmationSettlements = null, replacementRoot = null } = {},
 ) {
   const headChanged = forceHeadChanged || pendingHeadChanged(root.source);
   const participants = [
@@ -394,7 +406,8 @@ export function inspectPullRequestSourceCutover(
   const proposalSettlements = [];
   const blockers = participants.filter((item) => {
     const statusReady = item.itemId === root.itemId
-      ? ROOT_READY_STATUSES.has(item.status)
+      ? ROOT_READY_STATUSES.has(item.status) ||
+        ownerRequestedAfterCancellation(replacementRoot, item)
       : CHILD_TERMINAL_STATUSES.has(item.status) ||
         CHILD_SUPERSEDABLE_STATUSES.has(item.status);
     if (statusReady) return false;
@@ -423,8 +436,9 @@ export function crossRootPullRequestCutoverActivation(root, activation) {
     ...activation,
     participants: activation.participants.filter(
       (participant) =>
-        participant.itemId === root.itemId ||
-        !CHILD_TERMINAL_STATUSES.has(participant.status),
+        participant.status !== "cancelled" &&
+        (participant.itemId === root.itemId ||
+          !CHILD_TERMINAL_STATUSES.has(participant.status)),
     ),
   };
 }
@@ -521,7 +535,7 @@ export function applyReadyPullRequestSourceCutover({
   now,
   timelineEvents,
 }) {
-  let rootResult = activation.headChanged
+  let rootResult = activation.headChanged && root.status !== "cancelled"
     ? { ...root, decisionContext: null }
     : root;
   for (const participant of activation.participants) {
@@ -775,6 +789,7 @@ function planCrossRootPullRequestSourceReconciliation({
     outboxById,
     {
       forceHeadChanged: true,
+      replacementRoot: root,
       confirmationSettlements,
       timelineIndex: createPullRequestCutoverTimelineIndex(
         state.timeline,

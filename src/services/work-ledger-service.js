@@ -2064,6 +2064,7 @@ export class WorkLedgerService {
             outboxById,
             {
               forceHeadChanged: true,
+              replacementRoot: rootCandidate,
               timelineIndex: currentCutoverTimelineIndex(),
             },
           );
@@ -2182,6 +2183,7 @@ export class WorkLedgerService {
             outboxById,
             {
               forceHeadChanged: true,
+              replacementRoot: root,
               timelineIndex: currentCutoverTimelineIndex(),
             },
           );
@@ -2300,6 +2302,7 @@ export class WorkLedgerService {
               outboxById,
               {
                 forceHeadChanged: true,
+                replacementRoot: pendingRoot,
                 timelineIndex: currentCutoverTimelineIndex(),
               },
             );

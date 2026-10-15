@@ -1704,6 +1704,33 @@ test("policy rejection blocks safely and attention conflicts split blocked from 
   });
 });
 
+test("an already fixed owner PR goes from developer to internal PR review without confirmation", async () => {
+  const pair = workPair(4, {
+    ...handoffIntent(), capability: "pr-review",
+    brief: `Existing repair on Head ${"a".repeat(40)} covers the outstanding feedback; review code and regression evidence`,
+    evidence: ["current-head-diff", "regression-report"],
+  }, { target: { type: "role", id: "developer" } });
+  pair.item.event = normalizeWorkflowEvent({
+    schemaVersion: 1, eventType: "pull_request.owner_requested",
+    occurredAt: "2026-08-02T03:00:00.000Z",
+    source: { provider: "local-owner", scopeId: "owner-request:123e4567-e89b-42d3-a456-426614174000" },
+    subject: clone(pair.item.event.subject),
+    payload: { ...clone(pair.item.event.payload), title: "Existing PR repair", workType: "development" },
+  });
+  pair.item.source = createPullRequestWorkSource(prSourceEnvelope(4, pair.item.event, pair.item.assignmentId)).source;
+  const { dispatcher, ledger, attention, proposals } = fixture([pair], {
+    policy: policy({ capabilityRoles: { "pr-review": "pr-engineer" } }),
+  });
+  assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  assert.equal(ledger.items[0].status, "queued");
+  assert.equal(ledger.items[0].currentTarget.id, "pr-engineer");
+  assert.equal(ledger.outbox[0].dispatchBinding.boundIntent.binding.targetRoleId, "pr-engineer");
+  assert.equal(attention.calls.length, 0);
+  assert.equal(proposals.calls.length, 0);
+  assert.equal((await dispatcher.dispatchPending()).scanned, 0);
+  assert.equal(ledger.ackCalls.length, 1);
+});
+
 test("handoff uses only the policy-mapped role and never exposes a half-handoff crash state", async (t) => {
   await t.test("write fails before the atomic acknowledgement", async () => {
     const pair = workPair(4, handoffIntent());
