@@ -701,8 +701,13 @@ test("updates a branch with expected_head_sha and waits for an exact merge commi
   });
 });
 
-test("delegates push once to the exact frozen controlled publisher port", async () => {
-  const input = transportInput("push");
+for (const reviewRepair of [false, true]) {
+test(`delegates ${reviewRepair ? "single-parent review repair" : "conflict merge"} push once to the exact frozen controlled publisher port`, async () => {
+  const binding = pullRequestExternalActionBinding();
+  const input = transportInput("push", binding, {
+    type: "push",
+    controlledCommitEvidence: externalActionControlledCommit(binding, { reviewRepair }),
+  });
   const published = [];
   const publisher = Object.freeze({
     async publish(request) {
@@ -750,6 +755,39 @@ test("delegates push once to the exact frozen controlled publisher port", async 
     ),
     false,
   );
+});
+}
+
+test("single-parent review repair crosses the real executor and transport without duplicate publication", async () => {
+  const binding = pullRequestExternalActionBinding();
+  const evidence = externalActionControlledCommit(binding, { reviewRepair: true });
+  const plan = pullRequestExternalActionPlan({ type: "push", controlledCommitEvidence: evidence }, { binding });
+  const envelope = pullRequestExternalActionEnvelope(plan);
+  const input = transportInput("push", binding, { type: "push", controlledCommitEvidence: evidence });
+  const before = () => [actorRecord(input), pullRequestRecord(input)];
+  const after = () => [actorRecord(input), pullRequestRecord(input, { headOid: evidence.commit.oid })];
+  const runner = new FakeRunner([...before(), ...before(), ...before(), ...after(), ...after()]);
+  let publications = 0;
+  const executor = createPullRequestExternalActionExecutor({
+    enabledActions: ["push"],
+    credentialSource: credentialSource(),
+    transport: actionTransport(runner, {
+      controlledCommitPublisher: Object.freeze({
+        async publish(request) {
+          publications += 1;
+          assert.deepEqual(request.action.controlledCommitEvidence, evidence);
+          return { status: "applied", receipt: { id: evidence.commit.oid } };
+        },
+      }),
+    }),
+    inputAuthorityVerifier: { async verify() { return structuredClone(binding); } },
+    controlledCommitVerifier: { async verify() { return structuredClone(evidence); } },
+    pushAuthorization: { async verifyPush() { return true; } },
+  });
+  assert.deepEqual(await executor.execute(envelope), { status: "applied", receipt: { id: evidence.commit.oid } });
+  assert.deepEqual(await executor.reconcile(envelope), { status: "already", receipt: { id: evidence.commit.oid } });
+  assert.equal(publications, 1);
+  assert.equal(runner.responses.length, 0);
 });
 
 test("merges with an expected sha before writing a recoverable proof comment", async () => {

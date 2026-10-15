@@ -537,7 +537,7 @@ function normalizeMemoryAction(value, kind, message) {
     );
     const parents = strictProjectionList(commit.parents, 2, message);
     if (
-      parents.length !== 2 ||
+      ![1, 2].includes(parents.length) ||
       !SHA256.test(controlled.evidenceDigest) ||
       controlled.evidenceId !==
         `controlled-git-commit-${controlled.evidenceDigest}` ||
@@ -545,7 +545,7 @@ function normalizeMemoryAction(value, kind, message) {
       remote.repository !== inputBinding.gitTarget.headRepository ||
       remote.refName !== inputBinding.gitTarget.headRefName ||
       parents[0] !== inputBinding.gitTarget.headRefOid ||
-      parents[1] !== inputBinding.gitTarget.baseRefOid ||
+      (parents.length === 2 && parents[1] !== inputBinding.gitTarget.baseRefOid) ||
       !GIT_OID.test(commit.oid) ||
       !GIT_OID.test(commit.treeOid)
     ) {

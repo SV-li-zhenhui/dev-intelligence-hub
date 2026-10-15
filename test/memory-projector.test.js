@@ -16,9 +16,12 @@ import {
 import { createMemoryRuntime } from "../src/memory-runtime.js";
 import { MemoryContextRetriever } from "../src/services/memory-context-retriever.js";
 import { MemoryProjector } from "../src/services/memory-projector.js";
+import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
 import {
+  externalActionControlledCommit,
   pullRequestExternalActionBinding,
   pullRequestExternalActionPlan,
+  pullRequestExternalActionQueuePlan,
 } from "./support/pull-request-external-action-fixture.js";
 
 function workItem(id, status, revision = 1) {
@@ -297,6 +300,91 @@ function completedConfirmationMemoryItem(
     ownerDecision: null,
     invalidation: null,
   };
+}
+
+for (const { reviewRepair, sealedUnknown, invalidParents, invalidCase } of [
+  { reviewRepair: false, sealedUnknown: false },
+  { reviewRepair: true, sealedUnknown: false },
+  { reviewRepair: true, sealedUnknown: true },
+  { reviewRepair: true, invalidCase: "no parent", invalidParents: [] },
+  { reviewRepair: true, invalidCase: "wrong Head", invalidParents: ["e".repeat(40)] },
+  { reviewRepair: false, invalidCase: "wrong Base", invalidParents: ["2".repeat(40), "e".repeat(40)] },
+  { reviewRepair: false, invalidCase: "extra parent", invalidParents: ["2".repeat(40), "1".repeat(40), "e".repeat(40)] },
+]) {
+  test(`${invalidCase ? `rejects ${invalidCase} in` : "projects"} the real confirmation queue's ${reviewRepair ? "single-parent review repair" : "conflict merge"} ${sealedUnknown ? "sealed unknown" : "completed"} push${invalidCase ? "" : " idempotently"}`, async () => {
+    const binding = pullRequestExternalActionBinding();
+    const evidence = externalActionControlledCommit(binding, { reviewRepair });
+    const { journal, store, values } = await localMemoryFixture();
+    const queue = new ConfirmationQueue({
+      store,
+      exclusiveLease: { run: (operation) => operation() },
+      executor: {
+        async execute() {
+          return sealedUnknown ? { status: "unknown", code: "TEST_UNKNOWN" }
+            : { status: "applied", receipt: { id: evidence.commit.oid } };
+        },
+        async reconcile() { return { status: "already", receipt: { id: evidence.commit.oid } }; },
+      },
+      clock: () => new Date("2026-08-08T07:01:00.000Z"),
+    });
+    await queue.recover();
+    const pending = await queue.enqueue(pullRequestExternalActionQueuePlan({
+      type: "push", controlledCommitEvidence: evidence,
+    }, { binding }));
+    const approved = await queue.approve(pending.id, {
+      requestId: "publish-review-repair-projection",
+      expectedQueueRevision: pending.queueRevision,
+      expectedItemRevision: pending.itemRevision,
+      displayedPayloadDigest: pending.displayedPayloadDigest,
+      approvalBindingDigest: pending.approvalBindingDigest,
+    });
+    if (sealedUnknown) {
+      await queue.reject(approved.id, {
+        requestId: "seal-unknown-push-projection",
+        expectedQueueRevision: approved.queueRevision,
+        expectedItemRevision: approved.itemRevision,
+        displayedPayloadDigest: approved.displayedPayloadDigest,
+        approvalBindingDigest: approved.approvalBindingDigest,
+        reason: "Preserve unknown publication and forbid replay",
+      });
+    }
+    const graphSource = graphProjectionSource();
+    const projector = new MemoryProjector({
+      memoryLifecycleProducer: journal,
+      memoryAuthorityReader: journal,
+      memoryAuthoritySource: memoryAuthoritySource([pullRequestWorkItem(binding)], [], graphSource),
+      graphProjectionSource: graphSource,
+      confirmationProjectionSource: {
+        async readMemoryPage(input) {
+          const page = structuredClone(await queue.readMemoryPage(input));
+          if (invalidParents !== undefined) {
+            page.items[0].action.controlledCommit.commit.parents = invalidParents;
+          }
+          return page;
+        },
+      },
+      inputAuthorityVerifier: { async verify(value) { return structuredClone(value); } },
+      store,
+    });
+    if (invalidParents !== undefined) {
+      await assert.rejects(projector.runCycle(), /confirmation memory projection item is invalid/u);
+      assert.equal(values.has("unified-memory-records"), false, "invalid projection must not write memory");
+      return;
+    }
+    await projector.runCycle();
+    assert.equal((await projector.runCycle()).added, 0);
+    const records = values.get("unified-memory-records").records;
+    const confirmation = records.find((record) => record.source.kind === "confirmation");
+    const externalResult = records.find((record) => record.source.kind === "external-result");
+    assert.deepEqual(JSON.parse(confirmation.content).action.controlledCommit.commit.parents, evidence.commit.parents);
+    const result = JSON.parse(externalResult.content);
+    if (sealedUnknown) {
+      assert.equal(result.failure.outcome, "unknown");
+      assert.equal(result.ownerDecision.type, "seal_unknown_and_forbid_replay");
+    } else {
+      assert.equal(result.receipt.id, evidence.commit.oid);
+    }
+  });
 }
 
 function sealedUnknownConfirmationMemoryItem(binding, options = {}) {

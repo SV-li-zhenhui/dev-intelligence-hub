@@ -327,7 +327,8 @@ function normalizeAction(value, input) {
         binding,
       ) ||
       evidence.commit.parents[0] !== target.headRefOid ||
-      evidence.commit.parents[1] !== target.baseRefOid
+      (evidence.executionSource.kind !== "review_repair" &&
+        evidence.commit.parents[1] !== target.baseRefOid)
     ) {
       throw transportError("GITHUB_PROTOCOL_ERROR", "absent");
     }
