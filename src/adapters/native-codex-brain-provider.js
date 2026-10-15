@@ -339,6 +339,11 @@ export class NativeCodexBrainProvider {
     try { await rmdir(directory); } catch { throw failure("STRUCTURED_PROVIDER_CLEANUP_FAILED"); }
   }
 
+  #invalidateAvailability(error) {
+    if (['STRUCTURED_PROVIDER_UNAVAILABLE', 'STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE',
+      'STRUCTURED_PROVIDER_PROCESS_FAILED', 'STRUCTURED_PROVIDER_PROCESS_EXITED'].includes(error?.code)) this.#state.lastStatus = null;
+  }
+
   #operation(signal, callback, timeoutMs = this.#options.timeoutMs, {entityKey = randomUUID(), exclusive = false, model = false,enforceEntity=false} = {}) {
     if (this.#closed) return Promise.reject(failure());
     const operation = operationSignal(signal);
@@ -364,6 +369,7 @@ export class NativeCodexBrainProvider {
         return await callback(operation.signal);
       } catch (error) {
         if (!token && operation.signal.aborted) context?.confirmStopped?.();
+        if (model) this.#invalidateAvailability(error);
         if (error instanceof TypeError) throw error;
         throw failure(error?.code);
       } finally {
@@ -457,7 +463,7 @@ export class NativeCodexBrainProvider {
                 ...(skill?{skill:{name:NATIVE_REVIEW_SKILL_NAME,path:path.join(directory,NATIVE_REVIEW_SKILL_FILE)}}:{})}}} : {}),
             input: live?Buffer.from(wireInput):Buffer.alloc(0),...(lifecycle?{duplex:lifecycle.duplex}:{}), timeoutMs, maxStdoutBytes: reader || execution ? 64 * 1024 * 1024 : 1024 * 1024, maxStderrBytes: this.#options.maxResponseBytes }, operationSignal, this.#marker(), () => { processAttempted = true; }, live ? this.#dependencies.appServerRunner : this.#dependencies.processRunner);
           this.#state.lastStatus = status("available");
-        } catch (failure) { processFailure = failure; }
+        } catch (failure) { processFailure = failure; this.#invalidateAvailability(failure); }
         finally {lifecycle?.close();}
         if (request.sessionKey && !this.#state.blocked) {
           const threadId = threadFrom(processResult ?? SETTLED_FAILURE_OUTPUT.get(processFailure) ?? readReapedProcessFailureOutput(processFailure) ?? readAppServerFailureOutput(processFailure), previous);
@@ -538,7 +544,7 @@ export class NativeCodexBrainProvider {
         const prepare = await this.#prepare(operationSignal);
         let descriptor;
         try { descriptor = await this.#dependencies.commandLocator.resolve("codex-cli", { signal: operationSignal }); }
-        catch { operationSignal.throwIfAborted(); return status("cli_unavailable"); }
+        catch { operationSignal.throwIfAborted(); return this.#state.lastStatus = status("cli_unavailable"); }
         const directory = path.join(this.#root, `probe-${randomUUID()}`);
         await prepare(directory);
         try {
@@ -555,7 +561,7 @@ export class NativeCodexBrainProvider {
       }, Math.min(30_000,this.#options.timeoutMs), {exclusive:true});
     } catch (error) {
       if (error?.code === "STRUCTURED_PROVIDER_CANCELLED") throw error;
-      return status(this.#state.blocked || error?.code === "STRUCTURED_PROVIDER_REAP_FAILED" ? "broker_blocked" :
+      return this.#state.lastStatus = status(this.#state.blocked || error?.code === "STRUCTURED_PROVIDER_REAP_FAILED" ? "broker_blocked" :
         error?.code === "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE" ? "file_login_unavailable" : "cli_unavailable");
     }
   }
@@ -568,7 +574,10 @@ export class NativeCodexBrainProvider {
     if (this.transport === 'app-server' && this.#dependencies.appServerRunner.supportsContainedExecution === false) throw failure();
     // Availability is admission, not a second serialized model operation.
     // Each queued generation still validates the home, session and CLI itself.
-    if (this.#state.active.size) return;
+    // A successful login check is shared across idle workforce cycles. Repeating
+    // its exclusive probe before every claim can keep real work permanently out.
+    // Explicit status reads still refresh login; execution failures invalidate it.
+    if (this.#state.active.size || this.#state.lastStatus?.state === 'available') return;
     const result = await this.readStatus({ signal });
     if (result.state !== "available") throw failure(result.state === "broker_blocked" ? "STRUCTURED_PROVIDER_REAP_FAILED" :
       result.state === "file_login_unavailable" ? "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE" : "STRUCTURED_PROVIDER_UNAVAILABLE");

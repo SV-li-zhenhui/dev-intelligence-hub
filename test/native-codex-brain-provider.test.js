@@ -1028,6 +1028,76 @@ test("a retained process marker from an earlier service lifetime prevents a dupl
   assert.ok((await readdir(f.runtime)).includes(marker));
 });
 
+test('idle workforce availability reuses successful login evidence without starving model admission',async(t)=>{
+  const f=await fixture(t);let probes=0,models=0;
+  const handler=async call=>{
+    if(call.args[0]==='login'){probes++;return success('Logged in using ChatGPT');}
+    models++;return result(call);
+  };
+  const first=f.create(handler,{}, {maxConcurrentTurns:2,allowConcurrentNativeHome:true});
+  const second=f.create(handler,{}, {maxConcurrentTurns:2,allowConcurrentNativeHome:true});
+  await first.checkAvailability();
+  for(let cycle=0;cycle<3;cycle++){
+    await Promise.all([first.checkAvailability(),second.checkAvailability()]);
+    await Promise.all([
+      first.withAdmission({entityKey:`pr:first-${cycle}`},()=>first.generate(request())),
+      second.withAdmission({entityKey:`pr:second-${cycle}`},()=>second.generate(request())),
+    ]);
+  }
+  assert.equal(probes,1,'idle scheduling cycles must not start another exclusive login probe');
+  assert.equal(models,6,'both workforce slots remain available for real work');
+  await first.close();await second.close();
+});
+
+test('a native execution failure invalidates positive availability and requires a fresh login check',async(t)=>{
+  const f=await fixture(t);let probes=0,loggedIn=true;
+  const provider=f.create(async call=>{
+    if(call.args[0]==='login'){probes++;return success(loggedIn?'Logged in using ChatGPT':'Not logged in');}
+    throw error('STRUCTURED_PROVIDER_PROCESS_FAILED');
+  });
+  await provider.checkAvailability();
+  loggedIn=false;
+  await assert.rejects(provider.generate(request()),{code:'STRUCTURED_PROVIDER_PROCESS_FAILED'});
+  await assert.rejects(provider.checkAvailability(),{code:'STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE'});
+  assert.equal(probes,2);
+  loggedIn=true;await provider.checkAvailability();assert.equal(probes,3);
+  await provider.close();
+});
+
+for(const code of ['STRUCTURED_PROVIDER_UNAVAILABLE','STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE',
+  'STRUCTURED_PROVIDER_PROCESS_FAILED','STRUCTURED_PROVIDER_PROCESS_EXITED'])test(`a fresh-session ${code} invalidates shared availability before session recovery`,async(t)=>{
+  const f=await fixture(t);let probes=0,models=0,loggedIn=true;
+  const handler=async call=>{
+    if(call.args[0]==='login'){probes++;return success(loggedIn?'Logged in using ChatGPT':'Not logged in');}
+    models++;throw error(code);
+  };
+  const first=f.create(handler),second=f.create(handler);
+  await first.checkAvailability();loggedIn=false;
+  await assert.rejects(first.generate(request({sessionKey:'pr:42'})),{code:'STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED'});
+  const journal=await readdir(path.join(f.runtime,'sessions'));
+  assert.equal(journal.some(name=>name.endsWith('.pending')),true);
+  await assert.rejects(second.generate(request({sessionKey:'pr:42'})),{code:'STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED'});
+  assert.equal(models,1,'the unknown session journal must fence the same entity');
+  await assert.rejects(second.checkAvailability(),{code:'STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE'});
+  assert.equal(probes,2,'the shared native home must refresh stale login evidence');
+  assert.deepEqual(await readdir(path.join(f.runtime,'sessions')),journal);
+  await first.close();await second.close();
+});
+
+test('an explicit failed native status refresh cannot leave positive availability cached',async(t)=>{
+  const f=await fixture(t);let probes=0,available=true;
+  const provider=f.create(async()=>{
+    probes++;
+    if(!available)throw error('STRUCTURED_PROVIDER_PROCESS_FAILED');
+    return success('Logged in using ChatGPT');
+  });
+  await provider.checkAvailability();available=false;
+  assert.equal((await provider.readStatus()).state,'file_login_unavailable');
+  await assert.rejects(provider.checkAvailability(),{code:'STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE'});
+  assert.equal(probes,3);
+  await provider.close();
+});
+
 test('idle native status probes recover login and notice credential loss while active models use cached status',async(t)=>{
   const f=await fixture(t),entered=gate(),finish=gate();let loggedIn=false,probes=0;
   const provider=f.create(async call=>{
