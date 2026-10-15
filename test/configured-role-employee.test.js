@@ -808,6 +808,77 @@ test("RoleDecisionEngine rejects premature completion of initial structured PR t
   assert.equal(result.intent.action.capability, "development");
 });
 
+function externalRereviewContext(children = []) {
+  return {
+    requirements: { coordination: { directChildren: children } },
+    code: { sourceEvent: {
+      eventType: "pull_request.owner_requested",
+      source: { provider: "local-owner" },
+      payload: { workType: "general", nextAction: "rereview", suggestedCapability: "pr-review",
+        expectedHeadRefOid: "a".repeat(40) },
+    } },
+  };
+}
+
+function oneResponseEngine(roleId, result) {
+  return new RoleDecisionEngine({ definition: definition(roleId),
+    permissions: permissions("complete", "orchestrate", "submit_delivery", "propose_github_review"), brain: brain(),
+    brainRouter: { describe: () => ({ singleAttempt: true }), generate: async () => JSON.stringify(result) } });
+}
+
+test("external rereview requires a required authoritative contract and accepted publication before root completion", async (t) => {
+  for (const invalidKind of ["text-report", "test-report"]) {
+    await t.test(`reject ${invalidKind} decomposition`, async () => {
+      const result = triageDecompositionDecision("pr-review");
+      result.intent.action.acceptanceContract.expectedDeliverables[0].kind = invalidKind;
+      await assert.rejects(oneResponseEngine("orchestrator", result).decide({ context: externalRereviewContext() }),
+        { code: "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION" });
+    });
+  }
+  const accepted = { status: "completed", responsibility: { type: "role", id: "pr-engineer" },
+    hasAcceptedRequiredReview: true, deliverables: [{ kind: "github-review", required: true, state: "accepted" }] };
+  for (const child of [
+    { ...accepted, hasAcceptedRequiredReview: false, deliverables: [{ ...accepted.deliverables[0], kind: "text-report" }] },
+    { ...accepted, hasAcceptedRequiredReview: false, deliverables: [{ ...accepted.deliverables[0], required: false }] },
+    { ...accepted, hasAcceptedRequiredReview: false, deliverables: [{ ...accepted.deliverables[0], state: "submitted" }] },
+    { ...accepted, hasAcceptedRequiredReview: false, deliverables: [{ ...accepted.deliverables[0], state: "none" }] },
+    { ...accepted, hasAcceptedRequiredReview: false, deliverables: [] },
+    { ...accepted, status: "in_progress" },
+    { ...accepted, responsibility: { type: "role", id: "developer" } },
+    { ...accepted, hasAcceptedRequiredReview: "true" },
+    { ...accepted, hasAcceptedRequiredReview: undefined },
+  ]) {
+    if (child.hasAcceptedRequiredReview === undefined) delete child.hasAcceptedRequiredReview;
+    await assert.rejects(oneResponseEngine("orchestrator", completeDecision()).decide({ context: externalRereviewContext([child]) }),
+      { code: "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION" });
+  }
+  assert.equal((await oneResponseEngine("orchestrator", completeDecision()).decide({ context: externalRereviewContext([accepted]) })).intent.type, "complete");
+});
+
+test("contracted external reviewer proposes publication with its exact deliverable and Head", async () => {
+  const context = externalRereviewContext();
+  delete context.requirements.coordination;
+  context.requirements.currentTask = { acceptanceContract: {
+    expectedDeliverables: [{ deliverableId: "review-result", kind: "review-report", required: true }],
+  } };
+  const publish = completeDecision({ intent: { schemaVersion: 1, type: "propose_github_review",
+    summary: "Review completed", reason: "Full current diff read", verdict: "comment", body: "Review findings",
+    deliverableId: "review-result", evidence: [`head:${"a".repeat(40)}`] } });
+  assert.equal((await oneResponseEngine("pr-engineer", publish).decide({ context })).intent.type, "propose_github_review");
+  const unverifiedReview = deliveryDecision(); unverifiedReview.intent.deliverableId = "review-result";
+  for (const result of [completeDecision(), unverifiedReview,
+    { ...publish, intent: { ...publish.intent, deliverableId: "other" } },
+    { ...publish, intent: { ...publish.intent, evidence: [`head:${"b".repeat(40)}`] } },
+  ]) {
+    await assert.rejects(oneResponseEngine("pr-engineer", result).decide({ context }),
+      { code: "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION" });
+  }
+  context.code.internalReview = { kind: "developer_handoff" };
+  context.code.sourceEvent.payload.headRefOid = "a".repeat(40);
+  const local = completeDecision(); local.intent.evidence = [`head:${"a".repeat(40)}`];
+  assert.equal((await oneResponseEngine("pr-engineer", local).decide({ context })).intent.type, "complete");
+});
+
 test("RoleDecisionEngine explains and repairs the orchestration reason binding", async () => {
   const invalid = orchestrationDecision();
   invalid.intent.reason = "wrapper reason differs";

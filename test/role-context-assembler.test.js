@@ -1803,6 +1803,7 @@ test("a configured root orchestrator receives exact direct-child coordination by
       "contractRevision",
       "deliverableCount",
       "hasMoreDeliverables",
+      "hasAcceptedRequiredReview",
       "deliverables",
     ]);
   }
@@ -2042,6 +2043,36 @@ test("root coordination exposes one deterministic submitted-delivery window", as
     Buffer.byteLength(projectedCurrent.work.description, "utf8") <= 512,
     true,
   );
+});
+
+test("root coordination derives accepted required Review proof from every slot before previewing four", async (t) => {
+  for (const variant of ["accepted", "optional", "submitted", "none", "local-only"]) await t.test(variant, async () => {
+    const fixture = rootOrchestratorFixture();
+    const current = fixture.snapshot.graph.tasks.find(({ taskId }) => taskId === "task-current");
+    current.acceptanceContracts = [contract(1, [
+      ...Array.from({ length: 4 }, (_, index) => expected(`aa-support-${index}`, "text-report")),
+      expected("zz-review", variant === "local-only" ? "text-report" : "github-review", variant !== "optional"),
+    ])];
+    current.deliveries = [];
+    for (let index = 0; index < 4; index++) current.deliveries.push(...acceptedPair({
+      deliverableId: `aa-support-${index}`, contractRevision: 1, submittedRevision: index * 2 + 1,
+      submittedSummary: "Local support", acceptanceReason: "Support accepted",
+      records: [evidence("artifact", `support:${index}`, DIGEST_A)] }));
+    if (variant !== "none") {
+      const pair = acceptedPair({ deliverableId: "zz-review", contractRevision: 1, submittedRevision: 9,
+        submittedSummary: "Review receipt", acceptanceReason: "Review accepted",
+        records: [evidence(variant === "local-only" ? "artifact" : "github-review", "review:42", DIGEST_A)] });
+      current.deliveries.push(...(variant === "submitted" ? pair.slice(0, 1) : pair));
+    }
+    current.revision = 10;
+    fixture.snapshot.taskStates.find(({ taskId }) => taskId === current.taskId).taskRevision = 10;
+    const packet = await assemble(fixture, { roleId: "orchestrator" });
+    const projected = packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === current.taskId);
+    assert.equal(projected.deliverables.length, 4);
+    assert.equal(projected.hasMoreDeliverables, true);
+    assert.equal(projected.deliverables.every(({ kind }) => kind === "text-report"), true);
+    assert.equal(projected.hasAcceptedRequiredReview, variant === "accepted");
+  });
 });
 
 test("root coordination is canonical, digest-bound, detached, and root-only", async () => {

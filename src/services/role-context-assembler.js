@@ -900,6 +900,8 @@ function projectRootCoordination(roleId, currentTask, snapshot) {
       deliverableCount: deliveries.slots.length,
       hasMoreDeliverables:
         deliveries.slots.length > visibleDeliverables.length,
+      hasAcceptedRequiredReview: deliveries.slots.some(({ kind, required, state }) =>
+        required && state === "accepted" && ["review-report", "github-review"].includes(kind)),
       deliverables: visibleDeliverables,
     };
   });

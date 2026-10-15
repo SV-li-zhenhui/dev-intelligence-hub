@@ -3380,6 +3380,7 @@ test("unclassified structured failures preserve generic specialist behavior and 
   for (const code of [
     "STRUCTURED_BRAIN_RESPONSE_INVALID",
     "STRUCTURED_PROVIDER_RESPONSE_INVALID",
+    "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION",
   ]) {
     await t.test(`root defers ${code} without failing the employee`, async () => {
       const time = controlledClock();
