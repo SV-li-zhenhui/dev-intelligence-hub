@@ -1513,6 +1513,27 @@ function evaluatePullRequestSubjectAuthority(state, root) {
       validAuthorities.delete(observation.item.itemId);
       canonical = selectLatestValidAuthority();
       authorityFenced = canonical === null;
+      // Leaving scope revokes execution authority, not an already accepted
+      // causal bridge used by a later, independently active provenance.
+      if (
+        !authorityNegative &&
+        observation.revision.disposition === "accepted" &&
+        observation.occurredAtMs >= trustedOccurredAtWatermark &&
+        (predecessor === null ||
+          observation.revision.headRefOid === predecessor.revision.headRefOid ||
+          observation.revision.previousHeadRefOid === predecessor.revision.headRefOid)
+      ) {
+        predecessor = observation;
+        if (
+          observation.pointer !== null &&
+          (markerRequired ? gitTargetState === "available" : gitTargetState === "legacy")
+        ) {
+          trustedOccurredAtWatermark = Math.max(
+            trustedOccurredAtWatermark,
+            observation.occurredAtMs,
+          );
+        }
+      }
       continue;
     }
     if (authorityNegative) {

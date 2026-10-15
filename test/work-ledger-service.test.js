@@ -1068,6 +1068,8 @@ import {
   appendPullRequestWorkSource,
   currentWorkItemEvent,
   currentWorkItemInputBinding,
+  pullRequestHeadAdmission,
+  pullRequestTrustedPredecessor,
   LEGACY_PR_SOURCE_CUTOVER_REASON,
   LEGACY_PR_SOURCE_QUARANTINE_KIND,
 } from "../src/services/work-ledger-pr-source.js";
@@ -2258,6 +2260,111 @@ test("leaving and re-entering automatic PR scope fences every older authority ep
   assert.equal(updated.source.current.event.eventType, "pull_request.updated");
   assert.deepEqual(updated.source.scope, active.source.scope);
   assert.equal(updated.source.authorityEpoch, active.source.authorityEpoch);
+});
+
+async function sourceExitHistoryFixture({
+  ownerOccurredAt = "2026-08-02T01:00:00.000Z",
+  bridgeOptions = {},
+  omitBridge = false,
+  receiverHead = PR_HEAD_B,
+  receiverOccurredAt = "2026-08-02T01:20:00.000Z",
+  leaveScope = true,
+} = {}) {
+  const fixture = await createFixture({ records: [ownerRequestedPrAssignment(1, {
+    occurredAt: ownerOccurredAt,
+  })] });
+  await fixture.service.intake();
+  const records = [
+    prAssignment(2, { occurredAt: "2026-08-02T01:05:00.000Z", gitFacts: prGitFacts(PR_HEAD_A) }),
+    prAssignment(3, { occurredAt: "2026-08-02T01:10:00.000Z", headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A, changedFields: ["headRefOid"], gitFacts: prGitFacts(PR_HEAD_B), ...bridgeOptions }),
+    prScopeLifecycleAssignment(4, prAssignment(4, { eventType: "pull_request.left_scope",
+      occurredAt: "2026-08-02T01:15:00.000Z", headRefOid: PR_HEAD_B, gitFacts: prGitFacts(PR_HEAD_B) }).event),
+    prAssignment(5, { sourceScopeId: "github-secondary", occurredAt: receiverOccurredAt,
+      headRefOid: receiverHead, gitFacts: prGitFacts(receiverHead) }),
+  ];
+  let exitedState;
+  for (const record of records) {
+    fixture.source.records.push((omitBridge && record.sequence === 3) || (!leaveScope && record.sequence === 4)
+      ? assignment(record.sequence) : record);
+    fixture.source.highWatermark = record.sequence;
+    await fixture.service.intake();
+    if (record.sequence === 4) exitedState = fixture.store.stored();
+  }
+  const roots = (await fixture.service.listItems({ limit: 10 })).items;
+  const inactive = roots.find(item => item.source?.identity.scopeId === "github-dashboard");
+  const receiver = roots.find(item => item.source?.identity.scopeId === "github-secondary");
+  return { ...fixture, inactive, receiver, exitedState };
+}
+
+test("accepted Head history survives a source exit when a new provenance takes over", async () => {
+  const fixture = await sourceExitHistoryFixture();
+  const { inactive, receiver } = fixture;
+  assert.equal(inactive.source.scope.active, false);
+  const historicalAuthority = pullRequestTrustedPredecessor(fixture.exitedState, inactive);
+  assert.equal(historicalAuthority.headRefOid, PR_HEAD_B);
+  assert.notEqual(historicalAuthority.canonicalRootItemId, inactive.itemId);
+  assert.notEqual(historicalAuthority.lastTrustedRootItemId, inactive.itemId);
+  await assert.rejects(fixture.service.verifyPullRequestExecutionBinding(prExecutionBinding(inactive)),
+    error => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE");
+  const binding = prExecutionBinding(receiver);
+  assert.deepEqual(await fixture.service.verifyPullRequestExecutionBinding(binding), binding);
+  const claimed = await fixture.service.claim({ itemId: receiver.itemId, expectedRevision: receiver.revision,
+    workerId: "employee-pr-engineer", leaseDurationMs: 30_000 });
+  assert.equal(claimed.status, "working");
+  assert.equal(claimed.source.current.headRefOid, PR_HEAD_B);
+  assert.deepEqual((await fixture.service.listItems({ limit: 10 })).items.find(item => item.itemId === inactive.itemId), inactive);
+});
+
+for (const leaveScope of [false, true]) {
+  test(`accepted Head history rejects an older takeover while source exit=${leaveScope}`, async () => {
+    const fixture = await sourceExitHistoryFixture({ leaveScope, receiverOccurredAt: "2026-08-02T01:08:00.000Z" });
+    assert.equal(fixture.inactive.source.scope.active, !leaveScope);
+    const before = fixture.store.stored();
+    const writes = fixture.store.writes.length;
+    await assert.rejects(fixture.service.verifyPullRequestExecutionBinding(prExecutionBinding(fixture.receiver)),
+      error => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE");
+    await assert.rejects(fixture.service.claim({ itemId: fixture.receiver.itemId,
+      expectedRevision: fixture.receiver.revision, workerId: "employee-pr-engineer", leaseDurationMs: 30_000 }),
+    error => ["WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING", "WORK_LEDGER_PR_EXECUTION_BINDING_STALE"].includes(error.code));
+    assert.deepEqual(fixture.store.stored(), before);
+    assert.equal(fixture.store.writes.length, writes);
+  });
+}
+
+for (const [name, options] of [
+  ["unknown receiver Head", { receiverHead: PR_HEAD_C }],
+  ["missing historical bridge", { omitBridge: true }],
+  ["rejected historical bridge", { bridgeOptions: { previousHeadRefOid: undefined } }],
+  ["unavailable historical target", { bridgeOptions: { gitFacts: { gitTargetAvailable: false } } }],
+  ["legacy historical target downgrade", { bridgeOptions: { gitFacts: {} } }],
+  ["history older than the trusted watermark", { ownerOccurredAt: "2099-01-01T00:00:00.000Z" }],
+]) {
+  test(`a source exit cannot use ${name} to authorize a new provenance`, async () => {
+    const fixture = await sourceExitHistoryFixture(options);
+    const before = fixture.store.stored();
+    const writes = fixture.store.writes.length;
+    const binding = prExecutionBinding(fixture.receiver);
+    await assert.rejects(fixture.service.verifyPullRequestExecutionBinding(binding),
+      error => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE");
+    await assert.rejects(fixture.service.claim({ itemId: fixture.receiver.itemId,
+      expectedRevision: fixture.receiver.revision, workerId: "employee-pr-engineer", leaseDurationMs: 30_000 }),
+    error => ["WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING", "WORK_LEDGER_PR_EXECUTION_BINDING_STALE"].includes(error.code));
+    assert.deepEqual(fixture.store.stored(), before);
+    assert.equal(fixture.store.writes.length, writes);
+  });
+}
+
+test("quarantining an inactive source cannot lend its accepted history to a new provenance", async () => {
+  const fixture = await sourceExitHistoryFixture();
+  const state = fixture.store.stored();
+  const inactive = state.items.find(item => item.itemId === fixture.inactive.itemId);
+  inactive.sourceQuarantine = { kind: "legacy" };
+  const authority = pullRequestTrustedPredecessor(state, fixture.receiver);
+  assert.equal(authority.authorityFenced, true);
+  assert.equal(authority.canonicalRootItemId, null);
+  assert.equal(pullRequestHeadAdmission(state, fixture.receiver).current, false);
+  assert.equal(pullRequestHeadAdmission(state, inactive).current, false);
 });
 
 test("a changed Head cannot restore automatic PR scope without causal proof", async () => {
