@@ -453,6 +453,22 @@ function isConfiguredRootItem(item, resolution) {
   );
 }
 
+function blockedRootSweepFingerprint(item, allItems) {
+  // Child delivery or contract changes need not revise the root. Include only
+  // its related items so another role's unrelated writes cannot restart the sweep.
+  const current = allItems.find(({ itemId }) => itemId === item.itemId);
+  if (current?.revision !== item.revision) return null;
+  const dependencies = new Set(item.graph?.dependsOnItemIds ?? []);
+  const related = allItems.filter((candidate) =>
+    candidate.graph?.parentItemId === item.itemId || dependencies.has(candidate.itemId)
+  );
+  if ([...dependencies].some((itemId) => !related.some((candidate) => candidate.itemId === itemId)) ||
+      related.some((candidate) => !Number.isSafeInteger(candidate.revision))) return null;
+  return JSON.stringify([item.revision, related
+    .map(({ itemId, revision }) => [itemId, revision])
+    .sort(([left], [right]) => left.localeCompare(right))]);
+}
+
 function stableFailureCode(error) {
   try {
     const descriptor = Object.getOwnPropertyDescriptor(error, "code");
@@ -868,6 +884,7 @@ export class ProactiveWorkLoop {
     this.issueRetirementSweep = null;
     this.fencedClaimDeferrals = new Map();
     this.stalePrFactSweeps = new Map();
+    this.blockedRootSweeps = new Map();
     this.claimCycleSequence = 0;
   }
 
@@ -950,6 +967,32 @@ export class ProactiveWorkLoop {
 
     const prioritized = prioritizeWorkItems(items, candidateWindow.facts, graphBlocked);
     const scheduled = this.taskRuns ? await this.taskRuns.order(prioritized, 'work-item', 'itemId') : prioritized;
+    const blockedRoots = scheduled.filter((item) =>
+      item.currentTarget?.type === "role" && item.currentTarget.id === ORCHESTRATOR_ROLE_ID &&
+      item.graph?.parentItemId === null && graphBlocked.has(item.itemId)
+    );
+    const blockedRootSweep = this.blockedRootSweeps.get(scope) ?? new Map();
+    this.blockedRootSweeps.set(scope, blockedRootSweep);
+    let relatedItems;
+    const sweepFingerprint = async (item) => {
+      if (relatedItems === undefined) {
+        try {
+          relatedItems = await this.#listAllItems(options.signal);
+          if (new Set(relatedItems.map(({ itemId }) => itemId)).size !== relatedItems.length) relatedItems = null;
+        } catch {
+          throwIfLoopAborted(options.signal);
+          // Missing scheduling evidence must leave the ordinary decision path eligible.
+          relatedItems = null;
+        }
+      }
+      return relatedItems === null ? null : blockedRootSweepFingerprint(item, relatedItems);
+    };
+    for (const [itemId, visited] of blockedRootSweep) {
+      const item = blockedRoots.find((candidate) => candidate.itemId === itemId);
+      if (!item || item.revision !== visited.revision || await sweepFingerprint(item) !== visited.fingerprint) {
+        blockedRootSweep.delete(itemId);
+      }
+    }
     let completedCandidateSweep = true;
     for (const item of scheduled) {
       throwIfLoopAborted(options.signal);
@@ -962,6 +1005,7 @@ export class ProactiveWorkLoop {
         break;
       }
       if (stalePrFactSweep.get(item.itemId) === item.revision) continue;
+      if (blockedRootSweep.has(item.itemId)) continue;
       const fencedDeferral = this.fencedClaimDeferrals.get(item.itemId);
       if (
         fencedDeferral?.revision === item.revision &&
@@ -1102,12 +1146,19 @@ export class ProactiveWorkLoop {
             this.roleContextAssembler !== null &&
             configuredRoot
           ) {
+            const fingerprint = isGraphBlocked ? await sweepFingerprint(item) : null;
             const processed = await this.#processConfiguredOrchestrator({
               item,
               worker: resolution,
               options,
               graphBlocked: isGraphBlocked,
             });
+            if (fingerprint !== null && !processed.claimAttempted && !processed.claimed &&
+                processed.outcome.status === "graph_blocked") {
+              blockedRootSweep.set(item.itemId, { revision: item.revision, fingerprint });
+            } else {
+              blockedRootSweep.delete(item.itemId);
+            }
             const stalePrFact = isUnclaimedStalePrFact(processed);
             if (stalePrFact) stalePrFactSweep.set(item.itemId, item.revision);
             if (configuredResultConsumesWorkBudget(processed)) {
@@ -1179,6 +1230,7 @@ export class ProactiveWorkLoop {
     // Continue a bounded stale-fact sweep across cycles without moving new or
     // urgent candidates behind old work. A changed revision is never skipped.
     if (completedCandidateSweep) this.stalePrFactSweeps.delete(scope);
+    if (completedCandidateSweep) this.blockedRootSweeps.delete(scope);
     throwIfLoopAborted(options.signal);
     return {
       trigger: options.trigger,

@@ -111,6 +111,8 @@ test('owner adjustment discards the old real role decision before staging', asyn
 });
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
+import { WorkLedgerService } from "../src/services/work-ledger-service.js";
+import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { RoleContextAssembler, RoleContextAssemblerError } from "../src/services/role-context-assembler.js";
 import { PrEngineerServiceError } from "../src/services/pr-engineer-service.js";
 import { OrchestratorServiceError } from "../src/services/orchestrator-service.js";
@@ -3646,6 +3648,259 @@ test("a child-blocked root generic decision stays unclaimed", async () => {
   assert.equal(ledger.calls.claim.length, 0);
   assert.equal(ledger.calls.stageIntent.length, 0);
   assert.equal(serviceCalls, 0);
+});
+
+async function blockedRootSweepLoop({ listReadinessItems, rootPriority = null, includeTail = false } = {}) {
+  const time = controlledClock();
+  const values = new Map();
+  const store = {
+    async read(key, fallback) { return clone(values.get(key) ?? fallback); },
+    async write(key, value) { values.set(key, clone(value)); },
+  };
+  const records = Array.from({ length: includeTail ? 5 : 4 }, (_, index) => {
+    const item = workItem(501 + index, {
+      type: "role", id: index === 3 ? "pr-reviewer" : "orchestrator",
+    });
+    const event = normalizeWorkflowEvent(index < 3 && rootPriority !== null ? {
+      schemaVersion: 1, eventType: "owner_request.created", occurredAt: item.createdAt,
+      source: { provider: "local-owner", scopeId: "owner-command-center" },
+      subject: { id: `owner-request:00000000-0000-4000-8000-00000000050${index}`,
+        requestId: `00000000-0000-4000-8000-00000000050${index}` },
+      payload: { title: `Scheduled work ${index + 1}`, description: "Complete the owner assignment",
+        workType: "general", priority: rootPriority, acceptanceCriteria: [] },
+    } : {
+      schemaVersion: 1, eventType: "issue.created", occurredAt: item.createdAt,
+      source: { provider: "github", scopeId: "github-dashboard" },
+      subject: { id: `github:issue:acme/repo#${501 + index}`, repository: "acme/repo", number: 501 + index },
+      payload: { title: `Scheduled work ${index + 1}` },
+    });
+    return {
+      sequence: index + 1,
+      assignment: {
+        ...item.assignment, eventId: event.eventId,
+        reason: "scheduled-work", createdAt: item.createdAt,
+      },
+      event,
+    };
+  });
+  let nextId = 0;
+  const ledger = new WorkLedgerService({
+    store, clock: time.clock, idFactory: () => `sweep-lease-${++nextId}`,
+    exclusiveLease: { async run(operation) { return operation(); } },
+    assignmentSource: { async readAssignmentBatch({ afterSequence, limit }) {
+      const items = records.filter(({ sequence }) => sequence > afterSequence).slice(0, limit);
+      return clone({ items, nextSequence: items.at(-1)?.sequence ?? afterSequence,
+        highWatermark: records.length, oldestAvailableSequence: 1 });
+    } },
+  });
+  await ledger.recover();
+  await ledger.intake();
+  const initialItems = (await ledger.listItems()).items;
+  const roots = initialItems.slice(0, 3);
+  const tail = includeTail ? initialItems.at(-1) : null;
+  const children = [];
+  for (const root of roots) {
+    const created = await ledger.createGraphChild({
+      authority: { actorId: "employee-orchestrator", scopeRootTaskId: root.itemId },
+      command: {
+        parentTaskId: root.itemId, childKey: "implementation",
+        work: { title: "Implement assigned work", description: "Prepare a result for root acceptance." },
+        target: { type: "role", id: "developer" }, dependsOnTaskIds: [],
+        acceptanceContract: { revision: 1, acceptanceCriteria: [], expectedDeliverables: [] },
+        leaseId: null, expectedGraphRevision: (await ledger.getSummary()).revision,
+        expectedTaskRevisions: [{ taskId: root.itemId, revision: root.revision }],
+      },
+    });
+    children.push(await ledger.readItemForReconciliation({ itemId: created.taskId }));
+  }
+  const decisions = [];
+  let decideRoot = () => completeDecision();
+  if (listReadinessItems) {
+    const listItems = ledger.listItems.bind(ledger);
+    ledger.listItems = (options) => options.status === undefined
+      ? listReadinessItems(options, listItems) : listItems(options);
+  }
+  const loop = createLoop({
+    ledger, time, taskRuns: new TaskRunRegistry({ store, clock: time.clock,
+      settleControl: createTaskRunSettler({ ledger }) }),
+    directory: new FakeRoleDirectory({
+      orchestrator: worker({ roleId: "orchestrator", async decide({ item }) {
+        decisions.push(item.itemId);
+        return decideRoot(item);
+      } }),
+      developer: worker({ roleId: "developer" }),
+      "pr-reviewer": worker(),
+    }),
+    roleContextAssembler: new RoleContextAssembler({
+      graphReader: { getSnapshot: () => ledger.getGraphSnapshot() },
+    }),
+    orchestratorService: { async execute() { return { applied: true }; } },
+  });
+  return { loop, ledger, roots, tail, children, decisions, records,
+    setRootDecision(decide) { decideRoot = decide; } };
+}
+
+test("unchanged blocked roots complete a fair sweep across role cycles without extra decisions or claims", async () => {
+  const { loop, ledger, roots, decisions } = await blockedRootSweepLoop();
+  const before = await ledger.listItems();
+  for (let index = 0; index < roots.length; index += 1) {
+    const cycle = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+    assert.equal(cycle.workAttempts, 1);
+    assert.equal(cycle.availabilityChecks, 1);
+    assert.equal(cycle.claimAttempts, 0);
+    assert.equal(cycle.claimed, 0);
+    assert.deepEqual(cycle.outcomes.map(({ itemId, status }) => [itemId, status]),
+      [[roots[index].itemId, "graph_blocked"]]);
+    if (index === 0) {
+      const otherRole = await loop.runCycle({ roleId: "pr-reviewer", workLimit: 1 });
+      assert.equal(otherRole.workAttempts, 1);
+      assert.equal(otherRole.claimed, 1);
+    }
+  }
+  assert.deepEqual(decisions, roots.map(({ itemId }) => itemId));
+  const after = await ledger.listItems();
+  assert.deepEqual(after.items.filter((item) => item.currentTarget.id !== "pr-reviewer"),
+    before.items.filter((item) => item.currentTarget.id !== "pr-reviewer"));
+  const retry = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+  assert.equal(retry.workAttempts, 1, "a completed sweep starts its next round on the next role cycle");
+  assert.equal(retry.claimAttempts, 0);
+  assert.equal(decisions.at(-1), roots[0].itemId);
+});
+
+test("a blocked-root sweep reaches lower-priority ready work before retrying earlier roots", async () => {
+  const { loop, roots, tail, decisions } = await blockedRootSweepLoop({ rootPriority: "high", includeTail: true });
+  for (let index = 0; index < 4; index += 1) {
+    const cycle = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+    assert.equal(cycle.workAttempts, 1);
+    assert.deepEqual(cycle.outcomes.map(({ itemId, status }) => [itemId, status]),
+      [[index === 3 ? tail.itemId : roots[index].itemId, index === 3 ? "staged" : "graph_blocked"]]);
+    assert.equal(cycle.claimAttempts, index === 3 ? 1 : 0);
+  }
+  assert.deepEqual(decisions, [...roots, tail].map(({ itemId }) => itemId));
+});
+
+test("changed root or hidden child revisions interrupt a partial blocked-root sweep immediately", async (t) => {
+  for (const changed of ["root", "hidden child", "child completion"]) {
+    await t.test(changed, async () => {
+      const { loop, ledger, roots, children, decisions } = await blockedRootSweepLoop();
+      if (changed === "hidden child") {
+        await ledger.pauseGraphTask({
+          authority: { actorId: "employee-orchestrator", scopeRootTaskId: roots[0].itemId },
+          command: { taskId: children[0].itemId, expectedTaskRevision: children[0].revision,
+            expectedGraphRevision: (await ledger.getSummary()).revision, reason: "Await required input" },
+        });
+      }
+      await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+      const rootBefore = await ledger.readItemForReconciliation({ itemId: roots[0].itemId });
+      const factsBefore = (await ledger.listClaimCandidates({ at: "2026-08-02T08:00:00.000Z" })).facts
+        .find(({ itemId }) => itemId === roots[0].itemId);
+      let changedItem = await ledger.readItemForReconciliation({
+        itemId: changed === "root" ? roots[0].itemId : children[0].itemId,
+      });
+      if (changed === "child completion") {
+        const claim = await ledger.claim({ itemId: changedItem.itemId, expectedRevision: changedItem.revision,
+          workerId: "employee-developer", leaseDurationMs: 120_000 });
+        await ledger.complete({ itemId: claim.itemId, expectedRevision: claim.revision,
+          leaseId: claim.leaseId, actorId: "employee-developer", result: { outcome: "done" } });
+      } else {
+        if (changed === "hidden child") {
+          await ledger.resumeGraphTask({
+            authority: { actorId: "employee-orchestrator", scopeRootTaskId: roots[0].itemId },
+            command: { taskId: changedItem.itemId, expectedTaskRevision: changedItem.revision,
+              expectedGraphRevision: (await ledger.getSummary()).revision, reason: "Revise required input" },
+          });
+          changedItem = await ledger.readItemForReconciliation({ itemId: changedItem.itemId });
+        }
+        await ledger.reviseGraphAcceptance({
+          authority: { actorId: "employee-orchestrator", scopeRootTaskId: roots[0].itemId },
+          command: { taskId: changedItem.itemId, expectedTaskRevision: changedItem.revision,
+            expectedGraphRevision: (await ledger.getSummary()).revision, reason: "Updated acceptance input",
+            acceptanceContract: { revision: 2, expectedDeliverables: [],
+              acceptanceCriteria: [{ criterionId: "updated", description: "Account for new requirements" }] } },
+        });
+        if (changed === "hidden child") {
+          changedItem = await ledger.readItemForReconciliation({ itemId: changedItem.itemId });
+          await ledger.pauseGraphTask({
+            authority: { actorId: "employee-orchestrator", scopeRootTaskId: roots[0].itemId },
+            command: { taskId: changedItem.itemId, expectedTaskRevision: changedItem.revision,
+              expectedGraphRevision: (await ledger.getSummary()).revision, reason: "Await revised input" },
+          });
+        }
+      }
+      if (changed !== "root") {
+        assert.deepEqual(await ledger.readItemForReconciliation({ itemId: roots[0].itemId }), rootBefore);
+      }
+      if (changed === "hidden child") {
+        const candidates = await ledger.listClaimCandidates({ at: "2026-08-02T08:00:00.000Z" });
+        assert.ok(candidates.items.every(({ itemId }) => itemId !== changedItem.itemId));
+        assert.deepEqual(candidates.facts.find(({ itemId }) => itemId === roots[0].itemId), factsBefore,
+          "same-count readiness changes must not depend on aggregate candidate facts");
+      }
+      const cycle = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+      assert.deepEqual(decisions, [roots[0].itemId, roots[0].itemId]);
+      assert.equal(cycle.workAttempts, 1);
+      assert.equal(cycle.claimAttempts, changed === "child completion" ? 1 : 0);
+      assert.equal(cycle.outcomes[0].status, changed === "child completion" ? "staged" : "graph_blocked");
+    });
+  }
+});
+
+test("fresh urgent owner work and productive orchestration remain eligible during blocked-root sweeps", async (t) => {
+  await t.test("new urgent request", async () => {
+    const { loop, ledger, roots, records, decisions } = await blockedRootSweepLoop();
+    await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+    const requestId = "95abc353-8a86-46ba-b710-c01fb58d4a21";
+    const event = normalizeWorkflowEvent({
+      schemaVersion: 1, eventType: "owner_request.created", occurredAt: "2026-08-02T08:00:00.000Z",
+      source: { provider: "local-owner", scopeId: "owner-command-center" },
+      subject: { id: `owner-request:${requestId}`, requestId },
+      payload: { title: "Urgent owner follow-up", description: "Investigate the new incident", priority: "urgent",
+        workType: "general", acceptanceCriteria: [] },
+    });
+    records.push({ sequence: 5, event, assignment: { assignmentId: "urgent-sweep-assignment", eventId: event.eventId,
+      target: { type: "role", id: "orchestrator" }, reason: "owner-request", createdAt: event.occurredAt } });
+    const cycle = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+    assert.equal(cycle.staged, 1);
+    assert.equal(cycle.workAttempts, 1);
+    assert.equal(cycle.claimAttempts, 1);
+    assert.equal(decisions[0], roots[0].itemId);
+    assert.equal(decisions[1], cycle.outcomes[0].itemId);
+    assert.ok(roots.every(({ itemId }) => itemId !== decisions[1]));
+  });
+  await t.test("productive orchestration", async () => {
+    const { loop, roots, decisions, setRootDecision } = await blockedRootSweepLoop();
+    setRootDecision((item) => orchestrationDecision(item));
+    for (let index = 0; index < 3; index += 1) {
+      const cycle = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+      assert.equal(cycle.orchestrated, 1);
+      assert.equal(cycle.workAttempts, 1);
+      assert.equal(cycle.claimAttempts, 0);
+    }
+    assert.deepEqual(decisions, Array(3).fill(roots[0].itemId));
+  });
+});
+
+test("unavailable or inconsistent blocked-root sweep evidence keeps the ordinary decision eligible", async (t) => {
+  for (const failure of ["unavailable", "inconsistent"]) {
+    await t.test(failure, async () => {
+      let failReadiness = false;
+      const { loop, roots, decisions } = await blockedRootSweepLoop({
+        async listReadinessItems(options, listItems) {
+          if (failReadiness && failure === "unavailable") throw new Error("Readiness read unavailable");
+          const page = await listItems(options);
+          if (failReadiness) page.items[0].revision += 1;
+          return page;
+        },
+      });
+      await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+      failReadiness = true;
+      const cycle = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+      assert.deepEqual(decisions, [roots[0].itemId, roots[0].itemId]);
+      assert.equal(cycle.outcomes[0].status, "graph_blocked");
+      assert.equal(cycle.workAttempts, 1);
+      assert.equal(cycle.claimAttempts, 0);
+    });
+  }
 });
 
 test("a superseded child is terminal and does not block root completion", async () => {
