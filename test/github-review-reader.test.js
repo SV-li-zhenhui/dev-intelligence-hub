@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { GitHubReviewReader } from "../src/adapters/github-review-reader.js";
+import { summarizeOwnReviewFeedback } from "../src/adapters/github-own-review-feedback.js";
+import { createOriginalRepairFeedbackSnapshot } from "../src/domain/original-repair-feedback.js";
 
 const TARGET = { pullRequestNumber: 42, gitTarget: {
   schemaVersion: 1, provider: "github", sourceAccountId: "reviewer",
@@ -80,6 +82,55 @@ async function tool(session, name, args) {
   if (result.isError) throw Object.assign(new Error(result.content[0].text), { code: result.content[0].text });
   return JSON.parse(result.content[0].text);
 }
+
+test("internal repair review pages the immutable original defect and every thread beside the current Head", async (t) => {
+  const originalHead = "c".repeat(40);
+  const { feedback, reviewFeedbackDigest } = summarizeOwnReviewFeedback({ reviews: [], threads: Array.from({ length: 10 }, (_, index) => ({
+    id: `thread-${index}`, path: `src/${index}.js`, line: index + 1, isResolved: false, isOutdated: false,
+    comments: [
+      { id: `defect-${index}`, author: { login: "external-reviewer" }, body: `Original defect ${index}: ${"details ".repeat(1_000)}`,
+        createdAt: "2026-10-10T01:00:00Z", updatedAt: "2026-10-10T01:00:00Z", pullRequestReview: { state: "COMMENTED", commit: { oid: originalHead } } },
+      { id: `reply-${index}`, author: { login: "author" }, body: `Author reply ${index}: fixed`,
+        createdAt: "2026-10-10T02:00:00Z", updatedAt: "2026-10-10T02:00:00Z", pullRequestReview: { state: "COMMENTED", commit: { oid: originalHead } } },
+    ],
+  })) }, "author");
+  const snapshot = createOriginalRepairFeedbackSnapshot({ repository: "acme/repo", number: 42,
+    context: { schemaVersion: 1, headRefOid: originalHead, reviewFeedbackDigest, feedback },
+    provenance: { kind: "captured_before_repair", observedHeadRefOid: originalHead, observedAt: "2026-10-10T03:00:00.000Z" } });
+  const descriptor = { snapshotId: snapshot.snapshotId, feedbackDigest: reviewFeedbackDigest,
+    originalHeadRefOid: originalHead, reviewHeadRefOid: TARGET.gitTarget.headRefOid };
+  const f = fixture({ changed: 1 }); let reads = 0;
+  f.reader.originalRepairFeedbackReader = { async read(request) {
+    reads++; assert.equal(request.snapshotId, snapshot.snapshotId); return snapshot;
+  } };
+  const session = await f.reader.open({ ...TARGET, repairFeedback: descriptor }); t.after(() => session.close());
+  for (const document of ["review-manifest.json", "review.diff", "repair-feedback-manifest.json"]) {
+    await tool(session, "read_document", { document, offset: 0, length: 48_000 });
+  }
+  await assert.rejects(session.assertComplete(), { code: "PR_REVIEW_READ_INCOMPLETE" });
+  const first = await tool(session, "read_document", { document: "repair-feedback.json", offset: 0, length: 1_000 });
+  assert.ok(first.nextOffset); await assert.rejects(session.assertComplete(), { code: "PR_REVIEW_READ_INCOMPLETE" });
+  let text = first.text, offset = first.nextOffset;
+  while (offset !== null) { const next = await tool(session, "read_document", { document: "repair-feedback.json", offset, length: 8_000 }); text += next.text; offset = next.nextOffset; }
+  const original = JSON.parse(text);
+  assert.equal(original.feedback.threads.length, 10);
+  assert.match(original.feedback.threads[9].comments[0].body, /Original defect 9/);
+  assert.match(original.contextualObservations[9].discussion.at(-1).body, /Author reply 9/);
+  assert.equal(original.originalHeadRefOid, originalHead);
+  assert.equal(JSON.parse((await tool(session, "read_document", { document: "repair-feedback-manifest.json", offset: 0 })).text).reviewHeadRefOid,
+    TARGET.gitTarget.headRefOid);
+  await session.assertComplete(); assert.equal(reads, 1);
+});
+
+test("repair feedback cannot be substituted, omitted, or bound to another review Head", async () => {
+  const target = { ...TARGET, repairFeedback: { snapshotId: `repair-feedback-snapshot-${"a".repeat(64)}`,
+    feedbackDigest: "f".repeat(64), originalHeadRefOid: "c".repeat(40), reviewHeadRefOid: TARGET.gitTarget.headRefOid } };
+  await assert.rejects(fixture({ changed: 1 }).reader.open(target), { code: "OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE" });
+  const substituted = fixture({ changed: 1 }); substituted.reader.originalRepairFeedbackReader = { async read() { return {}; } };
+  await assert.rejects(substituted.reader.open(target), { code: "OWN_PR_REPAIR_ORIGINAL_FEEDBACK_INVALID" });
+  await assert.rejects(fixture({ changed: 1 }).reader.open({ ...target,
+    repairFeedback: { ...target.repairFeedback, reviewHeadRefOid: "9".repeat(40) } }), /feedback Head is invalid/);
+});
 
 test("native skill resources are scoped to this reader and must be read before a review completes", async (t) => {
   const skillDocuments = { "review-skill/SKILL.md": "Follow the native review procedure.", "review-skill/manifest.json": "{}", "review-skill/references/correctness.md": "Trace boundary conditions." };

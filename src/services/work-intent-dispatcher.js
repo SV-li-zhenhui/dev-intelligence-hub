@@ -959,6 +959,7 @@ export class WorkIntentDispatcher {
   #dispatcherId;
   #leaseDurationMs;
   #retryDelayMs;
+  #readInternalReviewHandoff;
 
   constructor({
     ledger,
@@ -978,6 +979,8 @@ export class WorkIntentDispatcher {
       typeof ledger?.verifyPullRequestExecutionBinding === "function"
         ? ledger.verifyPullRequestExecutionBinding.bind(ledger)
         : null;
+    this.#readInternalReviewHandoff = typeof ledger?.readInternalReviewHandoff === "function"
+      ? ledger.readInternalReviewHandoff.bind(ledger) : null;
     this.#ledger = validateDependency(
       ledger,
       [
@@ -1357,6 +1360,9 @@ export class WorkIntentDispatcher {
           );
         }
       }
+      const internalReview = this.#readInternalReviewHandoff === null || requester.roleId !== "pr-engineer" ||
+        !["propose_github_review", "propose_github_pull_request_action"].includes(claimed.intent.type) ? null
+        : await this.#readInternalReviewHandoff({ itemId: item.itemId });
       const bindingPlan = await this.#admitAction(() => {
         let plannedBound;
         try {
@@ -1372,6 +1378,7 @@ export class WorkIntentDispatcher {
               roleId: requester.roleId,
               event: currentWorkItemEvent(item),
               inputBinding,
+              ...(internalReview === null ? {} : { internalReview: true }),
               ...(executionSource === undefined ? {} : { executionSource }),
               ...(controlledCommitEvidence === undefined
                 ? {}

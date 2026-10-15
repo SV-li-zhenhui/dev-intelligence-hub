@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import {spawn} from 'node:child_process';
+import { mkdtemp, readFile, rm,writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -16,6 +17,25 @@ import {
 const WINDOWS_JOB_OBJECT_SKIP = process.platform !== "win32"
   ? "requires Windows Job Object process supervision"
   : false;
+
+test('Windows supervisor death immediately after child creation cannot leave a suspended orphan', {skip:WINDOWS_JOB_OBJECT_SKIP,timeout:30000},async t=>{
+  const directory=await temporaryDirectory(t,'supervised-runner-create-atomic-');
+  const pidFile=path.join(directory,'created-child-pid.txt');
+  const wrapperFile=path.join(directory,'instrumented-wrapper.ps1');
+  const source=await readFile(new URL('../src/lib/windows-process-tree-wrapper.ps1',import.meta.url),'utf8');
+  assert.ok(source.includes('processCreated = true;'));
+  const instrumented=source.replace('processCreated = true;',`processCreated = true;\n                File.WriteAllText(${JSON.stringify(pidFile)}, process.dwProcessId.ToString());\n                Thread.Sleep(30000);`);
+  await writeFile(wrapperFile,instrumented);
+  let wrapper,childPid;
+  const runner=testRunner({windowsWrapperPath:wrapperFile,spawnImpl(...args){wrapper=spawn(...args);return wrapper;}});
+  const running=runner.run(request(directory,'setInterval(()=>{},1000)',{timeoutMs:20000})).catch(error=>error);
+  t.after(async()=>{if(wrapper && processExists(wrapper.pid))wrapper.kill('SIGKILL');if(childPid && processExists(childPid))process.kill(childPid,'SIGKILL');await running;});
+  childPid=Number(await waitForMarker(pidFile,{timeoutMs:15000}));
+  assert.ok(Number.isSafeInteger(childPid) && childPid>0);
+  assert.equal(wrapper.kill('SIGKILL'),true);
+  assert.equal(await waitForProcessExit(childPid),true,'created child must already belong to kill-on-close job before user-mode assignment could run');
+  await running;
+});
 
 async function temporaryDirectory(t, prefix) {
   const directory = await mkdtemp(path.join(tmpdir(), prefix));

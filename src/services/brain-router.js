@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
+import { admissionEntityKeyForRequest, normalizeAdmissionEntityKey } from "../lib/model-admission-identity.js";
 import { normalizeSessionKey } from "../lib/session-key.js";
 import { isCodeReadContext } from "../lib/code-read-context.js";
 import { isCodeExecutionContext } from "../lib/code-execution-context.js";
@@ -148,6 +149,8 @@ function normalizeProvider(value) {
     "singleAttempt",
   );
   const availability = value.checkAvailability;
+  const admission = value.withAdmission;
+  if (admission !== undefined && typeof admission !== 'function') throw new TypeError('brain provider admission is invalid');
   if (
     attemptDescriptor &&
     (!("value" in attemptDescriptor) ||
@@ -186,6 +189,7 @@ function normalizeProvider(value) {
       ? { sessionIsolationKey: value.sessionIsolationKey }
       : {}),
     generate: value.generate.bind(value),
+    ...(admission ? {withAdmission:admission.bind(value)} : {}),
     ...(availability
       ? { checkAvailability: availability.bind(value) }
       : {}),
@@ -253,6 +257,7 @@ export class BrainRouter {
     schema,
     dataClasses = [],
     sessionKey: sessionKeyValue = null,
+    admissionEntityKey: admissionEntityKeyValue = null,
     signal = null,
     reviewTarget = null,
     codeReadContext = null,
@@ -303,6 +308,9 @@ export class BrainRouter {
         );
       }
     }
+    const admissionEntityKey = provider.withAdmission ? admissionEntityKeyForRequest({
+      admissionEntityKey: admissionEntityKeyValue, sessionKey: sessionKeyValue, reviewTarget,
+    }) : null;
     return provider.generate({
       model: brain.model,
       ...(brain.reasoningEffort
@@ -313,6 +321,7 @@ export class BrainRouter {
       ...(reviewTarget !== null && provider.supportsReviewReading ? { reviewTarget } : {}),
       ...(codeReadContext === null ? {} : { codeReadContext }),
       ...(codeExecutionContext === null ? {} : { codeExecutionContext }),
+      ...(admissionEntityKey === null ? {} : { admissionEntityKey }),
       ...(sessionKeyValue === null || !provider.supportsEntitySessions
         ? {}
         : { sessionKey: authorizedSessionKey(sessionKeyValue, provider, brain, classes) }),
@@ -335,6 +344,15 @@ export class BrainRouter {
     await provider.checkAvailability({
       ...(requestSignal ? { signal: requestSignal } : {}),
     });
+  }
+
+  async withAdmission(brainValue, {entityKey, signal = null} = {}, operation) {
+    const brain = normalizeBrainConfig(brainValue);
+    const provider = this.#provider(brain.provider);
+    const requestSignal = normalizeAbortSignal(signal);
+    requestSignal?.throwIfAborted();
+    if (typeof operation !== 'function') throw new TypeError('admission operation is invalid');
+    return provider.withAdmission ? provider.withAdmission({entityKey:normalizeAdmissionEntityKey(entityKey),signal:requestSignal},operation) : operation();
   }
 
   describe(brainValue) {

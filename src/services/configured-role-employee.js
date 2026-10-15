@@ -8,6 +8,7 @@ import {
   RoleDecisionEngine,
 } from "./role-decision-engine.js";
 import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
+import { githubEntitySessionKey } from '../lib/session-key.js';
 
 const SAFE_STATE_KEY = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
@@ -260,6 +261,8 @@ function requireDecisionEngine(value) {
     throw new TypeError("decisionEngine is invalid");
   }
   const availability = value.checkAvailability;
+  const admission=value.withAdmission;
+  if(admission!==undefined && typeof admission!=='function')throw new TypeError('decisionEngine admission is invalid');
   if (availability !== undefined && typeof availability !== "function") {
     throw new TypeError("decisionEngine is invalid");
   }
@@ -269,6 +272,7 @@ function requireDecisionEngine(value) {
     checkAvailability: availability
       ? availability.bind(value)
       : async () => {},
+    withAdmission: admission ? admission.bind(value) : (_request,operation) => operation(),
   });
 }
 
@@ -518,6 +522,7 @@ export class ConfiguredRoleEmployee {
       workerId: this.workerId,
       view: this.workerView.bind(this),
       checkAvailability: this.checkAvailability.bind(this),
+      withDecisionAdmission: this.withDecisionAdmission.bind(this),
       decide: this.decide.bind(this),
     });
     Object.freeze(this);
@@ -625,6 +630,23 @@ export class ConfiguredRoleEmployee {
     throwIfDecisionAborted(signal);
     await this.#assertRoleUnchanged(before, signal);
     return decision;
+  }
+
+  async withDecisionAdmission(input, operation) {
+    const signal = decisionSignal(input);
+    const before = await this.#activeRole(signal);
+    const engine = this.#decisionEngineFor(input);
+    const item = input?.item;
+    const event = item ? currentWorkItemEvent(item) : null;
+    const kind = event?.eventType?.startsWith('pull_request.') ? 'pull_request' : event?.eventType?.startsWith('issue.') ? 'issue' : null;
+    const entityKey = kind && typeof event.subject?.repository === 'string' && Number.isSafeInteger(event.subject?.number) && event.subject.number > 0
+      ? githubEntitySessionKey({kind,repository:event.subject.repository,number:event.subject.number})
+      : `work-item:${item?.itemId ?? this.workerId}`;
+    return engine.withAdmission({entityKey,signal}, async () => {
+      throwIfDecisionAborted(signal);
+      await this.#assertRoleUnchanged(before,signal);
+      return operation();
+    });
   }
 
   asRoleWorker() {

@@ -380,6 +380,7 @@ async function assemble(fixture, options = {}) {
     ...(options.failedCodeJobContextReader
       ? { failedCodeJobContextReader: options.failedCodeJobContextReader }
       : {}),
+    ...(options.internalReviewHandoffReader ? { internalReviewHandoffReader: options.internalReviewHandoffReader } : {}),
   });
   const roleId = options.roleId ?? "developer";
   return assembler.assemble({
@@ -617,6 +618,24 @@ test("adds only a validated persisted agent answer to the memory data class", as
   }]);
   assert.equal(Object.isFrozen(packet.context.memory.agentQuery), true);
   assert.match(packet.contextDigest, /^[a-f0-9]{64}$/);
+});
+
+test("internal review receives the server handoff as unverified developer evidence for the current Head", async () => {
+  const fixture = graphFixture({ pullRequest: true });
+  fixture.item.currentTarget.id = "pr-engineer";
+  fixture.snapshot.graph.tasks.find((task) => task.taskId === fixture.item.itemId).responsibility.id = "pr-engineer";
+  const handoff = { kind: "developer_handoff", headRefOid: "abc123", brief: "Verify the existing repair", evidence: ["developer-report:1"], evidenceAuthority: "developer_report" };
+  const options = { roleId: "pr-engineer", internalReviewHandoffReader: { async read(input) {
+    assert.deepEqual(input, { itemId: fixture.item.itemId });
+    return structuredClone(handoff);
+  } } };
+  const packet = await assemble(fixture, options);
+  assert.deepEqual(packet.context.code.internalReview, handoff);
+  assert.equal(packet.context.code.authoritativeEvidence, undefined);
+  handoff.headRefOid = "old-head";
+  await assert.rejects(assemble(fixture, options), { code: "ROLE_CONTEXT_STALE" });
+  const developer = graphFixture({ pullRequest: true });
+  await assemble(developer, { internalReviewHandoffReader: { read() { throw new Error("not a reviewer"); } } });
 });
 
 test("classifies PR source and fresh facts as code while keeping requirements present", async () => {

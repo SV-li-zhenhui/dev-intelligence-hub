@@ -1,4 +1,5 @@
 import nodePath from "node:path";
+import { isWindowsTestProfile, normalizeWindowsTestProfile } from "./windows-test-profile.js";
 import { types as utilTypes } from "node:util";
 
 import {
@@ -82,6 +83,7 @@ const PROVIDER_FIELDS = Object.freeze([
   "protocol",
   "responseFormat",
   "credentialMode",
+  "maxConcurrentTurns",
   "timeoutMs",
   "maxResponseBytes",
   "maxRequestBytes",
@@ -547,6 +549,12 @@ function normalizeProvider(value, path, id) {
       throw invalid(path, "CLI 大脑字段组合无效");
     }
     const normalized = { kind, remote: true };
+    if (Object.hasOwn(config, "maxConcurrentTurns")) {
+      if (kind !== "codex-cli" || config.credentialMode !== "codex-native-login") {
+        throw invalid(`${path}.maxConcurrentTurns`, "并发容量仅用于原生 Codex 登录");
+      }
+      normalized.maxConcurrentTurns = integer(config.maxConcurrentTurns, `${path}.maxConcurrentTurns`, 1, 4);
+    }
     if (Object.hasOwn(config, "credentialMode")) {
       const credentialMode = text(config.credentialMode, `${path}.credentialMode`, 32);
       if (
@@ -572,6 +580,7 @@ function normalizeProvider(value, path, id) {
   if (Object.hasOwn(config, "credentialMode")) {
     throw invalid(`${path}.credentialMode`, "仅 CLI 大脑支持认证方式");
   }
+  if (Object.hasOwn(config, "maxConcurrentTurns")) throw invalid(`${path}.maxConcurrentTurns`, "并发容量仅用于原生 Codex 登录");
   if (!Object.hasOwn(config, "baseUrl")) {
     throw invalid(`${path}.baseUrl`, "缺少必需字段");
   }
@@ -822,7 +831,7 @@ function normalizeCodeExecutor(value) {
   const enabled = boolean(config.enabled, `${path}.enabled`);
   if (
     enabled &&
-    ["docker", "workspaces", "profiles", "requiredProfilesByWorkspace"].some(
+    ["workspaces", "profiles", "requiredProfilesByWorkspace"].some(
       (name) => !Object.hasOwn(config, name),
     )
   ) {
@@ -947,6 +956,10 @@ function normalizeCodeExecutor(value) {
       (profile, profilePath, id) => {
         text(id, profilePath, 64, { pattern: SAFE_PROFILE_ID });
         profileIds.add(id);
+        if (isWindowsTestProfile(profile)) {
+          try { return normalizeWindowsTestProfile(profile); }
+          catch { throw invalid(profilePath, "Windows 测试资产或执行文件绑定无效"); }
+        }
         const isScript = profile?.kind === "node-script";
         const item = fields(
           profile,
@@ -1007,6 +1020,9 @@ function normalizeCodeExecutor(value) {
       { maximum: 100 },
     );
     if (enabled && profileIds.size === 0) throw invalid(`${path}.profiles`);
+    if (enabled && Object.values(normalized.profiles).some((profile) => !isWindowsTestProfile(profile)) && !Object.hasOwn(normalized, "docker")) {
+      throw invalid(`${path}.docker`, "Docker profiles 缺少执行器边界配置");
+    }
   }
   if (Object.hasOwn(config, "requiredProfilesByWorkspace")) {
     normalized.requiredProfilesByWorkspace = namedMap(
@@ -1529,6 +1545,10 @@ function normalizeGithubRead(value) {
 
 function assertProviderReferences(document) {
   const providers = new Set(Object.keys(document.brainProviders));
+  const nativeCapacities = new Set(Object.values(document.brainProviders)
+    .filter((provider) => provider.kind === "codex-cli" && provider.credentialMode === "codex-native-login")
+    .map((provider) => provider.maxConcurrentTurns ?? 1));
+  if (nativeCapacities.size > 1) throw invalid("brainProviders", "共享原生 Codex 登录的并发容量必须一致");
   const references = [
     ["brain.provider", document.brain.provider],
     ...Object.entries(document.employees.roles).flatMap(([id, role]) => [
@@ -1806,6 +1826,9 @@ function authorityDirection(change) {
       tightening: before !== after,
       expansion: before !== after,
     };
+  }
+  if (path.startsWith("brainProviders.") && path.endsWith(".maxConcurrentTurns")) {
+    return { tightening: (after ?? 1) < (before ?? 1), expansion: (after ?? 1) > (before ?? 1) };
   }
   const providerIdentity =
     path.startsWith("brainProviders.") &&

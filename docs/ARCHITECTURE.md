@@ -198,6 +198,38 @@ production activation and real PR acceptance. See
 
 ## Confirmation and side effects
 
+Native model admission reserves bounded capacity before claiming role work.
+Capacity waits do not consume model execution time or work attempts; different
+entities may use explicitly validated capacity while one entity remains serial.
+The admission key identifies the PR independently of its authorization session,
+so role preclaims and direct code-job calls cannot run that PR concurrently.
+Task execution receipts persist bounded phase, activity, native session and stop
+metadata without conversation or progress bodies. Open receipts recover as
+unknown after restart; metadata is not proof that a process has stopped.
+Failed receipt writes retain their bounded pending batch for the next operation;
+versioned updates and durable rereads prevent an uncertain acknowledgement from
+overwriting newer observations. Corrupt persisted state fails closed.
+
+Completed repair publication records a deterministic internal review delivery in
+the same durable update. Recovery submits that delivery without replaying push.
+The internal source binds publication, controlled commit and current Head and
+routes to the PR engineer. Developer reports remain unverified inputs, and the
+policy rejects external GitHub actions from internal review.
+Before repair, the service captures the complete original review feedback with
+its digest and original Head. Internal review reads that immutable snapshot and
+the repaired diff through the private paginated reader; native and supervised
+Codex terminal decisions require complete reads. Snapshots are immutable archive
+records; hot repair/publication rows retain digest-bound references. Archive
+readback precedes the hot-state update, so uncertain writes preserve the old
+inline copy. Schema 1 remains readable and restore validates every referenced
+archive before writing any migration. The reader works when repair automation is off.
+
+Delivered Head-bound fact waits can be superseded when newer PR code arrives;
+explicit time waits and unknown side effects remain fenced. Lost Review
+references recover only an exactly bound historical confirmation. Completed
+receipts can settle a previously misclassified stale root without republishing
+the Review or changing its recorded history.
+
 Human-only operations enter one durable confirmation queue. A request is bound
 to its revision, digest, actor, source provenance, and target identity. The UI
 shows one request at a time and cannot replace server-owned payloads. Stale or

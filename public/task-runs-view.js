@@ -18,7 +18,7 @@ function phaseLabel(task) {
   if (task.pendingCommand === "pause") return task.live ? "暂停请求已提交，等待停止确认" : "暂停请求已提交，等待检查点";
   if (task.pendingCommand === "cancel") return task.live ? "取消请求已提交，等待停止确认" : "取消请求已提交，等待检查点";
   if (task.phase === "waiting_checkpoint") return "补充要求等待检查点";
-  return { running: "正在运行", paused: "已暂停", cancelled: "已取消", completed:"已完成", failed:"已失败", fenced:"已隔离，等待维护", idle: "等待后续调度" }[task.phase] || "状态待确认";
+  return { preparing:'准备启动',starting_model:'准备启动模型',waiting_model:'等待模型资源，尚未启动',unknown:'恢复后状态未知',running: "正在运行", paused: "已暂停", cancelled: "已取消", completed:"已完成", failed:"已失败", fenced:"已隔离，等待维护", idle: "等待后续调度" }[task.phase] || "状态待确认";
 }
 
 function timeMarkup(value) {
@@ -29,13 +29,15 @@ function taskRow(task) {
   return `<li><button type="button" class="task-run-row" data-task-run-kind="${escapeHtml(task.kind)}" data-task-run-id="${escapeHtml(task.taskId)}">
     <span class="task-run-row-title"><strong>${escapeHtml(task.title || task.taskId)}</strong><span class="status-pill">${escapeHtml(phaseLabel(task))}</span></span>
     <span>${escapeHtml(task.roleId)} · ${escapeHtml(task.subject || "无关联对象")}</span>
-    <span>开始于 ${timeMarkup(task.startedAt)} · 优先级：${escapeHtml(priorities[task.priority] || "未知")}</span>
+    <span>${['waiting_model','preparing','starting_model'].includes(task.phase)?'登记于':'开始于'} ${timeMarkup(task.startedAt ?? task.queuedAt)} · 优先级：${escapeHtml(priorities[task.priority] || "未知")}</span>
     ${task.progress ? `<span>${escapeHtml(task.progress)}</span>` : ""}
   </button></li>`;
 }
 
-export function renderTaskRuns({ loaded = false, loading = false, enabled = false, items = [], held = [], background = [], error = "" } = {}) {
-  const active = items.filter((task) => task.active === true);
+export function renderTaskRuns({ loaded = false, loading = false, enabled = false, items = [], held = [], background = [], recent = [], error = "" } = {}) {
+  const queued=items.filter(task=>task.active===true && task.phase==='waiting_model');
+  const preparing=items.filter(task=>task.active===true && ['preparing','starting_model'].includes(task.phase));
+  const active = items.filter((task) => task.active === true && !['waiting_model','preparing','starting_model'].includes(task.phase));
   const paused = held.filter((task) => task.active !== true);
   return `<div class="section-heading task-runs-heading"><h2 id="task-runs-title">当前运行任务</h2>
     <button type="button" class="secondary-button" data-task-runs-refresh ${loading ? "disabled" : ""}>${loading ? "读取中…" : "刷新任务"}</button></div>
@@ -44,11 +46,15 @@ export function renderTaskRuns({ loaded = false, loading = false, enabled = fals
     ${loaded && !enabled ? '<p class="task-runs-empty">当前服务未启用运行任务控制。</p>' : ""}
     ${enabled || !loaded ? `<div class="task-runs-groups"><div><h3>正在运行 · ${active.length}</h3>
       ${active.length ? `<ul class="task-runs-list">${active.map(taskRow).join("")}</ul>` : `<p class="task-runs-empty">${loaded ? "当前没有正在运行的模型任务。" : "正在读取运行任务…"}</p>`}</div>
+      ${queued.length?`<div><h3>等待模型 · ${queued.length}</h3><ul class="task-runs-list">${queued.map(taskRow).join('')}</ul></div>`:''}
+      ${preparing.length?`<div><h3>准备启动 · ${preparing.length}</h3><ul class="task-runs-list">${preparing.map(taskRow).join('')}</ul></div>`:''}
       ${paused.length ? `<div class="task-runs-held"><h3>暂停与待确认 · ${paused.length}</h3><ul class="task-runs-list">${paused.map(taskRow).join("")}</ul></div>` : ""}
-      ${background.length ? `<div class="task-runs-background"><h3>后台作业 · ${background.length}</h3><p class="task-runs-hint">作业尚未结束，当前未在执行模型回合。点击查看已记录的进展。</p><ul class="task-runs-list">${background.map(taskRow).join("")}</ul></div>` : ""}</div>` : ""}`;
+      ${background.length ? `<div class="task-runs-background"><h3>后台作业 · ${background.length}</h3><p class="task-runs-hint">作业尚未结束，当前未在执行模型回合。点击查看已记录的进展。</p><ul class="task-runs-list">${background.map(taskRow).join("")}</ul></div>` : ""}
+      ${recent.length?`<div><h3>最近执行 · ${recent.length}</h3><ul class="task-runs-list">${recent.map(taskRow).join('')}</ul></div>`:''}</div>` : ""}`;
 }
 
 function deliveryMarkup(task) {
+  if(task.receipt && task.readOnly)return '执行凭据只保留开始、活动、终态和会话标识，无对话正文。状态未知时需要核对原生进程，不能据此推定已停止。';
   if (task.readOnly) return "后台作业详情只读；当前没有可微调的 CLI 回合。模型开始下一步骤后，可打开当前会话并补充要求。";
   if (task.instructionReceipt === "failed") return "实时引导未确认送达；补充要求已保存，将在安全检查点续接，请先核对已提交的要求。";
   if (task.live === true) {
@@ -75,10 +81,11 @@ export function renderTaskRunSummary(task) {
     <dl class="task-run-metadata">
       <div><dt>岗位</dt><dd>${escapeHtml(task.roleId)}</dd></div>
       <div><dt>关联对象</dt><dd>${escapeHtml(task.subject || "无")}</dd></div>
-      <div><dt>开始时间</dt><dd>${timeMarkup(task.startedAt)}</dd></div>
+      <div><dt>${['waiting_model','preparing','starting_model'].includes(task.phase)?'登记时间':'开始时间'}</dt><dd>${timeMarkup(task.receipt?.modelStartedAt ?? task.startedAt ?? task.queuedAt)}</dd></div>
       <div><dt>优先级</dt><dd>${escapeHtml(priorities[task.priority] || "未知")}</dd></div>
       <div><dt>${task.readOnly ? "作业修订" : "控制修订"}</dt><dd>${escapeHtml(task.revision)}${task.readOnly ? "" : ` · 已交给模型的修订 ${escapeHtml(task.appliedRevision)}`}</dd></div>
       ${task.lastActivityAt ? `<div><dt>最近活动</dt><dd>${timeMarkup(task.lastActivityAt)}</dd></div>` : ""}
+      ${task.receipt?.finishedAt?`<div><dt>结束时间</dt><dd>${timeMarkup(task.receipt.finishedAt)}</dd></div>`:''}
     </dl>
     ${task.progress ? `<p class="task-run-progress">${escapeHtml(task.progress)}</p>` : ""}
     <p class="task-run-delivery">${escapeHtml(deliveryMarkup(task))}</p>
@@ -170,7 +177,7 @@ export function createTaskRunsController({
   setTimeoutImpl = globalThis.setTimeout,
   clearTimeoutImpl = globalThis.clearTimeout,
 } = {}) {
-  const state = { loaded: false, loading: false, enabled: false, items: [], held: [], background: [], error: "",
+  const state = { loaded: false, loading: false, enabled: false, items: [], held: [], background: [], recent:[], error: "",
     selected: null, detail: null, detailLoading: false, detailStale: false, detailError: "",
     submitting: false, notice: "", draft: { instruction: "", priority: "normal" } };
   const drafts = new Map();
@@ -211,8 +218,8 @@ export function createTaskRunsController({
       try {
         const body = await readResponse(await fetchImpl("/api/task-runs", { cache: "no-store" }));
         if (typeof body.enabled !== "boolean" || !Array.isArray(body.items) || !Array.isArray(body.held) ||
-            (body.background !== undefined && !Array.isArray(body.background))) throw new Error("运行任务列表格式无效");
-        Object.assign(state, { loaded: true, enabled: body.enabled, items: body.items, held: body.held, background: body.background || [], error: "" });
+            (body.background !== undefined && !Array.isArray(body.background)) || (body.recent !== undefined && !Array.isArray(body.recent))) throw new Error("运行任务列表格式无效");
+        Object.assign(state, { loaded: true, enabled: body.enabled, items: body.items, held: body.held, background: body.background || [],recent:body.recent||[], error: "" });
       } catch (error) { state.error = error.message; }
       finally { state.loading = false; listRequest = null; notify(); }
     })();
@@ -272,6 +279,7 @@ export function createTaskRunsController({
     state.items = state.items.filter((task) => identity(task) !== key);
     state.held = state.held.filter((task) => identity(task) !== key);
     state.background = state.background.filter((task) => identity(task) !== key);
+    state.recent = state.recent.filter((task) => identity(task) !== key);
     if (detail.active) state.items.push(detail);
     else if (detail.phase === "paused" || detail.pendingCommand) state.held.push(detail);
   }

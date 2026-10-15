@@ -1231,7 +1231,7 @@ function activeAutomationTestSource(profileId) {
     activeConfigurationDocument()?.codeExecutor?.profiles?.[profileId],
   );
   const asset = plainRecord(profile?.asset);
-  return profile?.kind === "node-script" && typeof asset?.source === "string"
+  return ["node-script", "windows-test", "windows-build"].includes(profile?.kind) && typeof asset?.source === "string"
     ? asset.source
     : "";
 }
@@ -1257,10 +1257,10 @@ function automationTestsView() {
   const pendingAssets = Object.values(
     plainRecord(pendingConfiguration?.codeExecutor?.profiles) || {},
   ).filter(
-    (profile) => profile?.kind === "node-script" && plainRecord(profile.asset),
+    (profile) => ["node-script", "windows-test", "windows-build"].includes(profile?.kind) && plainRecord(profile.asset),
   ).length;
   const assets = Object.entries(profiles)
-    .filter(([, profile]) => profile?.kind === "node-script" && plainRecord(profile.asset))
+    .filter(([, profile]) => ["node-script", "windows-test", "windows-build"].includes(profile?.kind) && plainRecord(profile.asset))
     .sort(([left], [right]) => left.localeCompare(right, "zh-CN"));
   const activeVersion = Number.isSafeInteger(runtimeVersion) ? runtimeVersion : null;
   const rows = assets.map(([profileId, profile]) => {
@@ -1292,7 +1292,8 @@ function automationTestsView() {
       <p>${escapeHtml(asset.description)}</p>
       <dl>
         <div><dt>资产版本</dt><dd>v${escapeHtml(asset.version)}</dd></div>
-        <div><dt>运行镜像</dt><dd><code>${escapeHtml(profile.image)}</code></dd></div>
+        <div><dt>${profile.kind.startsWith("windows-") ? "Windows 运行程序" : "运行镜像"}</dt><dd><code>${escapeHtml(profile.nodeExecutable || profile.image)}</code></dd></div>
+        ${profile.kind === "windows-build" ? "<div><dt>验证类型</dt><dd>构建（不计为测试通过）</dd></div>" : ""}
         <div><dt>超时</dt><dd>${escapeHtml(profile.timeoutMs)} ms</dd></div>
         <div><dt>工作区</dt><dd>${workspaceIds.length ? workspaceIds.map(escapeHtml).join("、") : "未绑定"}</dd></div>
         <div><dt>自动复用仓库</dt><dd>${repositories.length ? repositories.map(escapeHtml).join("、") : "绑定工作区后生效"}</dd></div>

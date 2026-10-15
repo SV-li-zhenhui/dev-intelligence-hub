@@ -4,6 +4,7 @@ import { runCommand, runJson } from "../lib/command-runner.js";
 import { normalizeReviewReadTarget } from "../domain/review-read-target.js";
 import { samePullRequestGitTarget } from "../domain/git-tool-contract.js";
 import { readGitHubCurrentPullRequestTarget } from "./github-current-pull-request-target.js";
+import { normalizeOriginalRepairFeedbackSnapshot } from "../domain/original-repair-feedback.js";
 
 function failure(code) {
   return Object.assign(new Error(code), { code });
@@ -47,9 +48,10 @@ for (const tool of TOOLS) tool.annotations = { readOnlyHint: true, destructiveHi
 // GitHub credentials stay in the parent. The CLI receives only this invocation's
 // read endpoint, bound to one PR and immutable commit IDs, with no write tools.
 export class GitHubReviewReader {
-  constructor({ run = runJson, runText = runCommand } = {}) {
+  constructor({ run = runJson, runText = runCommand, originalRepairFeedbackReader = null } = {}) {
     this.run = run;
     this.runText = runText;
+    this.originalRepairFeedbackReader = originalRepairFeedbackReader;
   }
 
   async open(rawTarget, { signal = null, skillDocuments = {} } = {}) {
@@ -104,9 +106,24 @@ export class GitHubReviewReader {
     await checkTarget();
     const finalAccount = await this.run("gh", api("user"), options);
     if (finalAccount.login?.toLowerCase() !== git.sourceAccountId) throw failure("PR_REVIEW_READ_ACCOUNT_CHANGED");
-    const manifestText = JSON.stringify({ repository: git.baseRepository, pullRequestNumber: target.pullRequestNumber, base: git.baseRefOid, head: git.headRefOid, changedFiles: files.length, files }, null, 2);
-    const documents = { "review-manifest.json": manifestText, "review.diff": diffText, ...Object.fromEntries(skills) };
-    const requiredDocuments = ["review-manifest.json", "review.diff", ...skills.filter(([name]) => ["review-skill/SKILL.md", "review-skill/manifest.json"].includes(name)).map(([name]) => name)];
+    let feedbackDocuments = {};
+    if (target.repairFeedback) {
+      if (typeof this.originalRepairFeedbackReader?.read !== "function") throw failure("OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE");
+      const descriptor = target.repairFeedback;
+      const snapshot = normalizeOriginalRepairFeedbackSnapshot(await this.originalRepairFeedbackReader.read({ snapshotId: descriptor.snapshotId,
+        repository: git.baseRepository, number: target.pullRequestNumber, feedbackDigest: descriptor.feedbackDigest,
+        originalHeadRefOid: descriptor.originalHeadRefOid }));
+      if (snapshot.snapshotId !== descriptor.snapshotId || snapshot.repository !== git.baseRepository || snapshot.number !== target.pullRequestNumber ||
+          snapshot.feedbackDigest !== descriptor.feedbackDigest || snapshot.originalHeadRefOid !== descriptor.originalHeadRefOid) throw failure("OWN_PR_REPAIR_ORIGINAL_FEEDBACK_INVALID");
+      feedbackDocuments = { "repair-feedback-manifest.json": JSON.stringify({ ...descriptor,
+        originalRequestCount: snapshot.feedback.changeRequests.length + snapshot.feedback.threads.length,
+        provenance: snapshot.provenance, contextualObservations: "Paths, positions and discussion are contextual observations; only changeRequests and thread id/comments are covered by feedbackDigest." }, null, 2),
+        "repair-feedback.json": JSON.stringify(snapshot, null, 2) };
+    }
+    const manifestText = JSON.stringify({ repository: git.baseRepository, pullRequestNumber: target.pullRequestNumber, base: git.baseRefOid, head: git.headRefOid, changedFiles: files.length, files,
+      ...(target.repairFeedback ? { repairFeedback: target.repairFeedback } : {}) }, null, 2);
+    const documents = { "review-manifest.json": manifestText, "review.diff": diffText, ...Object.fromEntries(skills), ...feedbackDocuments };
+    const requiredDocuments = ["review-manifest.json", "review.diff", ...Object.keys(feedbackDocuments), ...skills.filter(([name]) => ["review-skill/SKILL.md", "review-skill/manifest.json"].includes(name)).map(([name]) => name)];
     const reads = Object.fromEntries(Object.keys(documents).map((name) => [name, []]));
     const tools = TOOLS.map((tool) => tool.name === "read_document" ? {
       ...tool, description: "Read a PR or trusted skill document in successive pages, following nextOffset until null.",

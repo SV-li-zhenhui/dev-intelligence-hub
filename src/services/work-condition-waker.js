@@ -1,4 +1,5 @@
 import { AUTO_RESUME_ON_CHILD_DELIVERY } from "./work-graph-wait-marker.js";
+import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
 
 const PAGE_SIZE = 100;
 const MAX_PAGES = 100;
@@ -114,7 +115,7 @@ function workerItemDto(item) {
     leaseUntil: _leaseUntil,
     ...visible
   } = item;
-  return structuredClone(visible);
+  return structuredClone({ ...visible, event: currentWorkItemEvent(item) });
 }
 
 export class WorkConditionWaker {

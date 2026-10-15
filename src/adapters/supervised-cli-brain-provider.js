@@ -24,6 +24,7 @@ import { projectRoot } from "../lib/config.js";
 import { KnownCliLocator } from "../lib/known-cli-locator.js";
 import { ProductionCliCompositionGrant } from "../composition-root.js";
 import { createNativeCodexBrainProvider } from "./native-codex-brain-provider.js";
+import { currentTaskExecution } from "../lib/task-execution-context.js";
 import {
   prepareCleanupTreesByIdentity,
   PRODUCTION_PRIVATE_DIRECTORY_MANAGER,
@@ -500,6 +501,9 @@ function productionDependencies(runtimeFacts = []) {
   const supervisedCliTemporaryRoot = Array.isArray(runtimeFacts)
     ? null
     : runtimeFacts.supervisedCliTemporaryRoot;
+  const originalRepairFeedbackReader = Array.isArray(runtimeFacts)
+    ? null
+    : runtimeFacts.originalRepairFeedbackReader;
   const temporaryRoot = supervisedCliTemporaryRoot ??
     path.join(homedir(), ".mydashboard-supervised-cli-v1");
   const sessionRoot = `${temporaryRoot}-sessions`;
@@ -533,7 +537,7 @@ function productionDependencies(runtimeFacts = []) {
     codexResultReader: readCodexResult,
     codexLoginCredentialBroker,
     codexSessionStore,
-    reviewReaderFactory: (target, options) => new GitHubReviewReader().open(target, options),
+    reviewReaderFactory: (target, options) => new GitHubReviewReader({ originalRepairFeedbackReader }).open(target, options),
   });
 }
 
@@ -2437,6 +2441,7 @@ export class SupervisedCliBrainProvider {
       deadline,
       (signal) => {
         this.#assertRunnable();
+        currentTaskExecution()?.reportModelState?.("running");
         return Promise.resolve(this.#processRunner.run({
           ...options,
           signal,
@@ -2675,7 +2680,7 @@ export class SupervisedCliBrainProvider {
             { signal },
           ),
         );
-        if (reviewReader && JSON.parse(result).intent?.type === "propose_github_review") {
+        if (reviewReader && ["propose_github_review", "complete", "handoff"].includes(JSON.parse(result).intent?.type)) {
           await deadline.run(() => reviewReader.assertComplete());
         }
       } else {

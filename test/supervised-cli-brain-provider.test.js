@@ -29,6 +29,10 @@ import {
 } from "../src/adapters/supervised-cli-brain-provider.js";
 import { createTestSupervisedProcessRunner } from "../src/lib/supervised-process-runner.js";
 import { BrainRouter } from "../src/services/brain-router.js";
+import {TaskRunRegistry} from '../src/services/task-run-registry.js';
+import { GitHubReviewReader } from "../src/adapters/github-review-reader.js";
+import { ownReviewFeedbackDigest } from "../src/adapters/github-own-review-feedback.js";
+import { createOriginalRepairFeedbackSnapshot } from "../src/domain/original-repair-feedback.js";
 
 const SCHEMA = Object.freeze({
   type: "object",
@@ -40,6 +44,26 @@ const SCHEMA = Object.freeze({
   },
 });
 const PRIVATE_PROMPT = "PRIVATE_PROMPT_MUST_STAY_IN_STDIN";
+
+for(const cliKind of ['codex-cli','claude-cli'])test(`legacy ${cliKind} reports running at its model launch boundary`,async t=>{
+  const parent=await temporaryDirectory(t,'legacy-cli-model-lifecycle-'),entered=deferred(),finish=deferred();
+  const runner=recordingRunner(async call=>{
+    entered.resolve();await finish.promise;
+    if(cliKind==='codex-cli'){await writeFile(argumentValue(call.args,'--output-last-message'),codexOutput({ok:true}));return successfulProcess();}
+    return successfulProcess(Buffer.from(JSON.stringify(claudeEnvelope('{"ok":true}'))));
+  });
+  const provider=createTestSupervisedCliBrainProvider(providerOptions(cliKind),{processRunner:runner,commandLocator:recordingLocator(testDescriptor(cliKind)),
+    environment:{OPENAI_API_KEY:'synthetic-key',ANTHROPIC_API_KEY:'synthetic-key'},temporaryRoot:path.join(parent,'runtime')});
+  const records=new Map(),store={async read(key,fallback){return structuredClone(records.get(key)??fallback);},async write(key,value){records.set(key,structuredClone(value));}};
+  const registry=new TaskRunRegistry({store,receiptStore:store,settleControl:async()=>{}});
+  const task={kind:'work-item',taskId:'legacy-1',roleId:'analyst',title:'Synthetic model task',subject:'fixture',revision:1};
+  const operation=registry.run(task,()=>provider.generate(brainRequest()));await entered.promise;
+  try{
+    const current=await registry.get(task.kind,task.taskId);
+    assert.equal(current.phase,'running');assert.notEqual(current.receipt.modelStartedAt,null);
+    assert.deepEqual((await registry.list()).counts,{active:1,queued:0,preparing:0});
+  }finally{finish.resolve();await operation;await provider.close();}
+});
 
 test("supervised factory routes native login without exposing the legacy credential broker", async (t) => {
   const temporaryRoot = await temporaryDirectory(t, "native-cli-factory-");
@@ -4236,3 +4260,147 @@ test("an incomplete CLI review is rejected before its proposal can reach GitHub"
   assert.equal(closed, true);
   await provider.close();
 });
+
+function internalRepairReviewFixture() {
+  const gitTarget = {
+    schemaVersion: 1, provider: "github", sourceAccountId: "reviewer",
+    baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "a".repeat(40),
+    headRepository: "contributor/repo", headRefName: "feature", headRefOid: "b".repeat(40),
+  };
+  const originalHeadRefOid = "c".repeat(40);
+  const feedback = {
+    changeRequests: [{ id: "review-1", author: "reviewer", body: "Fix the original defect." }],
+    threads: [{ id: "thread-1", comments: [{ id: "comment-1", author: "reviewer", body: "Original defect details. ".repeat(3_000) }] }],
+  };
+  const feedbackDigest = ownReviewFeedbackDigest(feedback);
+  const snapshot = createOriginalRepairFeedbackSnapshot({
+    repository: gitTarget.baseRepository, number: 42,
+    context: { schemaVersion: 1, headRefOid: originalHeadRefOid, reviewFeedbackDigest: feedbackDigest, feedback },
+    provenance: { kind: "captured_before_repair", observedHeadRefOid: originalHeadRefOid, observedAt: "2026-10-10T03:00:00.000Z" },
+  });
+  const target = { pullRequestNumber: 42, gitTarget, repairFeedback: {
+    snapshotId: snapshot.snapshotId, feedbackDigest, originalHeadRefOid, reviewHeadRefOid: gitTarget.headRefOid,
+  } };
+  const diffText = `diff --git a/src/fix.js b/src/fix.js\n--- a/src/fix.js\n+++ b/src/fix.js\n@@ -1 +1 @@\n-old\n+${"fixed ".repeat(10_000)}\n`;
+  const reader = new GitHubReviewReader({
+    async run(command, args) {
+      assert.equal(command, "gh");
+      assert.deepEqual(args.slice(0, 3), ["api", "--hostname", "github.com"]);
+      if (args[3] === "user") return { login: gitTarget.sourceAccountId };
+      if (args[3] === "graphql") return { data: { repository: {
+        nameWithOwner: gitTarget.baseRepository,
+        pullRequest: {
+          number: 42, url: "https://github.com/acme/repo/pull/42", state: "OPEN", author: { login: "contributor" }, changedFiles: 1,
+          baseRefName: gitTarget.baseRefName, baseRefOid: gitTarget.baseRefOid,
+          baseRef: { name: gitTarget.baseRefName, repository: { nameWithOwner: gitTarget.baseRepository }, target: { oid: gitTarget.baseRefOid } },
+          headRefName: gitTarget.headRefName, headRefOid: gitTarget.headRefOid,
+          headRef: { name: gitTarget.headRefName, repository: { nameWithOwner: gitTarget.headRepository }, target: { oid: gitTarget.headRefOid } },
+          headRepository: { nameWithOwner: gitTarget.headRepository },
+        },
+      } } };
+      assert.equal(args[3], "repos/acme/repo/pulls/42/files?per_page=100");
+      assert.ok(args.includes("--paginate"));
+      return [[{ filename: "src/fix.js", status: "modified", additions: 1, deletions: 1 }]];
+    },
+    async runText(command, args) {
+      assert.equal(command, "gh");
+      assert.equal(args[3], `repos/acme/repo/compare/${gitTarget.baseRefOid}...${gitTarget.headRefOid}`);
+      assert.ok(args.includes("Accept: application/vnd.github.diff"));
+      return diffText;
+    },
+    originalRepairFeedbackReader: {
+      async read(request) {
+        assert.deepEqual(request, { snapshotId: snapshot.snapshotId, repository: gitTarget.baseRepository,
+          number: 42, feedbackDigest, originalHeadRefOid });
+        return snapshot;
+      },
+    },
+  });
+  return { reader, target, snapshot };
+}
+
+async function readReviewDocument(url, document, coverage = "all-pages") {
+  let text = "";
+  let offset = 0;
+  let pages = 0;
+  do {
+    const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: ++pages, method: "tools/call",
+        params: { name: "read_document", arguments: { document, offset, length: 24_000 } } }) });
+    assert.equal(response.status, 200);
+    const result = (await response.json()).result;
+    assert.notEqual(result.isError, true);
+    const page = JSON.parse(result.content[0].text);
+    assert.equal(page.offset, offset);
+    text += page.text;
+    offset = page.nextOffset;
+    if (coverage === "first-page") {
+      assert.notEqual(offset, null, `${document} must exercise partial pagination`);
+      break;
+    }
+  } while (offset !== null);
+  return { text, pages };
+}
+
+for (const credentialMode of ["api-key", "codex-login"]) {
+  test(`${credentialMode} internal review enforces complete paginated reads`, async (t) => {
+    const cases = ["complete", "handoff"].flatMap((type) =>
+      ["unread", "partial-diff", "unread-feedback", "partial-feedback", "all-pages"].map((coverage) => ({ type, coverage })));
+    cases.push({ type: "wait_condition", coverage: "unread" });
+    for (const { type, coverage } of cases) {
+      await t.test(`${type} with ${coverage}`, async (child) => {
+        const parent = await temporaryDirectory(child, "supervised-internal-review-");
+        const temporaryRoot = path.join(parent, "runtime");
+        const { reader, target, snapshot } = internalRepairReviewFixture();
+        const events = [];
+        let readerUrl;
+        const intent = type === "handoff"
+          ? { type, capability: "development", brief: "The original defect remains in src/fix.js." }
+          : { type };
+        const decision = { intent, evidence: [`head:${target.gitTarget.headRefOid}`, "controlled-commit:fixture", "publication:fixture"] };
+        const runner = recordingRunner(async (invocation) => {
+          const endpoint = invocation.args.find((value) => value.startsWith("mcp_servers.pr_review.url="));
+          assert.ok(endpoint);
+          assert.equal(JSON.parse(endpoint.slice("mcp_servers.pr_review.url=".length)), readerUrl);
+          if (coverage !== "unread") {
+            await readReviewDocument(readerUrl, "review-manifest.json");
+            const diff = await readReviewDocument(readerUrl, "review.diff", coverage === "partial-diff" ? "first-page" : "all-pages");
+            if (coverage !== "partial-diff") assert.ok(diff.pages > 1);
+            await readReviewDocument(readerUrl, "repair-feedback-manifest.json");
+            if (coverage !== "unread-feedback") {
+              const original = await readReviewDocument(readerUrl, "repair-feedback.json", coverage === "partial-feedback" ? "first-page" : "all-pages");
+              if (coverage !== "partial-feedback") {
+                assert.ok(original.pages > 1);
+                assert.deepEqual(JSON.parse(original.text), snapshot);
+              }
+            }
+          }
+          await writeFile(argumentValue(invocation.args, "--output-last-message"), codexOutput(decision));
+          return successfulProcess();
+        });
+        const provider = createTestSupervisedCliBrainProvider({ ...providerOptions("codex-cli"), credentialMode }, {
+          processRunner: runner, commandLocator: recordingLocator(testDescriptor("codex-cli")), temporaryRoot,
+          environment: credentialMode === "api-key" ? { OPENAI_API_KEY: "fixture-key" } : {},
+          ...(credentialMode === "codex-login" ? { codexLoginCredentialBroker: recordingCodexLoginBroker(events) } : {}),
+          async reviewReaderFactory(observed, options) {
+            assert.deepEqual(observed, target);
+            const session = await reader.open(observed, options);
+            readerUrl = session.url;
+            return session;
+          },
+        });
+        child.after(() => provider.close());
+        const generation = provider.generate(brainRequest({ reviewTarget: target }));
+        if (type !== "wait_condition" && coverage !== "all-pages") {
+          await assert.rejects(generation, { code: "PR_REVIEW_READ_INCOMPLETE" });
+        } else {
+          assert.deepEqual(JSON.parse(await generation), decision);
+        }
+        assert.equal(runner.calls.length, 1);
+        assert.deepEqual(await readdir(temporaryRoot), []);
+        await assert.rejects(fetch(readerUrl, { method: "POST" }));
+        if (credentialMode === "codex-login") assert.deepEqual(events, ["acquire", "stage", "capture", "release:true"]);
+      });
+    }
+  });
+}

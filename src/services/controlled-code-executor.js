@@ -17,17 +17,19 @@ import {
   samePullRequestExecutionBinding,
 } from "../domain/pull-request-execution-binding.js";
 import { DockerSandboxError } from "../adapters/docker-test-sandbox.js";
+import { WindowsTestRunnerError } from "../adapters/windows-fixed-test-runner.js";
+import { executionIdentityKeys, executionIdentityFields, isExecutionIdentityProof } from "../domain/test-runtime-identity.js";
+import { isWindowsTestProfile } from "../domain/windows-test-profile.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 import { CodeExecutionJournalError } from "./code-execution-journal.js";
 
 export { ControlledCodeExecutorError };
 
 const LEGACY_SCHEMA_VERSION = 1;
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 export const CONTROLLED_CODE_EXECUTOR_STATE_KEY = "code-executor-state";
 const SHA256 = /^[a-f0-9]{64}$/;
 const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
-const IMAGE_ID = /^sha256:[a-f0-9]{64}$/;
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const SAFE_CONTAINER_NAME = /^[a-z0-9][a-z0-9_.-]{0,127}$/;
@@ -406,7 +408,7 @@ function validateProfileState(session) {
         "attemptNumber",
         "workspaceRevision",
         "configDigest",
-        "imageId",
+        ...executionIdentityKeys(proof),
       ]) ||
       typeof proof.passed !== "boolean" ||
       !SAFE_ID.test(proof.actionId) ||
@@ -414,8 +416,8 @@ function validateProfileState(session) {
       proof.attemptNumber < 1 ||
       !isRevision(proof.workspaceRevision) ||
       !isRevision(proof.configDigest) ||
-      typeof proof.imageId !== "string" ||
-      !IMAGE_ID.test(proof.imageId)
+      !isExecutionIdentityProof(proof) ||
+      (proof.runtimeIdentity && (proof.runtimeIdentity.actionId !== proof.actionId || proof.runtimeIdentity.executionId !== attemptExecutionId(session.id, proof.attemptNumber)))
     ) {
       invalidState();
     }
@@ -676,6 +678,11 @@ function validateSession(sessionId, session) {
 }
 
 function upgradeLegacyState(value) {
+  if (isPlainRecord(value) && [1, 2].includes(value.schemaVersion) && isPlainRecord(value.sessions)) {
+    if (Object.values(value.sessions).some((session) => isPlainRecord(session?.verifiedProfiles) &&
+      Object.values(session.verifiedProfiles).some((proof) => Object.hasOwn(proof ?? {}, "runtimeIdentity")))) return value;
+    if (value.schemaVersion === 2) { value.schemaVersion = SCHEMA_VERSION; return value; }
+  }
   if (
     !isPlainRecord(value) ||
     value.schemaVersion !== LEGACY_SCHEMA_VERSION ||
@@ -1098,6 +1105,7 @@ function safeRecordedError(error, fallbackCode = "ACTION_FAILED") {
     error instanceof ControlledCodeExecutorError ||
     error instanceof CodeExecutionError ||
     error instanceof DockerSandboxError ||
+    error instanceof WindowsTestRunnerError ||
     error instanceof CodeExecutionJournalError;
   const code =
     trustedError &&
@@ -1170,8 +1178,7 @@ function validateSandboxResult(value, expectedProfileFingerprint) {
     typeof value.stderr !== "string" ||
     !Number.isFinite(value.durationMs) ||
     value.durationMs < 0 ||
-    typeof value.imageId !== "string" ||
-    !IMAGE_ID.test(value.imageId) ||
+    !isExecutionIdentityProof(value) ||
     typeof value.profileFingerprint !== "string" ||
     !SHA256.test(value.profileFingerprint) ||
     typeof value.timedOut !== "boolean"
@@ -1406,7 +1413,8 @@ function validateSandboxProofArtifact(value, expectedFingerprint) {
       "exitCode",
       "signal",
       "durationMs",
-      "imageId",
+      ...executionIdentityKeys(value),
+      ...(Object.hasOwn(value || {}, "runtimeIdentity") ? ["workspaceRevision"] : []),
       "profileFingerprint",
       "timedOut",
       ...(Object.hasOwn(value || {}, "testSummary") ? ["testSummary"] : []),
@@ -1418,8 +1426,8 @@ function validateSandboxProofArtifact(value, expectedFingerprint) {
     ) ||
     !Number.isFinite(value.durationMs) ||
     value.durationMs < 0 ||
-    typeof value.imageId !== "string" ||
-    !IMAGE_ID.test(value.imageId) ||
+    !isExecutionIdentityProof(value) ||
+    (Object.hasOwn(value || {}, "runtimeIdentity") && !isRevision(value.workspaceRevision)) ||
     value.profileFingerprint !== expectedFingerprint ||
     value.timedOut !== false ||
     (Object.hasOwn(value, "testSummary") && !isNodeTestSummary(value.testSummary))
@@ -1519,7 +1527,8 @@ function validateSucceededActionResult(session, action, input, result) {
         "exitCode",
         "signal",
         "durationMs",
-        "imageId",
+        ...executionIdentityKeys(result),
+        ...(Object.hasOwn(result || {}, "runtimeIdentity") ? ["workspaceRevision"] : []),
         "profileFingerprint",
         "timedOut",
         "stdout",
@@ -1554,7 +1563,8 @@ function validateFailedActionResult(session, action, input, result) {
       "exitCode",
       "signal",
       "durationMs",
-      "imageId",
+      ...executionIdentityKeys(result),
+      ...(Object.hasOwn(result || {}, "runtimeIdentity") ? ["workspaceRevision"] : []),
       "profileFingerprint",
       "timedOut",
       "error",
@@ -1707,6 +1717,7 @@ export class ControlledCodeExecutor {
     this.profileKinds = new Map(
       Object.entries(profileDefinitions).map(([id, definition]) => [id, definition.kind]),
     );
+    this.profileDefinitions = structuredClone(profileDefinitions);
     validateDependency(
       sandbox,
       ["getProfileFingerprint"],
@@ -2037,7 +2048,7 @@ export class ControlledCodeExecutor {
     }
     if (stored === MISSING_STATE) return emptyState();
     const legacy = isPlainRecord(stored) &&
-      stored.schemaVersion === LEGACY_SCHEMA_VERSION;
+      [LEGACY_SCHEMA_VERSION, 2].includes(stored.schemaVersion);
     const state = validateState(upgradeLegacyState(stored));
     if (legacy && persistLegacyUpgrade) await this.#writeState(state);
     return state;
@@ -2456,7 +2467,7 @@ export class ControlledCodeExecutor {
             attemptNumber: storedAction.attemptNumber,
             workspaceRevision: outcome.workspaceRevision,
             configDigest: profile.configDigest,
-            imageId: outcome.profileResult.imageId,
+            ...executionIdentityFields(outcome.profileResult),
           };
         }
         if (action.type === "complete" && outcome.succeeded) {
@@ -2529,6 +2540,7 @@ export class ControlledCodeExecutor {
             executionId: context.executionId,
             actionId: action.actionId,
             signal,
+            ...(isWindowsTestProfile(this.profileDefinitions[action.profileId]) ? { workspaceRevision } : {}),
           });
         },
       );
@@ -2552,11 +2564,21 @@ export class ControlledCodeExecutor {
         locked.result,
         profile.configDigest,
       );
-      const summary = this.profileKinds.get(action.profileId) === "node-test"
+      const definition = this.profileDefinitions[action.profileId];
+      if (isWindowsTestProfile(definition) ? (
+        !result.runtimeIdentity || result.workspaceRevision !== action.expectedWorkspaceRevision ||
+        result.assetVersion !== definition.asset.version || result.verificationKind !== (definition.kind === "windows-test" ? "test" : "build") ||
+        result.runtimeIdentity.executionId !== context.executionId || result.runtimeIdentity.actionId !== action.actionId ||
+        result.runtimeIdentity.executableSha256 !== definition.nodeSha256
+      ) : Object.hasOwn(result, "runtimeIdentity")) {
+        throw executorError("SANDBOX_RESULT_INVALID", "测试执行身份或源码版本绑定无效");
+      }
+      const requiresTestCount = ["node-test", "windows-test"].includes(definition.kind);
+      const summary = requiresTestCount
         ? nodeTestSummary(result.stdout)
         : null;
       const succeeded = result.exitCode === 0 && (
-        this.profileKinds.get(action.profileId) !== "node-test" ||
+        !requiresTestCount ||
         (summary !== null && summary.passed > 0 && summary.failed === 0 && summary.cancelled === 0)
       );
       const auditedResult = {
@@ -2652,8 +2674,7 @@ export class ControlledCodeExecutor {
         proof.attemptNumber !== context.attemptNumber ||
         proof.workspaceRevision !== workspaceRevision ||
         proof.configDigest !== profile.configDigest ||
-        typeof proof.imageId !== "string" ||
-        !IMAGE_ID.test(proof.imageId)
+        !isExecutionIdentityProof(proof)
       ) {
         throw executorError("CHECKS_NOT_PASSED", "当前代码版本尚未通过全部测试");
       }
@@ -2732,10 +2753,12 @@ export class ControlledCodeExecutor {
     } catch {
       throw executorError("EXECUTION_AUDIT_INVALID", "测试证明审计产物无效");
     }
-    if (validatedOutput.imageId !== proof.imageId) {
-      throw executorError("EXECUTION_AUDIT_INVALID", "测试镜像证明不匹配");
+    if (digestValue(executionIdentityFields(validatedOutput)) !== digestValue(executionIdentityFields(proof)) ||
+      (proof.runtimeIdentity && (validatedOutput.workspaceRevision !== proof.workspaceRevision || proof.runtimeIdentity.actionId !== proof.actionId ||
+        proof.runtimeIdentity.executionId !== attemptExecutionId(context.sessionId, proof.attemptNumber)))) {
+      throw executorError("EXECUTION_AUDIT_INVALID", "测试执行身份或源码版本证明不匹配");
     }
-    if (this.profileKinds.get(profile.id) === "node-test") {
+    if (["node-test", "windows-test"].includes(this.profileKinds.get(profile.id))) {
       const summary = nodeTestSummary(stdout);
       if (
         summary === null ||
@@ -2774,7 +2797,8 @@ export class ControlledCodeExecutor {
             exitCode: result.exitCode,
             signal: result.signal,
             durationMs: result.durationMs,
-            imageId: result.imageId,
+            ...executionIdentityFields(result),
+            ...(result.runtimeIdentity ? { workspaceRevision: result.workspaceRevision } : {}),
             profileFingerprint: result.profileFingerprint,
             timedOut: Boolean(result.timedOut),
             ...(result.testSummary ? { testSummary: result.testSummary } : {}),
@@ -3102,7 +3126,7 @@ export class ControlledCodeExecutor {
         workspaceRevision: proof.workspaceRevision,
         actionId: proof.actionId,
         attemptNumber: proof.attemptNumber,
-        imageId: proof.imageId,
+        ...executionIdentityFields(proof),
         artifacts: {
           output: packageArtifact(action.outputArtifacts.output),
           stdout: packageArtifact(action.outputArtifacts.stdout),

@@ -259,7 +259,7 @@ function plainArray(value, name) {
 function normalizePullRequestScope(value) {
   exact(value, SCOPE_KEYS, "PR scope");
   if (
-    !["automatic", "owner_requested"].includes(value.kind) ||
+    !["automatic", "owner_requested", "internal_review"].includes(value.kind) ||
     typeof value.active !== "boolean"
   ) {
     throw invalid("PR scope 状态无效");
@@ -277,7 +277,7 @@ function normalizePullRequestScope(value) {
         ),
   };
   if (
-    normalized.kind === "owner_requested" &&
+    ["owner_requested", "internal_review"].includes(normalized.kind) &&
     (!normalized.active ||
       normalized.revision !== 1 ||
       normalized.lastLifecycleEventId !== null)
@@ -357,7 +357,9 @@ function identityFor(assignment, event, trustedLifecycle = false) {
     !(
       event.source.provider === "github" ||
       (event.source.provider === "local-owner" &&
-        event.eventType === "pull_request.owner_requested")
+        event.eventType === "pull_request.owner_requested") ||
+      (event.source.provider === "internal-review-repair" &&
+        event.eventType === "pull_request.internal_review_requested" && target.id === "pr-engineer")
     )
   ) {
     return null;
@@ -516,7 +518,7 @@ export function createPullRequestWorkSource(envelope) {
       scope: {
         kind: input.event.eventType === "pull_request.owner_requested"
           ? "owner_requested"
-          : "automatic",
+          : input.event.eventType === "pull_request.internal_review_requested" ? "internal_review" : "automatic",
         active: true,
         revision: 1,
         lastLifecycleEventId: null,
@@ -1365,7 +1367,7 @@ function evaluatePullRequestSubjectAuthority(state, root) {
       const independentOwnerAuthority = [...validAuthorities.values()].some(
         (candidate) =>
           candidate.item.itemId !== observation.item.itemId &&
-          candidate.source.scope.kind === "owner_requested",
+          ["owner_requested", "internal_review"].includes(candidate.source.scope.kind),
       );
       if (independentOwnerAuthority) {
         validAuthorities.delete(observation.item.itemId);
@@ -1387,16 +1389,17 @@ function evaluatePullRequestSubjectAuthority(state, root) {
         observation.pointer.event,
       );
     if (
-      observation.source.scope.kind !== "owner_requested" &&
+      !["owner_requested", "internal_review"].includes(observation.source.scope.kind) &&
       observation.occurredAtMs < trustedOccurredAtWatermark &&
       !exactFenceRecovery
     ) {
       continue;
     }
     const ownerRequestedAnchor =
-      observation.source.scope.kind === "owner_requested" &&
-      observation.pointer?.event.eventType ===
-        "pull_request.owner_requested";
+      (observation.source.scope.kind === "owner_requested" &&
+       observation.pointer?.event.eventType === "pull_request.owner_requested") ||
+      (observation.source.scope.kind === "internal_review" &&
+       observation.pointer?.event.eventType === "pull_request.internal_review_requested");
     const causal = ownerRequestedAnchor || predecessor === null ||
       observation.revision.headRefOid === predecessor.revision.headRefOid ||
       observation.revision.previousHeadRefOid ===

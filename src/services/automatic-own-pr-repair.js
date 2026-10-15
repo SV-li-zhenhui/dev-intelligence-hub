@@ -7,8 +7,15 @@ import { normalizePullRequestExecutionBinding, samePullRequestExecutionBinding }
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
 import { createPullRequestExternalActionConfirmationPlan } from "../domain/pull-request-external-action.js";
 import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
+import { normalizeOwnerWorkRequest } from "../domain/owner-work-request.js";
+import { internalRepairReviewRequestId, normalizeInternalReviewMetadata } from "../domain/internal-repair-review.js";
+import { createOriginalRepairFeedbackSnapshot, normalizeOriginalRepairFeedbackSnapshot, normalizeOriginalRepairFeedbackArchiveReference,
+  originalRepairFeedbackBinding, originalRepairFeedbackForRow } from "../domain/original-repair-feedback.js";
+import { persistOriginalRepairFeedbackArchives, planOriginalRepairFeedbackArchives, readOriginalRepairFeedbackSnapshot,
+  validateOriginalRepairFeedbackArchives } from "./original-repair-feedback-archive.js";
 
-const STATE_KEY = "automatic-own-pr-repair-state";
+export const AUTOMATIC_OWN_PR_REPAIR_STATE_KEY = "automatic-own-pr-repair-state";
+const STATE_KEY = AUTOMATIC_OWN_PR_REPAIR_STATE_KEY;
 const DIGEST = /^[a-f0-9]{64}$/;
 const STATUSES = new Set(["working", "failed", "stale", "pushing", "published"]);
 const digest = (value) => createHash("sha256").update(value).digest("hex");
@@ -22,11 +29,29 @@ function repairError(code, message) {
   return Object.assign(new Error(message), { code });
 }
 
-function normalizeState(value) {
-  if (value?.schemaVersion !== 1 || !Array.isArray(value.repairs) || !Array.isArray(value.published)) {
+export function normalizeAutomaticOwnPrRepairState(value) {
+  if (![1, 2].includes(value?.schemaVersion) || !Array.isArray(value.repairs) || !Array.isArray(value.published)) {
     throw repairError("OWN_PR_REPAIR_STATE_INVALID", "自动修复记录无法读取");
   }
   const ids = new Set();
+  const feedbackSnapshots = (value.feedbackSnapshots ?? []).map(normalizeOriginalRepairFeedbackSnapshot);
+  if (new Set(feedbackSnapshots.map((entry) => entry.snapshotId)).size !== feedbackSnapshots.length ||
+      (value.schemaVersion === 2 && feedbackSnapshots.length)) throw repairError("OWN_PR_REPAIR_STATE_INVALID", "原始反馈快照绑定无效");
+  const archiveReferences = new Map();
+  const snapshotFor = (row) => {
+    if (row.feedbackSnapshotArchive === undefined) {
+      if (value.schemaVersion === 2 && row.feedbackSnapshotId !== undefined) throw repairError("OWN_PR_REPAIR_STATE_INVALID", "原始反馈归档引用缺失");
+      return feedbackSnapshots.find((entry) => entry.snapshotId === row.feedbackSnapshotId);
+    }
+    if (value.schemaVersion !== 2) throw repairError("OWN_PR_REPAIR_STATE_INVALID", "原始反馈归档版本无效");
+    const reference = normalizeOriginalRepairFeedbackArchiveReference(row.feedbackSnapshotArchive);
+    if (reference.snapshotId !== row.feedbackSnapshotId ||
+        (archiveReferences.has(reference.snapshotId) && !isDeepStrictEqual(archiveReferences.get(reference.snapshotId), reference))) {
+      throw repairError("OWN_PR_REPAIR_STATE_INVALID", "原始反馈归档引用绑定无效");
+    }
+    archiveReferences.set(reference.snapshotId, reference);
+    return reference;
+  };
   for (const row of value.repairs) {
     normalizePullRequestExecutionBinding(row.inputBinding);
     if (!STATUSES.has(row.status) || !DIGEST.test(row.feedbackDigest) ||
@@ -35,6 +60,10 @@ function normalizeState(value) {
       throw repairError("OWN_PR_REPAIR_STATE_INVALID", "自动修复记录绑定无效");
     }
     ids.add(row.jobId);
+    const snapshot = snapshotFor(row);
+    if (row.feedbackSnapshotId !== undefined && (!snapshot || snapshot.originalHeadRefOid !== row.inputBinding.headRefOid ||
+      snapshot.feedbackDigest !== row.feedbackDigest || snapshot.repository !== row.inputBinding.repository ||
+      snapshot.number !== row.inputBinding.pullRequestNumber)) throw repairError("OWN_PR_REPAIR_STATE_INVALID", "修复任务原始反馈快照无效");
   }
   for (const row of value.published) {
     if (typeof row.repository !== "string" || !Number.isSafeInteger(row.number) ||
@@ -42,9 +71,26 @@ function normalizeState(value) {
         typeof row.confirmationId !== "string" || !fingerprintsValid(row.feedbackFingerprints)) {
       throw repairError("OWN_PR_REPAIR_STATE_INVALID", "自动修复发布记录绑定无效");
     }
+    const snapshot = snapshotFor(row);
+    if (row.feedbackSnapshotId !== undefined && (!snapshot || snapshot.repository !== row.repository ||
+      snapshot.number !== row.number || snapshot.feedbackDigest !== row.feedbackDigest)) throw repairError("OWN_PR_REPAIR_STATE_INVALID", "修复发布原始反馈快照无效");
+    if (row.reviewDelivery !== undefined) {
+      const delivery = row.reviewDelivery;
+      const request = normalizeOwnerWorkRequest(delivery.request);
+      if (request.schemaVersion !== 7 || request.pullRequest.repository !== row.repository ||
+          request.pullRequest.number !== row.number || request.internalReview.headRefOid !== row.commitOid ||
+          request.internalReview.publicationConfirmationId !== row.confirmationId ||
+          request.internalReview.feedbackDigest !== row.feedbackDigest ||
+          request.requestId !== internalRepairReviewRequestId({ repository: row.repository, number: row.number, ...request.internalReview }) ||
+          !["pending", "completed", "stale"].includes(delivery.status) ||
+          (delivery.status === "completed" && (typeof delivery.workItemId !== "string" || delivery.roleId !== "pr-engineer"))) {
+        throw repairError("OWN_PR_REPAIR_STATE_INVALID", "内部复审交接记录无效");
+      }
+    }
   }
-  return structuredClone(value);
+  return structuredClone({ ...value, feedbackSnapshots });
 }
+const normalizeState = normalizeAutomaticOwnPrRepairState;
 
 // This port is composed from trusted configuration, ledger and GitHub facts.
 // A model cannot opt an unrelated task into unattended execution.
@@ -52,9 +98,11 @@ export class AutomaticOwnPrRepair {
   #queue = new OperationQueue();
   #state = null;
   #lastJobId = null;
+  #lastPublishedId = null;
 
   constructor({ configurationReader, store, ledger, github, confirmations,
-    codeJobReader = null, controlledCommitReader = null, objectSync = null, grantVerifier }) {
+    codeJobReader = null, controlledCommitReader = null, objectSync = null, grantVerifier, ownerWorkRequests = null,
+    historicalRepairFeedbackReader = null, clock = () => new Date() }) {
     if (typeof grantVerifier?.verify !== "function") throw new TypeError("Automatic own PR repair requires current grant verification");
     this.configurationReader = configurationReader;
     this.store = store;
@@ -65,12 +113,17 @@ export class AutomaticOwnPrRepair {
     this.controlledCommitReader = controlledCommitReader;
     this.objectSync = objectSync;
     this.grantVerifier = grantVerifier;
+    this.ownerWorkRequests = ownerWorkRequests;
+    this.historicalRepairFeedbackReader = historicalRepairFeedbackReader;
+    this.clock = clock;
   }
 
   async recover() {
-    this.#state = normalizeState(await this.store.read(STATE_KEY, {
+    const state = normalizeState(await this.store.read(STATE_KEY, {
       schemaVersion: 1, repairs: [], published: [],
     }));
+    await validateOriginalRepairFeedbackArchives(this.store, state);
+    this.#state = state;
   }
 
   async #configuration() {
@@ -134,7 +187,7 @@ export class AutomaticOwnPrRepair {
       repository: binding.repository, number: binding.pullRequestNumber,
       account: config.githubActions.actorAccountId,
     });
-    if (facts.state !== "open" || !sameLogin(facts.author, context.author) ||
+    if (facts.state !== "open" || facts.isDraft === true || facts.draft === true || !sameLogin(facts.author, context.author) ||
         facts.headRefOid !== binding.headRefOid || facts.reviewFeedbackAvailable !== true ||
         !Number.isSafeInteger(facts.reviewFeedbackCount) || facts.reviewFeedbackCount < 1 || !DIGEST.test(facts.reviewFeedbackDigest) ||
         facts.reviewFeedbackDigest !== event.payload.reviewFeedbackDigest ||
@@ -173,8 +226,17 @@ export class AutomaticOwnPrRepair {
         const duplicate = this.#isInFlight(grant.repository, grant.inputBinding.pullRequestNumber) ||
           this.#wasPublished(grant.repository, grant.inputBinding.pullRequestNumber, current.facts.reviewFeedbackDigest);
         if (duplicate) throw repairError("OWN_PR_REPAIR_ALREADY_RUNNING", "此轮 Review 意见已经在修复");
-        await this.#save({ ...this.#state, repairs: [...this.#state.repairs, {
+        const snapshot = createOriginalRepairFeedbackSnapshot({ repository: grant.inputBinding.repository,
+          number: grant.inputBinding.pullRequestNumber,
+          context: { schemaVersion: 1, headRefOid: grant.inputBinding.headRefOid,
+            reviewFeedbackDigest: current.facts.reviewFeedbackDigest, feedback: current.facts.feedback },
+          provenance: { kind: "captured_before_repair", observedHeadRefOid: grant.inputBinding.headRefOid,
+            observedAt: new Date(this.clock()).toISOString() } });
+        await this.#save({ ...this.#state,
+          feedbackSnapshots: this.#state.feedbackSnapshots.some((entry) => entry.snapshotId === snapshot.snapshotId)
+            ? this.#state.feedbackSnapshots : [...this.#state.feedbackSnapshots, snapshot], repairs: [...this.#state.repairs, {
           jobId, confirmationId: item.id, inputBinding: grant.inputBinding,
+          feedbackSnapshotId: snapshot.snapshotId,
           feedbackDigest: current.facts.reviewFeedbackDigest, status: "working", pushConfirmationId: null,
           ...(current.facts.reviewFeedbackFingerprints ? { feedbackFingerprints: current.facts.reviewFeedbackFingerprints } : {}),
         }] });
@@ -213,8 +275,8 @@ export class AutomaticOwnPrRepair {
 
   runCycle({ limit = 10 } = {}) {
     return this.#queue.enqueue(async () => {
-      if (!this.codeJobReader || !this.controlledCommitReader) return { scanned: 0, published: 0 };
-      const pending = this.#state.repairs.filter((row) => ["working", "pushing"].includes(row.status));
+      const pending = !this.codeJobReader || !this.controlledCommitReader ? [] :
+        this.#state.repairs.filter((row) => ["working", "pushing"].includes(row.status));
       const start = pending.findIndex((row) => row.jobId === this.#lastJobId) + 1;
       const candidates = [...pending.slice(start), ...pending.slice(0, start)].slice(0, limit);
       this.#lastJobId = candidates.at(-1)?.jobId ?? null;
@@ -230,6 +292,7 @@ export class AutomaticOwnPrRepair {
           result.lastFailure = error?.code ?? "OWN_PR_REPAIR_PROGRESS_UNAVAILABLE";
         }
       }
+      await this.#reconcileReviews(limit, result);
       return result;
     });
   }
@@ -250,7 +313,9 @@ export class AutomaticOwnPrRepair {
         const published = { repository: record.inputBinding.repository,
           number: record.inputBinding.pullRequestNumber, feedbackDigest: record.feedbackDigest,
           commitOid, confirmationId: push.id };
+        if (record.feedbackSnapshotId) published.feedbackSnapshotId = record.feedbackSnapshotId;
         if (record.feedbackFingerprints) published.feedbackFingerprints = record.feedbackFingerprints;
+        published.reviewDelivery = this.#reviewDelivery(published, push.display.payload.action.controlledCommitEvidence);
         await this.#save({ ...this.#state,
           published: this.#wasPublished(published.repository, published.number, published.feedbackDigest)
             ? this.#state.published : [...this.#state.published, published],
@@ -329,15 +394,161 @@ export class AutomaticOwnPrRepair {
     return "waiting";
   }
 
+  #reviewDelivery(published, evidence) {
+    const internalReview = normalizeInternalReviewMetadata({ kind: "own_pr_repair", headRefOid: published.commitOid,
+      feedbackDigest: published.feedbackDigest, publicationConfirmationId: published.confirmationId,
+      controlledCommitEvidenceId: evidence.evidenceId });
+    const request = normalizeOwnerWorkRequest({ schemaVersion: 7,
+      requestId: internalRepairReviewRequestId({ repository: published.repository, number: published.number, ...internalReview }),
+      workType: "pull_request", priority: "high", title: `修复后内部复审：${published.repository} #${published.number}`,
+      description: `受控修复已确认发布到 Head ${published.commitOid}。请核对原 Review 反馈与当前代码，完成内部静态复审；有缺陷则退回研发。此交接不表示外部人员已收到通知或 GitHub 批准。`,
+      acceptanceCriteria: ["逐项核对修复反馈和当前 Head 代码", "区分已有真实测试证据与未覆盖范围", "交付绑定 Head 和修复发布来源的内部结论；剩余缺陷交接研发"],
+      pullRequest: { repository: published.repository, number: published.number }, internalReview });
+    return { status: "pending", request };
+  }
+
+  async #reviewCurrent(published) {
+    const config = await this.#configuration();
+    if (config?.githubActions?.enabled !== true || config.githubActions.automaticOwnPrRepair !== true ||
+        !config.trackedRepositories?.includes(published.repository)) return "automation_disabled";
+    const facts = await this.github.readOwnPullRequestFeedback({ repository: published.repository,
+      number: published.number, account: config.githubActions.actorAccountId });
+    if (facts.state !== "open") return "pull_request_closed";
+    if (facts.isDraft === true || facts.draft === true) return "pull_request_draft";
+    if (!sameLogin(facts.author, config.githubActions.actorAccountId)) return "author_changed";
+    if (facts.headRefOid !== published.commitOid) return "head_changed";
+    return null;
+  }
+
+  async #legacyReviewDelivery(published) {
+    // An archived publication alone cannot resurrect old work. Only the exact
+    // live Head and completed controlled-push receipt can establish this intent.
+    if (!this.ownerWorkRequests || !this.controlledCommitReader || await this.#reviewCurrent(published)) return null;
+    let push;
+    try { push = await this.confirmations.get(published.confirmationId); }
+    catch (error) { if (error?.code === "CONFIRMATION_NOT_FOUND") return null; throw error; }
+    const evidence = push?.display?.payload?.action?.controlledCommitEvidence;
+    if (push?.status !== "completed" || push.kind !== "github.pull-request-push" ||
+        evidence?.commit?.oid !== published.commitOid || evidence.executionSource?.kind !== "review_repair" ||
+        evidence.executionSource.inputBinding.repository !== published.repository ||
+        evidence.executionSource.inputBinding.pullRequestNumber !== published.number) return null;
+    const verified = await this.controlledCommitReader.verify({ evidenceId: evidence.evidenceId });
+    if (!isDeepStrictEqual(verified, evidence)) throw repairError("OWN_PR_REPAIR_COMMIT_INVALID", "历史发布回执与受控修复证据不匹配");
+    await this.#ensurePublishedSnapshot(published, evidence);
+    return this.#reviewDelivery(published, evidence);
+  }
+
+  async #ensurePublishedSnapshot(published, evidence = null) {
+    if (published.feedbackSnapshotId) return published;
+    if (!evidence) {
+      const push = await this.confirmations.get(published.confirmationId);
+      evidence = push?.display?.payload?.action?.controlledCommitEvidence;
+      if (push?.status !== "completed" || evidence?.commit?.oid !== published.commitOid ||
+          !isDeepStrictEqual(await this.controlledCommitReader.verify({ evidenceId: evidence.evidenceId }), evidence)) {
+        throw repairError("OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE", "缺少原始修复发布证据");
+      }
+    }
+    const binding = evidence.executionSource?.inputBinding;
+    if (evidence.executionSource?.kind !== "review_repair" || binding?.repository !== published.repository ||
+        binding.pullRequestNumber !== published.number) throw repairError("OWN_PR_REPAIR_ORIGINAL_FEEDBACK_INVALID", "原始反馈 Head 绑定无效");
+    let snapshot = [...this.#state.feedbackSnapshots, ...this.#state.repairs.map((row) => originalRepairFeedbackForRow(this.#state, row)).filter(Boolean)]
+      .find((entry) => entry.repository === published.repository &&
+      entry.number === published.number && entry.originalHeadRefOid === binding.headRefOid && entry.feedbackDigest === published.feedbackDigest);
+    if (snapshot?.bodyHash) snapshot = await readOriginalRepairFeedbackSnapshot(this.store, this.#state, snapshot);
+    if (!snapshot) {
+      if (typeof this.historicalRepairFeedbackReader?.read !== "function") throw repairError("OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE", "原始修复反馈证据尚不可用");
+      const historical = await this.historicalRepairFeedbackReader.read({ jobId: evidence.package.job.id,
+        inputBinding: binding, feedbackDigest: published.feedbackDigest });
+      if (historical?.context?.headRefOid !== binding.headRefOid || historical.context.reviewFeedbackDigest !== published.feedbackDigest) {
+        throw repairError("OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE", "原始完整反馈摘要或 Head 不匹配");
+      }
+      snapshot = createOriginalRepairFeedbackSnapshot({ repository: published.repository, number: published.number, ...historical });
+    }
+    const updated = { ...published, feedbackSnapshotId: snapshot.snapshotId };
+    await this.#save({ ...this.#state, feedbackSnapshots: this.#state.feedbackSnapshots.some((entry) => entry.snapshotId === snapshot.snapshotId)
+      ? this.#state.feedbackSnapshots : [...this.#state.feedbackSnapshots, snapshot],
+      published: this.#state.published.map((entry) => entry.confirmationId === published.confirmationId ? updated : entry) });
+    return this.#state.published.find((entry) => entry.confirmationId === published.confirmationId && entry.commitOid === published.commitOid);
+  }
+
+  async readOriginalFeedbackBinding({ inputBinding, internalReview }) {
+    return this.#queue.enqueue(async () => {
+      const metadata = normalizeInternalReviewMetadata(internalReview);
+      const row = this.#state.published.find((entry) => entry.repository === inputBinding.repository && entry.number === inputBinding.pullRequestNumber &&
+        entry.commitOid === inputBinding.headRefOid && entry.commitOid === metadata.headRefOid &&
+        entry.feedbackDigest === metadata.feedbackDigest && entry.confirmationId === metadata.publicationConfirmationId);
+      if (!row) throw repairError("OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE", "内部复审没有匹配的修复发布记录");
+      await this.#ensurePublishedSnapshot(row);
+      const current = await this.ledger.readPullRequestExecutionContext(inputBinding);
+      if (!samePullRequestExecutionBinding(current.inputBinding, inputBinding)) throw repairError("OWN_PR_REPAIR_ORIGINAL_FEEDBACK_INVALID", "内部复审当前 Head 授权已变化");
+      const descriptor = originalRepairFeedbackBinding(this.#state, inputBinding, metadata);
+      await readOriginalRepairFeedbackSnapshot(this.store, this.#state, { ...descriptor, repository: inputBinding.repository, number: inputBinding.pullRequestNumber });
+      return descriptor;
+    });
+  }
+
+  async readOriginalFeedbackSnapshot(query) {
+    return readOriginalRepairFeedbackSnapshot(this.store, this.#state, query);
+  }
+
+  async #reconcileReviews(limit, result) {
+    const eligible = this.#state.published.filter((row) => row.reviewDelivery === undefined || row.reviewDelivery.status === "pending");
+    const start = eligible.findIndex((row) => row.confirmationId === this.#lastPublishedId) + 1;
+    const candidates = [...eligible.slice(start), ...eligible.slice(0, start)].slice(0, limit);
+    this.#lastPublishedId = candidates.at(-1)?.confirmationId ?? null;
+    for (let published of candidates) {
+      try {
+        if (!published.reviewDelivery) {
+          const delivery = await this.#legacyReviewDelivery(published);
+          if (!delivery) continue;
+          published = this.#state.published.find((entry) => entry.confirmationId === published.confirmationId);
+          published = await this.#updateReview(published, delivery);
+        }
+        const stale = await this.#reviewCurrent(published);
+        if (stale) {
+          await this.#updateReview(published, { ...published.reviewDelivery, status: "stale", reason: stale });
+          result.reviewStale = (result.reviewStale ?? 0) + 1; continue;
+        }
+        published = await this.#ensurePublishedSnapshot(published);
+        if (typeof this.ownerWorkRequests?.submitInternalReview !== "function") {
+          throw repairError("OWN_PR_REPAIR_REVIEW_NOT_READY", "内部复审入口尚未就绪");
+        }
+        const accepted = await this.ownerWorkRequests.submitInternalReview(published.reviewDelivery.request);
+        if (accepted?.phase !== "intaken" || typeof accepted.workItemId !== "string" || accepted.assignment?.target?.id !== "pr-engineer") {
+          throw repairError("OWN_PR_REPAIR_REVIEW_NOT_INTAKEN", "内部复审未进入 PR 工程师台账");
+        }
+        await this.#updateReview(published, { ...published.reviewDelivery, status: "completed",
+          workItemId: accepted.workItemId, roleId: accepted.assignment.target.id });
+        result.reviewDelivered = (result.reviewDelivered ?? 0) + 1;
+      } catch (error) {
+        result.reviewPending = (result.reviewPending ?? 0) + 1;
+        result.lastReviewFailure = error?.code ?? "OWN_PR_REPAIR_REVIEW_UNAVAILABLE";
+      }
+    }
+  }
+
+  async #updateReview(published, reviewDelivery) {
+    const updated = { ...published, reviewDelivery };
+    await this.#save({ ...this.#state, published: this.#state.published.map((row) =>
+      row.confirmationId === published.confirmationId && row.commitOid === published.commitOid ? updated : row) });
+    return updated;
+  }
+
   async #update(record, patch) {
     await this.#save({ ...this.#state, repairs: this.#state.repairs.map((row) => row.jobId === record.jobId ? { ...row, ...patch } : row) });
   }
 
   async #save(value) {
-    const state = normalizeState(value);
+    const plan = planOriginalRepairFeedbackArchives(value);
+    const state = normalizeState(plan.state);
+    // The body must be durable and verified before its inline copy is released.
+    await persistOriginalRepairFeedbackArchives(this.store, plan.records);
+    await validateOriginalRepairFeedbackArchives(this.store, state, this.#state);
     try { await this.store.write(STATE_KEY, state); }
     catch (error) {
-      this.#state = normalizeState(await this.store.read(STATE_KEY, this.#state));
+      const durable = normalizeState(await this.store.read(STATE_KEY, this.#state));
+      await validateOriginalRepairFeedbackArchives(this.store, durable);
+      this.#state = durable;
       throw error;
     }
     this.#state = state;

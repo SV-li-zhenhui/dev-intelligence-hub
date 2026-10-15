@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-const PR_IDENTITY = "number url author { login } state headRefOid reviewDecision updatedAt";
+const PR_IDENTITY = "number url author { login } state isDraft headRefOid reviewDecision updatedAt";
 const REVIEW_FIELDS = "id author { login } state submittedAt commit { oid } body url";
 const COMMENT_FIELDS = "id author { login } body createdAt updatedAt url pullRequestReview { id state submittedAt commit { oid } }";
 const PAGE_INFO = "pageInfo { hasNextPage endCursor }";
@@ -129,9 +129,15 @@ function assertPullRequest(pr, identity, expectedHead = null) {
       pr.url?.toLowerCase() !== `https://github.com/${identity.repository}/pull/${identity.number}`.toLowerCase() ||
       !["OPEN", "CLOSED", "MERGED"].includes(pr.state) ||
       typeof pr.headRefOid !== "string" || !pr.headRefOid) throw invalid("identity is unavailable");
+  if (pr.isDraft !== undefined && typeof pr.isDraft !== "boolean") throw invalid("Draft identity is unavailable");
   if (login(pr) !== identity.account.toLowerCase()) throw invalid("author changed");
   if (expectedHead !== null && pr.headRefOid !== expectedHead) throw invalid("head changed during read");
   return pr;
+}
+
+function assertSameLifecycle(current, initial) {
+  if (current.state !== initial.state) throw invalid("state changed during read");
+  if (current.isDraft !== initial.isDraft) throw invalid("Draft changed during read");
 }
 
 function connection(value) {
@@ -180,7 +186,7 @@ export async function readOwnReviewFeedback(run, identity, options = {}) {
   const readPrPage = async (query, cursor, field) => {
     const result = await graphql(run, query, { ...parameters, cursor }, options);
     const page = assertPullRequest(result.repository?.pullRequest, identity, pr.headRefOid);
-    if (page.state !== pr.state) throw invalid("state changed during read");
+    assertSameLifecycle(page, pr);
     return page[field];
   };
   const [reviews, threads] = await Promise.all([
@@ -198,17 +204,18 @@ export async function readOwnReviewFeedback(run, identity, options = {}) {
       const result = await graphql(run, COMMENTS_QUERY, { id: thread.id, cursor }, options);
       if (result.node?.id !== thread.id) throw invalid("thread identity changed");
       const parent = assertPullRequest(result.node.pullRequest, identity, pr.headRefOid);
-      if (parent.state !== pr.state) throw invalid("state changed during read");
+      assertSameLifecycle(parent, pr);
       return result.node.comments;
     });
     assertNodes(thread.comments, "comment");
   }
   const final = await graphql(run, IDENTITY_QUERY, parameters, options);
   const current = assertPullRequest(final.repository?.pullRequest, identity, pr.headRefOid);
-  if (current.state !== pr.state) throw invalid("state changed during read");
+  assertSameLifecycle(current, pr);
   if (current.reviewDecision !== pr.reviewDecision || current.updatedAt !== pr.updatedAt) throw invalid("changed during read");
   return {
     state: pr.state.toLowerCase(),
+    ...(pr.isDraft === undefined ? {} : { isDraft: pr.isDraft }),
     author: pr.author.login,
     currentUser: identity.account,
     repo: identity.repository,

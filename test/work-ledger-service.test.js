@@ -4,6 +4,77 @@ import { EventEmitter } from "node:events";
 import test from "node:test";
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { createTaskRunSettler } from '../src/services/work-ledger-run-control.js';
+import { WorkConditionWaker } from '../src/services/work-condition-waker.js';
+import { WorkflowFactSource } from '../src/services/workflow-fact-source.js';
+import { WorkCoordinationService } from '../src/services/work-coordination-service.js';
+
+async function deliverHeadBoundWait(service, item, condition) {
+  const workerId = 'employee-pr-engineer';
+  const claimed = await service.claim({ itemId: item.itemId, expectedRevision: item.revision, workerId, leaseDurationMs: 30_000 });
+  const staged = await service.stageIntent({ itemId: claimed.itemId, expectedRevision: claimed.revision,
+    leaseId: claimed.leaseId, actorId: workerId, roleId: 'pr-engineer', intent: waitIntent(condition) });
+  const dispatch = await service.claimIntent({ intentId: staged.outbox.intentId, expectedRevision: staged.outbox.revision,
+    dispatcherId: 'work-intent-dispatcher', leaseDurationMs: 30_000 });
+  const result = await service.ackIntent({ intentId: dispatch.intentId, expectedRevision: dispatch.revision,
+    dispatchLeaseId: dispatch.dispatchLeaseId, itemExpectedRevision: staged.item.revision,
+    outcome: 'delivered', nextStatus: 'waiting_condition', actorId: 'work-intent-dispatcher',
+    details: { conditionRef: `bound-${dispatch.intentId}`, downstreamRef: `bound-${dispatch.intentId}` } });
+  return { item: result.item, intentId: dispatch.intentId };
+}
+
+test('a new PR Head supersedes an obsolete delivered condition and remains wakeable after recovery', async () => {
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  await fixture.service.intake();
+  const initial = (await fixture.service.listItems()).items[0];
+  const waiting = await deliverHeadBoundWait(fixture.service, initial, { kind: 'workflow_fact', fact: 'merge-state', oneOf: ['CLEAN', 'BLOCKED'] });
+  const historical = (await fixture.service.listOutbox()).items.find(entry => entry.intentId === waiting.intentId);
+  const latest = prAssignment(2, { headRefOid: PR_HEAD_B, previousHeadRefOid: PR_HEAD_A,
+    changedFields: ['headRefOid', 'mergeStateStatus'], occurredAt: '2026-08-02T01:05:00.000Z',
+    ciStatus: 'SUCCESS', gitFacts: { ...prGitFacts(PR_HEAD_B), mergeStateStatus: 'BLOCKED' } });
+  await fixture.store.write('snapshot', { refreshedAt: fixture.time.clock(),
+    sourceStatus: { githubPullRequests: { ok: true, stale: false } },
+    items: [{ id: initial.event.subject.id, ...latest.event.payload }] });
+  const facts = new WorkflowFactSource({ store: fixture.store, clock: fixture.time.clock });
+  const waker = new WorkConditionWaker({ ledger: fixture.service, factSource: facts, clock: fixture.time.clock });
+  assert.equal((await waker.runCycle()).woken, 0, 'new-Head facts must not satisfy an old-Head condition');
+  fixture.source.records.push(latest); fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  const housekeeping = new WorkCoordinationService({ ledger: fixture.service, conditionWaker: waker,
+    proposalResultReconciler: { async runCycle() {} }, attentionResultReconciler: { async runCycle() {} },
+    workLoop: { async runCycle() {} }, dispatcher: { async dispatchPending() {} } });
+  await housekeeping.runCycle({ includeWork: false });
+  let active = (await fixture.service.listItems()).items[0];
+  assert.equal(active.status, 'queued');
+  assert.equal(active.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(active.activeIntentId, null);
+  assert.deepEqual((await fixture.service.listOutbox()).items.find(entry => entry.intentId === waiting.intentId), historical,
+    'superseding a wait preserves the original delivered receipt');
+  assert.equal((await fixture.service.listTimeline({ limit: 100 })).items.filter(entry =>
+    entry.type === 'intent_superseded' && entry.details.intentId === waiting.intentId).length, 1);
+  const recovered = new WorkLedgerService({ store: fixture.store, assignmentSource: fixture.source,
+    exclusiveLease: new ExclusiveLease(), clock: fixture.time.clock, idFactory: incrementingIds() });
+  await recovered.recover();
+  active = (await recovered.listItems()).items[0];
+  await deliverHeadBoundWait(recovered, active, { kind: 'workflow_fact', fact: 'ci-status', oneOf: ['SUCCESS'] });
+  const recoveredWaker = new WorkConditionWaker({ ledger: recovered, factSource: facts, clock: fixture.time.clock });
+  assert.equal((await recoveredWaker.runCycle()).woken, 1, 'a later wait observes the active event, not the original root event');
+  assert.equal((await recoveredWaker.runCycle()).woken, 0);
+  const runnable = (await recovered.listItems()).items[0];
+  const claim = await recovered.claim({ itemId: runnable.itemId, expectedRevision: runnable.revision,
+    workerId: 'employee-pr-engineer', leaseDurationMs: 30_000 });
+  assert.equal(claim.source.current.headRefOid, PR_HEAD_B);
+});
+
+test('new PR code does not bypass an explicit time condition', async () => {
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  await fixture.service.intake();
+  const initial = (await fixture.service.listItems()).items[0];
+  await deliverHeadBoundWait(fixture.service, initial, { kind: 'time', notBefore: '2026-08-03T01:00:00.000Z' });
+  fixture.source.records.push(prAssignment(2, { headRefOid: PR_HEAD_B, previousHeadRefOid: PR_HEAD_A,
+    changedFields: ['headRefOid'], occurredAt: '2026-08-02T01:05:00.000Z', gitFacts: prGitFacts(PR_HEAD_B) }));
+  fixture.source.highWatermark = 2; await fixture.service.intake();
+  assert.equal((await fixture.service.listItems()).items[0].status, 'waiting_condition');
+});
 
 test('a cancelled PR predecessor stays unchanged without rejecting unrelated intake', async () => {
   const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });

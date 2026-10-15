@@ -7,6 +7,7 @@ import {
 import {
   createPullRequestExecutionBinding,
 } from "../domain/pull-request-execution-binding.js";
+import { normalizeRepairFeedbackDescriptor } from "../domain/original-repair-feedback.js";
 import { normalizeWorkGraphSnapshot } from "../domain/work-graph-contract.js";
 import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
 import { createRoleContextEvidenceCatalogAdapter } from "./role-context-evidence-catalog.js";
@@ -1228,6 +1229,8 @@ export class RoleContextAssembler {
   #memoryQueryReader;
   #evidenceCatalogAdapter;
   #failedCodeJobContextReader;
+  #internalReviewHandoffReader;
+  #originalRepairFeedbackReader;
 
   constructor({
     graphReader,
@@ -1236,6 +1239,8 @@ export class RoleContextAssembler {
     memoryQueryReader,
     evidenceCatalog,
     failedCodeJobContextReader,
+    internalReviewHandoffReader,
+    originalRepairFeedbackReader,
   } = {}) {
     this.#graphReader = requireGraphReader(graphReader);
     this.#factSource = optionalFactSource(factSource);
@@ -1245,6 +1250,12 @@ export class RoleContextAssembler {
     this.#memoryQueryReader = optionalMemoryQueryReader(memoryQueryReader);
     this.#failedCodeJobContextReader = failedCodeJobContextReader == null ? null : Object.freeze({
       read: bindPortMethod(failedCodeJobContextReader, "read", "failedCodeJobContextReader"),
+    });
+    this.#internalReviewHandoffReader = internalReviewHandoffReader == null ? null : Object.freeze({
+      read: bindPortMethod(internalReviewHandoffReader, "read", "internalReviewHandoffReader"),
+    });
+    this.#originalRepairFeedbackReader = originalRepairFeedbackReader == null ? null : Object.freeze({
+      readBinding: bindPortMethod(originalRepairFeedbackReader, "readBinding", "originalRepairFeedbackReader"),
     });
     this.#evidenceCatalogAdapter =
       createRoleContextEvidenceCatalogAdapter(evidenceCatalog);
@@ -1320,7 +1331,7 @@ export class RoleContextAssembler {
       currentTask,
       deliveryState,
     );
-    const [facts, authoritativeEvidence, pullRequest, memoryQuery, failedExecution] = await Promise.all([
+    const [facts, authoritativeEvidence, pullRequest, memoryQuery, failedExecution, internalReview] = await Promise.all([
       readFacts(this.#factSource, item.event, signal),
       this.#evidenceCatalogAdapter.read({
         roleId,
@@ -1331,8 +1342,23 @@ export class RoleContextAssembler {
       readPullRequestContext(this.#pullRequestContextReader, item, signal),
       readMemoryQueryContext(this.#memoryQueryReader, roleId, item, signal),
       readFailedCodeJobContext(this.#failedCodeJobContextReader, item, signal),
+      roleId === "pr-engineer" && this.#internalReviewHandoffReader !== null
+        ? this.#internalReviewHandoffReader.read({ itemId: item.taskId }) : null,
     ]);
     signal?.throwIfAborted();
+    if (internalReview !== null && internalReview.headRefOid !== item.event.payload?.headRefOid) {
+      throw contextError("ROLE_CONTEXT_STALE", "内部复审交接已不属于当前 Head", 409);
+    }
+    let originalRepairFeedback = null;
+    if (roleId === "pr-engineer" && item.eventType === "pull_request.internal_review_requested") {
+      if (this.#originalRepairFeedbackReader === null) throw contextError("OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE", "内部修复复审需要完整原始反馈快照", 503);
+      originalRepairFeedback = normalizeRepairFeedbackDescriptor(await this.#originalRepairFeedbackReader.readBinding({
+        inputBinding: createPullRequestExecutionBinding({ sourceBinding: item.sourceBinding, event: item.event }),
+        internalReview: item.event.payload.internalReview,
+      }));
+      if (originalRepairFeedback.reviewHeadRefOid !== item.event.payload.headRefOid ||
+          originalRepairFeedback.feedbackDigest !== item.event.payload.internalReview.feedbackDigest) throw contextError("ROLE_CONTEXT_STALE", "原始反馈与内部复审绑定不一致", 409);
+    }
     const isPullRequest = item.eventType.startsWith("pull_request.");
 
     const binding = {
@@ -1411,6 +1437,8 @@ export class RoleContextAssembler {
           ? {}
           : { decisionContext: proposalDecisionContext }),
         ...(failedExecution === null ? {} : { failedExecution }),
+        ...(internalReview === null ? {} : { internalReview }),
+        ...(originalRepairFeedback === null ? {} : { originalRepairFeedback }),
         ...(currentTaskRejection?.dataClass === "code"
           ? { currentTaskRejection: currentTaskRejection.value }
           : {}),

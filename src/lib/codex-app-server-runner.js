@@ -53,7 +53,7 @@ export class CodexAppServerRunner {
     const context=currentTaskExecution(); let threadId=appServer.previous,turnId=null,text=null;
     const codeExecution = appServer.isolation?.channel === 'code-job';
     const revokeTools = () => appServer.isolation?.execution?.revoke();
-    let sequence=0,started=false,initialized=false,terminal=false,interrupted=false,detach,output,error,turnAttempted=false;
+    let sequence=0,started=false,initialized=false,terminal=false,accepting=true,interrupted=false,detach,output,error,turnAttempted=false;
     const earlyEvents=[];const streamedItems=new Set();let earlyBytes=0;
     const request=(method,params)=>{
       if(process.exited) return Promise.reject(failure());
@@ -64,6 +64,7 @@ export class CodexAppServerRunner {
       return waiting.promise;
     };
     const fail=(cause)=>{
+      accepting=false;
       revokeTools();
       const problem=cause?.code?.startsWith('STRUCTURED_PROVIDER_') ? cause : failure(initialized ? 'STRUCTURED_PROVIDER_PROCESS_FAILED' : 'STRUCTURED_PROVIDER_UNAVAILABLE');
       completed.reject(problem);
@@ -71,7 +72,7 @@ export class CodexAppServerRunner {
       pending.clear();
     };
     const receive=({stream,line})=>{
-      if(stream!=='stdout' || !line.trim())return;
+      if(!accepting || stream!=='stdout' || !line.trim())return;
       try {
         const message=parseJsonWithUniqueKeys(line);
         if(!message || typeof message!=='object' || Array.isArray(message))throw failure('STRUCTURED_PROVIDER_RESPONSE_INVALID');
@@ -95,6 +96,7 @@ export class CodexAppServerRunner {
         const eventTurn=params.turnId??params.turn?.id;
         if(eventTurn && eventTurn!==turnId)return;
         if(terminal)return;
+        context?.reportActivity?.();
         if(message.method==='item/completed' && params.item?.type==='agentMessage')text=params.item.text;
         if(message.method==='item/agentMessage/delta' && typeof params.delta==='string') {
           streamedItems.add(params.itemId);
@@ -213,6 +215,7 @@ export class CodexAppServerRunner {
       output={exitCode:0,signal:null,stdoutBytes:Buffer.from(JSON.stringify({type:'thread.started',thread_id:threadId})+'\n'),interrupted};
     }catch(cause){error=cause;}
     finally {
+      accepting=false;
       revokeTools();
       clearTimeout(deadline);signal?.removeEventListener('abort',abort);detach?.();
       for(const waiting of pending.values()){clearTimeout(waiting.timer);waiting.reject(error??failure());}pending.clear();

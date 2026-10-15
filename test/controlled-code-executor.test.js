@@ -12,6 +12,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { DockerSandboxError } from "../src/adapters/docker-test-sandbox.js";
+import { WindowsFixedTestRunner } from "../src/adapters/windows-fixed-test-runner.js";
+import { ConfiguredTestRunner } from "../src/adapters/configured-test-runner.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
@@ -161,6 +163,120 @@ function sandboxResult(overrides = {}) {
     ...overrides,
   };
 }
+
+function windowsProfileResult(profile, request, overrides = {}) {
+  const { imageId: _image, ...result } = sandboxResult();
+  return { ...result, profileFingerprint: digestValue(profile), workspaceRevision: request.workspaceRevision,
+    assetVersion: profile.asset.version, verificationKind: profile.kind === "windows-test" ? "test" : "build",
+    runtimeIdentity: { schemaVersion: 1, kind: "windows-process", executionId: request.executionId,
+      actionId: request.actionId, pid: 4321, processStartTimeUtcTicks: "639013000000000000", executableSha256: profile.nodeSha256 }, ...overrides };
+}
+
+test("Windows test proofs complete, survive restart, and retain native identity without image IDs", async (t) => {
+  const profile = { kind: "windows-test", nodeExecutable: "C:/Program Files/nodejs/node.exe", nodeSha256: "d".repeat(64), timeoutMs: 30_000,
+    asset: { schemaVersion: 1, title: "Native", description: "Fixed assertions", version: 2, source: "fixed" } };
+  const profiles = { "node-tests": profile };
+  const sandbox = new FakeSandbox({ profiles, results: [(request) => windowsProfileResult(profile, request)] });
+  const setup = await fixture(t, { sandbox });
+  const { executor } = setup.createExecutor({ profiles });
+  await executor.recover();
+  const session = await executor.start(startRequest());
+  const tested = await executor.perform(actionRequest(session, { type: "run_profile", actionId: "native-test", profileId: "node-tests" }));
+  assert.equal((await setup.innerStore.read("code-executor-state")).schemaVersion, 3);
+  assert.equal(tested.action.status, "succeeded");
+  assert.equal(tested.result.testSummary.passed, 1);
+  assert.equal(Object.hasOwn(tested.result, "imageId"), false);
+  const completed = await executor.perform(actionRequest(session, { type: "complete", actionId: "complete-native" }));
+  assert.equal(completed.session.status, "completed");
+  const restarted = setup.createExecutor({ profiles }).executor;
+  await restarted.recover();
+  const changeSet = await restarted.exportCompletedChangeSet({ sessionId: session.id, completedActionId: "complete-native", expectedWorkspaceRevision: session.workspaceRevision });
+  assert.equal(changeSet.passedProfiles[0].runtimeIdentity.pid, 4321);
+  assert.equal(changeSet.passedProfiles[0].assetVersion, 2);
+  const state = await setup.innerStore.read("code-executor-state");
+  state.sessions[session.id].verifiedProfiles["node-tests"].runtimeIdentity.pid += 1;
+  await setup.innerStore.write("code-executor-state", state);
+  await assert.rejects(setup.createExecutor({ profiles }).executor.recover(), { code: "EXECUTOR_STATE_INVALID" });
+});
+
+test("Windows build proof remains distinct from unit test statistics", async (t) => {
+  const profile = { kind: "windows-build", nodeExecutable: "C:/node.exe", nodeSha256: "d".repeat(64), timeoutMs: 30_000,
+    asset: { schemaVersion: 1, title: "Build", description: "Fixed compilation", version: 1, source: "fixed" } };
+  const profiles = { "node-tests": profile };
+  const sandbox = new FakeSandbox({ profiles, results: [(request) => windowsProfileResult(profile, request, { stdout: "Compilation succeeded" })] });
+  const setup = await fixture(t, { sandbox });
+  const { executor } = setup.createExecutor({ profiles });
+  await executor.recover();
+  const session = await executor.start(startRequest());
+  const tested = await executor.perform(actionRequest(session, { type: "run_profile", actionId: "native-build", profileId: "node-tests" }));
+  assert.equal(tested.action.status, "succeeded");
+  assert.equal(tested.result.verificationKind, "build");
+  assert.equal(Object.hasOwn(tested.result, "testSummary"), false);
+});
+
+test("real Windows asset, broker, journal and executor produce a restartable completed proof", { skip: process.platform !== "win32" }, async (t) => {
+  const setup = await fixture(t);
+  await mkdir(path.join(setup.sourceRoot, "test"));
+  await writeFile(path.join(setup.sourceRoot, "test", "value.test.mjs"), 'import test from "node:test"; import assert from "node:assert/strict"; test("product value",()=>assert.equal(2+2,4));');
+  const profile = { kind: "windows-test", nodeExecutable: process.execPath,
+    nodeSha256: createHash("sha256").update(await readFile(process.execPath)).digest("hex"), timeoutMs: 20_000,
+    asset: { schemaVersion: 1, title: "Native integration", description: "Real assertions through the controlled executor", version: 1,
+      source: 'import { spawnSync } from "node:child_process"; const r=spawnSync(process.execPath,["--test","--test-isolation=none","--test-reporter=tap","test/value.test.mjs"],{stdio:"inherit",env:process.env}); process.exitCode=r.status??1;' } };
+  const profiles = { "node-tests": profile };
+  const windowsRunner = new WindowsFixedTestRunner({ allowedWorkspaceRoot: setup.scratchRoot, runRoot: path.join(setup.root, "native-runs"), profiles });
+  const sandbox = new ConfiguredTestRunner({ windowsRunner, profiles });
+  const { executor } = setup.createExecutor({ profiles, nextSandbox: sandbox });
+  await executor.recover();
+  const session = await executor.start(startRequest());
+  const checked = await executor.perform(actionRequest(session, { type: "run_profile", actionId: "native-real-test", profileId: "node-tests" }));
+  assert.equal(checked.action.status, "succeeded");
+  assert.equal(checked.result.testSummary.passed, 1);
+  const completed = await executor.perform(actionRequest(checked.session, { type: "complete", actionId: "native-real-complete" }));
+  assert.equal(completed.session.status, "completed");
+  const restarted = setup.createExecutor({ profiles, nextSandbox: sandbox }).executor;
+  await restarted.recover();
+  const exported = await restarted.exportCompletedChangeSet({ sessionId: session.id, completedActionId: "native-real-complete", expectedWorkspaceRevision: session.workspaceRevision });
+  assert.equal(exported.passedProfiles[0].runtimeIdentity.executableSha256, profile.nodeSha256);
+});
+
+test("Windows test proof rejects zero tests, mismatched workspace, and forged Docker identity", async (t) => {
+  const profile = { kind: "windows-test", nodeExecutable: "C:/node.exe", nodeSha256: "d".repeat(64), timeoutMs: 30_000,
+    asset: { schemaVersion: 1, title: "Native", description: "Fixed assertions", version: 1, source: "fixed" } };
+  for (const [name, overrides, expectedCode] of [
+    ["empty", { stdout: "compiled successfully" }, null],
+    ["revision", { workspaceRevision: "e".repeat(64) }, "SANDBOX_RESULT_INVALID"],
+    ["image", { imageId: `sha256:${"f".repeat(64)}` }, "SANDBOX_RESULT_INVALID"],
+    ["asset", { assetVersion: 99 }, "SANDBOX_RESULT_INVALID"],
+    ["kind", { verificationKind: "build" }, "SANDBOX_RESULT_INVALID"],
+  ]) {
+    const profiles = { "node-tests": profile };
+    const sandbox = new FakeSandbox({ profiles, results: [(request) => windowsProfileResult(profile, request, overrides)] });
+    const setup = await fixture(t, { sandbox });
+    const { executor } = setup.createExecutor({ profiles });
+    await executor.recover();
+    const session = await executor.start(startRequest());
+    const tested = await executor.perform(actionRequest(session, { type: "run_profile", actionId: `native-${name}`, profileId: "node-tests" }));
+    assert.equal(tested.action.status, "failed");
+    if (expectedCode) assert.equal(tested.action.error.code, expectedCode);
+    const completion = await executor.perform(actionRequest(tested.session, { type: "complete", actionId: `complete-${name}` }));
+    assert.equal(completion.result.error.code, "CHECKS_NOT_PASSED");
+  }
+});
+
+test("schema v2 Docker completion proofs migrate without changing historical session evidence", async (t) => {
+  const setup = await fixture(t);
+  const { completed } = await createCompletedSessionWithRead(setup);
+  const legacy = await setup.innerStore.read("code-executor-state");
+  legacy.schemaVersion = 2;
+  const originalSession = structuredClone(legacy.sessions[completed.session.id]);
+  await setup.innerStore.write("code-executor-state", legacy);
+  const restarted = setup.createExecutor().executor;
+  await restarted.recover();
+  const upgraded = await setup.innerStore.read("code-executor-state");
+  assert.equal(upgraded.schemaVersion, 3);
+  assert.deepEqual(upgraded.sessions[completed.session.id], originalSession);
+  assert.equal(Object.hasOwn(upgraded.sessions[completed.session.id].verifiedProfiles["node-tests"], "runtimeIdentity"), false);
+});
 
 function deferred() {
   let resolve;
@@ -512,7 +628,7 @@ test("start persists the exact PR input binding and requires the broker to echo 
     },
   ]);
   const stored = await setup.innerStore.read("code-executor-state");
-  assert.equal(stored.schemaVersion, 2);
+  assert.equal(stored.schemaVersion, 3);
   assert.deepEqual(stored.sessions[created.id].inputBinding, inputBinding);
   assert.equal(
     stored.sessions[created.id].requestDigest,
@@ -745,7 +861,7 @@ test("schema v1 sessions migrate to null binding and cannot be claimed by a PR",
   assert.equal(migrated.status, "interrupted");
   assert.equal(migrated.inputBinding, null);
   const migratedState = await setup.innerStore.read("code-executor-state");
-  assert.equal(migratedState.schemaVersion, 2);
+  assert.equal(migratedState.schemaVersion, 3);
   assert.equal(migratedState.sessions[active.id].inputBinding, null);
   assert.equal(
     migratedState.sessions[active.id].requestDigest,
@@ -790,7 +906,7 @@ test("schema v1 migration is durably persisted even without recovery mutations",
   await recovered.executor.recover();
 
   const stored = await setup.innerStore.read("code-executor-state");
-  assert.equal(stored.schemaVersion, 2);
+  assert.equal(stored.schemaVersion, 3);
   assert.equal(stored.revision, 8);
   assert.deepEqual(stored.sessions, {});
 });

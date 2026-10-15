@@ -4,6 +4,7 @@ import { normalizeSessionKey } from "./session-key.js";
 import { normalizeReviewReadTarget } from "../domain/review-read-target.js";
 import { isCodeReadContext } from "./code-read-context.js";
 import { isCodeExecutionContext } from "./code-execution-context.js";
+import { normalizeAdmissionEntityKey } from "./model-admission-identity.js";
 
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_MESSAGES = 16;
@@ -92,9 +93,9 @@ export function readStructuredBrainGenerateInput(rawRequest) {
     required.some((key) => !keys.includes(key)) ||
     keys.some((key) =>
       typeof key !== "string" ||
-      ![...required, "reasoningEffort", "sessionKey", "signal", "reviewTarget", "codeReadContext", "codeExecutionContext"].includes(key)
+      ![...required, "reasoningEffort", "sessionKey", "admissionEntityKey", "signal", "reviewTarget", "codeReadContext", "codeExecutionContext"].includes(key)
     ) ||
-    keys.length > required.length + 6
+    keys.length > required.length + 7
   ) {
     throw new TypeError("structured request is invalid");
   }
@@ -110,6 +111,7 @@ export function readStructuredBrainGenerateInput(rawRequest) {
     model: result.model,
     reasoningEffort: result.reasoningEffort ?? null,
     sessionKey: result.sessionKey ?? null,
+    admissionEntityKey: result.admissionEntityKey ?? null,
     messages: result.messages,
     schema: result.schema,
     signal: result.signal ?? null,
@@ -325,6 +327,7 @@ export function normalizeStructuredBrainRequest(rawRequest, options) {
     Object.hasOwn(rawRequest, key);
   const hasReasoningEffort = hasOwnPlainDataField("reasoningEffort");
   const hasSessionKey = hasOwnPlainDataField("sessionKey");
+  const hasAdmissionEntityKey = hasOwnPlainDataField("admissionEntityKey");
   const hasReviewTarget = hasOwnPlainDataField("reviewTarget");
   const hasCodeReadContext = hasOwnPlainDataField("codeReadContext");
   const hasCodeExecutionContext = hasOwnPlainDataField("codeExecutionContext");
@@ -334,6 +337,7 @@ export function normalizeStructuredBrainRequest(rawRequest, options) {
       "model",
       ...(hasReasoningEffort ? ["reasoningEffort"] : []),
       ...(hasSessionKey ? ["sessionKey"] : []),
+      ...(hasAdmissionEntityKey ? ["admissionEntityKey"] : []),
       ...(hasReviewTarget ? ["reviewTarget"] : []),
       ...(hasCodeReadContext ? ["codeReadContext"] : []),
       ...(hasCodeExecutionContext ? ["codeExecutionContext"] : []),
@@ -362,6 +366,7 @@ export function normalizeStructuredBrainRequest(rawRequest, options) {
     ...(hasSessionKey
       ? { sessionKey: normalizeSessionKey(request.sessionKey) }
       : {}),
+    ...(hasAdmissionEntityKey ? { admissionEntityKey: normalizeAdmissionEntityKey(request.admissionEntityKey) } : {}),
     messages: normalizeMessages(request.messages),
     ...(hasReviewTarget ? { reviewTarget: normalizeReviewReadTarget(request.reviewTarget) } : {}),
     ...(hasCodeReadContext ? { codeReadContext: request.codeReadContext } : {}),

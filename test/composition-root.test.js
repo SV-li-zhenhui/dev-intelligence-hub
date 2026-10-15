@@ -11,6 +11,8 @@ import {
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { ownReviewFeedbackDigest } from "../src/adapters/github-own-review-feedback.js";
+import { createOriginalRepairFeedbackSnapshot } from "../src/domain/original-repair-feedback.js";
 import {
   runBoundedValidationCommand,
 } from "../scripts/system-validation-command.mjs";
@@ -5632,6 +5634,46 @@ test("native login diagnostics use the selected route even when the legacy broke
   assert.equal(legacyStatusCalls, 0);
   await application.close();
   assert.ok(closeCalls.indexOf("native-status") < closeCalls.indexOf("legacy-broker"));
+});
+
+test("production native grants keep captured feedback read-only when automatic repair is disabled", async () => {
+  const rawConfig = structuredClone(defaultCodeJobConfiguration());
+  rawConfig.brainProviders["offline-cli"].credentialMode = "codex-native-login";
+  const config = normalizeConfigurationDocument(rawConfig);
+  const head = "a".repeat(40);
+  const feedback = { changeRequests: [{ id: "original-review", author: "reviewer", body: "Keep unsaved edits",
+    submittedAt: "2026-10-15T00:00:00.000Z", reviewedHeadRefOid: head }], threads: [] };
+  const snapshot = createOriginalRepairFeedbackSnapshot({ repository: "acme/repo", number: 1,
+    context: { schemaVersion: 1, headRefOid: head, reviewFeedbackDigest: ownReviewFeedbackDigest(feedback), feedback },
+    provenance: { kind: "captured_before_repair", observedHeadRefOid: head, observedAt: "2026-10-15T00:00:00.000Z" } });
+  let privateReader;
+  let feedbackWrites = 0;
+  const application = await createApplication({
+    ...defaultCodeJobApplicationOptions({ config, calls: {}, closeCalls: [],
+      lifecycle: createApplicationRuntimeLifecycle(), versioned: false }),
+    store: {
+      async read(key, fallback) { return key === "automatic-own-pr-repair-state"
+        ? structuredClone({ schemaVersion: 1, repairs: [], published: [], feedbackSnapshots: [snapshot] }) : fallback; },
+      async write(key) { if (key === "automatic-own-pr-repair-state") feedbackWrites += 1; },
+    },
+    nativeCodexStatusProviderFactory(_options, grant) {
+      const facts = grant.consume((value) => value);
+      privateReader = facts.originalRepairFeedbackReader;
+      assert.deepEqual(Object.keys(privateReader), ["read"]);
+      assert.equal(Object.isFrozen(privateReader), true);
+      return { async readStatus() { return { state: "available" }; }, async close() {} };
+    },
+  });
+  try {
+    assert.notEqual(config.githubActions?.automaticOwnPrRepair, true);
+    assert.equal("originalRepairFeedbackReader" in application, false);
+    const query = { snapshotId: snapshot.snapshotId, repository: snapshot.repository, number: snapshot.number,
+      feedbackDigest: snapshot.feedbackDigest, originalHeadRefOid: snapshot.originalHeadRefOid };
+    assert.deepEqual(await privateReader.read(query), snapshot);
+    await assert.rejects(privateReader.read({ ...query, feedbackDigest: "0".repeat(64) }),
+      { code: "OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE" });
+    assert.equal(feedbackWrites, 0);
+  } finally { await application.close(); }
 });
 
 test("application close stays bounded and incomplete while a configured provider activity never settles", async (t) => {

@@ -21,6 +21,7 @@ const PROVIDER_KEYS = new Set([
   "maxRequestBytes",
   "contextTokens",
   "credentialMode",
+  "maxConcurrentTurns",
   "remote",
 ]);
 const PROVIDER_LIMIT_KEYS = Object.freeze([
@@ -34,6 +35,7 @@ const CLI_PROVIDER_KEYS = new Set([
   "maxResponseBytes",
   "maxRequestBytes",
   "credentialMode",
+  "maxConcurrentTurns",
   "remote",
 ]);
 const ROLE_KEYS = new Set([
@@ -335,6 +337,8 @@ function providerWithBoundary(provider, remote, lifecycle, sessionIsolationKey =
     throw new TypeError("brain provider native review skill support is invalid");
   }
   const availability = provider.checkAvailability;
+  const admission=provider.withAdmission;
+  if(admission!==undefined && typeof admission!=='function')throw new TypeError('brain provider admission is invalid');
   if (
     attemptDescriptor &&
     (!("value" in attemptDescriptor) ||
@@ -373,6 +377,7 @@ function providerWithBoundary(provider, remote, lifecycle, sessionIsolationKey =
     ...(codeReadingDescriptor?.value === true ? { supportsCodeReading: true } : {}),
     ...(codeExecutionDescriptor?.value === true ? { supportsCodeExecution: true } : {}),
     generate: provider.generate.bind(provider),
+    ...(admission ? {withAdmission:admission.bind(provider)} : {}),
     ...(availability
       ? { checkAvailability: availability.bind(provider) }
       : {}),
@@ -391,6 +396,7 @@ function providerOptions(
 ) {
   const name = `brainProviders.${id}`;
   const config = exactConfig(value, PROVIDER_KEYS, name);
+  if(config.maxConcurrentTurns!==undefined && (config.kind!=='codex-cli' || config.credentialMode!=='codex-native-login'))throw new TypeError(`${name}.maxConcurrentTurns requires native Codex login`);
   const remote = declaredRemote(config, name);
   const common = {
     ...selectOptions(config, PROVIDER_LIMIT_KEYS),
@@ -432,7 +438,7 @@ function providerOptions(
       supervisedCliProviderFactory({
         ...common,
         cliKind: config.kind,
-        ...selectOptions(config, ["credentialMode"]),
+        ...selectOptions(config, ["credentialMode","maxConcurrentTurns"]),
       }, cliRuntimeFacts(dependencies)),
       remote,
       lifecycle,
@@ -500,6 +506,7 @@ function configuredBrainRouter(
     return Object.freeze({
       generate: router.generate.bind(router),
       checkAvailability: router.checkAvailability.bind(router),
+      withAdmission:router.withAdmission.bind(router),
       describe: router.describe.bind(router),
       close: lifecycle.close,
     });

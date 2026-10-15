@@ -215,6 +215,15 @@ function acceptanceContract() {
   };
 }
 
+test("internal reviews cannot publish external Review or PR actions", () => {
+  for (const intent of [
+    { ...common("propose_github_review"), verdict: "approve", body: "Reviewed", evidence: ["head:abc123"] },
+    { ...common("propose_github_pull_request_action"), action: { type: "comment", body: "Reviewed" }, evidence: ["head:abc123"] },
+  ]) {
+    assert.throws(() => policy().bind({ context: context({ internalReview: true }), intent }), { code: "WORK_INTENT_POLICY_DENIED" });
+  }
+});
+
 test("binds user questions and waits to the trusted work item and event", () => {
   const created = policy().bind({
     context: context(),

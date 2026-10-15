@@ -28,7 +28,8 @@ test("all automatic Review verdicts complete their GitHub handoff before acknowl
         },
       });
       assert.equal((await reconciler.runCycle())[0].status, "completed");
-      assert.deepEqual(events, [["work"], ["github", reviewEvent], ["ack", "completed", reviewEvent === "APPROVE" ? "tester" : "developer"]]);
+      assert.deepEqual(events, [...(reviewEvent === "APPROVE" ? [["work"]] : []),
+        ["github", reviewEvent], ["ack", "completed", reviewEvent === "APPROVE" ? "tester" : "developer"]]);
     });
   }
 });

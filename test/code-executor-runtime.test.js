@@ -5,6 +5,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  readFile,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -22,6 +23,22 @@ import { StateStore } from "../src/lib/state-store.js";
 
 const image =
   "node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32";
+
+test("Windows-only production composition needs no Docker service or configuration", { skip: process.platform !== "win32" }, async (t) => {
+  const value = await fixture(t);
+  const config = enabledConfig(value.root);
+  delete config.docker;
+  config.profiles = { native: {
+    kind: "windows-test", nodeExecutable: process.execPath,
+    nodeSha256: createHash("sha256").update(await readFile(process.execPath)).digest("hex"),
+    timeoutMs: 30_000,
+    asset: { schemaVersion: 1, title: "Windows tests", description: "Real assertions", version: 1, source: "import assert from 'node:assert/strict'; assert.equal(1,1); console.log('# tests 1\\n# pass 1\\n# fail 0');" },
+  } };
+  config.requiredProfilesByWorkspace = { dashboard: ["native"] };
+  const runtime = await createCodeExecutorRuntime(config, { sourceBaseRoot: value.sourceBaseRoot, runtimeRoot: value.runtimeRoot, store: value.store });
+  assert.equal(runtime.sandbox.dockerRunner, null);
+  assert.match(runtime.sandbox.getProfileFingerprint("native"), /^[a-f0-9]{64}$/);
+});
 
 async function fixture(t) {
   const root = await mkdtemp(path.join(tmpdir(), "code-executor-runtime-"));

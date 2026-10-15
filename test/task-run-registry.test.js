@@ -303,7 +303,7 @@ test("only actual operations appear and untouched runs never write task settings
   assert.match(running.view.runId, /^[a-f0-9-]{36}$/);
   assert.equal(running.view.revision, 0);
   assert.equal(running.view.startedAt, NOW);
-  assert.equal(running.view.phase, "running");
+  assert.equal(running.view.phase, "preparing");
   assert.equal(running.view.mode, "active");
   assert.equal(running.view.active, true);
   assert.deepEqual(running.calls, [[]]);
@@ -356,7 +356,7 @@ test("priority changes future ordering without repeating a completed operation",
   const running = await start(registry);
   const prioritized = await registry.control("work-item", "work-1", control(running.view, "priority", { priority: "urgent" }));
   assert.equal(prioritized.priority, "urgent");
-  assert.equal(prioritized.phase, "running");
+  assert.equal(prioritized.phase, "preparing");
   const items = [{ id: "work-2" }, { id: "work-1" }, { id: "work-3" }];
   assert.deepEqual(await registry.order(items, "work-item", "id"), [items[1], items[0], items[2]]);
   assert.deepEqual(items.map(({ id }) => id), ["work-2", "work-1", "work-3"]);

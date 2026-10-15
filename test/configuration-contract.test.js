@@ -755,6 +755,18 @@ test("versioned code executor profiles accept reusable Node script assets", () =
   );
 });
 
+test("Windows fixed profiles bind native executable and asset versions without Docker configuration", () => {
+  const value = document();
+  value.codeExecutor = { enabled: true, workspaces: [{ id: "dashboard", sourceRoot: "." }],
+    profiles: { native: { kind: "windows-test", nodeExecutable: "C:/Program Files/nodejs/node.exe", nodeSha256: "a".repeat(64), timeoutMs: 30_000,
+      asset: { schemaVersion: 1, title: "Native tests", description: "Fixed product assertions", version: 1, source: "fixed" } } },
+    requiredProfilesByWorkspace: { dashboard: ["native"] } };
+  assert.deepEqual(normalizeConfigurationDocument(value).codeExecutor.profiles, value.codeExecutor.profiles);
+  const unpinned = structuredClone(value);
+  delete unpinned.codeExecutor.profiles.native.nodeSha256;
+  assertInvalid(unpinned);
+});
+
 test("own PR repair is an optional strict boolean and preserves legacy documents", () => {
   const legacy = document();
   delete legacy.githubActions.automaticOwnPrRepair;
@@ -1249,6 +1261,28 @@ test("supervised CLI providers are closed remote-only brain identities", () => {
     assert.deepEqual(normalized.brainProviders[kind], value.brainProviders[kind]);
     assert.equal(normalized.employees.roles.orchestrator.brain.provider, kind);
   }
+});
+
+test("native Codex capacity is bounded, persistent, consistent and classified for restart", () => {
+  const before = document();
+  before.brainProviders.native = { kind: "codex-cli", credentialMode: "codex-native-login", remote: true };
+  const after = structuredClone(before);
+  after.brainProviders.native.maxConcurrentTurns = 2;
+  assert.equal(normalizeConfigurationDocument(after).brainProviders.native.maxConcurrentTurns, 2);
+  const field = "brainProviders.native.maxConcurrentTurns";
+  assert.ok(configurationDocumentImpact(before, after).restart_required.includes(field));
+  assert.ok(configurationDocumentImpact(before, after).authority_expansion.includes(field));
+  assert.ok(configurationDocumentImpact(after, before).security_tightening.includes(field));
+  for (const value of [0, 5, 1.5, "2"]) {
+    const invalid = structuredClone(after); invalid.brainProviders.native.maxConcurrentTurns = value; assertInvalid(invalid);
+  }
+  for (const credentialMode of ["api-key", "codex-login"]) {
+    const invalid = structuredClone(after); invalid.brainProviders.native.credentialMode = credentialMode; assertInvalid(invalid);
+  }
+  const inconsistent = structuredClone(after);
+  inconsistent.brainProviders.second = structuredClone(before.brainProviders.native);
+  assertInvalid(inconsistent);
+  const remote = document(); remote.brainProviders.ollama.maxConcurrentTurns = 2; assertInvalid(remote);
 });
 
 test("CLI provider credential modes remain optional legacy configuration and classify authority", () => {

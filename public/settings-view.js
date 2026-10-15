@@ -354,7 +354,10 @@ function optionalCollections(path, value, context) {
       (descriptor) =>
         descriptor.optional &&
         descriptor.pattern.length === path.length + 1 &&
-        descriptor.pattern.slice(0, -1).every((segment, index) => segment === `${path[index]}`) &&
+        descriptor.pattern.slice(0, -1).every((segment, index) =>
+          segment === `${path[index]}` || segment === "*" || (segment === "#" && /^\d+$/u.test(`${path[index]}`)),
+        ) &&
+        (!descriptor.profileKinds || descriptor.profileKinds.includes(value.kind)) &&
         !Object.hasOwn(value, descriptor.pattern.at(-1)),
     )
     .map((descriptor) => {

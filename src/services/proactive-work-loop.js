@@ -1048,66 +1048,78 @@ export class ProactiveWorkLoop {
           outcomes.push({ itemId: item.itemId, ...availabilityOutcome });
           continue;
         }
-        if (
-          this.roleContextAssembler !== null &&
-          configuredRoot
-        ) {
-          const processed = await this.#processConfiguredOrchestrator({
-            item,
-            worker: resolution,
-            options,
-            graphBlocked: isGraphBlocked,
-          });
-          const stalePrFact = isUnclaimedStalePrFact(processed);
-          if (stalePrFact) stalePrFactSweep.set(item.itemId, item.revision);
-          if (configuredResultConsumesWorkBudget(processed)) {
-            workAttempts += 1;
-          } else if (!stalePrFact) {
-            availabilityBudgetUsed -= 1;
-            this.fencedClaimDeferrals.set(item.itemId, {
-              revision: item.revision,
-              retryAfterCycle: claimCycleSequence + 1,
+        const processAdmitted = async () => {
+          if (
+            this.roleContextAssembler !== null &&
+            configuredRoot
+          ) {
+            const processed = await this.#processConfiguredOrchestrator({
+              item,
+              worker: resolution,
+              options,
+              graphBlocked: isGraphBlocked,
             });
+            const stalePrFact = isUnclaimedStalePrFact(processed);
+            if (stalePrFact) stalePrFactSweep.set(item.itemId, item.revision);
+            if (configuredResultConsumesWorkBudget(processed)) {
+              workAttempts += 1;
+            } else if (!stalePrFact) {
+              availabilityBudgetUsed -= 1;
+              this.fencedClaimDeferrals.set(item.itemId, {
+                revision: item.revision,
+                retryAfterCycle: claimCycleSequence + 1,
+              });
+            }
+            if (configuredResultConsumesWorkBudget(processed)) {
+              this.fencedClaimDeferrals.delete(item.itemId);
+            }
+            claimAttempts += processed.claimAttempted ? 1 : 0;
+            claimedCount += processed.claimed ? 1 : 0;
+            outcomes.push({ itemId: item.itemId, ...processed.outcome });
+            return;
           }
-          if (configuredResultConsumesWorkBudget(processed)) {
-            this.fencedClaimDeferrals.delete(item.itemId);
-          }
-          claimAttempts += processed.claimAttempted ? 1 : 0;
-          claimedCount += processed.claimed ? 1 : 0;
-          outcomes.push({ itemId: item.itemId, ...processed.outcome });
-          continue;
-        }
 
-        claimAttempts += 1;
-        const claim = await this.#claim(item, resolution, options);
-        if (!claim.item) {
-          if (claimFailureConsumesWorkBudget(claim)) {
-            workAttempts += 1;
-            this.fencedClaimDeferrals.delete(item.itemId);
-          } else {
-            availabilityBudgetUsed -= 1;
-            this.fencedClaimDeferrals.set(item.itemId, {
-              revision: item.revision,
-              retryAfterCycle: claimCycleSequence + 1,
-            });
+          claimAttempts += 1;
+          const claim = await this.#claim(item, resolution, options);
+          if (!claim.item) {
+            if (claimFailureConsumesWorkBudget(claim)) {
+              workAttempts += 1;
+              this.fencedClaimDeferrals.delete(item.itemId);
+            } else {
+              availabilityBudgetUsed -= 1;
+              this.fencedClaimDeferrals.set(item.itemId, {
+                revision: item.revision,
+                retryAfterCycle: claimCycleSequence + 1,
+              });
+            }
+            outcomes.push({ itemId: item.itemId, ...claimFailureOutcome(claim) });
+            return;
           }
-          outcomes.push({ itemId: item.itemId, ...claimFailureOutcome(claim) });
-          continue;
-        }
-        this.fencedClaimDeferrals.delete(item.itemId);
-        workAttempts += 1;
-        claimedCount += 1;
-        const outcome = this.roleContextAssembler === null || resolution.orchestrator
-          ? await this.#decideAndStage(claim.item, resolution, options)
-          : await this.#processSpecialist(claim.item, resolution, options);
-        outcomes.push({ itemId: item.itemId, ...outcome });
-        if (
-          resolution.orchestrator &&
-          ["staged", "stage_recovered", "stage_uncertain"].includes(
-            outcome.status,
-          )
-        ) {
-          activeQuestions.add(key);
+          this.fencedClaimDeferrals.delete(item.itemId);
+          workAttempts += 1;
+          claimedCount += 1;
+          const outcome = this.roleContextAssembler === null || resolution.orchestrator
+            ? await this.#decideAndStage(claim.item, resolution, options)
+            : await this.#processSpecialist(claim.item, resolution, options);
+          outcomes.push({ itemId: item.itemId, ...outcome });
+          if (
+            resolution.orchestrator &&
+            ["staged", "stage_recovered", "stage_uncertain"].includes(
+              outcome.status,
+            )
+          ) {
+            activeQuestions.add(key);
+          }
+        };
+        try {
+          if (typeof resolution.withDecisionAdmission === 'function') {
+            await resolution.withDecisionAdmission({item:workerItemDto(item),signal:options.signal},processAdmitted);
+          } else await processAdmitted();
+        } catch (error) {
+          throwIfLoopAborted(options.signal);
+          if (stableFailureCode(error) !== 'STRUCTURED_PROVIDER_BUSY') throw error;
+          availabilityBudgetUsed -= 1;
+          outcomes.push({itemId:item.itemId,status:'waiting_model',code:'STRUCTURED_PROVIDER_BUSY'});
         }
       } finally {
         this.inFlightItemIds.delete(item.itemId);
@@ -1176,6 +1188,7 @@ export class ProactiveWorkLoop {
       "checkAvailability",
       "roleDirectory returned an invalid worker",
     );
+    const withDecisionAdmission = optionalPortMethod(candidate,'withDecisionAdmission','roleDirectory returned an invalid worker');
     if (!candidate.enabled || candidate.paused) {
       return {
         status: "paused",
@@ -1191,6 +1204,7 @@ export class ProactiveWorkLoop {
       workerId,
       decide: candidate.decide.bind(candidate),
       ...(checkAvailability === null ? {} : { checkAvailability }),
+      ...(withDecisionAdmission === null ? {} : { withDecisionAdmission }),
     };
   }
 

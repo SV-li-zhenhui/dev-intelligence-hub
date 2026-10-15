@@ -1,5 +1,6 @@
 import { assertExpectedWorkGraphRevision } from "./work-ledger-graph-command-support.js";
 import { hasCodeConfirmationSettlement } from "./work-ledger-code-confirmation-settlement.js";
+import { hasReviewConfirmationSettlement } from "./work-ledger-review-confirmation-settlement.js";
 import { requireWorkLedgerItem } from "./work-ledger-item-commands.js";
 import {
   activatePendingPullRequestWorkSource,
@@ -9,6 +10,7 @@ import {
 import { assertItemRevision } from "./work-ledger-transitions.js";
 import {
   boundedLedgerString,
+  ledgerDigest,
   hasExactLedgerKeys,
   workLedgerError,
 } from "./work-ledger-values.js";
@@ -329,14 +331,14 @@ function definitiveBlockedSettlement(item, outboxById, timelineIndex, confirmati
   ) {
     return { proposalProof: null };
   }
-  const codeConfirmationSettled = hasCodeConfirmationSettlement(
+  const confirmationSettled = hasCodeConfirmationSettlement(
     item, outboxById, confirmationSettlements?.get(item.itemId),
-  );
-  const proposalProof = latestSettledProposalProof(item, timelineIndex, codeConfirmationSettled);
+  ) || hasReviewConfirmationSettlement(item, outboxById, confirmationSettlements?.get(item.itemId));
+  const proposalProof = latestSettledProposalProof(item, timelineIndex, confirmationSettled);
   if (
     proposalProof !== null &&
     (item.statusReason === `proposal_${item.decisionContext.outcome}` ||
-      (item.statusReason === "pr_source_revised" && codeConfirmationSettled) ||
+      (item.statusReason === "pr_source_revised" && confirmationSettled) ||
       crossRootPullRequestCutoverPendingId(item) !== null)
   ) {
     return { proposalProof };
@@ -380,6 +382,18 @@ function unstartedIntent(item, outboxById) {
   return null;
 }
 
+function obsoleteHeadCondition(item, outboxById) {
+  if (item.status !== "waiting_condition" || item.activeIntentId === null) return null;
+  const outbox = outboxById.get(item.activeIntentId);
+  const condition = outbox?.intent?.condition;
+  if (outbox?.status !== "delivered" || outbox.outcome?.status !== "delivered" ||
+      outbox.intent.type !== "wait_condition" || condition?.kind !== "workflow_fact" ||
+      !["merge-state", "ci-status", "review-decision", "next-action", "action-state", "head-oid", "base-oid", "state"].includes(condition.fact) ||
+      outbox.inputDigest !== item.inputDigest || outbox.sourceBinding == null ||
+      ledgerDigest(outbox.sourceBinding) !== ledgerDigest(currentWorkItemInputBinding(item))) return null;
+  return outbox;
+}
+
 function ownerRequestedAfterCancellation(replacementRoot, predecessor) {
   const event = replacementRoot?.event;
   return predecessor.status === "cancelled" &&
@@ -411,6 +425,7 @@ export function inspectPullRequestSourceCutover(
       : CHILD_TERMINAL_STATUSES.has(item.status) ||
         CHILD_SUPERSEDABLE_STATUSES.has(item.status);
     if (statusReady) return false;
+    if (headChanged && obsoleteHeadCondition(item, outboxById) !== null) return false;
     const settlement = definitiveBlockedSettlement(
       item,
       outboxById,
@@ -540,10 +555,11 @@ export function applyReadyPullRequestSourceCutover({
     : root;
   for (const participant of activation.participants) {
     const activeOutbox = unstartedIntent(participant, outboxById);
-    if (activeOutbox !== null) {
-      outboxById.set(
-        activeOutbox.intentId,
-        failSupersededIntent(activeOutbox, nextInputRevision, now),
+    const obsoleteCondition = activation.headChanged ? obsoleteHeadCondition(participant, outboxById) : null;
+    const supersededIntent = activeOutbox ?? obsoleteCondition;
+    if (supersededIntent !== null) {
+      if (activeOutbox !== null) outboxById.set(
+        activeOutbox.intentId, failSupersededIntent(activeOutbox, nextInputRevision, now),
       );
       timelineEvents.push({
         itemId: participant.itemId,
@@ -551,8 +567,8 @@ export function applyReadyPullRequestSourceCutover({
         at: now,
         actorId: "work-ledger-system",
         details: {
-          intentId: activeOutbox.intentId,
-          reason: "pr_source_superseded_before_dispatch",
+          intentId: supersededIntent.intentId,
+          reason: obsoleteCondition === null ? "pr_source_superseded_before_dispatch" : "pr_head_condition_superseded",
           nextInputRevision,
         },
       });

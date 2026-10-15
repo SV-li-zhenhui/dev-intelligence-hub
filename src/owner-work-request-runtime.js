@@ -75,6 +75,7 @@ export async function createOwnerWorkRequestRuntime({
     await service.recover();
     return Object.freeze({
       submit: (request, options) => admit(() => service.submit(request, options)),
+      submitInternalReview: (request, options) => admit(() => service.submitInternalReview(request, options)),
       get: (requestId) => admit(() => service.get(requestId)),
       list: (options) => admit(() => service.list(options)),
       resumePending: () => admit(() => service.resumePending()),
@@ -118,6 +119,7 @@ export function createLazyOwnerWorkRequestRuntime(factory) {
   };
   return Object.freeze({
     submit: async (...arguments_) => (await resolve()).submit(...arguments_),
+    submitInternalReview: async (...arguments_) => (await resolve()).submitInternalReview(...arguments_),
     get: async (...arguments_) => (await resolve()).get(...arguments_),
     list: async (...arguments_) => (await resolve()).list(...arguments_),
     resumePending: async (...arguments_) =>

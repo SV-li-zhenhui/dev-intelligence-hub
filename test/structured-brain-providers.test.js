@@ -5,7 +5,7 @@ import {
   OpenAICompatibleProvider,
   OpenAiCompatibleProvider,
 } from "../src/adapters/openai-compatible-provider.js";
-import { normalizeStructuredBrainRequest } from "../src/lib/structured-brain-request.js";
+import { normalizeStructuredBrainRequest, readStructuredBrainGenerateInput } from "../src/lib/structured-brain-request.js";
 import { BrainRouter } from "../src/services/brain-router.js";
 
 const SCHEMA = Object.freeze({
@@ -18,6 +18,21 @@ const MESSAGES = Object.freeze([
   Object.freeze({ role: "system", content: "Return JSON." }),
   Object.freeze({ role: "user", content: "{}" }),
 ]);
+
+test("structured scheduling identity stays separate from authorized session history", () => {
+  const source = { model: "bounded-model", messages: MESSAGES, schema: SCHEMA,
+    sessionKey: `auth-v2:${"a".repeat(64)}`, admissionEntityKey: "github:pull_request:Owner/Repo#42" };
+  const input = readStructuredBrainGenerateInput(source);
+  const normalized = normalizeStructuredBrainRequest(source, { maxRequestBytes: 8 * 1024 });
+  assert.equal(input.admissionEntityKey, source.admissionEntityKey);
+  assert.equal(normalized.admissionEntityKey, "github:pull_request:owner/repo#42");
+  assert.equal(normalized.sessionKey, source.sessionKey);
+  let getterCalls = 0;
+  Object.defineProperty(source, "admissionEntityKey", { enumerable: true, get() { getterCalls++; return "untrusted"; } });
+  assert.throws(() => readStructuredBrainGenerateInput(source), /structured request is invalid/);
+  assert.throws(() => normalizeStructuredBrainRequest(source, { maxRequestBytes: 8 * 1024 }), /structured request is invalid/);
+  assert.equal(getterCalls, 0);
+});
 
 function textResponse(value, { ok = true, status = 200 } = {}) {
   const text = typeof value === "string" ? value : JSON.stringify(value);

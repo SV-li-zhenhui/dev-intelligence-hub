@@ -121,8 +121,8 @@ models/effort, the original `CODEX_HOME` and entity thread references. New durab
 threads request legacy history; existing threads resume by their exact ID.
 
 The same Windows Job Object wrapper now carries a framed invocation header and
-persistent stdin. It starts the verified binary suspended, assigns the process
-tree before resuming, and retains the existing termination proof and limits.
+persistent stdin. It assigns the verified binary to its Job Object atomically
+at process creation, retaining the existing termination proof and limits.
 Direct-child exit is not substituted for tree cleanup. Live instructions use
 `turn/steer` with the current thread and expected turn ID. Acknowledgements must
 return that exact turn ID; they do not prove semantic adoption.
@@ -624,7 +624,11 @@ An existing archived compatibility conversation is not automatically imported
 into native mode. Its history remains available for maintenance; the new route
 creates its own entity-bound native conversation. Do not attempt a migration by
 copying an entire old invocation profile into the native home. Separate native
-invocations sharing the home are serialized by the service; avoid concurrent
+  invocations sharing the home use bounded service admission. Capacity defaults
+  to one; `brainProviders.<id>.maxConcurrentTurns` may be raised to 2–4 after real
+  Windows concurrency, authentication and process-cleanup validation. All native
+  providers sharing the home must use the same capacity. Different entities may
+  overlap while one entity and login probes remain serialized; avoid concurrent
 manual edits to that home during maintenance.
 
 To roll back, pause the affected role, allow supervised work to settle, select
@@ -751,7 +755,12 @@ durable checkpoint and can be recreated with `npm run setup:validation-browser`.
 Every other StateStore JSON value, including legacy array-valued stores, is
 hashed into the checkpoint; values without a revision envelope use revision
 `0` plus their content digest. Undeclared hidden paths and aliases still fail
-the scan closed instead of being silently omitted.
+the scan closed instead of being silently omitted. Source dotfiles are supported
+inside declared executor workspace copies, Windows test workspace/resource
+copies and the exact generated Docker test-library layout. Hidden files outside
+those namespaces, traversal, aliases, links and Windows device/stream paths are
+still rejected. Root archive stores share the existing file-count ceiling and
+the combined 16 MiB manifest budget.
 
 The equivalent same-origin browser contract is:
 

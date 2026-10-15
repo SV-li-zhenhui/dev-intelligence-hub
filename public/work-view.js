@@ -632,7 +632,9 @@ function manifestProfileMarkup(profiles, manifest) {
         <span>尝试 ${escapeWorkHtml(profile?.attemptNumber ?? "未知")}</span>
       </div>
       <dl class="detail-grid">
-        <dt>固定镜像</dt><dd><code>${escapeWorkHtml(profile?.imageId || "未知")}</code></dd>
+        ${profile?.runtimeIdentity?.kind === "windows-process"
+          ? `<dt>Windows 进程</dt><dd>${escapeWorkHtml(profile.runtimeIdentity.pid)} · ${escapeWorkHtml(profile.verificationKind === "build" ? "构建" : "测试")}</dd><dt>程序摘要</dt><dd><code>${escapeWorkHtml(profile.runtimeIdentity.executableSha256)}</code></dd>`
+          : `<dt>固定镜像</dt><dd><code>${escapeWorkHtml(profile?.imageId || "未知")}</code></dd>`}
         <dt>配置摘要</dt><dd><code>${escapeWorkHtml(profile?.configDigest || "未知")}</code></dd>
         <dt>工作区修订</dt><dd><code>${escapeWorkHtml(profile?.workspaceRevision || "未知")}</code></dd>
         <dt>执行动作</dt><dd>${escapeWorkHtml(profile?.actionId || "未知")}</dd>

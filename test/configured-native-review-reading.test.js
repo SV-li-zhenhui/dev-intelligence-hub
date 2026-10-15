@@ -26,6 +26,7 @@ async function assertConfiguredNativeReviewReading(t, patch) {
   };
   const targets = [];
   const calls = [];
+  const inputs=[];
   const skillDocuments = [];
   const registeredSkills = [];
   let completenessChecks = 0;
@@ -70,6 +71,7 @@ async function assertConfiguredNativeReviewReading(t, patch) {
         processRunner: {
           async run(call) {
             calls.push(call);
+            inputs.push(JSON.parse(await readFile(path.join(call.cwd,'task.json'),'utf8')));
             registeredSkills.push(await readFile(path.join(call.cwd, ".agents/skills/dih-pr-review/SKILL.md"), "utf8"));
             await writeFile(call.args[call.args.indexOf("--output-last-message") + 1], JSON.stringify({
               result: JSON.stringify({ intent: { type: "propose_github_review" } }),
@@ -121,7 +123,7 @@ async function assertConfiguredNativeReviewReading(t, patch) {
   assert.ok(call.args.includes("skills.include_instructions=false"));
   assert.ok(call.args.includes("skills.bundled.enabled=false"));
   assert.equal(call.args[call.args.indexOf("--sandbox") + 1], "read-only");
-  const input = JSON.parse(call.input.toString("utf8"));
+  const [input] = inputs;
   assert.match(input.instruction, /Use \$dih-pr-review/u);
   assert.match(input.messages[0].content, /native \$dih-pr-review/u);
   assert.doesNotMatch(input.messages[0].content, /Apply the bundled quick-pr-review skill below/u);

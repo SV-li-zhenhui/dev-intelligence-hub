@@ -1,4 +1,5 @@
 import { scheduler } from "node:timers/promises";
+import { createWorkIntentDispatchBinding } from "../domain/work-intent-dispatch-binding.js";
 import { planWorkItemRunControl } from './work-ledger-run-control.js';
 import {
   createRevokedCodeConfirmationSettlement,
@@ -6,6 +7,8 @@ import {
   createCompletedCodeConfirmationSettlement,
   isChangedCodeConfirmationDecision,
 } from "./work-ledger-code-confirmation-settlement.js";
+import { isChangedReviewConfirmationDecision, reviewConfirmationSettlementIds,
+  createCompletedReviewConfirmationSettlement } from "./work-ledger-review-confirmation-settlement.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 import {
   isTrustedPullRequestScopeLifecycleAssignment,
@@ -79,6 +82,7 @@ import {
   appendPullRequestWorkSource,
   currentWorkItemEvent,
   currentWorkItemInputBinding,
+  currentWorkItemExecutionBinding,
   pullRequestHeadAdmission,
   pullRequestWorkDescriptor,
   pullRequestTrustedPredecessor,
@@ -826,6 +830,49 @@ export class WorkLedgerService {
     );
   }
 
+  async readInternalReviewHandoff(input = {}) {
+    this.#assertReady();
+    if (!hasExactLedgerKeys(input, ["itemId"])) throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "内部复审交接查询无效");
+    let itemId;
+    try { itemId = boundedLedgerString(input.itemId, "itemId", 192); }
+    catch { throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "内部复审交接查询无效"); }
+    return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
+      this.state = await this.#readDurableState();
+      const item = this.state.items.find((entry) => entry.itemId === itemId);
+      if (item?.currentTarget?.type !== "role" || item.currentTarget.id !== "pr-engineer" || item.sourceQuarantine != null) return null;
+      const admission = pullRequestHeadAdmission(this.state, item);
+      if (admission.applies && (!admission.current || admission.pending)) return null;
+        const outbox = this.state.outbox.findLast((entry) => entry.itemId === itemId && entry.intent.type === "handoff" &&
+          entry.status === "delivered" && entry.outcome?.status === "delivered");
+      const bound = outbox?.dispatchBinding?.boundIntent;
+      const sourceBinding = currentWorkItemInputBinding(item);
+      const executionBinding = currentWorkItemExecutionBinding(item);
+      const event = currentWorkItemEvent(item);
+      if (!outbox || !bound || sourceBinding == null || executionBinding?.schemaVersion !== 2 ||
+          outbox.inputDigest !== item.inputDigest || ledgerDigest(outbox.sourceBinding) !== ledgerDigest(sourceBinding) ||
+          outbox.requestedBy.roleId !== "developer" || outbox.intent.capability !== "pr-review" ||
+          bound.kind !== "handoff" || bound.requestedBy.roleId !== "developer" || bound.requestedBy.workItemId !== itemId ||
+          bound.binding.targetRoleId !== "pr-engineer" || bound.binding.eventId !== event.eventId ||
+          ledgerDigest(bound.binding.subject) !== ledgerDigest(event.subject) ||
+          bound.source.assignmentId !== item.assignmentId || bound.source.eventId !== event.eventId ||
+          bound.payload.capability !== "pr-review" || bound.payload.brief !== outbox.intent.brief ||
+          ledgerDigest(bound.payload.evidence) !== ledgerDigest(outbox.intent.evidence) ||
+          ledgerDigest(createWorkIntentDispatchBinding(bound)) !== ledgerDigest(outbox.dispatchBinding) ||
+          outbox.outcome.details?.downstreamRef !== bound.intentId) return null;
+      // The atomic acknowledgement records the actual new responsibility in
+      // the adjacent handed_off timeline event, not in model-supplied data.
+      const acknowledged = this.state.timeline.findLast((entry) => entry.itemId === itemId &&
+        entry.type === "intent_acknowledged" && entry.details?.intentId === outbox.intentId &&
+        entry.details.outcome === "delivered" && entry.details.nextStatus === "queued");
+      const handedOff = acknowledged && this.state.timeline.find((entry) => entry.sequence === acknowledged.sequence + 1);
+      if (handedOff?.type !== "handed_off" || handedOff.itemId !== itemId || handedOff.at !== outbox.updatedAt ||
+          handedOff.details?.fromTarget?.type !== "role" || handedOff.details.fromTarget.id !== "developer" ||
+          handedOff.details.toTarget?.type !== "role" || handedOff.details.toTarget.id !== "pr-engineer") return null;
+      return cloneLedgerValue({ kind: "developer_handoff", headRefOid: executionBinding.headRefOid,
+        brief: bound.payload.brief, evidence: bound.payload.evidence, evidenceAuthority: "developer_report" });
+    }));
+  }
+
   async isAttentionRequestCurrent(input = {}) {
     return (await this.areAttentionRequestsCurrent([input]))[0];
   }
@@ -1346,7 +1393,8 @@ export class WorkLedgerService {
   async #readConfirmationSettlements(commands, expectedGraphRevision) {
     if (this.confirmationSettlementReader === null) return null;
     if (!this.state.items.some((item) => item.status === "blocked" &&
-      item.activeIntentId === null && isChangedCodeConfirmationDecision(item.decisionContext))) return null;
+      item.activeIntentId === null && (isChangedCodeConfirmationDecision(item.decisionContext) ||
+        isChangedReviewConfirmationDecision(item.decisionContext)))) return null;
     // Never hold the ledger lease while entering the confirmation queue: its
     // executor can call back into this ledger when verifying code authority.
     const snapshot = await this.#writeTransaction(() => {
@@ -1356,7 +1404,8 @@ export class WorkLedgerService {
       const itemsById = new Map(this.state.items.map((item) => [item.itemId, item]));
       const candidates = new Map();
       const eligible = this.state.items.filter((item) => item.status === "blocked" &&
-        item.activeIntentId === null && isChangedCodeConfirmationDecision(item.decisionContext))
+        item.activeIntentId === null && (isChangedCodeConfirmationDecision(item.decisionContext) ||
+          isChangedReviewConfirmationDecision(item.decisionContext)))
         .map((item) => ({ item, binding: currentWorkItemInputBinding(item) }));
       for (const command of commands) {
         const root = itemsById.get(command.itemId);
@@ -1384,6 +1433,15 @@ export class WorkLedgerService {
     const outboxById = new Map(snapshot.outbox.map((entry) => [entry.intentId, entry]));
     const proofs = new Map();
     for (const item of snapshot.candidates) {
+      if (isChangedReviewConfirmationDecision(item.decisionContext)) {
+        const confirmations = [];
+        for (const confirmationId of reviewConfirmationSettlementIds(item, outboxById)) {
+          confirmations.push(await this.confirmationSettlementReader.read({ confirmationId }));
+        }
+        const proof = createCompletedReviewConfirmationSettlement(item, outboxById, confirmations);
+        if (proof !== null) proofs.set(item.itemId, proof);
+        continue;
+      }
       const confirmation = await this.confirmationSettlementReader.read({
         confirmationId: item.decisionContext.value.downstreamRef,
       });

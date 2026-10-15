@@ -8,6 +8,7 @@ import {
 import { digestValue } from "./code-executor-contract.js";
 import { normalizeChangePackageManifest } from "./change-package-contract.js";
 import { CodeExecutionPolicy } from "./code-execution-policy.js";
+import { executionIdentityFields, executionIdentityKeys, isExecutionIdentityProof } from "./test-runtime-identity.js";
 
 const SHA256 = /^[a-f0-9]{64}$/u;
 const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
@@ -378,7 +379,7 @@ function profileProjection(profile) {
     workspaceRevision: profile.workspaceRevision,
     actionId: profile.actionId,
     attemptNumber: profile.attemptNumber,
-    imageId: profile.imageId,
+    ...executionIdentityFields(profile),
     artifactsDigest: digestValue(profile.artifacts),
   };
 }
@@ -491,7 +492,12 @@ function normalizePackage(value) {
 }
 
 function normalizeProfile(value, workspaceRevision) {
-  const fields = exactObject(value, TEST_PROFILE_KEYS, "tests.profiles[]");
+  const fields = exactObject(value, [...TEST_PROFILE_KEYS.filter((key) => key !== "imageId"), ...executionIdentityKeys(value)], "tests.profiles[]");
+  const identityProof = Object.fromEntries(fields);
+  if (!isExecutionIdentityProof(identityProof, IMAGE_ID) ||
+    (identityProof.runtimeIdentity && identityProof.runtimeIdentity.actionId !== identityProof.actionId)) {
+    throw invalid("tests.profiles[] 执行身份无效");
+  }
   const profileWorkspaceRevision = sha256(
     fields.get("workspaceRevision"),
     "tests.profiles[].workspaceRevision",
@@ -516,12 +522,7 @@ function normalizeProfile(value, workspaceRevision) {
       fields.get("attemptNumber"),
       "tests.profiles[].attemptNumber",
     ),
-    imageId: boundedText(
-      fields.get("imageId"),
-      "tests.profiles[].imageId",
-      256,
-      IMAGE_ID,
-    ),
+    ...executionIdentityFields(identityProof),
     artifactsDigest: sha256(
       fields.get("artifactsDigest"),
       "tests.profiles[].artifactsDigest",
@@ -743,7 +744,7 @@ function evidenceCore(value) {
 function normalizeEvidenceDocument(value) {
   const fields = exactObject(value, EVIDENCE_KEYS, "controlled commit evidence");
   if (
-    fields.get("schemaVersion") !== 1 ||
+    ![1, 2].includes(fields.get("schemaVersion")) ||
     fields.get("kind") !== "controlled_git_commit"
   ) {
     throw invalid("controlled commit evidence kind 或 schemaVersion 无效");
@@ -778,7 +779,7 @@ function normalizeEvidenceDocument(value) {
     expectedMessageDigest,
   });
   const core = {
-    schemaVersion: 1,
+    schemaVersion: tests.profiles.some((profile) => profile.runtimeIdentity) ? 2 : 1,
     kind: "controlled_git_commit",
     executionSource,
     executionSourceDigest,
@@ -790,6 +791,7 @@ function normalizeEvidenceDocument(value) {
     createdAt,
   };
   const evidenceDigest = sha256(fields.get("evidenceDigest"), "evidenceDigest");
+  if (fields.get("schemaVersion") !== core.schemaVersion) throw invalid("controlled commit schemaVersion 与执行身份不一致");
   const evidenceId = boundedText(
     fields.get("evidenceId"),
     "evidenceId",
@@ -852,7 +854,7 @@ export function createControlledCommitEvidence(value) {
       expectedMessageDigest: rawSha256(bindings.message),
     });
     const core = {
-      schemaVersion: 1,
+      schemaVersion: bindings.tests.profiles.some((profile) => profile.runtimeIdentity) ? 2 : 1,
       kind: "controlled_git_commit",
       executionSource: bindings.executionSource,
       executionSourceDigest: bindings.executionSourceDigest,

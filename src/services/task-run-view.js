@@ -43,7 +43,7 @@ function backgroundView(job, observations = []) {
 }
 
 function isCurrentRegistryRun(task) {
-  return task && (task.active === true || task.mode === "paused" || task.pendingCommand);
+  return task && (task.active === true || task.mode === "paused" || task.pendingCommand || task.receipt?.phase==='unknown');
 }
 
 async function readBackgroundJobs(reader, status) {
@@ -95,12 +95,14 @@ export function createTaskRunView({ registry, codeJobReader = null }) {
       try { jobs = (await Promise.all(BACKGROUND_STATUSES.map((status) => readBackgroundJobs(codeJobReader, status)))).flat(); }
       catch (cause) { throw unavailable(cause); }
       const current = await registry.list();
-      const occupied = new Set([...current.items, ...current.held].filter((task) => task.kind === "code-job").map((task) => task.taskId));
+      const occupied = new Set([...current.items, ...current.held,...(current.recent??[]).filter(isCurrentRegistryRun)].filter((task) => task.kind === "code-job").map((task) => task.taskId));
       const seen = new Set(occupied);
-      return { ...current, background: jobs.filter((job) => {
+      const background=jobs.filter((job) => {
         if (seen.has(job.jobId)) return false;
         seen.add(job.jobId); return true;
-      }).map((job) => backgroundView(job)) };
+      }).map((job) => backgroundView(job));
+      const backgroundTaskIds = new Set(background.map((job) => job.taskId));
+      return { ...current,...(current.recent ? {recent:current.recent.filter(task=>task.kind!=='code-job' || !backgroundTaskIds.has(task.taskId))}:{}),background };
     },
     async get(kind, taskId) {
       let current = await registryDetail(kind, taskId);

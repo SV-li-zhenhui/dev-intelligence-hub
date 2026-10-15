@@ -18,6 +18,9 @@ import { describeCodeReadContext, revokeCodeReadContext } from "../lib/code-read
 import { createCodeJobExecutionMcp } from "./code-job-execution-mcp.js";
 import { closeCodeExecutionContext, revokeCodeExecutionContext } from "../lib/code-execution-context.js";
 import { currentTaskExecution } from "../lib/task-execution-context.js";
+import { acquireNativeAdmission, createNativeModelAdmission, currentNativeAdmission, withNativeAdmission } from '../lib/native-model-admission.js';
+import {createNativeExecLifecycle} from '../lib/native-exec-lifecycle.js';
+import {readNativeModelCapacity} from '../lib/native-model-capacity.js';
 import { parseStructuredCodeActionDecision } from "../domain/structured-code-action-contract.js";
 import { CodexNativeSessionStore, isNativeCodexThreadId, nativeCodexDigest, nativeCodexHomeIdentity } from "./codex-native-session-store.js";
 import { loadNativeReviewSkill, NATIVE_REVIEW_SKILL_DOCUMENT, NATIVE_REVIEW_SKILL_FILE, NATIVE_REVIEW_SKILL_NAME } from "../lib/native-review-skill.js";
@@ -35,6 +38,8 @@ const DEFINITIONS = {
   STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE: [503, "Native Codex login is unavailable"],
   STRUCTURED_PROVIDER_CANCELLED: [499, "Native Codex request was cancelled"],
   STRUCTURED_PROVIDER_TIMEOUT: [504, "Native Codex request timed out"],
+  STRUCTURED_PROVIDER_QUEUE_TIMEOUT: [503, "Native Codex queue wait timed out before execution"],
+  STRUCTURED_PROVIDER_BUSY: [503, "Native Codex capacity is occupied; work remains unclaimed"],
   STRUCTURED_PROVIDER_REQUEST_TOO_LARGE: [413, "Native Codex input exceeds its limit"],
   STRUCTURED_PROVIDER_RESPONSE_TOO_LARGE: [413, "Native Codex response exceeds its limit"],
   STRUCTURED_PROVIDER_RESPONSE_INVALID: [502, "Native Codex response is invalid"],
@@ -80,49 +85,15 @@ function status(state) {
   return Object.freeze({ schemaVersion: 1, state, cliAvailable: state !== "cli_unavailable", fileLoginAvailable: state === "available", credentialMode: "codex-native-login" });
 }
 
-// One queue per native home, including providers using different models/roles.
-// A cancelled queued entry is removed without allowing its operation to start.
-function acquire(state, signal) {
-  if (state.blocked) return Promise.reject(failure("STRUCTURED_PROVIDER_REAP_FAILED"));
-  return new Promise((resolve, reject) => {
-    const entry = { start: null };
-    const abort = () => {
-      const index = state.queue.indexOf(entry);
-      if (index >= 0) state.queue.splice(index, 1);
-      signal?.removeEventListener("abort", abort);
-      reject(signal.reason ?? failure("STRUCTURED_PROVIDER_CANCELLED"));
-    };
-    entry.start = () => {
-      signal?.removeEventListener("abort", abort);
-      if (signal?.aborted) { abort(); drain(state); return; }
-      if (state.blocked) { reject(failure("STRUCTURED_PROVIDER_REAP_FAILED")); drain(state); return; }
-      state.active = true;
-      let released = false;
-      resolve(() => {
-        if (released) return;
-        released = true;
-        state.active = false;
-        drain(state);
-      });
-    };
-    state.queue.push(entry);
-    signal?.addEventListener("abort", abort, { once: true });
-    if (signal?.aborted) abort();
-    drain(state);
-  });
-}
-
-function drain(state) {
-  if (!state.active) state.queue.shift()?.start();
-}
-
-function operationSignal(caller, timeoutMs) {
+function operationSignal(caller) {
   const controller = new AbortController();
   const abort = () => controller.abort(failure("STRUCTURED_PROVIDER_CANCELLED"));
   caller?.addEventListener("abort", abort, { once: true });
   if (caller?.aborted) abort();
-  const timer = setTimeout(() => controller.abort(failure("STRUCTURED_PROVIDER_TIMEOUT")), timeoutMs);
-  return { signal: controller.signal, abort, close() { clearTimeout(timer); caller?.removeEventListener("abort", abort); } };
+  let timer;
+  return { signal: controller.signal, abort,
+    deadline(timeoutMs, code) { clearTimeout(timer); timer = setTimeout(() => controller.abort(failure(code)),timeoutMs); },
+    close() { clearTimeout(timer); caller?.removeEventListener("abort", abort); } };
 }
 
 function sanitizedEnvironment(environment, nativeHome) {
@@ -225,6 +196,7 @@ export class NativeCodexBrainProvider {
     this.supportsCodeReading = true;
     this.#options = {
       timeoutMs: bounded(options.timeoutMs, 120_000, 3_600_000, "timeoutMs"),
+      queueTimeoutMs: bounded(options.queueTimeoutMs, 3_600_000, 86_400_000, "queueTimeoutMs"),
       maxRequestBytes: bounded(options.maxRequestBytes, 256 * 1024, 1024 * 1024, "maxRequestBytes"),
       maxResponseBytes: bounded(options.maxResponseBytes, 256 * 1024, 1024 * 1024, "maxResponseBytes"),
     };
@@ -254,15 +226,25 @@ export class NativeCodexBrainProvider {
       clock: dependencies.clock ?? Date.now,
     };
     const key = nativeCodexHomeIdentity(this.#nativeHome);
+    const deploymentCapacity=dependencies.maxConcurrentTurns!==undefined?dependencies:
+      options.maxConcurrentTurns!==undefined?{maxConcurrentTurns:options.maxConcurrentTurns,allowConcurrentNativeHome:true}:readNativeModelCapacity(environment);
+    const capacity = bounded(deploymentCapacity.maxConcurrentTurns, 1, 4, 'maxConcurrentTurns');
+    if (capacity > 1 && deploymentCapacity.allowConcurrentNativeHome !== true) throw new TypeError('Concurrent native home access requires explicit validation opt-in');
     this.#state = HOMES.get(key);
-    if (!this.#state) HOMES.set(key, this.#state = { active: false, blocked: false, queue: [], lastStatus: null });
+    if (!this.#state) HOMES.set(key, this.#state = createNativeModelAdmission(capacity));
+    if (this.#state.capacity !== capacity) throw new TypeError('Native home admission capacity differs between providers');
     this.#sessions = dependencies.nativeSessionStore ?? new CodexNativeSessionStore({ root: path.join(this.#root, "sessions"), nativeHome: this.#nativeHome });
   }
 
-  #marker() { return path.join(this.#root, `active-${nativeCodexDigest(nativeCodexHomeIdentity(this.#nativeHome))}.json`); }
+  #marker() { return path.join(this.#root, `active-${nativeCodexDigest(nativeCodexHomeIdentity(this.#nativeHome))}${this.#state.capacity > 1 ? `-${randomUUID()}` : ''}.json`); }
 
   async #prepare(signal) {
+    return this.#state.preparation.enqueue(()=>this.#prepareRuntime(signal));
+  }
+
+  async #prepareRuntime(signal) {
     signal.throwIfAborted();
+    if(this.#state.blocked)throw failure('STRUCTURED_PROVIDER_REAP_FAILED');
     try {
       const details = await lstat(this.#nativeHome);
       if (!details.isDirectory() || details.isSymbolicLink() || nativeCodexHomeIdentity(await realpath(this.#nativeHome)) !== nativeCodexHomeIdentity(this.#nativeHome)) throw failure();
@@ -272,20 +254,23 @@ export class NativeCodexBrainProvider {
     } });
     await prepare(this.#root);
     await prepare(path.join(this.#root, "sessions"));
-    try {
-      await lstat(this.#marker());
+    const prefix = `active-${nativeCodexDigest(nativeCodexHomeIdentity(this.#nativeHome))}`;
+    if ((await readdir(this.#root)).some(name => name.startsWith(prefix) && name.endsWith('.json') && !this.#state.markers.has(path.join(this.#root,name)))) {
       this.#state.blocked = true;
       throw failure("STRUCTURED_PROVIDER_REAP_FAILED");
-    } catch (error) { if (error?.code !== "ENOENT") throw error; }
+    }
     signal.throwIfAborted();
     return prepare;
   }
 
   async #runProcess(options, signal, marker, onProcessAttempt = () => {}, runner = this.#dependencies.processRunner) {
     signal.throwIfAborted();
+    if(this.#state.blocked)throw failure('STRUCTURED_PROVIDER_REAP_FAILED');
+    this.#state.markers.add(marker);
     try {
       await writeFile(marker, JSON.stringify({ schemaVersion: 1, invocation: path.basename(options.cwd), createdAt: this.#dependencies.clock() }), { flag: "wx", mode: 0o600 });
     } catch (error) {
+      this.#state.markers.delete(marker);
       if (error?.code === "EEXIST") { this.#state.blocked = true; throw failure("STRUCTURED_PROVIDER_REAP_FAILED"); }
       throw error;
     }
@@ -314,6 +299,7 @@ export class NativeCodexBrainProvider {
         throw failure("STRUCTURED_PROVIDER_REAP_FAILED");
       }
       await unlink(marker);
+      this.#state.markers.delete(marker);
       if (signal.aborted) {
         if (didAppServerReap(outcome.error) || (runner === this.#dependencies.appServerRunner &&
             outcome.value?.exitCode === 0 && outcome.value?.signal === null)) SETTLED_NATIVE_REAPED.add(signal.reason);
@@ -353,24 +339,48 @@ export class NativeCodexBrainProvider {
     try { await rmdir(directory); } catch { throw failure("STRUCTURED_PROVIDER_CLEANUP_FAILED"); }
   }
 
-  #operation(signal, callback, timeoutMs = this.#options.timeoutMs) {
+  #operation(signal, callback, timeoutMs = this.#options.timeoutMs, {entityKey = randomUUID(), exclusive = false, model = false,enforceEntity=false} = {}) {
     if (this.#closed) return Promise.reject(failure());
-    const operation = operationSignal(signal, timeoutMs);
+    const operation = operationSignal(signal);
+    operation.deadline(this.#options.queueTimeoutMs, 'STRUCTURED_PROVIDER_QUEUE_TIMEOUT');
     this.#controllers.add(operation);
     const attempt = (async () => {
-      let release;
+      let token, borrowed = false, acquiredUse = false, detach;
+      const context = model ? currentTaskExecution() : null;
       try {
-        release = await acquire(this.#state, operation.signal);
+        context?.reportModelState?.('waiting_model');
+        detach = context?.registerLiveControl?.({steer:async () => { throw failure('STRUCTURED_PROVIDER_BUSY'); },interrupt:async () => operation.abort()});
+        token = !exclusive ? currentNativeAdmission(this.#state) : null;
+        borrowed = Boolean(token);
+        if(token && enforceEntity && token.entity!==entityKey)throw new TypeError('Native admission entity differs from the reserved entity');
+        if (token?.inUse) throw failure('STRUCTURED_PROVIDER_BUSY');
+        token ??= await acquireNativeAdmission(this.#state, entityKey, operation.signal, {exclusive});
+        token.inUse = true;
+        acquiredUse = true;
+        detach?.(); detach = null;
         operation.signal.throwIfAborted();
+        operation.deadline(timeoutMs, 'STRUCTURED_PROVIDER_TIMEOUT');
+        context?.reportModelState?.('starting_model');
         return await callback(operation.signal);
       } catch (error) {
+        if (!token && operation.signal.aborted) context?.confirmStopped?.();
         if (error instanceof TypeError) throw error;
         throw failure(error?.code);
-      } finally { release?.(); operation.close(); this.#controllers.delete(operation); }
+      } finally {
+        detach?.();
+        if (token && acquiredUse) { token.inUse = false; if (!borrowed || token.releaseRequested) token.release(); }
+        operation.close(); this.#controllers.delete(operation);
+      }
     })();
     this.#operations.add(attempt);
     void attempt.then(() => this.#operations.delete(attempt), () => this.#operations.delete(attempt));
     return attempt;
+  }
+
+  async withAdmission({entityKey, signal = null} = {}, operation) {
+    if (this.#closed) throw failure();
+    if (typeof entityKey !== 'string' || !entityKey || Buffer.byteLength(entityKey) > 1024 || /[\u0000-\u001f]/u.test(entityKey) || typeof operation !== 'function') throw new TypeError('Native admission request is invalid');
+    return withNativeAdmission(this.#state, nativeCodexDigest(entityKey), normalizeAbortSignal(signal), operation);
   }
 
   async generate(rawRequest) {
@@ -379,6 +389,7 @@ export class NativeCodexBrainProvider {
     const request = normalizeStructuredBrainRequest({ model: input.model, messages: input.messages, schema: input.schema,
       ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
       ...(input.sessionKey ? { sessionKey: input.sessionKey } : {}), ...(input.reviewTarget ? { reviewTarget: input.reviewTarget } : {}),
+      ...(input.admissionEntityKey?{admissionEntityKey:input.admissionEntityKey}:{}),
       ...(input.codeReadContext ? { codeReadContext: input.codeReadContext } : {}),
       ...(input.codeExecutionContext ? { codeExecutionContext: input.codeExecutionContext } : {}) }, { maxRequestBytes: this.#options.maxRequestBytes });
     if (!SAFE_MODEL.test(request.model)) throw new TypeError("CLI model is invalid");
@@ -436,6 +447,7 @@ export class NativeCodexBrainProvider {
         const previous = request.sessionKey ? await this.#sessions.read({ sessionKey: request.sessionKey, signal: operationSignal }) : null;
         if (request.sessionKey) await this.#sessions.begin?.({ sessionKey: request.sessionKey, threadId: previous, signal: operationSignal });
         let processAttempted = false;
+        const lifecycle=live?null:createNativeExecLifecycle(currentTaskExecution(),Buffer.from(wireInput));
         try {
           const args = argumentsFor(request, directory, previous, reader, Boolean(skill));
           processResult = await this.#runProcess({ executable: descriptor, args: live ? appServerArguments(request,instructionsFile,Boolean(skill)) : args, cwd: directory, env: this.#dependencies.environment,
@@ -443,9 +455,10 @@ export class NativeCodexBrainProvider {
               isolation:{reader:reader?{url:reader.url}:null,agentConfigPath,ephemeral:!request.sessionKey,
                 ...(execution?{channel:'code-job',execution:{url:execution.url,revoke:execution.revoke}}:{}),
                 ...(skill?{skill:{name:NATIVE_REVIEW_SKILL_NAME,path:path.join(directory,NATIVE_REVIEW_SKILL_FILE)}}:{})}}} : {}),
-            input: Buffer.from(wireInput), timeoutMs, maxStdoutBytes: reader || execution ? 64 * 1024 * 1024 : 1024 * 1024, maxStderrBytes: this.#options.maxResponseBytes }, operationSignal, this.#marker(), () => { processAttempted = true; }, live ? this.#dependencies.appServerRunner : this.#dependencies.processRunner);
+            input: live?Buffer.from(wireInput):Buffer.alloc(0),...(lifecycle?{duplex:lifecycle.duplex}:{}), timeoutMs, maxStdoutBytes: reader || execution ? 64 * 1024 * 1024 : 1024 * 1024, maxStderrBytes: this.#options.maxResponseBytes }, operationSignal, this.#marker(), () => { processAttempted = true; }, live ? this.#dependencies.appServerRunner : this.#dependencies.processRunner);
           this.#state.lastStatus = status("available");
         } catch (failure) { processFailure = failure; }
+        finally {lifecycle?.close();}
         if (request.sessionKey && !this.#state.blocked) {
           const threadId = threadFrom(processResult ?? SETTLED_FAILURE_OUTPUT.get(processFailure) ?? readReapedProcessFailureOutput(processFailure) ?? readAppServerFailureOutput(processFailure), previous);
           if (threadId) await this.#sessions.save({ sessionKey: request.sessionKey, threadId });
@@ -474,7 +487,7 @@ export class NativeCodexBrainProvider {
           reader.commit();
           operationSignal.throwIfAborted();
         }
-        if (reader && JSON.parse(result).intent?.type === "propose_github_review") await reader.assertComplete();
+        if (request.reviewTarget && reader && ['propose_github_review','complete','handoff'].includes(JSON.parse(result).intent?.type)) await reader.assertComplete();
       } catch (caught) { error = caught; }
       finally {
         if (request.codeExecutionContext) {
@@ -501,7 +514,7 @@ export class NativeCodexBrainProvider {
       }
       if (error) throw error;
       return result;
-    }, timeoutMs);
+    }, timeoutMs, {entityKey: request.admissionEntityKey ? nativeCodexDigest(request.admissionEntityKey) : request.sessionKey ? nativeCodexDigest(request.sessionKey) : randomUUID(),model:true,enforceEntity:request.admissionEntityKey!==undefined});
     if (!request.codeExecutionContext) return operation;
     // Queue/preparation failures happen before endpoint construction. They must
     // still revoke the opaque capability and release its host owner exactly once.
@@ -519,7 +532,7 @@ export class NativeCodexBrainProvider {
     if (this.#closed) throw failure();
     if (this.transport === 'app-server' && this.#dependencies.appServerRunner.supportsContainedExecution === false) return status('cli_unavailable');
     if (this.#state.blocked) return status("broker_blocked");
-    if (this.#state.active && this.#state.lastStatus) return this.#state.lastStatus;
+    if (this.#state.active.size > 0 && this.#state.lastStatus) return this.#state.lastStatus;
     try {
       return await this.#operation(signal, async (operationSignal) => {
         const prepare = await this.#prepare(operationSignal);
@@ -539,7 +552,7 @@ export class NativeCodexBrainProvider {
           if (["STRUCTURED_PROVIDER_PROCESS_EXITED", "STRUCTURED_PROVIDER_PROCESS_FAILED"].includes(error?.code)) throw failure("STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE");
           throw error;
         } finally { if (!this.#state.blocked) await this.#cleanup(directory, []); }
-      });
+      }, Math.min(30_000,this.#options.timeoutMs), {exclusive:true});
     } catch (error) {
       if (error?.code === "STRUCTURED_PROVIDER_CANCELLED") throw error;
       return status(this.#state.blocked || error?.code === "STRUCTURED_PROVIDER_REAP_FAILED" ? "broker_blocked" :
@@ -555,7 +568,7 @@ export class NativeCodexBrainProvider {
     if (this.transport === 'app-server' && this.#dependencies.appServerRunner.supportsContainedExecution === false) throw failure();
     // Availability is admission, not a second serialized model operation.
     // Each queued generation still validates the home, session and CLI itself.
-    if (this.#state.active) return;
+    if (this.#state.active.size) return;
     const result = await this.readStatus({ signal });
     if (result.state !== "available") throw failure(result.state === "broker_blocked" ? "STRUCTURED_PROVIDER_REAP_FAILED" :
       result.state === "file_login_unavailable" ? "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE" : "STRUCTURED_PROVIDER_UNAVAILABLE");

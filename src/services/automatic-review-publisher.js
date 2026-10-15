@@ -28,7 +28,7 @@ export class AutomaticReviewPublisher {
         if (!responsiblePerson) return item;
         reviewHandoff = { workType: "testing", responsiblePerson };
       } else {
-        reviewHandoff = { workType: "pull_request", responsiblePerson: null };
+        reviewHandoff = { workType: "assignment", responsiblePerson: null };
       }
     }
     const digest = createHash("sha256").update(item.id + ":" + item.approvalBindingDigest).digest("hex").slice(0, 48);

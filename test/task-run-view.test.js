@@ -32,6 +32,16 @@ function readerFor(jobs) {
     async getDetail({ jobId }) { return { job: jobs.find((item) => item.jobId === jobId), observations: [], nextCursor: null }; } };
 }
 
+test('recovered unknown native execution remains visible ahead of background waiting state',async()=>{
+  const unknown={kind:'code-job',taskId:JOB_ID,phase:'unknown',active:false,mode:'active',pendingCommand:null,receipt:{phase:'unknown',stopConfirmed:false}};
+  const registry={async get(){return unknown;},async list(){return {enabled:true,items:[],held:[],recent:[unknown]};}};
+  const view=createTaskRunView({registry,codeJobReader:readerFor([job()])});
+  assert.equal((await view.get('code-job',JOB_ID)).phase,'unknown');
+  const list=await view.list();
+  assert.equal(list.background.length,0);
+  assert.equal(list.recent.length,1);
+});
+
 test("ongoing background jobs remain visible between steps, without counting queued or terminal jobs as running", async () => {
   const { view } = setup(readerFor([job(), job({ jobId: "starting", status: "starting" }), job({ jobId: "queued", status: "queued" }), job({ jobId: "done", status: "completed" })]));
   const result = await view.list();

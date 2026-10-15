@@ -291,6 +291,16 @@ export class OwnerWorkRequestService {
   }
 
   async submit(value, { signal = null } = {}) {
+    if (value?.schemaVersion === 7) throw ownerRequestError("OWNER_WORK_REQUEST_INTERNAL_ONLY", "内部复审请求只能由受信服务提交", 403);
+    return this.#submit(value, signal);
+  }
+
+  async submitInternalReview(value, { signal = null } = {}) {
+    if (value?.schemaVersion !== 7) throw ownerRequestError("OWNER_WORK_REQUEST_INVALID", "内部复审请求类型无效");
+    return this.#submit(value, signal);
+  }
+
+  async #submit(value, signal) {
     normalizeAbortSignal(signal);
     throwIfCancelled(signal);
     this.#assertReady();
@@ -407,7 +417,7 @@ export class OwnerWorkRequestService {
         await this.#requireCapabilityReady(request.triage.suggestedCapability);
       }
       const createdAt = this.#now();
-      const event = [2, 3, 4, 5].includes(request.schemaVersion)
+      const event = [2, 3, 4, 5, 7].includes(request.schemaVersion)
         ? await this.#createPullRequestEvent(request, createdAt, signal)
         : request.schemaVersion === 6
         ? createOwnerIssueEvent(request, createdAt)

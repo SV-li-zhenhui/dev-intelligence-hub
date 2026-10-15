@@ -119,6 +119,39 @@ function machinePaths(markup, attribute) {
   );
 }
 
+test("Windows profile resources can be added when absent and edited as structured fields", () => {
+  const configuration = configurationWithCredentialReferences();
+  configuration.codeExecutor = {
+    enabled: true,
+    workspaces: [{ id: "dashboard", sourceRoot: "D:/workspace" }],
+    requiredProfilesByWorkspace: { dashboard: ["native"] },
+    profiles: { native: {
+      kind: "windows-test", nodeExecutable: "C:/Program Files/nodejs/node.exe", nodeSha256: "a".repeat(64), timeoutMs: 30_000,
+      asset: { schemaVersion: 1, title: "Native checks", description: "Native assertions", version: 1, source: "console.log('ok');" },
+    } },
+  };
+  const initial = createConfigurationFormState(configuration);
+  const markup = renderConfigurationSettingsSkeleton({ state: initial });
+  const path = ["codeExecutor", "profiles", "native", "resources"];
+  assert.equal(machinePaths(markup, "data-configuration-collection").some((value) => JSON.stringify(value) === JSON.stringify(path)), true);
+  assert.match(markup, /新增固定资源/u);
+  assert.equal(Object.hasOwn(configurationDocumentFromForm(initial).configuration.codeExecutor.profiles.native, "resources"), false);
+  const state = applyConfigurationStructureOperation(initial, {
+    operation: "add", path, value: { name: "fixture", sourcePath: "D:/fixtures", sha256: "c".repeat(64), kind: "directory" },
+  });
+  const edited = renderConfigurationSettingsSkeleton({ state });
+  for (const field of ["name", "sourcePath", "sha256", "kind"]) controlForPath(edited, [...path, 0, field]);
+  assert.match(selectForPath(edited, [...path, 0, "kind"]), /<option value="directory" selected>/u);
+  assert.equal(configurationDocumentFromForm(state).ok, true);
+
+  const containerConfiguration = configurationWithCredentialReferences();
+  containerConfiguration.codeExecutor.profiles = { container: { kind: "node-script", image: `node@sha256:${"e".repeat(64)}`, timeoutMs: 30_000, asset: configuration.codeExecutor.profiles.native.asset } };
+  containerConfiguration.codeExecutor.enabled = false;
+  delete containerConfiguration.codeExecutor.requiredProfilesByWorkspace;
+  const containerMarkup = renderConfigurationSettingsSkeleton({ state: createConfigurationFormState(containerConfiguration) });
+  assert.equal(machinePaths(containerMarkup, "data-configuration-collection").some((value) => value.at(-1) === "resources"), false);
+});
+
 test("own PR repair checkbox renders its scope with accessible help", () => {
   const configuration = configurationWithCredentialReferences();
   configuration.githubActions.automaticOwnPrRepair = false;

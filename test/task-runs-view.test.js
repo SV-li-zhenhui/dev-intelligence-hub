@@ -25,6 +25,24 @@ const response = (value, status = 200) => ({
   async json() { return structuredClone(value); },
 });
 
+test('model queue and recovered receipts have distinct counts and readable states', async () => {
+  const queued=run({taskId:'queued-model',phase:'waiting_model'});
+  const preparing=run({taskId:'preparing-model',phase:'starting_model'});
+  const unknown=run({taskId:'unknown-run',phase:'unknown',active:false,readOnly:true,receipt:{modelStartedAt:null,finishedAt:null,stopConfirmed:false}});
+  const body={enabled:true,items:[queued,preparing,run()],held:[],recent:[unknown]};
+  const markup=renderTaskRuns({loaded:true,...body});
+  assert.match(markup,/正在运行 · 1/);
+  assert.match(markup,/等待模型 · 1/);
+  assert.match(markup,/准备启动 · 1/);
+  assert.match(markup,/最近执行 · 1/);
+  assert.match(markup,/等待模型资源，尚未启动/);
+  assert.match(markup,/恢复后状态未知/);
+  const controller=createTaskRunsController({fetchImpl:async()=>response(body)});
+  await controller.refresh();
+  assert.equal(controller.getState().recent.length,1);
+  assert.match(renderTaskRunDetail({detail:unknown}),/无对话正文/);
+});
+
 function deferred() {
   let resolve;
   const promise = new Promise((done) => { resolve = done; });

@@ -23,16 +23,16 @@ test("eligible proposals publish using durable approval and configured testing h
   assert.match(calls[0][1].requestId, /^auto-review-v1-/);
   assert.deepEqual(calls[0][1].reviewHandoff, { workType: "testing", responsiblePerson: { login: "tester", product: "qt" } });
 });
-test("request_changes retains PR follow-up and automatic developer assignment", async () => {
+test("request_changes assigns the author without creating local follow-up work", async () => {
   const { publisher, item, calls } = fixture({ event: "REQUEST_CHANGES" });
   await publisher.publish(item);
-  assert.deepEqual(calls[0][1].reviewHandoff, { workType: "pull_request", responsiblePerson: null });
+  assert.deepEqual(calls[0][1].reviewHandoff, { workType: "assignment", responsiblePerson: null });
 });
 
 test("comment prepares the same durable author handoff as request_changes", async () => {
   const { publisher, item, calls } = fixture({ event: "COMMENT" });
   assert.equal((await publisher.publish(item)).status, "completed");
-  assert.deepEqual(calls[0][1].reviewHandoff, { workType: "pull_request", responsiblePerson: null });
+  assert.deepEqual(calls[0][1].reviewHandoff, { workType: "assignment", responsiblePerson: null });
 });
 test("disabled, old, changed, revoked, already published and unknown outcomes never auto approve", async () => {
   for (const options of [ { enabled: false }, { facts: { reviewReceivedAt: "2026-10-01T09:00:00Z" } },

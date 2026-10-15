@@ -14,6 +14,9 @@ import { createCodeReadContext, hasCompleteCodeRead } from "../src/lib/code-read
 import { createCodeJobArtifactReader } from "../src/adapters/code-job-artifact-reader.js";
 import { beginCodeExecutionSession, createCodeExecutionContext } from "../src/lib/code-execution-context.js";
 import { withTaskExecution } from "../src/lib/task-execution-context.js";
+import {TaskRunRegistry} from '../src/services/task-run-registry.js';
+import {CodeJobBrainDirectory} from '../src/services/code-job-brain-directory.js';
+import {githubEntitySessionKey} from '../src/lib/session-key.js';
 
 const schema = { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false };
 const request = (overrides = {}) => ({ model: "gpt-6.1-sol", reasoningEffort: "high", messages: [{ role: "user", content: "PRIVATE_TASK_INPUT" }], schema, ...overrides });
@@ -21,6 +24,191 @@ const error = (code) => Object.assign(new Error("private diagnostic must not esc
 const options = { id: "native-test", cliKind: "codex-cli", credentialMode: "codex-native-login", timeoutMs: 3000 };
 const success = (stdout = "") => ({ exitCode: 0, signal: null, stdout, stderr: "", stdoutBytes: Buffer.from(stdout), stderrBytes: Buffer.alloc(0) });
 const gate = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
+
+for(const sharedSessionScope of [true,false])test(`employee admission and direct code jobs serialize one PR with session scopes ${sharedSessionScope?'equal':'isolated'}`,async t=>{
+  const f=await fixture(t),entered=gate(),finish=gate(),otherEntered=gate(),starts=[];
+  const provider=f.create(async call=>{
+    const wire=JSON.parse(await readFile(path.join(call.cwd,'task.json'),'utf8'));
+    const label=wire.messages[0].content==='employee-42'?'employee-42':JSON.parse(wire.messages[1].content).task.objective;
+    starts.push(label);
+    if(label==='employee-42'){entered.resolve();await finish.promise;}
+    if(label==='code-43')otherEntered.resolve();
+    const resume=call.args.indexOf('resume');
+    return result(call,codeDecision({type:'read_text',path:'src/example.js'}),resume<0?`thread-${label}`:call.args[resume+1]);
+  },{}, {maxConcurrentTurns:2,allowConcurrentNativeHome:true});
+  const router=new BrainRouter({providers:[provider]});
+  const brain={provider:'native-test',model:'review-model',remoteData:{requirements:true,code:true,memory:false}};
+  const directory=new CodeJobBrainDirectory({brainRouter:router,roles:{developer:{taskBrain:{...brain,model:sharedSessionScope?'review-model':'code-model'}}}});
+  const entity=number=>githubEntitySessionKey({kind:'pull_request',repository:'Owner/Repo',number});
+  const job=number=>({roleId:'developer',sessionKey:entity(number),task:{operation:'inspect',repository:'owner/repo',objective:`code-${number}`,acceptanceCriteria:[],evidence:[]},
+    capabilities:{allowedActions:['read_text'],writablePaths:[],requiredProfilesRemaining:0},turn:1,observations:[]});
+  const active=router.withAdmission(brain,{entityKey:entity(42)},()=>router.generate({brain,messages:[{role:'user',content:'employee-42'}],schema:{type:'object'},dataClasses:['requirements','code'],sessionKey:entity(42)}));
+  await entered.promise;
+  const same=directory.decide(job(42),{beforeGenerate:async()=>{}}).then(value=>({value}),error=>({error}));
+  const other=directory.decide(job(43),{beforeGenerate:async()=>{}}).then(value=>({value}),error=>({error}));
+  try{
+    await Promise.race([otherEntered.promise,new Promise((_,reject)=>setTimeout(()=>reject(new Error('different PR could not enter')),2000))]);
+    assert.deepEqual(starts,['employee-42','code-43'],'same PR must remain queued before session staging or model start');
+  }finally{finish.resolve();await active;}
+  assert.equal((await same).error,undefined,'shared native session must not collide with its pending journal');
+  assert.equal((await other).error,undefined);
+  assert.equal(starts.at(-1),'code-42');await provider.close();
+});
+
+test("model execution budget starts after shared-home admission", async (t) => {
+  const f = await fixture(t), entered = gate(), finish = gate();
+  const first = f.create(async (call) => { entered.resolve(); await finish.promise; return result(call); });
+  const second = f.create(call => result(call), { timeoutMs: 200 });
+  const active = first.generate(request()); await entered.promise;
+  const queued = second.generate(request()).then(value => ({value}), error => ({error}));
+  await new Promise(resolve => setTimeout(resolve, 260));
+  assert.equal(f.calls.length, 1);
+  finish.resolve(); await active;
+  const outcome = await queued;
+  assert.equal(outcome.error, undefined, "waiting must not consume the model's execution deadline");
+  assert.deepEqual(JSON.parse(outcome.value), {ok:true});
+  await first.close(); await second.close();
+});
+
+test("native resource admission is nonblocking, held through callback, and released on errors", async (t) => {
+  const f = await fixture(t), entered = gate(), finish = gate();
+  const provider = f.create();
+  const active = provider.withAdmission({entityKey:'github:owner/repo:pull_request:42'}, async () => {
+    entered.resolve(); await finish.promise; return provider.generate(request({sessionKey:'pr:42'}));
+  });
+  await entered.promise;
+  await assert.rejects(provider.withAdmission({entityKey:'github:owner/repo:pull_request:43'}, () => assert.fail('busy callback')), {code:'STRUCTURED_PROVIDER_BUSY'});
+  finish.resolve(); await active;
+  await assert.rejects(provider.withAdmission({entityKey:'pr:43'}, () => { throw new Error('callback failed'); }), /callback failed/);
+  await provider.withAdmission({entityKey:'pr:43'}, () => provider.generate(request({sessionKey:'pr:43'})));
+  await provider.close();
+});
+
+test('a rejected overlapping use cannot unlock a still-running reservation',async(t)=>{
+  const f=await fixture(t),entered=gate(),finish=gate();
+  const provider=f.create(async call=>{entered.resolve();await finish.promise;return result(call);});
+  await provider.withAdmission({entityKey:'pr:42'},async()=>{
+    const active=provider.generate(request());void active.catch(()=>{});await entered.promise;
+    try {
+      await assert.rejects(provider.generate(request()),{code:'STRUCTURED_PROVIDER_BUSY'});
+      await assert.rejects(provider.generate(request()),{code:'STRUCTURED_PROVIDER_BUSY'});
+      assert.equal(f.calls.length,1);
+    } finally {finish.resolve();await active.catch(()=>{});}
+  });
+});
+
+test('native concurrency remains opt-in and protocol fixtures preserve entity, login, and marker barriers',async(t)=>{
+  const f=await fixture(t),enteredA=gate(),enteredB=gate(),finishA=gate(),finishB=gate();
+  assert.throws(()=>f.create(undefined,{}, {maxConcurrentTurns:2}),/explicit validation opt-in/);
+  let models=0,loginStarted=false;
+  const provider=f.create(async call=>{
+    if(call.args[0]==='login'){loginStarted=true;return success('Logged in using ChatGPT');}
+    models++;
+    if(models===1){enteredA.resolve();await finishA.promise;}
+    if(models===2){enteredB.resolve();await finishB.promise;}
+    return result(call);
+  },{}, {maxConcurrentTurns:2,allowConcurrentNativeHome:true});
+  const a=provider.generate(request({sessionKey:'pr:42'}));await enteredA.promise;
+  const same=provider.generate(request({sessionKey:'pr:42'}));
+  const b=provider.generate(request({sessionKey:'pr:43'}));await enteredB.promise;
+  assert.equal(models,2,'another entity can occupy the second slot while the first entity stays serialized');
+  assert.equal((await readdir(f.runtime)).filter(name=>name.startsWith('active-')).length,2);
+  const probe=provider.readStatus();
+  const c=provider.generate(request({sessionKey:'pr:44'}));
+  finishB.resolve();await b;
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(loginStarted,false,'login probe is exclusive');
+  assert.equal(models,2,'waiting login probe prevents new model admission');
+  finishA.resolve();await Promise.all([a,same,c]);
+  assert.equal((await probe).state,'available');
+  assert.equal((await readdir(f.runtime)).filter(name=>name.startsWith('active-')).length,0);
+  await provider.close();
+});
+
+test('queued registry cancellation certifies no model start and keeps durable receipt body-free',async(t)=>{
+  const f=await fixture(t),entered=gate(),finish=gate();
+  const provider=f.create(async call=>{entered.resolve();await finish.promise;return result(call);});
+  const active=provider.generate(request());await entered.promise;
+  t.after(async()=>{finish.resolve();await active.catch(()=>{});});
+  const values=new Map(),store={async read(key,fallback){return structuredClone(values.get(key)??fallback);},async write(key,value){values.set(key,structuredClone(value));}};
+  const registry=new TaskRunRegistry({store,receiptStore:store,settleControl:async()=>{}});
+  const task={kind:'work-item',taskId:'queued-work',roleId:'reviewer',title:'Private task title',subject:'owner/repo#42',revision:1};
+  const queued=registry.run(task,()=>provider.generate(request()),{requireStopConfirmation:true});
+  const rejected=assert.rejects(queued,{code:'TASK_RUN_CANCELLED'});
+  let view;
+  for(let attempt=0;attempt<100;attempt++){
+    view=await registry.get(task.kind,task.taskId).catch(()=>null);
+    if(view?.phase==='waiting_model' && view.live)break;
+    await new Promise(resolve=>setImmediate(resolve));
+  }
+  assert.equal(view.phase,'waiting_model');
+  assert.deepEqual((await registry.list()).counts,{active:0,queued:1,preparing:0});
+  await registry.control(task.kind,task.taskId,{runId:view.runId,expectedRevision:view.revision,command:'cancel'});
+  await rejected;
+  const receipt=values.get('task-run-execution-receipts').records.at(-1);
+  assert.equal(receipt.modelStartedAt,null);assert.equal(receipt.stopConfirmed,true);
+  assert.equal(f.calls.length,1,'cancelled queued request never launches');
+  assert.equal(JSON.stringify(values.get('task-run-execution-receipts')).includes('PRIVATE_TASK_INPUT'),false);
+  finish.resolve();await active;await provider.close();
+});
+
+test('certified exec preparation failures never claim the model started',async(t)=>{
+  const f=await fixture(t),phases=[];
+  const runner=createTestSupervisedProcessRunner({platform:process.platform,descriptorMaterializer:async()=>{throw error('STRUCTURED_PROVIDER_UNAVAILABLE');}});
+  const provider=f.create(undefined,{}, {processRunner:runner});
+  await assert.rejects(withTaskExecution({reportModelState:phase=>phases.push(phase)},()=>provider.generate(request())),{code:'STRUCTURED_PROVIDER_UNAVAILABLE'});
+  assert.equal(phases.includes('running'),false);
+  await provider.close();
+});
+
+test('queue admission has its own bounded deadline and never reports model execution timeout',async(t)=>{
+  const f=await fixture(t),entered=gate(),finish=gate();
+  const first=f.create(async call=>{entered.resolve();await finish.promise;return result(call);});
+  const active=first.generate(request());await entered.promise;
+  t.after(async()=>{finish.resolve();await active.catch(()=>{});});
+  const queued=f.create(undefined,{queueTimeoutMs:20,timeoutMs:1000});
+  await assert.rejects(queued.generate(request()),{code:'STRUCTURED_PROVIDER_QUEUE_TIMEOUT'});
+  assert.equal(f.calls.length,1);
+  finish.resolve();await active;await first.close();await queued.close();
+});
+
+test('unknown concurrent-home markers block admission after recovery without removing owned files',async(t)=>{
+  const f=await fixture(t);await mkdir(f.runtime);
+  const marker=`active-${nativeCodexDigest(nativeCodexHomeIdentity(f.home))}-old-concurrent-invocation.json`;
+  await writeFile(path.join(f.runtime,marker),'{"schemaVersion":1,"invocation":"unknown-process"}');
+  const provider=f.create(undefined,{}, {maxConcurrentTurns:2,allowConcurrentNativeHome:true});
+  await assert.rejects(provider.generate(request()),{code:'STRUCTURED_PROVIDER_REAP_FAILED'});
+  assert.equal(f.calls.length,0);assert.equal((await readdir(f.runtime)).includes(marker),true);
+  await assert.rejects(provider.withAdmission({entityKey:'pr:42'},()=>assert.fail('unknown process owner')),{code:'STRUCTURED_PROVIDER_REAP_FAILED'});
+});
+
+test('concurrent model slots serialize private runtime bootstrap before either process launch',async(t)=>{
+  const f=await fixture(t),entered=gate(),finish=gate();let preparing=false;
+  const manager={async prepare(options){
+    if(options.directory===f.runtime){
+      if(preparing)throw error('STRUCTURED_PROVIDER_UNAVAILABLE');
+      preparing=true;entered.resolve();await finish.promise;
+      try{return await f.dependencies.rootDirectoryManager.prepare(options);}finally{preparing=false;}
+    }
+    return f.dependencies.rootDirectoryManager.prepare(options);
+  }};
+  const provider=f.create(undefined,{}, {maxConcurrentTurns:2,allowConcurrentNativeHome:true,rootDirectoryManager:manager});
+  const first=provider.generate(request({sessionKey:'pr:42'})).then(value=>({value}),error=>({error}));await entered.promise;
+  const second=provider.generate(request({sessionKey:'pr:43'})).then(value=>({value}),error=>({error}));
+  await new Promise(resolve=>setTimeout(resolve,10));finish.resolve();
+  const outcomes=await Promise.all([first,second]);
+  assert.ok(outcomes.every(outcome=>!outcome.error),'shared private roots cannot be created concurrently');
+  assert.equal(f.calls.length,2);await provider.close();
+});
+
+test('admission callback completion cannot release a model still owned by its reservation',async(t)=>{
+  const f=await fixture(t),entered=gate(),finish=gate();
+  const provider=f.create(async call=>{entered.resolve();await finish.promise;return result(call);});
+  let active;
+  await provider.withAdmission({entityKey:'pr:42'},async()=>{active=provider.generate(request());await entered.promise;});
+  try{await assert.rejects(provider.withAdmission({entityKey:'pr:43'},()=>assert.fail('active model lost its slot')),{code:'STRUCTURED_PROVIDER_BUSY'});}
+  finally{finish.resolve();await active;await provider.close();}
+});
 
 function auditedCode(content = "\uFEFF中文开头\n" + "x".repeat(80 * 1024) + "\n完整文件尾部") {
   const document = { actionId: "read-current", path: "src/large.cpp", content,
@@ -325,6 +513,7 @@ test('cancellation racing a certified unavailable live transport still clears a 
 });
 
 async function result(invocation, value = { ok: true }, threadId = "thread-42") {
+  invocation.duplex?.onOutput({stream:'stdout',chunk:Buffer.from('{"type":"turn.started"}\n')});
   await writeFile(invocation.args[invocation.args.indexOf("--output-last-message") + 1], JSON.stringify({ result: JSON.stringify(value) }));
   return success(JSON.stringify({ type: "thread.started", thread_id: threadId }));
 }
@@ -455,8 +644,9 @@ test("native login status failure distinguishes missing login from a missing CLI
 test("native FIFO is shared across providers and a cancelled queued request never launches", async (t) => {
   const f = await fixture(t);
   const started = gate(); const finish = gate();
-  let running = 0; let maximum = 0;
+  let running = 0; let maximum = 0;const inputs=[];
   const handler = async (call, count) => {
+    inputs.push(await readFile(path.join(call.cwd,'task.json'),'utf8'));
     running += 1; maximum = Math.max(maximum, running);
     if (count === 1) { started.resolve(); await finish.promise; }
     try { return await result(call); } finally { running -= 1; }
@@ -470,7 +660,7 @@ test("native FIFO is shared across providers and a cancelled queued request neve
   assert.equal(f.calls.length, 1);
   finish.resolve(); await Promise.all([a, b]);
   assert.equal(maximum, 1); assert.equal(f.calls.length, 2);
-  assert.ok(f.calls[1].input.toString().includes("SECOND"));
+  assert.ok(inputs[1].includes("SECOND"));
 });
 
 test("native availability does not queue behind the first active model in the shared home", async (t) => {
@@ -838,7 +1028,22 @@ test("a retained process marker from an earlier service lifetime prevents a dupl
   assert.ok((await readdir(f.runtime)).includes(marker));
 });
 
-test("native review requires immutable reader completeness and closes the read endpoint on failure", async (t) => {
+test('idle native status probes recover login and notice credential loss while active models use cached status',async(t)=>{
+  const f=await fixture(t),entered=gate(),finish=gate();let loggedIn=false,probes=0;
+  const provider=f.create(async call=>{
+    if(call.args[0]==='login'){probes++;return success(loggedIn?'Logged in using ChatGPT':'Not logged in');}
+    entered.resolve();await finish.promise;return result(call);
+  });
+  assert.equal((await provider.readStatus()).state,'file_login_unavailable');
+  loggedIn=true;await provider.checkAvailability();assert.equal(probes,2);
+  const active=provider.generate(request());await entered.promise;
+  assert.equal((await provider.readStatus()).state,'available');assert.equal(probes,2);
+  finish.resolve();await active;
+  loggedIn=false;assert.equal((await provider.readStatus()).state,'file_login_unavailable');assert.equal(probes,3);
+  await provider.close();
+});
+
+for(const intentType of ['propose_github_review','complete','handoff'])test(`native review requires immutable reader completeness before ${intentType}`, async (t) => {
   const f = await fixture(t);
   const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "owner", baseRepository: "owner/repo", headRepository: "owner/repo", baseRefName: "main", headRefName: "feature", baseRefOid: "a".repeat(40), headRefOid: "b".repeat(40) };
   let closed = 0; let checked = 0;
@@ -846,10 +1051,19 @@ test("native review requires immutable reader completeness and closes the read e
     assert.equal(await readFile(path.join(call.cwd, "review.diff"), "utf8"), "complete-diff");
     assert.ok(call.args.includes('mcp_servers.pr_review.required=true'));
     assert.equal(call.maxStdoutBytes, 64 * 1024 * 1024);
-    return result(call, { intent: { type: "propose_github_review" } });
+    return result(call, { intent: { type: intentType } });
   }, {}, { reviewReaderFactory: async () => ({ url: "http://127.0.0.1:12345/fixture", diffText: "complete-diff", manifestText: "{}",
     async assertComplete() { checked += 1; throw error("PR_REVIEW_READ_INCOMPLETE"); }, async close() { closed += 1; } }) });
   await assert.rejects(provider.generate(request({ reviewTarget: { gitTarget, pullRequestNumber: 42 } })), { code: "PR_REVIEW_READ_INCOMPLETE" });
   assert.equal(checked, 1); assert.equal(closed, 1);
   assert.deepEqual(await readdir(f.runtime), ["sessions"]);
+});
+
+test('native nonterminal review wait closes its reader without pretending completeness',async(t)=>{
+  const f=await fixture(t);let checked=0,closed=0;
+  const gitTarget={schemaVersion:1,provider:'github',sourceAccountId:'owner',baseRepository:'owner/repo',headRepository:'owner/repo',baseRefName:'main',headRefName:'feature',baseRefOid:'a'.repeat(40),headRefOid:'b'.repeat(40)};
+  const provider=f.create(call=>result(call,{intent:{type:'wait_condition'}}),{}, {reviewReaderFactory:async()=>({url:'http://127.0.0.1:12345/fixture',diffText:'complete-diff',manifestText:'{}',
+    async assertComplete(){checked++;throw error('PR_REVIEW_READ_INCOMPLETE');},async close(){closed++;}})});
+  assert.equal(JSON.parse(await provider.generate(request({reviewTarget:{gitTarget,pullRequestNumber:42}}))).intent.type,'wait_condition');
+  assert.equal(checked,0);assert.equal(closed,1);await provider.close();
 });

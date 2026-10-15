@@ -8,7 +8,7 @@ The owner requested a clickable running-task list, supplemental instructions,
 priority changes, pause, resume and cancellation. The source audit of
 agent-feishu-bridge confirms that its live Codex steering uses the persistent
 app-server protocol and `turn/steer`, bound to a thread and expected turn.
-Our current native `exec` route can only continue at a later checkpoint; that
+The explicit native `exec` route can only continue at a later checkpoint; that
 compatibility behavior must not be presented as live steering.
 
 The [source review and integration design](research/2026-10-13-agent-feishu-bridge-source-review.md)
@@ -16,10 +16,11 @@ records the transport, progress events, stale-turn protection and recovery
 limitations. The registry, global running-task UI, origin/CAS protected HTTP
 controls and role/code-worker integration are implemented. Focused checks cover
 real ledger settlement, fixture stdio communication and an isolated Chromium
-interaction. The app-server protocol adapter is tested but production activation
-is blocked: the installed CLI rejects required config/rule isolation flags, and
-equivalent bidirectional process-tree containment is not verified. The default
-runner rejects this mode before spawn rather than weaken either condition.
+interaction. Windows native login now defaults to the contained App Server
+transport with capability attestation and thread/turn-bound control. The earlier
+activation blocker is superseded by that implementation; the explicit exec
+transport retains checkpoint-only behavior. Bounded execution metadata now
+survives restart; open receipts recover as unknown until stopping is proved.
 Deployment and a live business-task acceptance check remain separate gates;
 this entry is not closed by fixture or initialization-only success. Existing
 runtime configuration is preserved.
@@ -55,11 +56,13 @@ counts and distinguish verification failure, timeout, unavailable environment
 and unknown cause. None of these classifications alone authorizes product-code
 repair or produces a completed test-report.
 
-The configured OCT/Picasso assets currently perform repository preflight only.
-The Docker Node runner cannot execute the local Windows Qt build and desktop
-workflow. Integrate a version-bound Windows test adapter, approved build/data
-inputs, authoritative failure evidence, a dedicated test-driven repair source,
-and separate developer/retest graph children with idempotent reconciliation.
+Version-bound Windows assets now use LPAC, copied hashed resources and actual
+token evidence; their Job Object lifecycle includes confirmed-stop cleanup.
+Controlled product validation covers three OCT TaskQueue QtCore assertions and
+106 stable Picasso assertions in a digest-pinned Docker image. These assets need
+normal configuration activation in each deployment; repository preflight alone
+remains insufficient. Full desktop/hardware workflows, a dedicated test-driven
+repair source and separate developer/retest graph children remain open.
 Do not reassign a test-report child to a developer or reuse old-Head results.
 
 **Acceptance:** a real scoped PR fails an executed test, a separate developer

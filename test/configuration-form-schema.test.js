@@ -366,7 +366,7 @@ test("test library profiles expose a dedicated script template and source editor
     ["codeExecutor", "profiles", "reusable-smoke", "kind"],
     "node-script",
   );
-  assert.deepEqual(kind.options, ["node-test", "node-script"]);
+  assert.deepEqual(kind.options, ["node-test", "node-script", "windows-test", "windows-build"]);
   const source = configurationFieldDescriptor(
     [
       "codeExecutor",
@@ -379,6 +379,27 @@ test("test library profiles expose a dedicated script template and source editor
   );
   assert.equal(source.control, "textarea");
   assert.equal(source.maximumBytes, 65_536);
+});
+
+test("Windows fixed resources expose a bounded optional collection and editable fields", () => {
+  const path = ["codeExecutor", "profiles", "native", "resources"];
+  const collection = configurationCollectionDescriptor(path);
+  assert.equal(collection.kind, "array");
+  assert.equal(collection.optional, true);
+  assert.equal(collection.maximum, 16);
+  assert.equal(collection.uniqueBy, "name");
+  const template = configurationStructureTemplate(path);
+  assert.deepEqual(template.value, { name: "resource", sourcePath: "C:/path/to/resource", sha256: "0".repeat(64), kind: "file" });
+  for (const [field, format, maximumBytes] of [["name", "resource-name", 64], ["sourcePath", "windows-absolute-path", 4096], ["sha256", "sha256", 64]]) {
+    const descriptor = configurationFieldDescriptor([...path, 0, field], template.value[field]);
+    assert.equal(descriptor.format, format);
+    assert.equal(descriptor.maximumBytes, maximumBytes);
+    assert.notEqual(descriptor.readOnly, true);
+  }
+  assert.deepEqual(configurationFieldDescriptor([...path, 0, "kind"], "file").options, ["file", "directory"]);
+  for (const kind of ["windows-test", "windows-build", "node-script"]) {
+    assert.equal(Object.hasOwn(configurationStructureTemplate(["codeExecutor", "profiles"], kind).value, "resources"), false);
+  }
 });
 
 test("own PR repair exposes a disabled checkbox template and scoped help", () => {

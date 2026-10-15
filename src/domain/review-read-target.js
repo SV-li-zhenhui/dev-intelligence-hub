@@ -1,12 +1,14 @@
 import { types } from "node:util";
 import { normalizePullRequestGitTarget } from "./git-tool-contract.js";
+import { normalizeRepairFeedbackDescriptor } from "./original-repair-feedback.js";
 
 export function normalizeReviewReadTarget(value) {
   if (!value || types.isProxy(value) || Object.getPrototypeOf(value) !== Object.prototype) {
     throw new TypeError("reviewTarget is invalid");
   }
   const keys = Reflect.ownKeys(value);
-  if (keys.length !== 2 || !keys.includes("gitTarget") || !keys.includes("pullRequestNumber")) {
+  const hasFeedback = keys.includes("repairFeedback");
+  if (keys.length !== (hasFeedback ? 3 : 2) || !keys.includes("gitTarget") || !keys.includes("pullRequestNumber")) {
     throw new TypeError("reviewTarget is invalid");
   }
   for (const key of keys) {
@@ -16,8 +18,11 @@ export function normalizeReviewReadTarget(value) {
   if (!Number.isSafeInteger(value.pullRequestNumber) || value.pullRequestNumber < 1) {
     throw new TypeError("reviewTarget is invalid");
   }
+  const feedback = hasFeedback ? normalizeRepairFeedbackDescriptor(value.repairFeedback) : null;
+  if (feedback && feedback.reviewHeadRefOid !== value.gitTarget?.headRefOid) throw new TypeError("reviewTarget feedback Head is invalid");
   return Object.freeze({
     pullRequestNumber: value.pullRequestNumber,
     gitTarget: Object.freeze(normalizePullRequestGitTarget(value.gitTarget)),
+    ...(feedback === null ? {} : { repairFeedback: feedback }),
   });
 }

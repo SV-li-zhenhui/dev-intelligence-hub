@@ -3,6 +3,22 @@ import test from "node:test";
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { createTaskRunSettler, planWorkItemRunControl } from '../src/services/work-ledger-run-control.js';
 
+test('busy model admission leaves work unclaimed without consuming decision attempts', async () => {
+  const time = controlledClock(), ledger = new FakeLedger({source:[workItem(1)],time});
+  const candidate = worker(); let admissionCalls = 0;
+  candidate.withDecisionAdmission = async (_input, _operation) => {
+    admissionCalls++;
+    throw Object.assign(new Error('capacity occupied'), {code:'STRUCTURED_PROVIDER_BUSY'});
+  };
+  const cycle = await createLoop({ledger,directory:new FakeRoleDirectory({'pr-reviewer':candidate}),time}).runCycle();
+  assert.equal(admissionCalls,1);
+  assert.equal(ledger.calls.claim.length,0);
+  assert.equal(ledger.calls.scheduleRetry.length,0);
+  assert.equal(cycle.workAttempts,0);
+  assert.equal(cycle.claimed,0);
+  assert.equal(cycle.outcomes[0].status,'waiting_model');
+});
+
 for (const command of ['pause', 'cancel']) {
   test(`accepted ${command} survives a decision deadline until process stop is confirmed`, { timeout: 10_000 }, async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });

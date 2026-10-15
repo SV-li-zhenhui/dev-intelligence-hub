@@ -22,6 +22,8 @@ namespace MyDashboard
         private const uint CREATE_SUSPENDED = 0x00000004;
         private const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
         private const uint CREATE_NO_WINDOW = 0x08000000;
+        private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+        private const int PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000d;
         private const uint STARTF_USESTDHANDLES = 0x00000100;
         private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
         private const uint DUPLICATE_SAME_ACCESS = 0x00000002;
@@ -81,6 +83,13 @@ namespace MyDashboard
             public IntPtr hThread;
             public uint dwProcessId;
             public uint dwThreadId;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct STARTUPINFOEX
+        {
+            public STARTUPINFO StartupInfo;
+            public IntPtr lpAttributeList;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -154,7 +163,17 @@ namespace MyDashboard
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+        private static extern bool InitializeProcThreadAttributeList(
+            IntPtr attributes, uint count, uint flags, ref IntPtr size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool UpdateProcThreadAttribute(
+            IntPtr attributes, uint flags, IntPtr attribute, IntPtr value,
+            IntPtr size, IntPtr previousValue, IntPtr returnSize);
+
+        [DllImport("kernel32.dll")]
+        private static extern void DeleteProcThreadAttributeList(IntPtr attributes);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -171,7 +190,7 @@ namespace MyDashboard
             uint creationFlags,
             IntPtr environment,
             string currentDirectory,
-            ref STARTUPINFO startupInfo,
+            ref STARTUPINFOEX startupInfo,
             out PROCESS_INFORMATION processInformation);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -211,9 +230,6 @@ namespace MyDashboard
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
 
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool TerminateProcess(IntPtr process, uint exitCode);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -234,10 +250,12 @@ namespace MyDashboard
             IntPtr output = IntPtr.Zero;
             IntPtr error = IntPtr.Zero;
             IntPtr environment = IntPtr.Zero;
+            IntPtr attributes = IntPtr.Zero;
+            IntPtr jobList = IntPtr.Zero;
+            bool attributesInitialized = false;
             FileStream executableLock = null;
             PROCESS_INFORMATION process = new PROCESS_INFORMATION();
             bool processCreated = false;
-            bool assigned = false;
             try
             {
                 executableLock = LockAndVerifyExecutable(command, expectedSha256);
@@ -249,14 +267,31 @@ namespace MyDashboard
                 error = DuplicateInheritedStandardHandle(STD_ERROR_HANDLE);
                 environment = CreateEnvironmentBlock(environmentNames, environmentValues);
 
-                STARTUPINFO startup = new STARTUPINFO();
-                startup.cb = Marshal.SizeOf(typeof(STARTUPINFO));
-                startup.dwFlags = STARTF_USESTDHANDLES;
-                startup.hStdInput = input;
-                startup.hStdOutput = output;
-                startup.hStdError = error;
+                // Assign at process creation. A supervisor killed between a
+                // suspended CreateProcess and a later AssignProcessToJobObject
+                // otherwise leaves an uncontained suspended orphan.
+                IntPtr attributeSize = IntPtr.Zero;
+                InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref attributeSize);
+                if (attributeSize == IntPtr.Zero) ThrowLastError("attribute-size");
+                attributes = Marshal.AllocHGlobal(attributeSize);
+                if (!InitializeProcThreadAttributeList(attributes, 1, 0, ref attributeSize))
+                    ThrowLastError("attribute-init");
+                attributesInitialized = true;
+                jobList = Marshal.AllocHGlobal(IntPtr.Size);
+                Marshal.WriteIntPtr(jobList, job);
+                if (!UpdateProcThreadAttribute(attributes, 0,
+                    new IntPtr(PROC_THREAD_ATTRIBUTE_JOB_LIST), jobList,
+                    new IntPtr(IntPtr.Size), IntPtr.Zero, IntPtr.Zero))
+                    ThrowLastError("attribute-job");
+                STARTUPINFOEX startup = new STARTUPINFOEX();
+                startup.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
+                startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+                startup.StartupInfo.hStdInput = input;
+                startup.StartupInfo.hStdOutput = output;
+                startup.StartupInfo.hStdError = error;
+                startup.lpAttributeList = attributes;
                 StringBuilder commandLine = BuildCommandLine(command, arguments);
-                uint flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+                uint flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT;
                 if (!CreateProcess(
                     command,
                     commandLine,
@@ -272,11 +307,6 @@ namespace MyDashboard
                     ThrowLastError("create");
                 }
                 processCreated = true;
-                if (!AssignProcessToJobObject(job, process.hProcess))
-                {
-                    ThrowLastError("assign");
-                }
-                assigned = true;
                 if (ResumeThread(process.hThread) == UInt32.MaxValue)
                 {
                     ThrowLastError("resume");
@@ -300,10 +330,7 @@ namespace MyDashboard
             }
             finally
             {
-                if (processCreated && !assigned && process.hProcess != IntPtr.Zero)
-                {
-                    TerminateProcess(process.hProcess, 1);
-                }
+                if (processCreated && job != IntPtr.Zero) TerminateJobObject(job, 1);
                 CloseIfValid(process.hThread);
                 CloseIfValid(process.hProcess);
                 if (environment != IntPtr.Zero) Marshal.FreeHGlobal(environment);
@@ -311,6 +338,9 @@ namespace MyDashboard
                 CloseIfValid(error);
                 CloseIfValid(output);
                 CloseIfValid(input);
+                if (attributesInitialized) DeleteProcThreadAttributeList(attributes);
+                if (attributes != IntPtr.Zero) Marshal.FreeHGlobal(attributes);
+                if (jobList != IntPtr.Zero) Marshal.FreeHGlobal(jobList);
                 CloseIfValid(job);
             }
         }

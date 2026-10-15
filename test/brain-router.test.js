@@ -19,6 +19,25 @@ const BRAIN = Object.freeze({
   }),
 });
 
+test("BrainRouter shares scheduling identity across authorization scopes without merging sessions", async () => {
+  const calls = [], reservations = [];
+  const router = new BrainRouter({ providers: [provider({ supportsEntitySessions: true,
+    sessionIsolationKey: "native:login", supportsReviewReading: true,
+    async withAdmission(request, operation) { reservations.push(request.entityKey); return operation(); },
+    async generate(request) { calls.push(request); return '{"ok":true}'; },
+  })] });
+  const sessionKey = "github:pull_request:Owner/Repo#42";
+  const request = { sessionKey, messages: [], schema: { type: "object" }, dataClasses: ["code"] };
+  await router.withAdmission(BRAIN, { entityKey: sessionKey }, () => router.generate({ ...request, brain: BRAIN }));
+  await router.generate({ ...request, brain: { ...BRAIN, model: "different-model" } });
+  await router.generate({ ...request, brain: { ...BRAIN, remoteData: { ...BRAIN.remoteData, memory: true } } });
+  await router.generate({ ...request, brain: BRAIN, dataClasses: ["requirements", "code"] });
+  assert.deepEqual(reservations, ["github:pull_request:owner/repo#42"]);
+  assert.equal(calls.every(call => call.admissionEntityKey === reservations[0]), true);
+  assert.equal(new Set(calls.map(call => call.sessionKey)).size, 4);
+  assert.equal(calls.every(call => /^auth-v2:[a-f0-9]{64}$/u.test(call.sessionKey)), true);
+});
+
 function provider(overrides = {}) {
   return {
     id: "codex",

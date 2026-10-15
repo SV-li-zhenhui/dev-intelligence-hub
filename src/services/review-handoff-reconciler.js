@@ -99,14 +99,20 @@ export class ReviewHandoffReconciler {
   async #dispatch(item, signal) {
     let outcome;
     let assignedLogin;
+    const assignmentOnly = item.automaticReview && ["REQUEST_CHANGES", "COMMENT"].includes(item.automaticReview.reviewEvent) &&
+      (item.request.kind === "review_author_assignment" || item.request.workType === "pull_request");
     try {
       if (item.automaticReview && !this.automaticAssignmentsEnabled) throw failure("REVIEW_HANDOFF_AUTOMATION_DISABLED");
+      if (item.request.kind === "review_author_assignment" && (!assignmentOnly ||
+          item.request.headRefOid !== item.automaticReview.headRefOid || item.request.reviewEvent !== item.automaticReview.reviewEvent)) {
+        throw failure("REVIEW_HANDOFF_ASSIGNMENT_INVALID");
+      }
       if (item.automaticReview?.reviewEvent === "APPROVE" && this.testingOwners !== null) {
         const person = item.request.responsiblePerson;
         if (!person || !this.testingOwners[person.product]?.some((login) => login.toLowerCase() === person.login.toLowerCase())) throw failure("REVIEW_HANDOFF_OWNER_REMOVED");
       }
-      const result = await this.ownerWorkRequests.submit(item.request, { signal });
-      if (result?.phase !== "intaken" || !result.workItemId || !result.assignment?.target?.id) {
+      const result = assignmentOnly ? null : await this.ownerWorkRequests.submit(item.request, { signal });
+      if (!assignmentOnly && (result?.phase !== "intaken" || !result.workItemId || !result.assignment?.target?.id)) {
         throw failure("REVIEW_HANDOFF_NOT_INTAKEN");
       }
       if (item.automaticReview && ["APPROVE", "REQUEST_CHANGES", "COMMENT"].includes(item.automaticReview.reviewEvent)) {
@@ -129,10 +135,13 @@ export class ReviewHandoffReconciler {
           assigneeLogin: item.request.responsiblePerson.login,
         }, { signal });
       }
-      outcome = { status: "completed", diagnosticCode: null, workItemId: result.workItemId, roleId: result.assignment.target.id, ...(assignedLogin ? { assignedLogin } : {}) };
+      outcome = { status: "completed", diagnosticCode: null,
+        workItemId: result?.workItemId ?? null, roleId: result?.assignment.target.id ?? null,
+        ...(assignmentOnly ? { deliveryKind: "assignment_only" } : {}), ...(assignedLogin ? { assignedLogin } : {}) };
     } catch (error) {
       if (signal.aborted) throw error;
       outcome = { status: ["GITHUB_HANDOFF_HEAD_CHANGED", "GITHUB_HANDOFF_SELF_AUTHORED", "REVIEW_HANDOFF_OWNER_REMOVED", "REVIEW_HANDOFF_AUTOMATION_DISABLED"].includes(error?.code) ? "stale" : "retrying", diagnosticCode: diagnostic(error, "REVIEW_HANDOFF_SUBMIT_FAILED"), workItemId: null, roleId: null };
+      if (assignmentOnly) outcome.deliveryKind = "assignment_only";
     }
     // Keep the accepted request ID even if the acknowledgement cannot be saved.
     try {

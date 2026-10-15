@@ -194,6 +194,23 @@ function mutableClone(value) {
   return structuredClone(value);
 }
 
+test("Windows controlled commit evidence preserves native test identity and binds its digest", () => {
+  const source = executionSource();
+  const profile = passedProfile("windows-tests", WORKSPACE_REVISION);
+  delete profile.imageId;
+  Object.assign(profile, { runtimeIdentity: { schemaVersion: 1, kind: "windows-process", executionId: "session-1-attempt-2", actionId: profile.actionId,
+    pid: 4567, processStartTimeUtcTicks: "639013000000000000", executableSha256: "d".repeat(64) }, assetVersion: 2, verificationKind: "test" });
+  const manifest = manifestFor(source, { passedProfiles: [profile] });
+  const evidence = createControlledCommitEvidence(evidenceInput({ source, manifest }));
+  assert.equal(evidence.schemaVersion, 2);
+  assert.deepEqual(normalizeControlledCommitEvidence(evidence), evidence);
+  assert.equal(evidence.tests.profiles[0].runtimeIdentity.pid, 4567);
+  assert.equal(Object.hasOwn(evidence.tests.profiles[0], "imageId"), false);
+  const tampered = mutableClone(evidence);
+  tampered.tests.profiles[0].runtimeIdentity.pid += 1;
+  assert.throws(() => normalizeControlledCommitEvidence(tampered), hasControlledEvidenceError);
+});
+
 test("review repair evidence binds actual changed files and one exact Head parent", () => {
   const source = createReviewRepairCodeExecutionSource({ inputBinding: pullRequestBinding(gitTarget()), writablePaths: ["src", "test"] });
   const manifest = manifestFor(source, { modified: [{ path: "src/value.js", beforeSha256: "1".repeat(64), content: Buffer.from("fixed\n") }] });

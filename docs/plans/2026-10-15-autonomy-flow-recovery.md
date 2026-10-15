@@ -31,6 +31,8 @@ Files：work-ledger PR cutover/source/settlement、github-review-proposal-handle
 持久化有界、无对话正文的执行凭据，覆盖启动、最近活动、终态和恢复后的未知状态。
 吸收按实体/线程隔离的排期方式；并发必须有上限，同实体保持串行，取消/reap
 和原生 home 保护必须成立。真实 Windows 双任务验证前不直接打开未经验证的并发。
+实体排队键与授权隔离的会话键分开；岗位预领取和直接代码任务须对同一 PR 串行。
+执行凭据写入失败须保留待写元数据，并允许存储恢复后重试。
 Files：native provider、App Server runner、task-run registry/view、task-runs UI及对应测试。
 共享配置与 composition-root 由主执行者集成。
 
@@ -40,6 +42,8 @@ Files：native provider、App Server runner、task-run registry/view、task-runs
 交接失败保留待恢复记录；重启补记交接而不重放推送。
 研发 PR 开发工作不能用直接 `complete` 绕过复审；已有修复须带代码与验证证据交接。
 内部自身 PR 复审不冒充 GitHub 自我批准或外部人员已收到通知。
+原始反馈须在修复前保存完整、摘要绑定的快照；内部复审须分页读完原反馈和当前改动。
+旧记录只允许凭严格匹配原摘要的完整内容恢复，不使用截断的最新评论代替。
 Files：automatic-own-pr-repair、role-decision-engine、相关新增交接模块和对应测试。
 共享配置、composition-root 及全局文档由主执行者集成。
 
@@ -49,6 +53,11 @@ Files：automatic-own-pr-repair、role-decision-engine、相关新增交接模�
 执行保留源码版本、实际 Windows 进程/执行身份、日志与真实测试统计，不伪造 Docker 身份。
 构建产物写入独立副本；取消和超时须确认进程结束。仅编译/环境检查不能记为单元测试通过。
 实际启用当前机器可执行的 OCT/Picasso 回归；桌面或硬件仍需实机证据，不冒充已覆盖。
+Windows 测试使用 LPAC 系统隔离，实际令牌须证明 AppContainer、Low 完整性及
+禁用 ALL_APPLICATION_PACKAGES。只允许写本次源码副本和临时目录，固定程序、
+资产与摘要绑定的复制资源只读，宿主租约和服务数据不授予访问，不开放网络能力。
+确认进程停止并保存执行证据后回收大副本与隔离 profile。Picasso 使用既有 Docker
+隔离执行 Linux 固定资产，不为兼容当前 Windows Node 管道而扩大宿主权限。
 Files：code-executor/configuration 合约、受控执行器、测试 runner、相关测试。
 配置激活、共享装配和产品级验收由主执行者处理。
 

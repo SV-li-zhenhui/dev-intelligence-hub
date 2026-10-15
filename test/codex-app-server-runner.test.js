@@ -9,6 +9,20 @@ import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { withTaskExecution } from '../src/lib/task-execution-context.js';
 import { createTestSupervisedProcessRunner } from '../src/lib/supervised-process-runner.js';
 const threadId='01973bca-3d8b-7000-a000-123456789abc';
+
+test('late native activity after failure cannot change runtime receipts while reap drains',async()=>{
+  let release;const stopGate={promise:new Promise(resolve=>{release=resolve;})};
+  const f=fixture({hold:true,stopGate}),events=[];
+  await invocation(f.runner,async run=>{
+    const operation=withTaskExecution({reportProgress(){},reportEvent:event=>events.push(event)},run);void operation.catch(()=>{});
+    while(!f.calls.some(call=>call.method==='turn/start'))await new Promise(resolve=>setImmediate(resolve));
+    f.send({method:'error',params:{threadId,willRetry:false}});
+    await f.stopping;
+    f.send({method:'item/agentMessage/delta',params:{threadId,turnId:'turn-1',itemId:'late',delta:'LATE_PRIVATE_BODY'}});
+    release();await assert.rejects(operation);
+    assert.equal(events.length,0);
+  });
+});
 test('production app-server certifies invalid invocations as not started',async()=>{
   const runner=new CodexAppServerRunner({materialize:async()=>assert.fail('must not materialize or spawn')});
   await assert.rejects(runner.run({}),error=>error.code==='STRUCTURED_PROVIDER_UNAVAILABLE' && didAppServerNotStart(error));

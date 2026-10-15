@@ -1,6 +1,9 @@
 import path from "node:path";
 import { types as utilTypes } from "node:util";
 import { DockerTestSandbox } from "./adapters/docker-test-sandbox.js";
+import { WindowsFixedTestRunner } from "./adapters/windows-fixed-test-runner.js";
+import { ConfiguredTestRunner } from "./adapters/configured-test-runner.js";
+import { isWindowsTestProfile } from "./domain/windows-test-profile.js";
 import { GitObjectSnapshotter } from "./adapters/git-object-snapshotter.js";
 import { createControlledGitRuntimeBundle } from "./controlled-git-runtime.js";
 import { projectRoot } from "./lib/config.js";
@@ -139,8 +142,8 @@ function normalizeEnabledConfig(config) {
   assertRecord(config);
   if (config.enabled === false || config.enabled === undefined) return null;
   if (config.enabled !== true) throw invalidConfig();
-  assertRecord(config.docker);
   assertRecord(config.profiles);
+  if (Object.values(config.profiles).some((profile) => !isWindowsTestProfile(profile))) assertRecord(config.docker);
   assertRecord(config.requiredProfilesByWorkspace);
   if (Object.keys(config.profiles).length === 0) {
     throw invalidConfig("至少需要配置一个固定测试配置");
@@ -548,17 +551,26 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
     });
   const sandbox =
     dependencies.sandbox ||
-    new DockerTestSandbox({
-      dockerExecutable: enabledConfig.docker.executable,
-      dockerHost: enabledConfig.docker.host,
-      allowedWorkspaceRoot: path.join(runtimeRoot, "workspaces"),
+    new ConfiguredTestRunner({
       profiles: enabledConfig.profiles,
-      ...(dependencies.processRunner
-        ? { processRunner: dependencies.processRunner }
-        : {}),
-      ...(dependencies.sourceEnvironment
-        ? { sourceEnvironment: dependencies.sourceEnvironment }
-        : {}),
+      ...(Object.values(enabledConfig.profiles).some((profile) => !isWindowsTestProfile(profile)) ? {
+        dockerRunner: new DockerTestSandbox({
+          dockerExecutable: enabledConfig.docker.executable,
+          dockerHost: enabledConfig.docker.host,
+          allowedWorkspaceRoot: path.join(runtimeRoot, "workspaces"),
+          profiles: Object.fromEntries(Object.entries(enabledConfig.profiles).filter(([, profile]) => !isWindowsTestProfile(profile))),
+          ...(dependencies.processRunner ? { processRunner: dependencies.processRunner } : {}),
+          ...(dependencies.sourceEnvironment ? { sourceEnvironment: dependencies.sourceEnvironment } : {}),
+        }),
+      } : {}),
+      ...(Object.values(enabledConfig.profiles).some(isWindowsTestProfile) ? {
+        windowsRunner: new WindowsFixedTestRunner({
+          allowedWorkspaceRoot: path.join(runtimeRoot, "workspaces"),
+          runRoot: path.join(runtimeRoot, "windows-tests"),
+          profiles: Object.fromEntries(Object.entries(enabledConfig.profiles).filter(([, profile]) => isWindowsTestProfile(profile))),
+          ...(dependencies.sourceEnvironment ? { sourceEnvironment: dependencies.sourceEnvironment } : {}),
+        }),
+      } : {}),
     });
   const executor = new ControlledCodeExecutor({
     broker,

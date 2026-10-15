@@ -428,6 +428,30 @@ export class GitHubReviewProposalHandler {
           throw error;
         }
       }
+    } else if (input.attempt > 1 || authority === null) {
+      // The queue may have completed publication before the proposal runner
+      // persisted its downstream reference. Recover the exact historical plan;
+      // current assignment changes cannot erase an observed external result.
+      const candidates = [initialExpected, selfExpected, legacySelfExpected, legacyUnversionedSelfExpected];
+      for (const id of new Set(candidates.map((candidate) => candidate.id))) {
+        let stored;
+        try { stored = await this.#get(id); }
+        catch (error) {
+          if (error?.code === "CONFIRMATION_NOT_FOUND") continue;
+          throw error;
+        }
+        for (const candidate of candidates.filter((candidate) => candidate.id === id)) {
+          try {
+            item = normalizeConfirmationItem(stored, candidate);
+            referencedExpected = candidate;
+            break;
+          } catch (error) {
+            if (error?.code !== "INVALID_GITHUB_REVIEW_CONFIRMATION") throw error;
+          }
+        }
+        if (item === null) throw invalidConfirmation();
+        break;
+      }
     }
     const migratesLegacySelfReview =
       selfAuthored &&

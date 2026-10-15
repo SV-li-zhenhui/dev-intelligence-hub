@@ -8,7 +8,8 @@ import { GitHubAdapter } from "./adapters/github-adapter.js";
 import { createProductionSupervisedCliBrainProvider } from "./adapters/supervised-cli-brain-provider.js";
 import { AutomaticReviewPublisher } from "./services/automatic-review-publisher.js";
 import { AutomaticOwnPrRepair } from "./services/automatic-own-pr-repair.js";
-import { ReviewRepairContextReader } from "./services/review-repair-context-reader.js";
+import { ReviewRepairContextReader, normalizeReviewRepairFeedbackContext } from "./services/review-repair-context-reader.js";
+import { OriginalRepairFeedbackReader } from "./services/original-repair-feedback-reader.js";
 import { OwnPrRepairObjectSync } from "./adapters/own-pr-repair-object-sync.js";
 import { createGitHubPullRequestActionTransport } from "./adapters/github-pull-request-action-transport.js";
 import { createGhLoginCredentialSource } from "./adapters/gh-login-credential-source.js";
@@ -449,11 +450,12 @@ function productionCliRuntimeFacts(value) {
     "protectedRoots",
     "codexLoginCredentialBroker",
     "supervisedCliTemporaryRoot",
+    "originalRepairFeedbackReader",
   ]);
   if (
     !Object.hasOwn(descriptors, "protectedRoots") ||
     keys.length < 1 ||
-    keys.length > 3 ||
+    keys.length > 4 ||
     keys.some(
       (key) =>
         typeof key !== "string" ||
@@ -497,12 +499,19 @@ function productionCliRuntimeFacts(value) {
   ) {
     throw new TypeError("Production CLI runtime facts are invalid");
   }
+  const feedbackReader = descriptors.originalRepairFeedbackReader?.value;
+  if (feedbackReader !== undefined && typeof feedbackReader?.read !== "function") {
+    throw new TypeError("Production CLI original feedback reader is invalid");
+  }
   return Object.freeze({
     protectedRoots: distinctAbsolutePaths(protectedRoots),
     ...(broker === undefined ? {} : { codexLoginCredentialBroker: broker }),
     ...(supervisedCliTemporaryRoot === undefined
       ? {}
       : { supervisedCliTemporaryRoot: path.resolve(supervisedCliTemporaryRoot) }),
+    ...(feedbackReader === undefined ? {} : {
+      originalRepairFeedbackReader: frozenPort(feedbackReader, ["read"], "originalRepairFeedbackReader"),
+    }),
   });
 }
 
@@ -1040,6 +1049,17 @@ export async function createApplication({
   let automaticOwnPrRepair = null;
   let workflowRouting = null;
   let workLedgerRuntime = null;
+  const originalRepairFeedbackReader = new OriginalRepairFeedbackReader({
+    store,
+    executionContextReader: Object.freeze({
+      readPullRequestExecutionContext(input) {
+        if (!workLedgerRuntime) throw Object.assign(new Error("Original feedback authority is not ready"), {
+          code: "OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE",
+        });
+        return workLedgerRuntime.readPullRequestExecutionContext(input);
+      },
+    }),
+  });
   let ownerWorkRetry = null;
   let ownerWorkRequests = null;
   let attentionInboxRuntime = null;
@@ -1056,7 +1076,7 @@ export async function createApplication({
   let inputAuthorityVerifier = null;
   let codeJobDeliveryEvidenceReader = null;
   let codeJobControl = null;
-  const taskRuns = new TaskRunRegistry({store,...(workCoordinationDependencies.clock ? {clock:workCoordinationDependencies.clock} : {}),
+  const taskRuns = new TaskRunRegistry({store,receiptStore:store,...(workCoordinationDependencies.clock ? {clock:workCoordinationDependencies.clock} : {}),
     verifyStopped: async () => {
       if (!canUseNativeStopEvidence(config.brainProviders)) return false;
       const evidence = await brainProviderStatus?.readStatus();
@@ -1155,6 +1175,7 @@ export async function createApplication({
     const cliRuntimeFacts = {
       protectedRoots: cliAndCredentialProtectedRoots,
       codexLoginCredentialBroker,
+      originalRepairFeedbackReader: frozenPort(originalRepairFeedbackReader, ["read"], "originalRepairFeedbackReader"),
       ...(typeof privateRuntimeDirectory === "string" &&
           path.isAbsolute(privateRuntimeDirectory) &&
           path.resolve(privateRuntimeDirectory) ===
@@ -1168,14 +1189,18 @@ export async function createApplication({
         : {}),
     };
     cliCompositionCapability = issueProductionCliCompositionGrant(cliRuntimeFacts);
-    if (Object.values(config.brainProviders || {}).some(
+    const nativeProviderConfiguration = Object.values(config.brainProviders || {}).find(
       (provider) => provider.kind === "codex-cli" && provider.credentialMode === "codex-native-login",
-    )) {
+    );
+    if (nativeProviderConfiguration) {
       const nativeStatus = trackRuntime(frozenPort(
         await nativeCodexStatusProviderFactory({
           id: "codex-native-readiness",
           cliKind: "codex-cli",
           credentialMode: "codex-native-login",
+          ...(nativeProviderConfiguration.maxConcurrentTurns === undefined ? {} : {
+            maxConcurrentTurns: nativeProviderConfiguration.maxConcurrentTurns,
+          }),
           timeoutMs: 30_000,
         }, issueProductionCliCompositionGrant(cliRuntimeFacts)),
         ["readStatus", "close"],
@@ -1953,6 +1978,36 @@ export async function createApplication({
         github, confirmations: Object.freeze({ ...confirmationRuntime.producerQueue, ...confirmationRuntime.queue }), codeJobReader,
         controlledCommitReader: codeExecutorRuntime.controlledCommitBuilder,
         grantVerifier: activeCodeJobOptions.grantVerifier,
+        historicalRepairFeedbackReader: Object.freeze({
+          async read({ inputBinding, feedbackDigest }) {
+            const account = inputBinding.gitTarget.sourceAccountId;
+            const live = await github.readOwnPullRequestFeedback({
+              repository: inputBinding.repository, number: inputBinding.pullRequestNumber, account,
+            });
+            if (live.state !== "open" || live.isDraft === true ||
+                live.author?.toLowerCase() !== account.toLowerCase() ||
+                live.currentUser?.toLowerCase() !== account.toLowerCase() ||
+                live.repo?.toLowerCase() !== inputBinding.repository.toLowerCase() ||
+                live.number !== inputBinding.pullRequestNumber || live.reviewFeedbackAvailable !== true ||
+                live.reviewFeedbackDigest !== feedbackDigest || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(live.headRefOid)) {
+              throw Object.assign(new Error("Original repair feedback cannot be recovered exactly"), {
+                code: "OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE",
+              });
+            }
+            return {
+              context: normalizeReviewRepairFeedbackContext({ schemaVersion: 1,
+                headRefOid: inputBinding.headRefOid, reviewFeedbackDigest: feedbackDigest, feedback: live.feedback }),
+              provenance: { kind: "github_digest_matched_feedback", observedHeadRefOid: live.headRefOid,
+                observedAt: new Date().toISOString() },
+            };
+          },
+        }),
+        ownerWorkRequests: Object.freeze({
+          submitInternalReview: (request) => {
+            if (!ownerWorkRequests) throw new Error("内部复审交接运行时尚未就绪");
+            return ownerWorkRequests.submitInternalReview(request);
+          },
+        }),
         objectSync: trackRuntime(new OwnPrRepairObjectSync({ credentialSource: githubCredentialSource })),
       });
       await automaticOwnPrRepair.recover();
@@ -2429,6 +2484,15 @@ export async function createApplication({
         ),
         factSource,
         pullRequestContextReader,
+        internalReviewHandoffReader: Object.freeze({
+          read: (input) => workLedgerRuntime.readInternalReviewHandoff(input),
+        }),
+        originalRepairFeedbackReader: Object.freeze({
+          async readBinding(input) {
+            if (automaticOwnPrRepair) await automaticOwnPrRepair.readOriginalFeedbackBinding(input);
+            return originalRepairFeedbackReader.readBinding(input);
+          },
+        }),
         ...(codeJobReader === null ? {} : {
           failedCodeJobContextReader: new FailedCodeJobContextReader({ codeJobReader, ledger: workLedgerRuntime }),
         }),

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { GitHubAdapter } from "../src/adapters/github-adapter.js";
-import { summarizeOwnReviewFeedback } from "../src/adapters/github-own-review-feedback.js";
+import { readOwnReviewFeedback, summarizeOwnReviewFeedback } from "../src/adapters/github-own-review-feedback.js";
 
 const ACCOUNT = "local-owner";
 const HEAD = "a".repeat(40);
@@ -64,6 +64,35 @@ function page(nodes, hasNextPage = false, endCursor = null) {
 
 function pullRequest(overrides = {}) {
   return { number: 42, url: "https://github.com/acme/repo/pull/42", author: { login: ACCOUNT }, state: "OPEN", headRefOid: HEAD, reviewDecision: "CHANGES_REQUESTED", ...overrides };
+}
+
+test("live own feedback queries and returns the current Draft fact", async () => {
+  const queries = [];
+  const result = await readOwnReviewFeedback(async (_command, args) => {
+    queries.push(args.find((value) => value.startsWith("query=")));
+    return { data: { repository: { pullRequest: pullRequest({ isDraft: true,
+      reviews: page([]), reviewThreads: page([]) }) } } };
+  }, { repository: "acme/repo", number: 42, account: ACCOUNT });
+  assert.equal(result.isDraft, true);
+  assert.equal(queries.every((query) => query.includes("isDraft")), true);
+});
+
+for (const driftAt of ["Reviews", "Threads", "ThreadComments", "Identity"]) {
+  test(`live own feedback rejects a Draft change during ${driftAt}`, async () => {
+    const run = async (_command, args) => {
+      const query = args.find((value) => value.startsWith("query="));
+      const isChangedPage = query.includes(`query OwnReviewFeedback${driftAt}(`);
+      const pr = pullRequest({ isDraft: isChangedPage, reviews: page([]), reviewThreads: page([]) });
+      if (query.includes("ThreadComments")) return { data: { node: { id: "thread-1", pullRequest: pr, comments: page([]) } } };
+      if (query.includes("query OwnReviewFeedback(")) {
+        pr.reviews = page([], driftAt === "Reviews", driftAt === "Reviews" ? "next" : null);
+        pr.reviewThreads = page([thread({ comments: page([], driftAt === "ThreadComments", driftAt === "ThreadComments" ? "next" : null) })],
+          driftAt === "Threads", driftAt === "Threads" ? "next" : null);
+      }
+      return { data: { repository: { pullRequest: pr } } };
+    };
+    await assert.rejects(readOwnReviewFeedback(run, { repository: "acme/repo", number: 42, account: ACCOUNT }), /Draft changed during read/);
+  });
 }
 
 test("live own feedback follows reviews, threads and nested comments through every page", async () => {

@@ -222,6 +222,74 @@ function deferred() {
   return { promise, resolve };
 }
 
+function fixedDecisionEngine(roleId, decision) {
+  return new RoleDecisionEngine({ definition: definition(roleId),
+    permissions: permissions("complete", "handoff", "ask_user", "propose_github_review", "propose_code_action"), brain: brain(),
+    brainRouter: { describe: () => ({ singleAttempt: true, supportsReviewReading: true }), generate: async () => JSON.stringify(decision) },
+  });
+}
+
+test("developer PR development cannot complete without review, including an already committed alleged fix", async () => {
+  for (const event of [
+    { eventType: "pull_request.owner_requested", payload: { workType: "development", headRefOid: "a".repeat(40) } },
+    { eventType: "pull_request.updated", payload: { relation: "authored", nextAction: "address_review", headRefOid: "a".repeat(40) } },
+    { eventType: "pull_request.updated", payload: { relation: "authored", nextAction: "fix_ci", headRefOid: "a".repeat(40) } },
+  ]) {
+    const engine = fixedDecisionEngine("developer", completeDecision());
+    await assert.rejects(engine.decide({ item: { event }, context: {
+      requirements: {}, code: { sourceEvent: event, existingRepair: { commitOid: "b".repeat(40) } },
+    } }), { code: "ROLE_DECISION_PR_REVIEW_REQUIRED" });
+  }
+});
+
+test("an existing-fix developer handoff remains internal through the PR engineer decision", async () => {
+  const event = { eventType: "pull_request.owner_requested", source: { provider: "local-owner" },
+    payload: { workType: "development", headRefOid: "a".repeat(40) } };
+  const input = { item: { event }, context: { requirements: {}, code: { sourceEvent: event,
+    internalReview: { kind: "developer_handoff", headRefOid: event.payload.headRefOid,
+      brief: "Existing commit is claimed to fix the review", evidence: ["developer-report-only"] } } } };
+  const external = completeDecision({ intent: { schemaVersion: 1, type: "propose_github_review",
+    summary: "Publish", reason: "Review complete", verdict: "approve", body: "ok", evidence: [] } });
+  await assert.rejects(fixedDecisionEngine("pr-engineer", external).decide(input), { code: "ROLE_DECISION_INTERNAL_REVIEW_ONLY" });
+  await assert.rejects(fixedDecisionEngine("pr-engineer", completeDecision()).decide(input), { code: "ROLE_DECISION_INTERNAL_REVIEW_EVIDENCE_REQUIRED" });
+  const internal = completeDecision(); internal.intent.evidence = [`head:${event.payload.headRefOid}`, "code-inspection", "actual-regression-report"];
+  assert.equal((await fixedDecisionEngine("pr-engineer", internal).decide(input)).intent.type, "complete");
+});
+
+test("PR development retains real requirements questions and ordinary non-PR completion", async () => {
+  const event = { eventType: "pull_request.owner_requested", payload: { workType: "development" } };
+  assert.equal((await fixedDecisionEngine("developer", askUserDecision()).decide({ item: { event },
+    context: { requirements: {}, code: { sourceEvent: event } } })).intent.type, "ask_user");
+  assert.equal((await fixedDecisionEngine("developer", completeDecision()).decide({ item: {},
+    context: { requirements: {} } })).intent.type, "complete");
+  const testing = { eventType: "pull_request.owner_requested", payload: { workType: "testing" } };
+  assert.equal((await fixedDecisionEngine("developer", completeDecision()).decide({ item: { event: testing },
+    context: { requirements: {}, code: { sourceEvent: testing } } })).intent.type, "complete");
+});
+
+test("internal own PR review rejects external publication and requires Head and repair evidence on completion", async () => {
+  const internalReview = { kind: "own_pr_repair", headRefOid: "a".repeat(40), feedbackDigest: "f".repeat(64),
+    publicationConfirmationId: "confirmation-push", controlledCommitEvidenceId: "controlled-repair" };
+  const event = { eventType: "pull_request.internal_review_requested", source: { provider: "internal-review-repair" },
+    payload: { internalReview, headRefOid: internalReview.headRefOid } };
+  const input = { item: { event }, context: { requirements: {}, code: { sourceEvent: event } } };
+  await assert.rejects(fixedDecisionEngine("pr-engineer", completeDecision()).decide(input),
+    { code: "ROLE_DECISION_INTERNAL_REVIEW_EVIDENCE_REQUIRED" });
+  const bound = completeDecision();
+  bound.intent.evidence = [`head:${internalReview.headRefOid}`, "controlled-commit:controlled-repair", "publication:confirmation-push"];
+  await assert.rejects(fixedDecisionEngine("pr-engineer", bound).decide(input), { code: "ROLE_DECISION_INTERNAL_REVIEW_FEEDBACK_REQUIRED" });
+  event.subject = { repository: "acme/repo", number: 42 };
+  input.context.code.originalRepairFeedback = { snapshotId: `repair-feedback-snapshot-${"d".repeat(64)}`, feedbackDigest: internalReview.feedbackDigest,
+    originalHeadRefOid: "b".repeat(40), reviewHeadRefOid: internalReview.headRefOid };
+  input.context.code.pullRequest = { reviewMaterial: { gitTarget: { schemaVersion: 1, provider: "github", sourceAccountId: "me",
+    baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "c".repeat(40), headRepository: "acme/repo", headRefName: "fix", headRefOid: internalReview.headRefOid } } };
+  assert.equal((await fixedDecisionEngine("pr-engineer", bound).decide(input)).intent.type, "complete");
+  const external = completeDecision({ intent: { schemaVersion: 1, type: "propose_github_review", summary: "Publish",
+    reason: "Review complete", verdict: "approve", body: "ok", evidence: [] } });
+  await assert.rejects(fixedDecisionEngine("pr-engineer", external).decide(input),
+    { code: "ROLE_DECISION_INTERNAL_REVIEW_ONLY" });
+});
+
 test("RoleDecisionEngine classifies context, routes the configured brain, and normalizes output", async () => {
   const calls = [];
   const router = {

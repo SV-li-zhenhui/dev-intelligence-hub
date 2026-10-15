@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { types as utilTypes } from "node:util";
 import { OperationQueue } from "../lib/operation-queue.js";
 import { withTaskExecution } from '../lib/task-execution-context.js';
+import {TaskRunExecutionReceipts,executionReceiptView} from './task-run-execution-receipts.js';
 
 export const TASK_RUN_STATE_KEY = "task-run-settings";
 const MAX_RECORDS = 1_000;
@@ -299,7 +300,7 @@ function runView(record, run) {
     title: task.title,
     subject: task.subject,
     startedAt: run?.startedAt ?? record.startedAt,
-    phase: run ? (waiting ? "waiting_checkpoint" : "running") :
+    phase: run ? (waiting ? "waiting_checkpoint" : run.phase) :
       (record.pendingCommand === null ? record.terminalStatus ?? record.phase : "control_failed"),
     priority: record.priority,
     instructions: record.instructions.map((entry) => ({ ...entry })),
@@ -314,6 +315,7 @@ function runView(record, run) {
     stopUnconfirmed: record.stopUnconfirmed === true,
     session: run?.session ? { ...run.session } : null,
     events: run?.events.map((event) => ({ ...event })) ?? [],
+    ...(run?.receipt ? {receipt:structuredClone(run.receipt)} : {}),
   };
 }
 
@@ -321,8 +323,9 @@ export class TaskRunRegistry {
   #queue = new OperationQueue();
   #active = new Map();
   #knownState = null;
+  #receipts;
 
-  constructor({ store, clock = () => new Date(), settleControl, verifyStopped = async () => false } = {}) {
+  constructor({ store, receiptStore = null, clock = () => new Date(), settleControl, verifyStopped = async () => false } = {}) {
     if (!store || typeof store.read !== "function" || typeof store.write !== "function" ||
         typeof clock !== "function" || typeof settleControl !== "function" || typeof verifyStopped !== 'function') {
       throw new TypeError("TaskRunRegistry dependencies are invalid");
@@ -331,6 +334,8 @@ export class TaskRunRegistry {
     this.clock = clock;
     this.settleControl = settleControl;
     this.verifyStopped = verifyStopped;
+    if(receiptStore && (typeof receiptStore.read!=='function' || typeof receiptStore.write!=='function'))throw new TypeError('receiptStore is invalid');
+    this.#receipts=receiptStore ? new TaskRunExecutionReceipts(receiptStore) : null;
   }
 
   async run(input, operation, {repeatOnInstruction = true, requireStopConfirmation = false} = {}) {
@@ -339,6 +344,7 @@ export class TaskRunRegistry {
     const run = await this.#queue.enqueue(() => this.#register(task));
     run.repeatOnInstruction = repeatOnInstruction;
     run.requireStopConfirmation = requireStopConfirmation;
+    let outcomeError;
     try {
       let instructions = run.instructions;
       for (let round = 1; ; round += 1) {
@@ -347,16 +353,29 @@ export class TaskRunRegistry {
         run.scope = scope;
         const current = () => run.scope === scope && this.#active.get(run.key) === run;
         const context = {
-          reportProgress: (text) => { if (current()) { run.progress = displayText(text, 500, invalidInput()); run.lastActivityAt = this.#now(); } },
-          reportSession: (session) => { if (current()) { run.session = normalizeSession(session); run.lastActivityAt = this.#now(); } },
-          reportEvent: (event) => { if (current()) reportEvent(run, event, this.#now()); },
+          reportActivity: () => {if(current()){run.lastActivityAt=this.#now();this.#recordReceipt(run);}},
+          reportModelState: (phase) => {
+            if(!current())return;
+            if(!['waiting_model','starting_model','running'].includes(phase))throw invalidInput();
+            run.phase=phase;run.lastActivityAt=this.#now();
+            if(phase==='running')run.modelStartedAt??=run.lastActivityAt;
+            this.#recordReceipt(run);
+          },
+          reportProgress: (text) => { if (current()) { run.progress = displayText(text, 500, invalidInput()); run.lastActivityAt = this.#now(); this.#recordReceipt(run); } },
+          reportSession: (session) => { if (current()) {
+            run.session = normalizeSession(session); run.lastActivityAt = this.#now();
+            if(session.status==='starting')run.phase='starting_model';
+            if(session.status==='running') {run.phase='running';run.modelStartedAt??=run.lastActivityAt;}
+            this.#recordReceipt(run);
+          } },
+          reportEvent: (event) => { if (current()) { reportEvent(run, event, this.#now()); this.#recordReceipt(run); } },
           registerLiveControl: (control) => {
             if (!current()) return () => {};
             if (typeof control?.steer !== 'function' || typeof control?.interrupt !== 'function') throw invalidInput();
             run.liveControl = control;
             return () => { if (current() && run.liveControl === control) run.liveControl = null; };
           },
-          confirmStopped: () => { if (current()) run.stoppedConfirmed = true; },
+          confirmStopped: () => { if (current()) {run.stoppedConfirmed = true;this.#recordReceipt(run);} },
           assertRunning: () => {
             if (!current()) throw registryError("TASK_RUN_NOT_ACTIVE", "任务运行已结束");
             if (run.stopRequested) throw heldError(run.stopRequested);
@@ -396,10 +415,18 @@ export class TaskRunRegistry {
         if (checkpoint.done) return result;
         instructions = checkpoint.instructions;
       }
-    } finally {
+    } catch(error) { outcomeError=error;throw error; }
+    finally {
       // The final checkpoint and every control share this queue, closing acceptance before dispatch.
-      await this.#queue.enqueue(() => {
+      await this.#queue.enqueue(async () => {
         if (this.#active.get(run.key) === run) this.#active.delete(run.key);
+        const code=outcomeError?.code;
+        run.phase=!outcomeError?'completed':code==='TASK_RUN_PAUSED'?'paused':code==='TASK_RUN_CANCELLED'?'cancelled':
+          ['STRUCTURED_PROVIDER_REAP_FAILED','TASK_RUN_CONTROL_PENDING'].includes(code)?'unknown':'failed';
+        run.finishedAt=run.phase==='unknown'?null:this.#now();
+        run.outcomeCode=typeof code==='string' && /^[A-Z][A-Z0-9_]{0,127}$/u.test(code)?code:null;
+        if(!outcomeError)run.stoppedConfirmed=true;
+        await this.#recordReceipt(run);
       });
     }
   }
@@ -412,7 +439,13 @@ export class TaskRunRegistry {
         const key = identity(record.task.kind, record.task.taskId);
         return !this.#active.has(key) && (record.mode === "paused" || record.pendingCommand !== null);
       }).map((record) => runView(record));
-      return { enabled: true, items, held };
+      if(!this.#receipts)return { enabled:true,items,held };
+      const occupied=new Set([...items,...held].map(item=>`${item.kind}:${item.taskId}`));
+      const latest=new Map();
+      for(const receipt of await this.#receipts.list())latest.set(`${receipt.kind}:${receipt.taskId}`,receipt);
+      const recent=[...latest].filter(([key])=>!occupied.has(key)).map(([,receipt])=>executionReceiptView(receipt));
+      return {enabled:true,items,held,recent,counts:{active:items.filter(item=>item.receipt?.modelStartedAt && ['running','waiting_checkpoint'].includes(item.phase)).length,
+        queued:items.filter(item=>item.phase==='waiting_model').length,preparing:items.filter(item=>['preparing','starting_model'].includes(item.phase)).length}};
     });
   }
 
@@ -434,6 +467,8 @@ export class TaskRunRegistry {
       const state = await this.#readState();
       const run = this.#active.get(key);
       const record = findRecord(state, key) ?? (run && defaultRecord(run));
+      const receipt=this.#receipts ? (await this.#receipts.list()).findLast(entry=>entry.kind===kind && entry.taskId===taskId) : null;
+      if(!run && receipt && (!record || record.mode==='active' && record.pendingCommand===null))return executionReceiptView(receipt);
       if (!record) throw registryError("TASK_RUN_NOT_FOUND", "运行任务不存在", 404);
       return runView(record, run);
     });
@@ -484,6 +519,7 @@ export class TaskRunRegistry {
       savedInstructionCount: current?.instructions.length ?? 0,
       instructions: current?.instructions.map(({ text }) => text) ?? [],
       session: null, events: [], eventSequence: 0,
+      phase:'preparing',modelStartedAt:null,lastActivityAt:this.#now(),stoppedConfirmed:false,
     };
     if (current) {
       await this.#writeRecord(state, {
@@ -491,6 +527,7 @@ export class TaskRunRegistry {
         appliedRevision: run.appliedRevision,
       });
     }
+    await this.#recordReceipt(run);
     this.#active.set(key, run);
     return run;
   }
@@ -661,5 +698,17 @@ export class TaskRunRegistry {
       return value.toISOString();
     }
     return timestamp(value, error);
+  }
+
+  #recordReceipt(run) {
+    if(!this.#receipts)return;
+    run.receipt={runId:run.runId,kind:run.task.kind,taskId:run.task.taskId,roleId:run.task.roleId,
+      taskRevision:run.task.revision,leaseId:run.task.leaseId??null,registeredAt:run.startedAt,
+      modelStartedAt:run.modelStartedAt,lastActivityAt:run.lastActivityAt??run.startedAt,
+      finishedAt:run.finishedAt??null,phase:run.phase,stopConfirmed:run.stoppedConfirmed===true,
+      session:run.session ? {...run.session}:null,eventCount:run.eventSequence,outcomeCode:run.outcomeCode??null};
+    const recorded=this.#receipts.record(run.receipt);
+    void recorded.catch(()=>{}); // Synchronous event callbacks report persistence failure at the next read/checkpoint.
+    return recorded;
   }
 }
