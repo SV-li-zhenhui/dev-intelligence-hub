@@ -287,6 +287,36 @@ test("the archive owner supports immutable tombstones through verification outco
   assert.deepEqual(owner.supportedVersions, [1, 2, 3]);
 });
 
+test("the ledger owner upgrades schema 11 without changing an already current authority baseline", async (t) => {
+  const owner = allPersistedSchemaOwners().find(({ ownerId }) => ownerId === "work-ledger-state");
+  assert.equal(owner.currentVersion, 12);
+  assert.deepEqual(owner.supportedVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  const current = emptyWorkLedgerState();
+  const legacy = { ...structuredClone(current), schemaVersion: 11 };
+  const fixture = await candidateDirectory(t, { "work-ledger-state.json": legacy });
+  const registry = createProductionRestoreMigrationRegistry();
+  await registry.migrate(fixture);
+  assert.deepEqual(await readJson(fixture.directory, "work-ledger-state"), current);
+  const before = await readFile(path.join(fixture.directory, "work-ledger-state.json"));
+  await registry.migrate(fixture);
+  assert.deepEqual(await readFile(path.join(fixture.directory, "work-ledger-state.json")), before);
+  assert.equal(legacy.schemaVersion, 11);
+});
+
+test("a future ledger schema blocks the production restore before any writes", async (t) => {
+  const fixture = await candidateDirectory(t, { "work-ledger-state.json": {
+    ...emptyWorkLedgerState(), schemaVersion: 13,
+  } });
+  const originalWrite = StateStore.prototype.write;
+  let writes = 0;
+  t.mock.method(StateStore.prototype, "write", function (...args) {
+    writes += 1;
+    return originalWrite.apply(this, args);
+  });
+  await assert.rejects(createProductionRestoreMigrationRegistry().migrate(fixture));
+  assert.equal(writes, 0);
+});
+
 test("execution receipts are a validated backup owner and remain byte-for-byte unchanged", async (t) => {
   const owner = allPersistedSchemaOwners().find(({ ownerId }) => ownerId === "task-run-execution-receipts");
   assert.equal(owner.mode, "validate");
@@ -893,7 +923,7 @@ test("the production registry plans every fixed owner before deterministic write
   );
   assert.equal(
     (await readJson(fixture.directory, "work-ledger-state")).schemaVersion,
-    11,
+    12,
   );
   assert.equal(
     (await readJson(fixture.directory, "code-job-state")).schemaVersion,

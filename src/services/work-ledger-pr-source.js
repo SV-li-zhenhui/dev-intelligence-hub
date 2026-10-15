@@ -1459,7 +1459,7 @@ function subjectSourceObservations(item) {
   };
 }
 
-function evaluatePullRequestSubjectAuthority(state, root) {
+function evaluatePullRequestSubjectAuthority(state, root, preserveInactiveHistory = true) {
   if (
     root?.source?.kind !== "pull_request" ||
     !Array.isArray(state?.items)
@@ -1516,6 +1516,7 @@ function evaluatePullRequestSubjectAuthority(state, root) {
       // Leaving scope revokes execution authority, not an already accepted
       // causal bridge used by a later, independently active provenance.
       if (
+        preserveInactiveHistory &&
         !authorityNegative &&
         observation.revision.disposition === "accepted" &&
         observation.occurredAtMs >= trustedOccurredAtWatermark &&
@@ -1631,9 +1632,9 @@ function evaluatePullRequestSubjectAuthority(state, root) {
   };
 }
 
-function canonicalPullRequestSourceRoot(state, root) {
+function canonicalPullRequestSourceRoot(state, root, preserveInactiveHistory = true) {
   try {
-    return evaluatePullRequestSubjectAuthority(state, root)?.canonical?.item ??
+    return evaluatePullRequestSubjectAuthority(state, root, preserveInactiveHistory)?.canonical?.item ??
       null;
   } catch {
     return null;
@@ -1665,7 +1666,7 @@ export function pullRequestTrustedPredecessorHead(state, root) {
   return pullRequestTrustedPredecessor(state, root)?.headRefOid ?? null;
 }
 
-export function pullRequestHeadAdmission(state, item) {
+function headAdmission(state, item, preserveInactiveHistory) {
   const binding = currentWorkItemInputBinding(item);
   if (binding === null) {
     return Object.freeze({ applies: false, current: true, pending: false });
@@ -1680,7 +1681,7 @@ export function pullRequestHeadAdmission(state, item) {
   const currentEvent = root?.source?.kind === "pull_request"
     ? currentWorkItemEvent(root)
     : null;
-  const canonicalRoot = canonicalPullRequestSourceRoot(state, root);
+  const canonicalRoot = canonicalPullRequestSourceRoot(state, root, preserveInactiveHistory);
   const crossRootCutoverPending = state.items.some(
     (candidate) =>
       samePullRequestSourceSubject(candidate, root) &&
@@ -1728,6 +1729,16 @@ export function pullRequestHeadAdmission(state, item) {
     headRevision: binding.headRevision,
     currentHeadRevision: current?.headRevision ?? null,
   });
+}
+
+export function pullRequestHeadAdmission(state, item) {
+  return headAdmission(state, item, true);
+}
+
+// Only persisted schema 11 projection validation uses the former policy.
+// Execution and all newly persisted authority continue using the current one.
+export function pullRequestHeadAdmissionForSchema11Migration(state, item) {
+  return headAdmission(state, item, false);
 }
 
 export function verifyPullRequestExecutionBinding(state, value) {

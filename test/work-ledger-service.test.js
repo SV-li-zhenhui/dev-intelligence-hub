@@ -2,6 +2,12 @@ import { digestValue } from "../src/domain/code-executor-contract.js";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { createBackupManifest } from "../src/domain/backup-manifest.js";
+import { createProductionRestoreMigrationRegistry } from "../src/services/production-restore-migration-registry.js";
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { createTaskRunSettler } from '../src/services/work-ledger-run-control.js';
 import { WorkConditionWaker } from '../src/services/work-condition-waker.js';
@@ -1028,6 +1034,8 @@ import {
   REVIEWED_PR_APPROVED_RULE_ID,
 } from "../src/domain/pr-lifecycle-routing.js";
 import {
+  createWorkGraphAuthorityObservationEvent,
+  createWorkGraphSourceAuthority,
   createLegacyWorkGraphMemoryEvent,
   workGraphMemoryRecordReceipt,
 } from "../src/domain/work-graph-memory-event.js";
@@ -1055,6 +1063,7 @@ import {
   createWorkDecisionContext,
   emptyWorkLedgerState,
   normalizeWorkLedgerLimits,
+  normalizeWorkLedgerPersistedState,
   WORK_LEDGER_STATE_SCHEMA_VERSION,
 } from "../src/services/work-ledger-state.js";
 import { ledgerDigest } from "../src/services/work-ledger-values.js";
@@ -1063,6 +1072,7 @@ import { validateWorkLedgerGraphTransition } from "../src/services/work-ledger-g
 import {
   migrateWorkGraphMemoryProjection,
   appendWorkGraphMemoryEvents,
+  acknowledgeWorkGraphMemoryProjectionBatch,
 } from "../src/services/work-ledger-graph-memory.js";
 import {
   appendPullRequestWorkSource,
@@ -2295,6 +2305,213 @@ async function sourceExitHistoryFixture({
   const inactive = roots.find(item => item.source?.identity.scopeId === "github-dashboard");
   const receiver = roots.find(item => item.source?.identity.scopeId === "github-secondary");
   return { ...fixture, inactive, receiver, exitedState };
+}
+
+async function schema11SourceExitProjectionFixture(options) {
+  const fixture = await sourceExitHistoryFixture(options);
+  const state = fixture.store.stored();
+  state.schemaVersion = 11;
+  const projection = acknowledgeWorkGraphMemoryProjectionBatch(state.graphMemoryProjection, {
+    receipts: state.graphMemoryProjection.pending.slice(0, 2).map(workGraphMemoryRecordReceipt),
+  }, state.revision).projection;
+  state.graphMemoryProjection = projection;
+  // Under the previous policy, skipping the inactive A -> B bridge leaves
+  // the receiving B provenance fenced. Preserve that sealed old baseline.
+  const authorities = state.items.filter(item => item.source?.kind === "pull_request")
+    .map(item => ({ item, authority: createWorkGraphSourceAuthority({
+      executionBinding: prExecutionBinding(item),
+      provenance: { provider: item.source.identity.provider, scopeId: item.source.identity.scopeId },
+      citable: false,
+    }) }));
+  const authorityStateDigest = ledgerDigest(authorities.map(({ item, authority }) => ({
+    taskId: item.itemId, bindingDigest: authority.bindingDigest, citable: false,
+  })).sort((left, right) => left.taskId.localeCompare(right.taskId, "en")));
+  const receiverAuthority = authorities.find(({ item }) => item.itemId === fixture.receiver.itemId).authority;
+  const event = createWorkGraphAuthorityObservationEvent({
+    sequence: projection.nextSequence,
+    previousDigest: projection.pending.at(-1)?.eventDigest ?? projection.checkpointDigest,
+    ledgerRevision: state.revision,
+    taskRevision: fixture.receiver.revision,
+    item: fixture.receiver,
+    occurredAt: state.timeline.at(-1).at,
+    sourceAuthority: receiverAuthority,
+    authorityStateDigest,
+  });
+  projection.pending.push(event);
+  projection.nextSequence += 1;
+  projection.authorityStateDigest = authorityStateDigest;
+  fixture.store.replaceStored(state);
+  return { ...fixture, legacy: state };
+}
+
+test("schema v11 recovers a previous-policy authority baseline before appending the current observation", async () => {
+  const fixture = await schema11SourceExitProjectionFixture();
+  const before = clone(fixture.legacy);
+  const normalized = normalizeWorkLedgerPersistedState(before);
+  assert.equal(normalized.schemaVersion, 12);
+  assert.deepEqual(before, fixture.legacy);
+  assert.deepEqual(normalized.items, before.items);
+  assert.deepEqual(normalized.timeline, before.timeline);
+  assert.deepEqual(normalized.outbox, before.outbox);
+  const previous = before.graphMemoryProjection;
+  const next = normalized.graphMemoryProjection;
+  assert.deepEqual(next.pending.slice(0, previous.pending.length), previous.pending);
+  assert.equal(next.pending.length, previous.pending.length + 1);
+  assert.equal(next.pending.at(-1).kind, "authority_observed");
+  assert.equal(next.pending.at(-1).previousDigest, previous.pending.at(-1).eventDigest);
+  assert.notEqual(next.authorityStateDigest, previous.authorityStateDigest);
+  for (const key of ["cursor", "checkpointDigest", "lastAcknowledgement", "sourceHistoryDigest"]) {
+    assert.deepEqual(next[key], previous[key]);
+  }
+  assert.deepEqual(normalizeWorkLedgerPersistedState(normalized), normalized);
+  const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  const batch = await restarted.service.readGraphMemoryProjectionBatch({ limit: 100 });
+  assert.deepEqual(batch.items, next.pending);
+  assert.deepEqual(fixture.store.stored(), before, "read-only migration does not rewrite the original store");
+  await assert.rejects(restarted.service.verifyPullRequestExecutionBinding(prExecutionBinding(fixture.inactive)),
+    error => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE");
+  const receiver = (await restarted.service.listItems({ limit: 10 })).items.find(item => item.itemId === fixture.receiver.itemId);
+  assert.equal((await restarted.service.claim({ itemId: receiver.itemId, expectedRevision: receiver.revision,
+    workerId: "employee-pr-engineer", leaseDurationMs: 30_000 })).status, "working");
+  assert.equal(fixture.store.stored().schemaVersion, 12);
+  const second = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  assert.deepEqual(await second.service.listItems({ limit: 10 }), await restarted.service.listItems({ limit: 10 }));
+});
+
+test("schema v11 preserves an already current policy projection without appending another observation", async () => {
+  const fixture = await sourceExitHistoryFixture();
+  const state = fixture.store.stored();
+  state.schemaVersion = 11;
+  const normalized = normalizeWorkLedgerPersistedState(state);
+  assert.equal(normalized.schemaVersion, 12);
+  assert.deepEqual(normalized.graphMemoryProjection, state.graphMemoryProjection);
+});
+
+for (const schemaVersion of [10, 11]) {
+  test(`schema v${schemaVersion} policy upgrade recovers a full migration tail and drains it across restarts`, async () => {
+    const fixture = await schema11SourceExitProjectionFixture();
+    const state = clone(fixture.legacy);
+    state.schemaVersion = schemaVersion;
+    fixture.store.replaceStored(state);
+    const limits = { graphMemoryOutboxLimit: 1 };
+    assert.equal(state.items.length, 3);
+    assert.deepEqual(state.graphMemoryProjection.pending.map(event => event.kind),
+      ["authority_invalidated", "authority_invalidated", "authority_invalidated", "authority_observed"]);
+    const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time, limits });
+    const normalized = normalizeWorkLedgerPersistedState(state, limits);
+    assert.deepEqual(normalizeWorkLedgerPersistedState(normalized, limits), normalized);
+    const batch = await restarted.service.readGraphMemoryProjectionBatch({ limit: 100 });
+    assert.deepEqual(batch.items.slice(0, 4), state.graphMemoryProjection.pending);
+    assert.equal(batch.items.length, 5);
+    assert.equal(batch.items.at(-1).kind, "authority_observed");
+    const extraObservation = clone(normalized);
+    const projection = extraObservation.graphMemoryProjection;
+    const tail = projection.pending.at(-1);
+    const receiver = normalized.items.find(item => item.itemId === fixture.receiver.itemId);
+    projection.pending.push(createWorkGraphAuthorityObservationEvent({
+      sequence: projection.nextSequence++, previousDigest: tail.eventDigest,
+      ledgerRevision: normalized.revision, taskRevision: receiver.revision, item: receiver,
+      occurredAt: tail.occurredAt, sourceAuthority: tail.sourceAuthority,
+      authorityStateDigest: tail.authorityStateDigest,
+    }));
+    assert.throws(() => normalizeWorkLedgerPersistedState(extraObservation, limits),
+      error => error.code === "WORK_LEDGER_STATE_CORRUPTED");
+    assert.throws(() => normalizeWorkLedgerPersistedState(normalized, {
+      ...limits, graphMemoryEventByteBudget: 1,
+    }), error => error.code === "WORK_LEDGER_STATE_CORRUPTED");
+    const writes = fixture.store.writes.length;
+    await assert.rejects(restarted.service.reviseGraphAcceptance({
+      authority: { actorId: "employee-orchestrator", scopeRootTaskId: receiver.itemId },
+      command: { taskId: receiver.itemId, acceptanceContract: { revision: 2,
+        acceptanceCriteria: [{ criterionId: "capacity-boundary", description: "Require a new ordinary graph record" }],
+        expectedDeliverables: [] }, reason: "ordinary-command-at-capacity",
+        expectedGraphRevision: normalized.revision, expectedTaskRevision: receiver.revision },
+    }), error => error.code === "WORK_LEDGER_GRAPH_MEMORY_CAPACITY_EXCEEDED");
+    assert.equal(fixture.store.writes.length, writes);
+    fixture.store.replaceStored(normalized);
+    const second = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time, limits });
+    assert.deepEqual(await second.service.readGraphMemoryProjectionBatch({ limit: 100 }), batch);
+    for (const event of batch.items) {
+      await second.service.acknowledgeGraphMemoryProjection(workGraphMemoryRecordReceipt(event));
+      const recovered = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time, limits });
+      assert.equal((await recovered.service.readGraphMemoryProjectionBatch({ limit: 100 })).cursor, event.sequence);
+    }
+    const drained = await second.service.readGraphMemoryProjectionBatch({ limit: 100 });
+    assert.deepEqual(drained.items, []);
+    assert.equal(drained.cursor, batch.highWatermark);
+    assert.equal(fixture.store.stored().schemaVersion, 12);
+  });
+}
+
+test("schema v10 former-policy authority baseline passes the production restore before public recovery", async (t) => {
+  const fixture = await schema11SourceExitProjectionFixture();
+  const state = clone(fixture.legacy);
+  state.schemaVersion = 10;
+  const prefix = path.join(tmpdir(), "mydashboard-policy-upgrade-");
+  const directory = await mkdtemp(prefix);
+  assert.ok(path.resolve(directory).startsWith(path.resolve(prefix)));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const bytes = Buffer.from(`${JSON.stringify(state, null, 2)}\n`);
+  await writeFile(path.join(directory, "work-ledger-state.json"), bytes);
+  const manifest = createBackupManifest({ createdAt: fixture.time.clock(),
+    stores: [{ name: "fixture", revision: state.revision, digest: ledgerDigest(state) }],
+    files: [{ path: "work-ledger-state.json", kind: "mutable", bytes: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex") }] });
+  const registry = createProductionRestoreMigrationRegistry();
+  await registry.migrate({ directory, manifest });
+  const restored = JSON.parse(await readFile(path.join(directory, "work-ledger-state.json"), "utf8"));
+  assert.equal(restored.schemaVersion, 12);
+  assert.deepEqual(restored.items, state.items);
+  assert.deepEqual(restored.graphMemoryProjection.pending.slice(0, 4), state.graphMemoryProjection.pending);
+  const once = await readFile(path.join(directory, "work-ledger-state.json"));
+  await registry.migrate({ directory, manifest });
+  assert.deepEqual(await readFile(path.join(directory, "work-ledger-state.json")), once);
+  fixture.store.replaceStored(restored);
+  const recovered = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time,
+    limits: { graphMemoryOutboxLimit: 1 } });
+  assert.equal((await recovered.service.readGraphMemoryProjectionBatch({ limit: 100 })).items.length, 5);
+});
+
+test("schema v11 authority migration cannot authorize a takeover older than the accepted history", async () => {
+  const fixture = await schema11SourceExitProjectionFixture({ receiverOccurredAt: "2026-08-02T01:08:00.000Z" });
+  const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  const writes = fixture.store.writes.length;
+  const receiver = (await restarted.service.listItems({ limit: 10 })).items.find(item => item.itemId === fixture.receiver.itemId);
+  await assert.rejects(restarted.service.verifyPullRequestExecutionBinding(prExecutionBinding(receiver)),
+    error => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE");
+  await assert.rejects(restarted.service.claim({ itemId: receiver.itemId, expectedRevision: receiver.revision,
+    workerId: "employee-pr-engineer", leaseDurationMs: 30_000 }),
+  error => ["WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING", "WORK_LEDGER_PR_EXECUTION_BINDING_STALE"].includes(error.code));
+  assert.equal(fixture.store.writes.length, writes);
+});
+
+for (const corruption of ["authority digest", "high watermark", "sealed high watermark", "event", "chain", "receipt", "source history", "schema 12 legacy baseline"]) {
+  test(`schema v11 authority migration rejects ${corruption} without writing`, async () => {
+    const fixture = await schema11SourceExitProjectionFixture();
+    const state = clone(fixture.legacy);
+    const projection = state.graphMemoryProjection;
+    if (corruption === "authority digest") projection.authorityStateDigest = "0".repeat(64);
+    if (corruption === "high watermark") projection.nextSequence += 1;
+    if (corruption === "event") projection.pending.at(-1).memoryRecord.title = "forged";
+    if (["sealed high watermark", "chain"].includes(corruption)) {
+      const tail = projection.pending.at(-1);
+      projection.pending[projection.pending.length - 1] = createWorkGraphAuthorityObservationEvent({
+        sequence: tail.sequence, previousDigest: corruption === "chain" ? "0".repeat(64) : tail.previousDigest,
+        ledgerRevision: tail.ledgerRevision, taskRevision: tail.taskRevision, item: fixture.receiver,
+        occurredAt: tail.occurredAt, sourceAuthority: tail.sourceAuthority,
+        authorityStateDigest: corruption === "sealed high watermark" ? "0".repeat(64) : tail.authorityStateDigest,
+      });
+    }
+    if (corruption === "receipt") projection.lastAcknowledgement.receipt.memoryRecordDigest = "0".repeat(64);
+    if (corruption === "source history") projection.sourceHistoryDigest = "0".repeat(64);
+    if (corruption === "schema 12 legacy baseline") state.schemaVersion = 12;
+    fixture.store.replaceStored(state);
+    const writes = fixture.store.writes.length;
+    await assert.rejects(createFixture({ source: fixture.source, store: fixture.store, time: fixture.time }),
+      error => error.code === "WORK_LEDGER_STATE_CORRUPTED");
+    assert.equal(fixture.store.writes.length, writes);
+    assert.deepEqual(fixture.store.stored(), state);
+  });
 }
 
 test("accepted Head history survives a source exit when a new provenance takes over", async () => {

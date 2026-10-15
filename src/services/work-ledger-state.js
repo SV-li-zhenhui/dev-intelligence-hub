@@ -38,6 +38,7 @@ import {
   migrateLegacyWorkGraphMemoryProjection,
   migrateWorkGraphMemoryProjection,
   normalizeWorkGraphMemoryProjection,
+  migrateSchema11WorkGraphMemoryAuthority,
   reconcileMigratedWorkGraphMemoryAuthority,
 } from "./work-ledger-graph-memory.js";
 import {
@@ -60,7 +61,7 @@ import {
 } from "./work-ledger-pr-source.js";
 
 export const WORK_LEDGER_STATE_KEY = "work-ledger-state";
-export const WORK_LEDGER_STATE_SCHEMA_VERSION = 11;
+export const WORK_LEDGER_STATE_SCHEMA_VERSION = 12;
 const GRAPH_MEMORY_STATE_SCHEMA_VERSION = 7;
 const DISPATCH_BINDING_STATE_SCHEMA_VERSION = 8;
 const PR_INPUT_BINDING_STATE_SCHEMA_VERSION = 9;
@@ -1378,15 +1379,18 @@ export function assertWorkLedgerCapacity(state, limits) {
     ).length,
   );
   const graphPending = state.graphMemoryProjection.pending;
+  const policyObservationAllowance = graphPending.at(-1)?.schemaVersion === 2 &&
+    graphPending.at(-1)?.kind === "authority_observed" ? 1 : 0;
   const graphPendingWithinCapacity =
-    graphPending.length <= limits.graphMemoryOutboxLimit ||
-    (graphPending.length <=
-        limits.graphMemoryOutboxLimit + graphMigrationAllowance &&
-      graphPending.slice(limits.graphMemoryOutboxLimit).every(
-        (event) =>
-          event.schemaVersion === 2 &&
-          ["authority_invalidated", "authority_observed"].includes(event.kind),
-      ));
+    graphPending.length <= MAX_WORK_GRAPH_MEMORY_EVENTS && (
+      graphPending.length <= limits.graphMemoryOutboxLimit ||
+      (graphPending.length <=
+          limits.graphMemoryOutboxLimit + graphMigrationAllowance + policyObservationAllowance &&
+        graphPending.slice(limits.graphMemoryOutboxLimit).every(
+          (event) =>
+            event.schemaVersion === 2 &&
+            ["authority_invalidated", "authority_observed"].includes(event.kind),
+        )));
   if (
     operationalItemCount > limits.itemLimit ||
     sourceRootCount > limits.sourceRootLimit ||
@@ -1844,7 +1848,9 @@ function migrateResultAttestationState(value, limits) {
   );
   return {
     ...value,
-    schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
+    // Keep the historical intermediate fixed so every older state also
+    // receives the schema 11 authority-policy compatibility validation.
+    schemaVersion: 11,
     timeline: normalized.map(migrateUnattestedResultTimeline),
   };
 }
@@ -2139,7 +2145,7 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
     : null;
   if (
     !hasCurrentStateFields ||
-    value.schemaVersion !== WORK_LEDGER_STATE_SCHEMA_VERSION ||
+    ![11, WORK_LEDGER_STATE_SCHEMA_VERSION].includes(value.schemaVersion) ||
     !Number.isSafeInteger(value.revision) ||
     value.revision < 0 ||
     !Number.isSafeInteger(value.intakeCursor) ||
@@ -2216,12 +2222,14 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
       : value.graphMemoryProjection;
     state = {
       ...state,
-      graphMemoryProjection: normalizeWorkGraphMemoryProjection(
-        graphMemoryProjection,
-        state.revision,
-        state.items,
-        limits,
-      ),
+      graphMemoryProjection: value.schemaVersion === 11
+        ? migrateSchema11WorkGraphMemoryAuthority(graphMemoryProjection, state, limits)
+        : normalizeWorkGraphMemoryProjection(
+            graphMemoryProjection,
+            state.revision,
+            state.items,
+            limits,
+          ),
     };
   } catch {
     throw corrupted("任务图记忆投影状态损坏");

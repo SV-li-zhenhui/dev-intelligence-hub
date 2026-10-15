@@ -17,6 +17,7 @@ import {
   currentWorkItemEvent,
   currentWorkItemInputBinding,
   pullRequestHeadAdmission,
+  pullRequestHeadAdmissionForSchema11Migration,
 } from "./work-ledger-pr-source.js";
 import {
   cloneLedgerValue,
@@ -132,7 +133,10 @@ function safeText(value, maximumBytes, error) {
   return value;
 }
 
-function sourceAuthorityFor(state, item, { forceNonCitable = false } = {}) {
+function sourceAuthorityFor(state, item, {
+  forceNonCitable = false,
+  headAdmission = pullRequestHeadAdmission,
+} = {}) {
   const sourceBinding = currentWorkItemInputBinding(item);
   if (sourceBinding === null) return createWorkGraphSourceAuthority();
   const event = currentWorkItemEvent(item);
@@ -151,7 +155,7 @@ function sourceAuthorityFor(state, item, { forceNonCitable = false } = {}) {
       ...sourceBinding,
     });
   }
-  const admission = pullRequestHeadAdmission(state, item);
+  const admission = headAdmission(state, item);
   return createWorkGraphSourceAuthority({
     executionBinding,
     provenance: {
@@ -167,10 +171,14 @@ function sourceAuthorityFor(state, item, { forceNonCitable = false } = {}) {
 }
 
 export function workGraphMemoryAuthorityStateDigest(state) {
+  return authorityStateDigestForAdmission(state, pullRequestHeadAdmission);
+}
+
+function authorityStateDigestForAdmission(state, headAdmission) {
   const items = Array.isArray(state?.items) ? state.items : [];
   return ledgerDigest(
     items.flatMap((item) => {
-      const authority = sourceAuthorityFor(state, item);
+      const authority = sourceAuthorityFor(state, item, { headAdmission });
       return authority.applies
         ? [{
             taskId: item.itemId,
@@ -779,13 +787,15 @@ export function reconcileMigratedWorkGraphMemoryAuthority(
   };
 }
 
-export function normalizeWorkGraphMemoryProjection(
+function normalizeProjection(
   suppliedValue,
   stateRevision,
   items,
   limits,
+  headAdmission,
 ) {
   const error = corrupted();
+  const expectedAuthorityStateDigest = authorityStateDigestForAdmission({ items }, headAdmission);
   const migratingAuthority = hasExactLedgerKeys(
     suppliedValue,
     PRE_AUTHORITY_PROJECTION_KEYS,
@@ -793,7 +803,7 @@ export function normalizeWorkGraphMemoryProjection(
   let value = migratingAuthority
     ? {
         ...cloneLedgerValue(suppliedValue),
-        authorityStateDigest: workGraphMemoryAuthorityStateDigest({ items }),
+        authorityStateDigest: expectedAuthorityStateDigest,
       }
     : suppliedValue;
   const prAuthorityItem = items.find(
@@ -819,7 +829,7 @@ export function normalizeWorkGraphMemoryProjection(
     });
     value = {
       ...value,
-      authorityStateDigest: workGraphMemoryAuthorityStateDigest({ items }),
+      authorityStateDigest: expectedAuthorityStateDigest,
     };
   }
   if (!hasExactLedgerKeys(value, PROJECTION_KEYS)) throw error;
@@ -858,7 +868,7 @@ export function normalizeWorkGraphMemoryProjection(
     (cursor === 0) !== (checkpointDigest === null) ||
     (cursor === 0) !== (lastAcknowledgement === null) ||
     sourceHistoryDigest !== workGraphMemorySourceHistoryDigest(items) ||
-    authorityStateDigest !== workGraphMemoryAuthorityStateDigest({ items }) ||
+    authorityStateDigest !== expectedAuthorityStateDigest ||
     (lastAcknowledgement !== null &&
       (lastAcknowledgement.event.sequence !== cursor ||
         lastAcknowledgement.event.eventDigest !== checkpointDigest))
@@ -904,8 +914,10 @@ export function normalizeWorkGraphMemoryProjection(
     1,
     items.filter((item) => sourceAuthorityFor({ items }, item).applies).length,
   );
+  const policyObservationAllowance = headAdmission === pullRequestHeadAdmission &&
+    pending.at(-1)?.kind === "authority_observed" ? 1 : 0;
   if (
-    pending.length > limits.graphMemoryOutboxLimit + migrationAllowance
+    pending.length > limits.graphMemoryOutboxLimit + migrationAllowance + policyObservationAllowance
   ) {
     throw error;
   }
@@ -930,6 +942,31 @@ export function normalizeWorkGraphMemoryProjection(
     lastAcknowledgement,
     pending,
   };
+}
+
+export function normalizeWorkGraphMemoryProjection(value, stateRevision, items, limits) {
+  return normalizeProjection(value, stateRevision, items, limits, pullRequestHeadAdmission);
+}
+
+export function migrateSchema11WorkGraphMemoryAuthority(value, state, limits) {
+  try {
+    return normalizeWorkGraphMemoryProjection(value, state.revision, state.items, limits);
+  } catch {
+    // A policy change is eligible only after every old projection invariant,
+    // including its sealed high watermark and event chain, has been verified.
+    const previous = normalizeProjection(value, state.revision, state.items, limits,
+      pullRequestHeadAdmissionForSchema11Migration);
+    return normalizeWorkGraphMemoryProjection(
+      reconcileMigratedWorkGraphMemoryAuthority(previous, state, {
+        ...limits,
+        // A previous authority-migration tail can already occupy its complete
+        // allowance. Reserve one additional sealed policy-baseline observation.
+        graphMemoryOutboxLimit: Math.min(MAX_WORK_GRAPH_MEMORY_EVENTS,
+          limits.graphMemoryOutboxLimit + 1),
+      }),
+      state.revision, state.items, limits,
+    );
+  }
 }
 
 export function normalizeWorkGraphMemoryBatchOptions(value = {}) {
