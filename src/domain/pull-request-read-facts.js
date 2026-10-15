@@ -991,6 +991,17 @@ function projectedContext(facts, selected, profile) {
 
 export function projectPullRequestReadFactsContext(value) {
   const facts = normalizePullRequestReadFacts(value);
+  // Observation receipts keep their historical digest. Only complete source
+  // material can prove that a later observation contains the same PR inputs.
+  const complete = !Object.values(facts.truncation).some(Boolean) &&
+    !facts.comments.some(({ bodyTruncated }) => bodyTruncated) &&
+    !facts.reviews.some(({ bodyTruncated }) => bodyTruncated) &&
+    !facts.reviewThreads.some(({ commentsTruncated, comments }) =>
+      commentsTruncated || comments.some(({ bodyTruncated }) => bodyTruncated));
+  const { observedAt, contentDigest, ...material } = facts;
+  const materialDigest = complete
+    ? digest({ domain: "mydashboard-pull-request-read-material/v1", material })
+    : null;
   const reviewThreads = [...facts.reviewThreads]
     .sort((left, right) => {
       const priority = threadPriority(left) - threadPriority(right);
@@ -1010,7 +1021,10 @@ export function projectPullRequestReadFactsContext(value) {
     .slice(0, MAX_CONTEXT_CHECKS);
   const selected = { reviewThreads, checks };
   for (const profile of CONTEXT_PROFILES) {
-    const context = projectedContext(facts, selected, profile);
+    const context = {
+      ...projectedContext(facts, selected, profile),
+      ...(materialDigest === null ? {} : { materialDigest }),
+    };
     if (Buffer.byteLength(JSON.stringify(context), "utf8") <= MAX_CONTEXT_BYTES) {
       return deepFreeze(context);
     }

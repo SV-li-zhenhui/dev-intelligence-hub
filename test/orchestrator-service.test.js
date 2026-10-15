@@ -11,6 +11,16 @@ import {
   OrchestratorServiceError,
 } from "../src/services/orchestrator-service.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
+import { createPullRequestExecutionBinding } from "../src/domain/pull-request-execution-binding.js";
+import {
+  createPullRequestReadFacts,
+  createPullRequestReadIdentity,
+  projectPullRequestReadFactsContext,
+} from "../src/domain/pull-request-read-facts.js";
+import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { RoleContextAssembler } from "../src/services/role-context-assembler.js";
+import { WorkGraphStore } from "../src/services/work-graph-store.js";
+import { WorkLedgerService } from "../src/services/work-ledger-service.js";
 
 const INPUT_DIGEST = "a".repeat(64);
 const CONTEXT_DIGEST = "b".repeat(64);
@@ -1201,6 +1211,209 @@ test("scoped rebase rejects changed inputs, forged digests and intent revisions"
       assertNoTrustedMutation(fakes.calls);
     });
   }
+});
+
+async function refreshedPrDeliveryFixture() {
+  const originalAt = "2026-10-15T18:23:34.401Z";
+  const refreshedAt = "2026-10-15T18:39:53.208Z";
+  const state = { observedAt: originalAt, factObservedAt: originalAt, facts: {}, mutatePacket: null };
+  const values = new Map();
+  let writes = 0;
+  const store = {
+    async read(name, fallback = null) { return structuredClone(values.get(name) ?? fallback); },
+    async write(name, value) { writes += 1; values.set(name, structuredClone(value)); },
+  };
+  const gitTarget = {
+    schemaVersion: 1, provider: "github", sourceAccountId: "reviewer",
+    baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "a".repeat(40),
+    headRepository: "acme/repo", headRefName: "fix", headRefOid: "b".repeat(40),
+  };
+  const event = normalizeWorkflowEvent({
+    schemaVersion: 1, eventType: "pull_request.owner_requested", occurredAt: originalAt,
+    source: { provider: "local-owner", scopeId: "owner-request:12345678-1234-4123-8123-123456789abc" },
+    subject: { id: "github:pr:acme/repo#42", repository: "acme/repo", number: 42 },
+    payload: { title: "Review current repair", workType: "general", nextAction: "rereview",
+      suggestedCapability: "pr-review", expectedHeadRefOid: gitTarget.headRefOid,
+      headRefOid: gitTarget.headRefOid, gitTargetAvailable: true, gitTarget },
+  });
+  const record = { sequence: 1, event, assignment: { assignmentId: "assignment-refresh",
+    eventId: event.eventId, target: { type: "role", id: "orchestrator" }, reason: "review" } };
+  const ledger = new WorkLedgerService({ store, idFactory: () => "refresh-lease", clock: () => "2026-10-15T18:34:00.000Z",
+    exclusiveLease: { async run(operation) { return operation(); } },
+    assignmentSource: { async readAssignmentBatch({ afterSequence }) {
+      return { items: afterSequence < 1 ? [record] : [], nextSequence: 1,
+        highWatermark: 1, oldestAvailableSequence: 1 };
+    } },
+  });
+  await ledger.recover();
+  await ledger.intake();
+  const graph = new WorkGraphStore({ ledger });
+  const graphReader = graph.reader();
+  const root = (await ledger.listItems()).items[0];
+  const planner = graph.planner({ principalId: "employee-orchestrator", scopeRootTaskId: root.itemId });
+  async function createChild(childKey) {
+    const parent = (await ledger.listItems()).items.find(({ itemId }) => itemId === root.itemId);
+    return planner.createChild({ parentTaskId: root.itemId, childKey,
+      work: { title: childKey, description: "Assess every request against the pinned code" },
+      target: { type: "role", id: "pr-engineer" }, dependsOnTaskIds: [], leaseId: null,
+      acceptanceContract: contract({ deliverableId: "rereview-report", kind: "text-report" }),
+      expectedGraphRevision: (await graphReader.getSnapshot()).graph.revision,
+      expectedTaskRevisions: [{ taskId: parent.itemId, revision: parent.revision }] });
+  }
+  await createChild("rereview");
+  let item = (await ledger.listItems()).items.find(({ kind }) => kind === "graph_task");
+  item = await ledger.claim({ itemId: item.itemId, expectedRevision: item.revision,
+    workerId: "employee-pr-engineer", leaseDurationMs: 600_000 });
+  const assembler = new RoleContextAssembler({ graphReader,
+    factSource: { async read({ fact }) { return { healthy: true, fresh: true,
+      value: fact === "state" ? "open" : null, observedAt: state.factObservedAt }; } },
+    pullRequestContextReader: { async read(input) {
+      const executionBinding = createPullRequestExecutionBinding(input);
+      const identity = createPullRequestReadIdentity({ executionBinding, event: input.event });
+      state.lastFacts = createPullRequestReadFacts({ identity,
+        observedAt: state.observedAt, reviewDecision: "CHANGES_REQUESTED",
+        comments: [{ id: "comment-1", author: "reviewer", body: "x".repeat(3_000), bodyTruncated: false,
+          createdAt: originalAt, updatedAt: originalAt, url: "https://github.com/acme/repo/pull/42#issuecomment-1" }],
+        reviews: [], reviewThreads: [], checks: [],
+        truncation: { comments: false, reviews: false, reviewThreads: false, checks: false, byteBudget: false },
+        ...state.facts });
+      return projectPullRequestReadFactsContext(state.lastFacts);
+    } },
+  });
+  const original = await assembler.assemble({ roleId: "pr-engineer", item, trigger: "employee:pr-engineer" });
+  let deliveryCalls = 0;
+  const service = new OrchestratorService({ graphReader, clock: () => "2026-10-15T18:34:00.000Z",
+    contextAssembler: { async assemble(input) {
+      const packet = await assembler.assemble(input);
+      return state.mutatePacket ? state.mutatePacket(structuredClone(packet)) : packet;
+    } },
+    scopedGraphPlannerFactory: { forRoot() { assert.fail("Specialist cannot obtain planner authority"); } },
+    graphDelivererFactory: { forClaim({ workerId, ...authority }) {
+      const deliverer = graph.deliverer({ principalId: workerId, ...authority });
+      return { async submitDelivery(command) { deliveryCalls += 1; return deliverer.submitDelivery(command); } };
+    } },
+  });
+  const intent = { schemaVersion: 1, type: "submit_delivery", taskId: item.itemId,
+    expectedTaskRevision: item.revision, expectedGraphRevision: original.binding.graphRevision,
+    contractRevision: 1, deliverableId: "rereview-report", summary: "Review complete",
+    reason: "All requests assessed", evidence: [], artifact: null };
+  return { ledger, graphReader, state, original, item, intent, createChild, refreshedAt,
+    writes: () => writes, deliveryCalls: () => deliveryCalls,
+    execute: (packet = original, claimed = item) => service.execute({
+      worker: { roleId: "pr-engineer", workerId: "employee-pr-engineer" },
+      item: claimed, contextPacket: packet, intent }),
+  };
+}
+
+test("complete unchanged PR facts refresh without repeating the specialist decision", async (t) => {
+  for (const advanceGraph of [false, true]) {
+    await t.test(advanceGraph ? "unrelated graph advances" : "same graph", async () => {
+      const fixture = await refreshedPrDeliveryFixture();
+      assert.equal(fixture.original.context.code.pullRequest.contextTruncated, true);
+      fixture.state.observedAt = fixture.refreshedAt;
+      fixture.state.factObservedAt = fixture.refreshedAt;
+      if (advanceGraph) await fixture.createChild("unrelated");
+      const result = await fixture.execute();
+      assert.equal(result.applied, true);
+      assert.equal(fixture.deliveryCalls(), 1);
+      const submitted = (await fixture.graphReader.getSnapshot()).graph.tasks
+        .find(({ taskId }) => taskId === fixture.item.itemId).deliveries;
+      assert.equal(submitted.length, 1);
+      assert.equal(submitted[0].status, "submitted");
+      assert.equal(fixture.original.context.code.pullRequest.observedAt, "2026-10-15T18:23:34.401Z");
+    });
+  }
+});
+
+test("PR observation refresh preserves material, authority and full packet stale checks", async (t) => {
+  const packetChanges = {
+    "fact value": (packet) => { packet.context.code.facts[0].value = "closed"; },
+    "fact name": (packet) => { packet.context.code.facts[0].name = "reviewDecision"; },
+    "added fact": (packet) => { packet.context.code.facts.push({ ...packet.context.code.facts[0], name: "reviewDecision" }); },
+    "removed fact": (packet) => { packet.context.code.facts = []; },
+    "accepted inputs": (packet) => { packet.acceptedInputs = [{ changed: true }]; },
+    "role permission": (packet) => { packet.binding.roleId = "developer"; },
+    "source revision": (packet) => { packet.binding.source.inputRevision += 1; },
+    "current task revision": (packet) => { packet.binding.taskRevision += 1; },
+    "Head": (packet) => { packet.binding.source.headRefOid = "d".repeat(40); },
+    "Base": (packet) => { packet.context.code.sourceEvent.payload.gitTarget.baseRefOid = "d".repeat(40); },
+    "unknown business field": (packet) => { packet.context.code.newMaterial = "changed"; },
+    "contradictory summary digest": (packet) => { packet.context.code.pullRequest.summary.contentDigest = "f".repeat(64); },
+    "missing fresh proof": (packet) => { delete packet.context.code.pullRequest.materialDigest; },
+    "changed proof": (packet) => { packet.context.code.pullRequest.materialDigest = "f".repeat(64); },
+    "invalid proof": (packet) => { packet.context.code.pullRequest.materialDigest = "invalid"; },
+    "receipt digest changes without observation advance": (packet) => {
+      packet.context.code.pullRequest.observedAt = "2026-10-15T18:23:34.401Z";
+    },
+    "same revision graph digest": (packet) => {
+      packet.binding.graphContentDigest = "f".repeat(64);
+      packet.context.requirements.graph.contentDigest = "f".repeat(64);
+    },
+    "graph rollback": (packet) => {
+      packet.binding.graphRevision -= 1;
+      packet.context.requirements.graph.revision -= 1;
+    },
+  };
+  const cases = [...Object.entries(packetChanges).map(([name, change]) => ({ name, setup(fixture) {
+    fixture.state.mutatePacket = (packet) => {
+      change(packet);
+      return signedContextPacket(packet, { graph: { graphId: packet.binding.graphId,
+        revision: packet.binding.graphRevision, contentDigest: packet.binding.graphContentDigest } });
+    };
+  } })),
+  { name: "hidden comment tail", setup(fixture) {
+    fixture.state.facts.comments = fixture.state.lastFacts.comments.map((entry) => ({ ...entry, body: `${entry.body.slice(0, -1)}y` }));
+  } },
+  { name: "same Head feedback changes", setup(fixture) { fixture.state.facts.reviewDecision = "APPROVED"; } },
+  { name: "same Head checks change", setup(fixture) { fixture.state.facts.checks = [{ kind: "check_run", name: "build",
+    status: "COMPLETED", conclusion: "FAILURE", url: "https://github.com/acme/repo/actions/runs/1",
+    startedAt: null, completedAt: null, requirement: "required" }]; } },
+  { name: "incomplete facts", setup(fixture) { fixture.state.facts.truncation = {
+    ...fixture.state.lastFacts.truncation, comments: true }; } },
+  { name: "PR observation rollback", setup(fixture) { fixture.state.observedAt = "2026-10-15T18:20:00.000Z"; } },
+  { name: "fact observation rollback", setup(fixture) { fixture.state.factObservedAt = "2026-10-15T18:20:00.000Z"; } },
+  { name: "forged fresh context digest", setup(fixture) { fixture.state.mutatePacket = (packet) => ({ ...packet, contextDigest: "f".repeat(64) }); } },
+  { name: "forged original context digest", setup(_fixture, original) { original.contextDigest = "f".repeat(64); } },
+  { name: "missing original proof", setup(fixture, original) {
+    delete original.context.code.pullRequest.materialDigest;
+    Object.assign(original, signedContextPacket(original, { graph: { graphId: original.binding.graphId,
+      revision: original.binding.graphRevision, contentDigest: original.binding.graphContentDigest } }));
+  } },
+  ];
+  for (const { name, setup } of cases) {
+    await t.test(name, async () => {
+      const fixture = await refreshedPrDeliveryFixture();
+      fixture.state.observedAt = fixture.refreshedAt;
+      fixture.state.factObservedAt = fixture.refreshedAt;
+      const original = structuredClone(fixture.original);
+      setup(fixture, original);
+      const writesBefore = fixture.writes();
+      await assert.rejects(fixture.execute(original), (error) => error.code === "ORCHESTRATOR_CONTEXT_STALE");
+      assert.equal(fixture.deliveryCalls(), 0);
+      assert.equal(fixture.writes(), writesBefore);
+    });
+  }
+  await t.test("changed current claim", async () => {
+    const fixture = await refreshedPrDeliveryFixture();
+    fixture.state.observedAt = fixture.refreshedAt;
+    fixture.state.factObservedAt = fixture.refreshedAt;
+    await assert.rejects(fixture.execute(fixture.original, { ...fixture.item, ownerId: "another-worker" }),
+      (error) => error.code === "ORCHESTRATOR_AUTHORITY_DENIED");
+    assert.equal(fixture.deliveryCalls(), 0);
+  });
+  await t.test("ledger revision advances before submission", async () => {
+    const fixture = await refreshedPrDeliveryFixture();
+    fixture.state.observedAt = fixture.refreshedAt;
+    fixture.state.factObservedAt = fixture.refreshedAt;
+    await fixture.ledger.scheduleRetry({ itemId: fixture.item.itemId,
+      expectedRevision: fixture.item.revision, leaseId: fixture.item.leaseId,
+      actorId: "employee-pr-engineer", reason: "competing-context-change",
+      availableAt: "2026-10-15T18:35:00.000Z" });
+    const writesBefore = fixture.writes();
+    await assert.rejects(fixture.execute(), (error) => error.code === "ORCHESTRATOR_CONTEXT_STALE");
+    assert.equal(fixture.deliveryCalls(), 0);
+    assert.equal(fixture.writes(), writesBefore);
+  });
 });
 
 test("submits ordinary and requirement-spec deliveries with trusted evidence", async (t) => {

@@ -430,25 +430,66 @@ function hasConsistentContextGraph(packet) {
     graph.contentDigest === binding?.graphContentDigest;
 }
 
+function observationAdvanced(original, fresh) {
+  return typeof original === "string" && typeof fresh === "string" &&
+    Number.isFinite(Date.parse(original)) && Number.isFinite(Date.parse(fresh)) &&
+    new Date(original).toISOString() === original &&
+    new Date(fresh).toISOString() === fresh && Date.parse(fresh) > Date.parse(original);
+}
+
+function rebasePullRequestObservations(rebased, fresh) {
+  const originalPr = rebased.context?.code?.pullRequest;
+  const freshPr = fresh.context?.code?.pullRequest;
+  if (
+    !originalPr || !freshPr ||
+    !SHA256.test(originalPr.identityDigest) ||
+    originalPr.identityDigest !== freshPr.identityDigest ||
+    !SHA256.test(originalPr.materialDigest) ||
+    originalPr.materialDigest !== freshPr.materialDigest
+  ) return;
+
+  if (observationAdvanced(originalPr.observedAt, freshPr.observedAt) &&
+      originalPr.summary?.contentDigest === originalPr.contentDigest &&
+      freshPr.summary?.contentDigest === freshPr.contentDigest) {
+    originalPr.observedAt = freshPr.observedAt;
+    originalPr.contentDigest = freshPr.contentDigest;
+    originalPr.summary.contentDigest = freshPr.summary.contentDigest;
+  }
+  for (const dataClass of ["requirements", "code"]) {
+    const originalFacts = rebased.context[dataClass]?.facts;
+    const freshFacts = fresh.context[dataClass]?.facts;
+    if (!Array.isArray(originalFacts) || !Array.isArray(freshFacts) ||
+        originalFacts.length !== freshFacts.length) continue;
+    for (let index = 0; index < originalFacts.length; index += 1) {
+      if (observationAdvanced(originalFacts[index].observedAt, freshFacts[index].observedAt)) {
+        originalFacts[index].observedAt = freshFacts[index].observedAt;
+      }
+    }
+  }
+}
+
 function assertPacketIsFresh(original, fresh) {
   const normalizedFresh = checkedClone(fresh);
   if (sameValue(original, normalizedFresh)) return normalizedFresh;
   if (
     !hasConsistentContextGraph(original) ||
     !hasConsistentContextGraph(normalizedFresh) ||
-    normalizedFresh.binding.graphRevision <= original.binding.graphRevision ||
+    normalizedFresh.binding.graphRevision < original.binding.graphRevision ||
+    (normalizedFresh.binding.graphRevision === original.binding.graphRevision &&
+      normalizedFresh.binding.graphContentDigest !== original.binding.graphContentDigest) ||
     original.contextDigest !== roleContextDigest(original) ||
     normalizedFresh.contextDigest !== roleContextDigest(normalizedFresh)
   ) {
     throw stale("Role context changed before the requested action could execute");
   }
-  // Only global graph metadata may advance without changing this role's inputs.
-  // Validate both digests before recomputing; all scoped fields still compare.
+  // Rebase only graph metadata and complete, identical PR material observed
+  // again. Validate both packet digests; every other scoped field still compares.
   const rebased = checkedClone(original);
   rebased.binding.graphRevision = normalizedFresh.binding.graphRevision;
   rebased.binding.graphContentDigest = normalizedFresh.binding.graphContentDigest;
   rebased.context.requirements.graph.revision = normalizedFresh.context.requirements.graph.revision;
   rebased.context.requirements.graph.contentDigest = normalizedFresh.context.requirements.graph.contentDigest;
+  rebasePullRequestObservations(rebased, normalizedFresh);
   rebased.contextDigest = roleContextDigest(rebased);
   if (!sameValue(rebased, normalizedFresh)) {
     throw stale("Role context changed before the requested action could execute");

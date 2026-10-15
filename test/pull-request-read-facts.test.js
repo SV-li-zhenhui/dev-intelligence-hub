@@ -188,6 +188,47 @@ test("read facts form a frozen JSON-roundtrippable persistence contract", () => 
   assert.equal(Object.isFrozen(facts.reviewThreads[0].comments[0]), true);
 });
 
+test("complete material proof survives observation refresh and covers hidden context tails", () => {
+  const facts = factsFixture();
+  const longComments = facts.comments.map((comment) => ({ ...comment, body: "x".repeat(3_000) }));
+  const original = createPullRequestReadFacts(factInput(facts, { comments: longComments }));
+  const refreshed = createPullRequestReadFacts(factInput(original, { observedAt: "2026-08-08T01:20:00.000Z" }));
+  const oldContext = projectPullRequestReadFactsContext(original);
+  const freshContext = projectPullRequestReadFactsContext(refreshed);
+  assert.notEqual(original.contentDigest, refreshed.contentDigest);
+  assert.equal(oldContext.materialDigest, freshContext.materialDigest);
+  assert.match(oldContext.materialDigest, /^[a-f0-9]{64}$/u);
+  assert.equal(oldContext.contextTruncated, true);
+
+  const changed = createPullRequestReadFacts(factInput(refreshed, {
+    comments: longComments.map((comment) => ({ ...comment, body: `${comment.body.slice(0, -1)}y` })),
+  }));
+  const changedContext = projectPullRequestReadFactsContext(changed);
+  assert.deepEqual(freshContext.comments, changedContext.comments);
+  assert.notEqual(freshContext.materialDigest, changedContext.materialDigest);
+  assert.equal(Object.hasOwn(original, "materialDigest"), false);
+  assert.deepEqual(normalizePullRequestReadFacts(JSON.parse(JSON.stringify(original))), original);
+});
+
+test("incomplete source facts never issue a material proof", async (t) => {
+  const base = factsFixture();
+  const cases = Object.keys(base.truncation).map((name) => ({ name: `source ${name}`,
+    input: { truncation: { ...base.truncation, [name]: true } } }));
+  cases.push(
+    { name: "comment body", input: { comments: base.comments.map((entry) => ({ ...entry, bodyTruncated: true })) } },
+    { name: "review body", input: { reviews: base.reviews.map((entry) => ({ ...entry, bodyTruncated: true })) } },
+    { name: "thread comments", input: { reviewThreads: base.reviewThreads.map((entry) => ({ ...entry, commentsTruncated: true })) } },
+    { name: "thread body", input: { reviewThreads: base.reviewThreads.map((entry) => ({ ...entry,
+      comments: entry.comments.map((comment) => ({ ...comment, bodyTruncated: true })) })) } },
+  );
+  for (const { name, input } of cases) {
+    await t.test(name, () => {
+      const context = projectPullRequestReadFactsContext(createPullRequestReadFacts(factInput(base, input)));
+      assert.equal(Object.hasOwn(context, "materialDigest"), false);
+    });
+  }
+});
+
 test("the identity binds the exact Head and outer event/source provenance", () => {
   const first = identityFixture({ scopeId: "scope:first" });
   const otherSource = identityFixture({ scopeId: "scope:second" });

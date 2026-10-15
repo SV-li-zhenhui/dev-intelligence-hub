@@ -1011,6 +1011,7 @@ async function readFacts(factSource, event, signal) {
 function normalizePullRequestContext(value) {
   const normalized = canonicalValue(value);
   const hasReviewMaterial = Object.hasOwn(normalized, "reviewMaterial");
+  const hasMaterialDigest = Object.hasOwn(normalized, "materialDigest");
   const fields = exactData(
     normalized,
     [
@@ -1025,6 +1026,7 @@ function normalizePullRequestContext(value) {
       "checks",
       "contextTruncated",
       ...(hasReviewMaterial ? ["reviewMaterial"] : []),
+      ...(hasMaterialDigest ? ["materialDigest"] : []),
     ],
     "pullRequest context",
   );
@@ -1089,6 +1091,7 @@ function normalizePullRequestContext(value) {
   }
   digest(fields.get("identityDigest"), "pullRequest.identityDigest");
   digest(fields.get("contentDigest"), "pullRequest.contentDigest");
+  if (hasMaterialDigest) digest(fields.get("materialDigest"), "pullRequest.materialDigest");
   const observedAt = fields.get("observedAt");
   if (
     typeof observedAt !== "string" ||
