@@ -117,6 +117,8 @@ export function summarizeOwnReviewFeedback({ reviews, threads }, account) {
     reviewFeedbackAvailable: true,
     reviewFeedbackDigest: ownReviewFeedbackDigest(feedback),
     reviewFeedbackCount: reviewFeedbackIds.length,
+    reviewPendingThreadCount: pendingThreads.length,
+    reviewChangeRequestCount: changeRequests.length,
     reviewFeedbackAt: latestTime([...changeRequests, ...pendingThreads.flatMap(({ comments }) => comments)]),
     reviewFeedbackIds,
     reviewFeedbackFingerprints,

@@ -75,6 +75,17 @@ test("a newer Comment consumes the assignment even when an older decisive Review
   };
   assert.equal(projectIncomingReview(pr, "me").myLatestPublishedReviewAt, "2026-10-09T09:30:00Z");
 });
+
+test("latest published Review state and Head stay paired with its publication time", () => {
+  const pr = { assignees: { nodes: [] }, timelineItems: { nodes: [] }, reviews: { nodes: [
+    { author: { login: "me" }, state: "CHANGES_REQUESTED", submittedAt: "2026-10-08T00:00:00Z", commit: { oid: "old-head" } },
+    { author: { login: "me" }, state: "COMMENTED", submittedAt: "2026-10-09T00:00:00Z", commit: { oid: "current-head" } },
+    { author: { login: "me" }, state: "PENDING", submittedAt: null, commit: { oid: "pending-head" } },
+  ] } };
+  const facts = projectIncomingReview(pr, "me");
+  assert.equal(facts.myLatestPublishedReviewState, "COMMENTED");
+  assert.equal(facts.myLatestPublishedReviewCommitOid, "current-head");
+});
 test("bounded timeline without a matching event cannot invent a receipt time", () => {
   const pr = { reviews: { nodes: [] }, assignees: { nodes: [{ login: "me" }] }, reviewRequests: { nodes: [] }, timelineItems: { nodes: [], pageInfo: { hasPreviousPage: true } } };
   assert.equal(projectIncomingReview(pr, "me").reviewReceivedAt, null);

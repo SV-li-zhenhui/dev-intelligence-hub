@@ -639,6 +639,9 @@ export function summarizeReviewFacts(reviews = [], currentUser) {
   );
   const myReview =
     myDecision || latestReview(reviews, authoredByCurrentUser);
+  const myLatestPublishedReview = latestReview(reviews, review => authoredByCurrentUser(review) &&
+    ["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"].includes(review.state) &&
+    Number.isFinite(Date.parse(review.submittedAt)));
   const latestOtherDecision = latestReview(
     reviews,
     (review) =>
@@ -673,6 +676,7 @@ export function summarizeReviewFacts(reviews = [], currentUser) {
   const latestChangeRequest = outstandingChangeRequests[0];
   return {
     ...reviewFields("myReview", myReview),
+    ...reviewFields("myLatestPublishedReview", myLatestPublishedReview),
     ...reviewFields("latestOtherDecision", latestOtherDecision),
     ...reviewFields("latestChangeRequest", latestChangeRequest),
     outstandingChangeRequestCommitOids: [
@@ -983,7 +987,8 @@ export class GitHubAdapter {
         // whole batch. Each PR needs only one additional facts read here.
         incoming = await this.#readIncomingReviewRequest({ repository: repo, number: record.number, account: currentUser }, options);
         if (incoming.headRefOid !== detail.headRefOid) throw new Error("GitHub incoming Review head changed");
-        incoming = projectIncomingReview(incoming.raw, currentUser);
+        const { myReviewState, myReviewAt, myReviewCommitOid, raw } = incoming;
+        incoming = { ...projectIncomingReview(raw, currentUser), myReviewState, myReviewAt, myReviewCommitOid };
       } catch (error) {
         options.signal?.throwIfAborted();
         incoming = { incomingReviewFactsAvailable: false };
@@ -1026,8 +1031,8 @@ export class GitHubAdapter {
         ? { ...gitFacts, gitTarget: gitTargetFromFacts(gitFacts) }
         : {}),
       reviewFactsAvailable: true,
-      ...incoming,
       ...summarizeReviewFacts(detail.reviews, currentUser),
+      ...incoming,
       ...ownFeedback,
     };
   }
@@ -1082,6 +1087,17 @@ export class GitHubAdapter {
     const facts = await readOwnReviewFeedback(this.run, { repository, number, account }, options);
     if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
     return facts;
+  }
+
+  async isCommitAncestor({ repository, ancestorOid, headRefOid }, options = {}) {
+    if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository) ||
+        !/^[a-f0-9]{40,64}$/.test(ancestorOid) || !/^[a-f0-9]{40,64}$/.test(headRefOid)) {
+      throw new TypeError("Invalid fixed commit ancestry target");
+    }
+    const result = await this.run("gh", ["api", "--hostname", GITHUB_HOST,
+      `repos/${repository}/compare/${ancestorOid}...${headRefOid}`], { timeoutMs: 15_000, ...options });
+    return ["ahead", "identical"].includes(result?.status) && result.behind_by === 0 &&
+      result.merge_base_commit?.sha === ancestorOid;
   }
 
   async #readIncomingReviewRequest({ repository, number, account }, options) {

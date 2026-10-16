@@ -63,6 +63,65 @@ test("a new head commit after my review needs my re-review", () => {
   assert.equal(result.nextAction, "rereview");
 });
 
+test("a Comment on the current Head reports unfinished review instead of an unreviewed new commit", () => {
+  const result = assess({ relation: "review_requested", author: "contributor",
+    myReviewState: "CHANGES_REQUESTED", myReviewCommitOid: "old-head",
+    myLatestPublishedReviewState: "COMMENTED", myLatestPublishedReviewCommitOid: "head-2" });
+  assert.equal(result.nextAction, "complete_review");
+  assert.match(result.actionReasons[0], /当前提交已复审评论/);
+});
+
+test("a later Comment cannot undo a decisive verdict on the same Head", () => {
+  for (const state of ["APPROVED", "CHANGES_REQUESTED"]) {
+    const result = assess({ relation: "review_requested", author: "contributor",
+      myReviewState: state, myReviewCommitOid: "head-2",
+      myLatestPublishedReviewState: "COMMENTED", myLatestPublishedReviewCommitOid: "head-2" });
+    assert.equal(result.nextAction, state === "APPROVED" ? "wait_merge" : "wait_author_changes");
+  }
+});
+
+test("fresh current-Head publication facts fill a missing or older detail Review summary", () => {
+  const missing = assess({ relation: "review_requested", author: "contributor",
+    myLatestPublishedReviewState: "COMMENTED", myLatestPublishedReviewCommitOid: "head-2" });
+  assert.equal(missing.nextAction, "complete_review");
+  const approved = assess({ relation: "review_requested", author: "contributor",
+    myReviewState: "CHANGES_REQUESTED", myReviewCommitOid: "old-head", myReviewAt: "2026-07-20T00:00:00Z",
+    myLatestPublishedReviewState: "APPROVED", myLatestPublishedReviewCommitOid: "head-2", myLatestPublishedReviewAt: "2026-07-30T00:00:00Z" });
+  assert.equal(approved.nextAction, "wait_merge");
+});
+
+test("historical change requests with resolved threads require verification without asserting an unfixed defect", () => {
+  const result = assess({ reviewDecision: "CHANGES_REQUESTED", reviewFeedbackAvailable: true,
+    reviewFeedbackCount: 1, reviewPendingThreadCount: 0, reviewChangeRequestCount: 1,
+    outstandingChangeRequestCommitOids: ["old-head"] });
+  assert.equal(result.nextAction, "address_review");
+  assert.match(result.actionReasons[0], /历史修改要求.*核验/);
+  assert.doesNotMatch(result.actionReasons[0], /尚未解决|尚未处理/);
+});
+
+test("a verified publication covering current feedback waits for review, retaining open discussion facts", () => {
+  const result = assess({ reviewDecision: "CHANGES_REQUESTED", reviewFeedbackAvailable: true,
+    reviewFeedbackCount: 2, reviewFeedbackDigest: "f".repeat(64), reviewPendingThreadCount: 1,
+    reviewRepairProgress: { status: "published", headRefOid: "head-2", feedbackDigest: "f".repeat(64), commitOids: ["a".repeat(40)] } });
+  assert.equal(result.actionState, ACTION_STATES.WAITING_OTHER);
+  assert.equal(result.nextActor, "reviewer");
+  assert.equal(result.nextAction, "wait_review");
+  assert.match(result.actionReasons[0], /修复已发布.*当前提交复审/);
+  assert.match(result.actionReasons[0], /讨论未关闭/);
+});
+
+test("stale publication progress cannot hide new feedback or a different Head", () => {
+  for (const progress of [
+    { headRefOid: "old-head", feedbackDigest: "f".repeat(64) },
+    { headRefOid: "head-2", feedbackDigest: "e".repeat(64) },
+  ]) {
+    const result = assess({ reviewDecision: "CHANGES_REQUESTED", reviewFeedbackAvailable: true,
+      reviewFeedbackCount: 1, reviewFeedbackDigest: "f".repeat(64),
+      reviewRepairProgress: { status: "published", commitOids: ["a".repeat(40)], ...progress } });
+    assert.equal(result.nextAction, "address_review");
+  }
+});
+
 test("changes I requested without a new commit are waiting on the author", () => {
   const result = assess({
     relation: "review_requested",

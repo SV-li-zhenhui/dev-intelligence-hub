@@ -69,7 +69,26 @@ function assessAssignedReview(item) {
     );
   }
 
-  if (!item.myReviewState) {
+  let reviewState = item.myReviewState;
+  let reviewCommitOid = item.myReviewCommitOid;
+  const publishedAt = Date.parse(item.myLatestPublishedReviewAt);
+  const summarizedAt = Date.parse(item.myReviewAt);
+  if (["APPROVED", "CHANGES_REQUESTED"].includes(item.myLatestPublishedReviewState) &&
+      item.myLatestPublishedReviewCommitOid === item.headRefOid && Number.isFinite(publishedAt) &&
+      (!Number.isFinite(summarizedAt) || publishedAt >= summarizedAt)) {
+    reviewState = item.myLatestPublishedReviewState;
+    reviewCommitOid = item.myLatestPublishedReviewCommitOid;
+  }
+
+  const decisiveOnHead = ["APPROVED", "CHANGES_REQUESTED"].includes(reviewState) &&
+    reviewCommitOid === item.headRefOid;
+  if (item.myLatestPublishedReviewState === "COMMENTED" &&
+      item.myLatestPublishedReviewCommitOid === item.headRefOid && !decisiveOnHead) {
+    return assessment(ACTION_STATES.ACTION_NOW, "me", "complete_review",
+      "当前提交已复审评论，尚未给出最终审核结论");
+  }
+
+  if (!reviewState) {
     return assessment(
       ACTION_STATES.ACTION_NOW,
       "me",
@@ -78,7 +97,7 @@ function assessAssignedReview(item) {
     );
   }
 
-  if (hasUnreviewedHead(item, item.myReviewCommitOid)) {
+  if (hasUnreviewedHead(item, reviewCommitOid)) {
     return assessment(
       ACTION_STATES.ACTION_NOW,
       "me",
@@ -87,7 +106,7 @@ function assessAssignedReview(item) {
     );
   }
 
-  if (!item.myReviewCommitOid || !item.headRefOid) {
+  if (!reviewCommitOid || !item.headRefOid) {
     return assessment(
       ACTION_STATES.UNCERTAIN,
       "unknown",
@@ -96,7 +115,7 @@ function assessAssignedReview(item) {
     );
   }
 
-  if (item.myReviewState === "CHANGES_REQUESTED") {
+  if (reviewState === "CHANGES_REQUESTED") {
     return assessment(
       ACTION_STATES.WAITING_OTHER,
       "author",
@@ -105,7 +124,7 @@ function assessAssignedReview(item) {
     );
   }
 
-  if (item.myReviewState === "APPROVED") {
+  if (reviewState === "APPROVED") {
     return assessment(
       ACTION_STATES.WAITING_OTHER,
       "merge_owner",
@@ -114,7 +133,7 @@ function assessAssignedReview(item) {
     );
   }
 
-  if (item.myReviewState === "COMMENTED") {
+  if (reviewState === "COMMENTED") {
     return assessment(
       ACTION_STATES.ACTION_NOW,
       "me",
@@ -127,7 +146,7 @@ function assessAssignedReview(item) {
     ACTION_STATES.UNCERTAIN,
     "unknown",
     "confirm",
-    `无法解释你的审核状态 ${item.myReviewState}`,
+    `无法解释你的审核状态 ${reviewState}`,
   );
 }
 
@@ -137,15 +156,27 @@ function assessAuthoredPullRequest(item) {
       ACTION_STATES.ACTION_NOW,
       "me",
       "resolve_conflict",
-      "先解决合并冲突，再处理审核意见",
+      item.reviewFeedbackCount > 0 || item.reviewDecision === "CHANGES_REQUESTED"
+        ? "先解决合并冲突，再核验审核意见" : "需要先解决合并冲突",
     );
   }
-  if (item.reviewFeedbackAvailable === true && Number.isSafeInteger(item.reviewFeedbackCount) && item.reviewFeedbackCount > 0) {
+  const progress = item.reviewRepairProgress;
+  const publishedRepair = item.reviewFeedbackAvailable === true && progress?.status === "published" &&
+    progress.headRefOid === item.headRefOid && progress.feedbackDigest === item.reviewFeedbackDigest &&
+    typeof progress.feedbackDigest === "string" && /^[a-f0-9]{64}$/.test(progress.feedbackDigest) &&
+    Array.isArray(progress.commitOids) && progress.commitOids.length > 0 &&
+    progress.commitOids.every(oid => typeof oid === "string" && /^[a-f0-9]{40,64}$/.test(oid));
+  if (item.reviewFeedbackAvailable === true && Number.isSafeInteger(item.reviewFeedbackCount) && item.reviewFeedbackCount > 0 && !publishedRepair) {
+    const historicalOnly = item.reviewPendingThreadCount === 0 && item.reviewChangeRequestCount > 0 &&
+      item.outstandingChangeRequestCommitOids?.length > 0 &&
+      item.outstandingChangeRequestCommitOids.every(oid => oid !== item.headRefOid);
     return assessment(
       ACTION_STATES.ACTION_NOW,
       "me",
       "address_review",
-      "有尚未解决的他人审核意见，需要结合当前代码处理",
+      historicalOnly ? "有历史修改要求，需核验当前代码后安排复审" :
+        item.reviewPendingThreadCount > 0 ? "仍有未关闭的审核讨论，需核验当前代码中的处理情况" :
+          "有审核修改要求，需核验当前代码中的处理情况",
     );
   }
 
@@ -165,6 +196,11 @@ function assessAuthoredPullRequest(item) {
       "continue_draft",
       "草稿仍需继续推进或关闭",
     );
+  }
+
+  if (publishedRepair) {
+    return assessment(ACTION_STATES.WAITING_OTHER, "reviewer", "wait_review",
+      `修复已发布，等待当前提交复审${item.reviewPendingThreadCount > 0 ? "（仍有讨论未关闭）" : ""}`);
   }
 
   if (item.reviewDecision === "CHANGES_REQUESTED") {

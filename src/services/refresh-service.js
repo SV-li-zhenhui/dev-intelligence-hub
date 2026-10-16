@@ -153,6 +153,7 @@ export class RefreshService {
     config,
     brain = null,
     operationQueue = null,
+    repairProgressReader = null,
     clock = () => new Date(),
   }) {
     this.github = github;
@@ -167,6 +168,7 @@ export class RefreshService {
     this.clock = clock;
     this.running = null;
     this.operationQueue = operationQueue;
+    this.repairProgressReader = repairProgressReader;
     this.operations = Promise.resolve();
   }
 
@@ -383,7 +385,11 @@ export class RefreshService {
         .filter((item) => item.kind === "pull_request")
         .map((item) => [item.id, item]),
     );
-    const classifiedPullRequests = githubValues[0].map((item) => {
+    let pullRequests = githubValues[0].map(({ reviewRepairProgress: _previous, ...item }) => item);
+    if (githubCalls[0].status === "fulfilled" && this.config.githubRead?.enabled !== false && this.repairProgressReader !== null) {
+      pullRequests = await this.repairProgressReader.enrich(pullRequests, { signal });
+    }
+    const classifiedPullRequests = pullRequests.map((item) => {
       const classified = {
         ...item,
         ...assessPullRequestResponsibility(item, {

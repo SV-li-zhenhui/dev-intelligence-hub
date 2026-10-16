@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { assessPullRequestResponsibility } from "../src/domain/pr-responsibility.js";
+import { workflowEventsFromSnapshots } from "../src/domain/workflow-snapshot-events.js";
+import { withPrLifecycleRoutes } from "../src/domain/pr-lifecycle-routing.js";
+import { routeWorkflowEvent } from "../src/domain/workflow-router.js";
 import {
   GitHubAdapter,
   classifyPullRequestRelation,
@@ -53,6 +57,39 @@ function currentTargetBatchResponse(args, target = (number) => ({ number, url: `
     nameWithOwner: `${owner}/${name}`, pullRequest: currentTargetPr(target(Number(number))),
   }])) };
 }
+
+test("fresh incoming approval updates shared facts and automatically routes the snapshot to testing", async () => {
+  const head = "b".repeat(40);
+  const approved = { author: { login: "runtime-user" }, state: "APPROVED",
+    submittedAt: "2026-10-16T01:00:00Z", commit: { oid: head } };
+  for (const reviews of [[approved], [approved, { ...approved, state: "COMMENTED", submittedAt: "2026-10-16T02:00:00Z" }]]) {
+    const record = { number: 42, title: "PR 42", url: "https://github.com/acme/repo/pull/42",
+      repository: { nameWithOwner: "acme/repo" }, author: { login: "contributor" }, state: "open",
+      updatedAt: "2026-10-16T02:00:00Z" };
+    const adapter = new GitHubAdapter({ readIncomingReviews: true, run: async (_command, args) => {
+      if (isCurrentTargetBatchCall(args)) return currentTargetBatchResponse(args);
+      if (args[0] === "api" && args.includes("graphql")) return { data: { repository: { pullRequest: {
+        number: 42, url: record.url, state: "OPEN", headRefOid: head, author: record.author,
+        timelineItems: { nodes: [] }, assignees: { nodes: [] }, reviews: { nodes: reviews },
+      } } } };
+      if (args[0] === "api") return { login: "runtime-user" };
+      if (args[0] === "search") return args.includes("--assignee=@me") ? [record] : [];
+      if (args[0] === "pr") return { ...currentTargetPr(), labels: [], statusCheckRollup: [],
+        reviews: [{ ...approved, state: "CHANGES_REQUESTED", submittedAt: "2026-10-15T00:00:00Z", commit: { oid: "c".repeat(40) } }] };
+      assert.fail(`Unexpected command: ${args.join(" ")}`);
+    } });
+    const [item] = await adapter.searchRelevantPullRequests();
+    assert.equal(item.myReviewState, "APPROVED");
+    assert.equal(item.myReviewCommitOid, head);
+    assert.equal(item.myReviewAt, approved.submittedAt);
+    const classified = { ...item, ...assessPullRequestResponsibility(item, { now: "2026-10-16T03:00:00Z" }) };
+    assert.equal(classified.nextAction, "wait_merge");
+    const [event] = workflowEventsFromSnapshots(null, { refreshedAt: "2026-10-16T03:00:00.000Z", items: [classified],
+      sourceStatus: { githubPullRequests: { ok: true, stale: false } } }, { sourceScopeId: "dashboard" });
+    const routed = routeWorkflowEvent({ event, config: withPrLifecycleRoutes({ schemaVersion: 1, enabled: true, maxHops: 8, rules: [] }) });
+    assert.deepEqual(routed.assignments.map(({ target }) => target), [{ type: "role", id: "tester" }]);
+  }
+});
 
 test("a pull request assigned to me by another author means review", () => {
   assert.equal(
@@ -136,6 +173,8 @@ test("review facts retain the commit reviewed by each responsible person", () =>
 
   assert.equal(facts.myReviewState, "APPROVED");
   assert.equal(facts.myReviewCommitOid, "head-2");
+  assert.equal(facts.myLatestPublishedReviewState, "COMMENTED");
+  assert.equal(facts.myLatestPublishedReviewCommitOid, "head-3");
   assert.equal(facts.latestOtherDecisionState, "CHANGES_REQUESTED");
   assert.equal(facts.latestOtherDecisionCommitOid, "head-3");
   assert.equal(facts.latestChangeRequestCommitOid, "head-3");

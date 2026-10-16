@@ -79,6 +79,7 @@ import { FailedCodeJobContextReader } from "./services/failed-code-job-context-r
 import { ProactivePrEmployeeService } from "./services/proactive-pr-employee.js";
 import { PrEngineerService } from "./services/pr-engineer-service.js";
 import { RefreshService } from "./services/refresh-service.js";
+import { OwnPrRepairProgressReader } from "./services/own-pr-repair-progress-reader.js";
 import { RoleWorkerDirectory } from "./services/role-worker-directory.js";
 import { WorkConditionWaker } from "./services/work-condition-waker.js";
 import { normalizeWorkCoordinationTiming } from "./services/work-coordination-timing.js";
@@ -2833,6 +2834,7 @@ export async function createApplication({
       notifier,
       config,
       operationQueue,
+      repairProgressReader: new OwnPrRepairProgressReader({ store, github }),
     });
     const operations = operationsRuntimeFactory(
       {

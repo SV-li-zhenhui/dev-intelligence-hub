@@ -22,5 +22,7 @@ export function projectIncomingReview(pr, account) {
     reviewReceivedVia: received ? "assignee" : null,
     reviewRequestEventId: received?.id || null,
     myLatestPublishedReviewAt: latestPublishedReview?.submittedAt || null,
+    myLatestPublishedReviewState: latestPublishedReview?.state || "",
+    myLatestPublishedReviewCommitOid: latestPublishedReview?.commit?.oid || "",
   };
 }

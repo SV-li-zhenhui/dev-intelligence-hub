@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { RefreshService } from "../src/services/refresh-service.js";
 import { WorkflowFactSource } from "../src/services/workflow-fact-source.js";
+import { OwnPrRepairProgressReader } from "../src/services/own-pr-repair-progress-reader.js";
 
 const REFRESH_STARTED_AT = "2026-08-13T01:02:03.004Z";
 
@@ -77,6 +78,29 @@ test("an explicitly disabled GitHub read boundary makes no adapter call", async 
     snapshot.sourceStatus.githubPullRequests.effectiveUpdatedWindow.mode,
     "unlimited",
   );
+});
+
+test("refresh classifies verified repair publication before building action and waiting groups", async () => {
+  const digest = "f".repeat(64), head = "a".repeat(40), repair = "b".repeat(40);
+  const pr = pullRequest({ relation: "authored", repo: "acme/repo", number: 1,
+    author: "local-owner", headRefOid: head, reviewDecision: "CHANGES_REQUESTED",
+    reviewFeedbackAvailable: true, reviewFeedbackCount: 1, reviewFeedbackDigest: digest });
+  const store = new MemoryStore({ "automatic-own-pr-repair-state": { schemaVersion: 1, repairs: [],
+    published: [{ repository: "acme/repo", number: 1, commitOid: repair, feedbackDigest: digest, confirmationId: "completed-push" }] } });
+  const github = { async searchRelevantPullRequests() { return [pr]; }, async searchIssues() { return []; },
+    async versions() { return []; }, async isCommitAncestor() { return true; } };
+  const service = new RefreshService({ github, dingtalk: {}, store, notifier: {},
+    repairProgressReader: new OwnPrRepairProgressReader({ store, github }),
+    config: { trackedRepositories: [], dingtalk: { enabled: false }, brain: { enabled: false }, prResponsibility: { historicalAfterDays: 60 } },
+    clock: () => "2026-08-01T00:00:00Z" });
+  await service.refresh({ notify: false });
+  const dashboard = await store.read("dashboard");
+  assert.equal(dashboard.groups.actionNow.length, 0);
+  assert.equal(dashboard.groups.waitingOther[0].nextActor, "reviewer");
+  assert.match(dashboard.groups.waitingOther[0].actionReasons[0], /修复已发布.*当前提交复审/);
+  github.searchRelevantPullRequests = async () => { throw new Error("GitHub unavailable"); };
+  await service.refresh({ notify: false });
+  assert.equal((await store.read("snapshot")).items[0].reviewRepairProgress, undefined);
 });
 
 test("notification failure keeps fresh facts while preserving the retry baseline", async () => {

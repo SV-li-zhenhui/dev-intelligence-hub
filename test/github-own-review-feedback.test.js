@@ -23,6 +23,8 @@ test("own feedback includes requests for changes and unresolved inline comments,
   const result = summarizeOwnReviewFeedback({ reviews: [review(), review({ id: "review-comment", state: "COMMENTED", body: "Thanks!" })], threads: [thread()] }, ACCOUNT);
   assert.equal(result.reviewFeedbackAvailable, true);
   assert.equal(result.reviewFeedbackCount, 2);
+  assert.equal(result.reviewPendingThreadCount, 1);
+  assert.equal(result.reviewChangeRequestCount, 1);
   assert.deepEqual(result.reviewFeedbackIds, ["review:review-1", "thread:thread-1"]);
   assert.equal(result.feedback.threads[0].comments[0].body, "Handle the empty value");
 });
