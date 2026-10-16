@@ -1003,10 +1003,25 @@ function requireMemorySearch(application) {
   return search;
 }
 
+const memoryHealthProbes = new WeakMap();
+
 async function readMemoryHealth(application) {
   if (!application.memorySearch) return null;
+  let probe = memoryHealthProbes.get(application);
+  if (!probe) {
+    const authorityCheck = Promise.resolve().then(() => requireMemorySearch(application).getHealth());
+    let timeout;
+    probe = Promise.race([authorityCheck, new Promise(resolve => {
+      timeout = setTimeout(() => resolve(Object.freeze({
+        ready: false, authorityCurrent: false, checking: true,
+      })), 250);
+    })]).finally(() => clearTimeout(timeout));
+    const release = () => memoryHealthProbes.delete(application);
+    authorityCheck.then(release, release);
+    memoryHealthProbes.set(application, probe);
+  }
   try {
-    return await requireMemorySearch(application).getHealth();
+    return await probe;
   } catch (error) {
     if (
       error?.code === "MEMORY_AUTHORITY_NOT_CURRENT" &&

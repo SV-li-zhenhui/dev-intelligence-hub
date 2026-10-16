@@ -9428,6 +9428,32 @@ test("health does not mask unexpected memory failures", async () => {
   );
 });
 
+test("health stays responsive during a pending memory authority check and shares its probe", async () => {
+  let resolveHealth;
+  let calls = 0;
+  const pending = new Promise(resolve => { resolveHealth = resolve; });
+  const memorySearch = { async search() { throw new Error("Query must retain its own authority check"); },
+    async getHealth() { calls += 1; return pending; } };
+  await withServer(async ({ server }) => {
+    const started = Date.now();
+    const checks = Promise.all([request(server, { path: "/api/health" }), request(server, { path: "/api/health" })]);
+    const failSafe = setTimeout(() => resolveHealth({ ready: true }), 2_000);
+    try {
+      const responses = await checks;
+      assert.ok(Date.now() - started < 1_500, "Health must not wait for the authority queue");
+      assert.equal(calls, 1);
+      for (const health of responses) {
+        assert.equal(health.status, 200);
+        assert.deepEqual(JSON.parse(health.body).memory, { ready: false, authorityCurrent: false, checking: true });
+      }
+      resolveHealth({ ready: true, authorityCurrent: true });
+      await new Promise(resolve => setImmediate(resolve));
+      await request(server, { path: "/api/health" });
+      assert.equal(calls, 2, "A completed probe must not become a cached authority claim");
+    } finally { clearTimeout(failSafe); resolveHealth({ ready: true }); }
+  }, { memorySearch });
+});
+
 test("unified memory query forwards only bounded filters and pagination", async () => {
   const calls = [];
   const cursor = Buffer.from(
