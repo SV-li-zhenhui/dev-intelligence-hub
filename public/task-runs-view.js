@@ -34,11 +34,14 @@ function taskRow(task) {
   </button></li>`;
 }
 
-export function renderTaskRuns({ loaded = false, loading = false, enabled = false, items = [], held = [], background = [], recent = [], error = "" } = {}) {
+export function renderTaskRuns({ loaded = false, loading = false, enabled = false, items = [], held = [], background = [], recent = [], recentExpanded = false, error = "" } = {}) {
   const queued=items.filter(task=>task.active===true && task.phase==='waiting_model');
   const preparing=items.filter(task=>task.active===true && ['preparing','starting_model'].includes(task.phase));
   const active = items.filter((task) => task.active === true && !['waiting_model','preparing','starting_model'].includes(task.phase));
   const paused = held.filter((task) => task.active !== true);
+  const orderedRecent = recent.toSorted((left, right) =>
+    (Date.parse(right.startedAt ?? right.queuedAt) || 0) - (Date.parse(left.startedAt ?? left.queuedAt) || 0));
+  const visibleRecent = recentExpanded ? orderedRecent : orderedRecent.slice(0, 5);
   return `<div class="section-heading task-runs-heading"><h2 id="task-runs-title">当前运行任务</h2>
     <button type="button" class="secondary-button" data-task-runs-refresh ${loading ? "disabled" : ""}>${loading ? "读取中…" : "刷新任务"}</button></div>
     <p class="task-runs-hint">点击正在运行的任务，查看 CLI 会话和微调要求；后台作业显示步骤间的进度。</p>
@@ -50,7 +53,9 @@ export function renderTaskRuns({ loaded = false, loading = false, enabled = fals
       ${preparing.length?`<div><h3>准备启动 · ${preparing.length}</h3><ul class="task-runs-list">${preparing.map(taskRow).join('')}</ul></div>`:''}
       ${paused.length ? `<div class="task-runs-held"><h3>暂停与待确认 · ${paused.length}</h3><ul class="task-runs-list">${paused.map(taskRow).join("")}</ul></div>` : ""}
       ${background.length ? `<div class="task-runs-background"><h3>后台作业 · ${background.length}</h3><p class="task-runs-hint">作业尚未结束，当前未在执行模型回合。点击查看已记录的进展。</p><ul class="task-runs-list">${background.map(taskRow).join("")}</ul></div>` : ""}
-      ${recent.length?`<div><h3>最近执行 · ${recent.length}</h3><ul class="task-runs-list">${recent.map(taskRow).join('')}</ul></div>`:''}</div>` : ""}`;
+      ${recent.length ? `<div><div class="section-heading"><h3>最近执行 · ${recent.length}</h3>
+        ${recent.length > 5 ? `<button type="button" class="secondary-button" data-task-runs-recent-toggle aria-expanded="${recentExpanded}" aria-controls="task-runs-recent-list">${recentExpanded ? "收起" : `展开全部（${recent.length} 条）`}</button>` : ""}</div>
+        <ul id="task-runs-recent-list" class="task-runs-list">${visibleRecent.map(taskRow).join("")}</ul></div>` : ""}</div>` : ""}`;
 }
 
 function deliveryMarkup(task) {
@@ -177,7 +182,7 @@ export function createTaskRunsController({
   setTimeoutImpl = globalThis.setTimeout,
   clearTimeoutImpl = globalThis.clearTimeout,
 } = {}) {
-  const state = { loaded: false, loading: false, enabled: false, items: [], held: [], background: [], recent:[], error: "",
+  const state = { loaded: false, loading: false, enabled: false, items: [], held: [], background: [], recent:[], recentExpanded: false, error: "",
     selected: null, detail: null, detailLoading: false, detailStale: false, detailError: "",
     submitting: false, notice: "", draft: { instruction: "", priority: "normal" } };
   const drafts = new Map();
@@ -191,6 +196,7 @@ export function createTaskRunsController({
 
   function getState() { return { ...state, draft: { ...state.draft } }; }
   function notify() { onChange(getState()); }
+  function toggleRecent() { state.recentExpanded = !state.recentExpanded; notify(); }
   function currentDraft() { return state.selected ? drafts.get(identity(state.selected)) : null; }
 
   function applyDetail(detail) {
@@ -345,7 +351,7 @@ export function createTaskRunsController({
   function stop() { running = false; clearTimer(); }
   async function visibilityChanged() { clearTimer(); if (isVisible()) await poll(); }
 
-  return { getState, setDraft, refresh, refreshDetail, open, close, control, start, stop, visibilityChanged };
+  return { getState, setDraft, toggleRecent, refresh, refreshDetail, open, close, control, start, stop, visibilityChanged };
 }
 
 export function createTaskRunsView({ container, dialog, documentImpl = document, ...options }) {
@@ -363,6 +369,7 @@ export function createTaskRunsView({ container, dialog, documentImpl = document,
       const focused = documentImpl.activeElement;
       const taskButton = focused?.closest?.("[data-task-run-kind]");
       const refreshFocused = focused?.matches?.("[data-task-runs-refresh]");
+      const recentFocused = focused?.matches?.("[data-task-runs-recent-toggle]");
       container.innerHTML = listMarkup;
       lastListMarkup = listMarkup;
       if (taskButton) {
@@ -370,6 +377,7 @@ export function createTaskRunsView({ container, dialog, documentImpl = document,
           button.dataset.taskRunKind === taskButton.dataset.taskRunKind && button.dataset.taskRunId === taskButton.dataset.taskRunId,
         )?.focus({ preventScroll: true });
       } else if (refreshFocused) container.querySelector("[data-task-runs-refresh]")?.focus({ preventScroll: true });
+      else if (recentFocused) container.querySelector("[data-task-runs-recent-toggle]")?.focus({ preventScroll: true });
     }
     if (!state.selected) return;
     const selected = identity(state.selected);
@@ -423,6 +431,7 @@ export function createTaskRunsView({ container, dialog, documentImpl = document,
 
   container.addEventListener("click", (event) => {
     if (event.target.closest("[data-task-runs-refresh]")) { void controller.refresh(); return; }
+    if (event.target.closest("[data-task-runs-recent-toggle]")) { controller.toggleRecent(); return; }
     const button = event.target.closest("[data-task-run-kind]");
     if (!button) return;
     renderedSelection = "";
