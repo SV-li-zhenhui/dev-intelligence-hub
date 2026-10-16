@@ -1518,33 +1518,155 @@ test("legacy external rereview returns its local report, cancels it, and publish
   assert.equal(externalWrites, 1);
 });
 
-test("automatic rereview correction preserves a deliberately paused malformed child", async () => {
-  const fixture = await refreshedPrDeliveryFixture();
-  const { ledger, graph, graphReader, assembler, root } = fixture;
-  await fixture.execute();
-  const planner = graph.planner({ principalId: "employee-orchestrator", scopeRootTaskId: root.itemId });
-  const childId = fixture.item.itemId;
-  const child = async () => (await ledger.listItems()).items.find(({ itemId }) => itemId === childId);
-  let current = await child();
-  await planner.decideDelivery({ taskId: childId, submittedDeliveryRevision: 1, decision: "reject", reason: "Return local report",
-    expectedTaskRevision: current.revision, expectedGraphRevision: (await graphReader.getSnapshot()).graph.revision });
-  current = await child();
-  await planner.pauseTask({ taskId: childId, reason: "Intentional suspension",
-    expectedTaskRevision: current.revision, expectedGraphRevision: (await graphReader.getSnapshot()).graph.revision });
-  const paused = await child();
-  const item = (await ledger.listItems()).items.find(({ itemId }) => itemId === root.itemId);
-  const packet = await assembler.assemble({ roleId: "orchestrator", item, trigger: "scheduled" });
-  const view = await graphReader.getSnapshot();
-  const host = new OrchestratorService({ contextAssembler: assembler, graphReader,
-    scopedGraphPlannerFactory: { forRoot() { return planner; } },
-    graphDelivererFactory: { forClaim() { assert.fail("Root cannot submit specialist delivery"); } },
-    capabilityRoles: { "pr-review": "pr-engineer" } });
-  const before = await graphReader.getSnapshot();
-  await assert.rejects(host.execute({ worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
-    item, contextPacket: packet, intent: orchestrate(commonAction("cancel", view.graph.tasks.find(({ taskId }) => taskId === childId), view)) }),
-    { code: "ORCHESTRATOR_AUTHORITY_DENIED" });
-  assert.deepEqual(await child(), paused);
-  assert.deepEqual(await graphReader.getSnapshot(), before);
+test("automatic rereview correction preserves a deliberately paused malformed child", async (t) => {
+  for (const handedBack of [false, true]) await t.test(handedBack ? "after coordination handoff" : "PR engineer", async () => {
+    const fixture = await refreshedPrDeliveryFixture();
+    const { ledger, graph, graphReader, assembler, root } = fixture;
+    await fixture.execute();
+    const planner = graph.planner({ principalId: "employee-orchestrator", scopeRootTaskId: root.itemId });
+    const childId = fixture.item.itemId;
+    const child = async () => (await ledger.listItems()).items.find(({ itemId }) => itemId === childId);
+    let current = await child();
+    await planner.decideDelivery({ taskId: childId, submittedDeliveryRevision: 1, decision: "reject", reason: "Return local report",
+      expectedTaskRevision: current.revision, expectedGraphRevision: (await graphReader.getSnapshot()).graph.revision });
+    current = await child();
+    if (handedBack) {
+      current = await ledger.claim({ itemId: current.itemId, expectedRevision: current.revision,
+        workerId: "employee-pr-engineer", leaseDurationMs: 600_000 });
+      current = await ledger.handoff({ itemId: current.itemId, expectedRevision: current.revision,
+        leaseId: current.leaseId, actorId: "employee-pr-engineer", target: { type: "role", id: "orchestrator" },
+        reason: "Correction requires a typed Review child" });
+    }
+    await planner.pauseTask({ taskId: childId, reason: "Intentional suspension",
+      expectedTaskRevision: current.revision, expectedGraphRevision: (await graphReader.getSnapshot()).graph.revision });
+    const paused = await child();
+    const item = (await ledger.listItems()).items.find(({ itemId }) => itemId === root.itemId);
+    const packet = await assembler.assemble({ roleId: "orchestrator", item, trigger: "scheduled" });
+    const view = await graphReader.getSnapshot();
+    const host = new OrchestratorService({ contextAssembler: assembler, graphReader,
+      scopedGraphPlannerFactory: { forRoot() { return planner; } },
+      graphDelivererFactory: { forClaim() { assert.fail("Root cannot submit specialist delivery"); } },
+      capabilityRoles: { "pr-review": "pr-engineer" } });
+    const before = await graphReader.getSnapshot();
+    await assert.rejects(host.execute({ worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+      item, contextPacket: packet, intent: orchestrate(commonAction("cancel", view.graph.tasks.find(({ taskId }) => taskId === childId), view)) }),
+      { code: "ORCHESTRATOR_AUTHORITY_DENIED" });
+    assert.deepEqual(await child(), paused);
+    assert.deepEqual(await graphReader.getSnapshot(), before);
+  });
+});
+
+test("settled malformed external rereview cannot be paused and converges through cancellation and a typed child", async (t) => {
+  for (const scenario of [
+    ...["queued", "retry_wait", "blocked"].map((ledgerStatus) => ({ ledgerStatus })),
+    { ledgerStatus: "queued", handedBack: true },
+  ]) {
+    const { ledgerStatus, handedBack } = scenario;
+    await t.test(`${ledgerStatus}${handedBack ? " after coordination handoff" : ""}`, async () => {
+      const fixture = await refreshedPrDeliveryFixture();
+      const { ledger, graph, graphReader, assembler, root } = fixture;
+      let child = fixture.item;
+      if (handedBack) {
+        child = await ledger.handoff({ itemId: child.itemId, expectedRevision: child.revision,
+          leaseId: child.leaseId, actorId: "employee-pr-engineer", target: { type: "role", id: "orchestrator" },
+          reason: "Correction requires a typed Review child" });
+      } else if (ledgerStatus === "blocked") {
+        child = await ledger.transition({ itemId: child.itemId, expectedRevision: child.revision,
+          leaseId: child.leaseId, actorId: "employee-pr-engineer", toStatus: "blocked", reason: "delivery_attempts_exhausted" });
+      } else {
+        child = await ledger.scheduleRetry({ itemId: child.itemId, expectedRevision: child.revision,
+          leaseId: child.leaseId, actorId: "employee-pr-engineer", availableAt: "2026-10-15T18:35:00.000Z", reason: "delivery_failed" });
+        if (ledgerStatus === "queued") child = await ledger.transition({ itemId: child.itemId,
+          expectedRevision: child.revision, leaseId: null, actorId: "work-retry-waker", toStatus: "queued", reason: "retry_due" });
+      }
+      assert.equal(child.status, ledgerStatus);
+      if (handedBack) {
+        const currentRoot = (await ledger.listItems()).items.find(({ itemId }) => itemId === root.itemId);
+        const packet = await assembler.assemble({ roleId: "orchestrator", item: currentRoot, trigger: "scheduled" });
+        const engine = new RoleDecisionEngine({ definition: { id: "orchestrator", name: "Orchestrator", mission: "Coordinate review", enabled: true },
+          permissions: { allowedIntents: ["complete"] },
+          brain: { provider: "local-fixture", model: "fixture", remoteData: { code: false, requirements: false, memory: false } },
+          brainRouter: { describe: () => ({ singleAttempt: true }), generate: async () => JSON.stringify({ schemaVersion: 1,
+            confidence: 90, summary: "Review assessment", intent: { schemaVersion: 1, type: "complete", summary: "Reported locally",
+              reason: "Specialist handed back findings", outcome: "done", evidence: [] } }) } });
+        await assert.rejects(engine.decide({ context: packet.context }), { code: "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION" });
+      }
+      let plannerCalls = 0;
+      const host = new OrchestratorService({ contextAssembler: assembler, graphReader,
+        scopedGraphPlannerFactory: { forRoot({ scopeRootTaskId }) {
+          plannerCalls += 1;
+          return graph.planner({ principalId: "employee-orchestrator", scopeRootTaskId });
+        } },
+        graphDelivererFactory: { forClaim() { assert.fail("Root cannot submit specialist delivery"); } },
+        capabilityRoles: { "pr-review": "pr-engineer" } });
+      async function action(type, taskId, extra = {}) {
+        const item = (await ledger.listItems()).items.find(({ itemId }) => itemId === root.itemId);
+        const packet = await assembler.assemble({ roleId: "orchestrator", item, trigger: "scheduled" });
+        const view = await graphReader.getSnapshot();
+        const source = view.graph.tasks.find(({ taskId: id }) => id === taskId);
+        return host.execute({ worker: { roleId: "orchestrator", workerId: "employee-orchestrator" }, item, contextPacket: packet,
+          intent: orchestrate({ ...commonAction(type, source, view), ...extra }) });
+      }
+      const before = await graphReader.getSnapshot();
+      const writes = fixture.writes();
+      await assert.rejects(action("pause", child.itemId), { code: "ORCHESTRATOR_AUTHORITY_DENIED" });
+      assert.equal(plannerCalls, 0, "wrong pause must be rejected before obtaining planner authority");
+      assert.equal(fixture.writes(), writes);
+      assert.deepEqual(await graphReader.getSnapshot(), before);
+      await action("cancel", child.itemId);
+      const cancelled = (await ledger.listItems()).items.find(({ itemId }) => itemId === child.itemId);
+      assert.equal(cancelled.status, "cancelled");
+      assert.equal(cancelled.attempt, child.attempt);
+      assert.deepEqual(cancelled.graph.deliveries, child.graph.deliveries);
+      await action("decompose", root.itemId, { childKey: "authoritative-rereview-v2", capability: "pr-review", dependsOn: [],
+        work: { title: "Publish current review", description: "Assess the bound Head and publish the authoritative Review" },
+        acceptanceContract: contract({ deliverableId: "published-review", kind: "github-review" }) });
+      const children = (await ledger.listItems()).items.filter(({ graph: metadata }) => metadata?.parentItemId === root.itemId);
+      assert.equal(children.length, 2);
+      const replacement = children.find(({ itemId }) => itemId !== child.itemId);
+      assert.equal(replacement.status, "queued");
+      assert.equal(replacement.graph.acceptanceContracts.at(-1).expectedDeliverables[0].kind, "github-review");
+      assert.equal(replacement.graph.acceptanceContracts.at(-1).expectedDeliverables[0].required, true);
+    });
+  }
+});
+
+test("settled rereview pause guard preserves other task controls and full contract evidence", async (t) => {
+  const scenarios = [
+    ...["working", "dispatch_pending", "waiting_user", "waiting_condition", "waiting_external", "paused"].map((ledgerStatus) =>
+      ({ name: ledgerStatus, ledgerStatus, graphStatus: ledgerStatus === "paused" ? "paused" : "in_progress" })),
+    { name: "missing ledger status", ledgerStatus: null, graphStatus: "in_progress" },
+    { name: "different specialist", ledgerStatus: "blocked", graphStatus: "in_progress", role: "developer" },
+    { name: "ordinary analysis", ledgerStatus: "blocked", graphStatus: "in_progress", nextAction: "analyze" },
+    { name: "internal review", ledgerStatus: "blocked", graphStatus: "in_progress", internalReview: true },
+    { name: "authoritative fifth deliverable", ledgerStatus: "blocked", graphStatus: "in_progress", authoritativeTail: true },
+    { name: "submitted local report", ledgerStatus: "blocked", graphStatus: "in_progress", delivery: "submitted" },
+    { name: "accepted historical report", ledgerStatus: "blocked", graphStatus: "in_progress", delivery: "accepted" },
+  ];
+  for (const scenario of scenarios) await t.test(scenario.name, async () => {
+    const root = task({ taskId: "rereview-root" });
+    const child = task({ taskId: "rereview-root/old", revision: 2, parentTaskId: root.taskId, status: scenario.graphStatus,
+      role: scenario.role ?? "pr-engineer", acceptanceContract: contract({ kind: "text-report" }) });
+    if (scenario.authoritativeTail) {
+      child.acceptanceContracts[0].expectedDeliverables = Array.from({ length: 5 }, (_, index) => ({
+        deliverableId: `delivery-${index}`, kind: index === 4 ? "github-review" : "text-report", description: "Expected review result", required: true }));
+    }
+    if (scenario.delivery) {
+      child.deliveries = [{ revision: 1, contractRevision: 1, deliverableId: "implementation", status: "submitted",
+        summary: "Local findings", evidence: [workInputEvidence(child)] }];
+      if (scenario.delivery === "accepted") child.deliveries.push({ ...child.deliveries[0], revision: 2, status: "accepted" });
+    }
+    const view = graphView([root, child], 3);
+    const event = structuredTriageEvent("pr-review"); event.payload.nextAction = scenario.nextAction ?? "rereview";
+    const packet = packetFor(view, root, { directChildren: [child], event });
+    packet.context.requirements.coordination.directChildren[0].ledgerStatus = scenario.ledgerStatus;
+    if (scenario.internalReview) packet.context.code.internalReview = { kind: "developer_handoff" };
+    const fakes = fakePorts({ packet, views: view });
+    const result = await serviceFrom(fakes).execute({ worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+      item: itemFor(root), contextPacket: packet, intent: orchestrate(commonAction("pause", child, view)) });
+    assert.equal(result.action, "pause");
+    assert.equal(fakes.calls.planner[0].method, "pauseTask", "existing ledger safety checks still own this task control");
+  });
 });
 
 test("configured PR engineer delivers a multiline review report through the real graph", async () => {

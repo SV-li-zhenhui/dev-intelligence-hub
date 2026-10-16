@@ -609,14 +609,22 @@ function requiredReviewDeliverable(contract) {
     required && ["review-report", "github-review"].includes(kind));
 }
 
-function cancelledMalformedReviewChild(task) {
+function reviewChildResponsibility(task) {
+  return task.responsibility.type === "role" &&
+    ["pr-engineer", "orchestrator"].includes(task.responsibility.id);
+}
+
+function malformedReviewChildWithSettledDeliveries(task) {
   const expected = latestContract(task).expectedDeliverables;
   const latestDeliveries = new Map(task.deliveries.map((delivery) => [delivery.deliverableId, delivery]));
-  return task.status === "cancelled" && task.responsibility.type === "role" &&
-    task.responsibility.id === "pr-engineer" && expected.length > 0 &&
+  return reviewChildResponsibility(task) && expected.length > 0 &&
     expected.every(({ kind }) => kind === "text-report") &&
     task.deliveries.every(({ status }) => status !== "accepted") &&
     [...latestDeliveries.values()].every(({ status }) => status !== "submitted");
+}
+
+function cancelledMalformedReviewChild(task) {
+  return task.status === "cancelled" && malformedReviewChildWithSettledDeliveries(task);
 }
 
 function assertStructuredPrTriageAction(packet, children, action, tasksById) {
@@ -626,8 +634,15 @@ function assertStructuredPrTriageAction(packet, children, action, tasksById) {
     throw denied("Initial structured PR triage must be decomposed");
   }
   const controlledChild = children.has(action.sourceTaskId) ? tasksById.get(action.sourceTaskId) : null;
+  const childLedgerStatus = packet.context.requirements.coordination.directChildren.find(
+    ({ taskId }) => taskId === action.sourceTaskId)?.ledgerStatus;
+  if (isExternalRereview(packet) && action.type === "pause" && controlledChild &&
+      ["queued", "retry_wait", "blocked"].includes(childLedgerStatus) &&
+      malformedReviewChildWithSettledDeliveries(controlledChild)) {
+    throw denied("A settled malformed external rereview child must be cancelled before authoritative replacement");
+  }
   if (isExternalRereview(packet) && action.type === "cancel" && controlledChild?.status === "paused" &&
-      controlledChild.responsibility.type === "role" && controlledChild.responsibility.id === "pr-engineer") {
+      reviewChildResponsibility(controlledChild)) {
     throw denied("Automatic rereview correction must preserve an intentionally paused Review child");
   }
   if (action.type !== "decompose") return;

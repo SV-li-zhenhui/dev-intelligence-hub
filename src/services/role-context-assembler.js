@@ -10,6 +10,7 @@ import {
 import { normalizeRepairFeedbackDescriptor } from "../domain/original-repair-feedback.js";
 import { normalizeWorkGraphSnapshot } from "../domain/work-graph-contract.js";
 import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
+import { WORK_LEDGER_STATUSES } from "./work-ledger-values.js";
 import { createRoleContextEvidenceCatalogAdapter } from "./role-context-evidence-catalog.js";
 import {
   RoleContextAssemblerError,
@@ -500,6 +501,10 @@ function normalizeSnapshot(value) {
       if (!fields.has(key)) throw invalid("task state is invalid");
     }
     const taskId = identifier(fields.get("taskId"), "taskState.taskId");
+    const ledgerStatus = fields.get("ledgerStatus") ?? null;
+    if (ledgerStatus !== null && !WORK_LEDGER_STATUSES.has(ledgerStatus)) {
+      throw invalid("taskState.ledgerStatus is invalid");
+    }
     const work = exactData(fields.get("work"), ["title", "description"], "task work");
     if (statesById.has(taskId)) throw invalid("task state IDs are duplicated");
     statesById.set(taskId, {
@@ -508,6 +513,7 @@ function normalizeSnapshot(value) {
         fields.get("taskRevision"),
         "taskState.taskRevision",
       ),
+      ledgerStatus,
       work: {
         title: nullableText(work.get("title"), "work.title", 256),
         description: nullableText(
@@ -882,6 +888,7 @@ function projectRootCoordination(roleId, currentTask, snapshot) {
       taskId: child.taskId,
       taskRevision: child.revision,
       status: child.status,
+      ledgerStatus: taskState.ledgerStatus,
       responsibility: { ...child.responsibility },
       work: {
         title: taskState.work.title,

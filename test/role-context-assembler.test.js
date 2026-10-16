@@ -1796,6 +1796,7 @@ test("a configured root orchestrator receives exact direct-child coordination by
       "taskId",
       "taskRevision",
       "status",
+      "ledgerStatus",
       "responsibility",
       "work",
       "directDependencyTaskIds",
@@ -1849,6 +1850,7 @@ test("a configured root orchestrator receives exact direct-child coordination by
     ({ taskId }) => taskId === "task-tester",
   );
   assert.equal(paused.status, "paused");
+  assert.equal(paused.ledgerStatus, "paused");
   assert.deepEqual(paused.directDependencyTaskIds, ["task-implementation"]);
   assert.deepEqual(paused.deliverables, [
     {
@@ -1935,6 +1937,35 @@ test("a configured root orchestrator receives exact direct-child coordination by
   assert.equal(Object.isFrozen(coordination.directChildren), true);
   assert.equal(Object.isFrozen(paused.deliverables[0]), true);
   assert.equal(Object.isFrozen(packet.context.code.childDeliveries[0]), true);
+});
+
+test("root coordination distinguishes settled ledger work from coarse graph progress", async (t) => {
+  for (const ledgerStatus of ["queued", "retry_wait", "blocked", "working", "waiting_external"]) {
+    await t.test(ledgerStatus, async () => {
+      const fixture = rootOrchestratorFixture();
+      const child = fixture.snapshot.graph.tasks.find(({ taskId }) => taskId === "task-current");
+      child.status = ledgerStatus === "queued" ? "pending" : "in_progress";
+      fixture.snapshot.taskStates.find(({ taskId }) => taskId === child.taskId).ledgerStatus = ledgerStatus;
+      const packet = await assemble(fixture, { roleId: "orchestrator" });
+      const visible = packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === child.taskId);
+      assert.equal(visible.status, child.status);
+      assert.equal(visible.ledgerStatus, ledgerStatus);
+      assert.equal(Object.keys(visible).some((key) => ["ownerId", "leaseUntil", "statusReason"].includes(key)), false);
+    });
+  }
+  await t.test("missing legacy status stays unknown", async () => {
+    const fixture = rootOrchestratorFixture();
+    delete fixture.snapshot.taskStates.find(({ taskId }) => taskId === "task-current").ledgerStatus;
+    const packet = await assemble(fixture, { roleId: "orchestrator" });
+    assert.equal(packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === "task-current").ledgerStatus, null);
+  });
+  for (const ledgerStatus of ["in_progress", "blocked\nSECRET-STATUS", {}]) {
+    await t.test(`invalid ledger status ${JSON.stringify(ledgerStatus)}`, async () => {
+      const fixture = rootOrchestratorFixture();
+      fixture.snapshot.taskStates.find(({ taskId }) => taskId === "task-current").ledgerStatus = ledgerStatus;
+      await assert.rejects(assemble(fixture, { roleId: "orchestrator" }), { code: "ROLE_CONTEXT_INVALID" });
+    });
+  }
 });
 
 test("root coordination excludes bounded superseded-Head history", async () => {
