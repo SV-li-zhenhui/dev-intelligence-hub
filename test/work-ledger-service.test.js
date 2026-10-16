@@ -1078,6 +1078,7 @@ import {
   appendPullRequestWorkSource,
   currentWorkItemEvent,
   currentWorkItemInputBinding,
+  normalizePullRequestWorkSource,
   pullRequestHeadAdmission,
   pullRequestTrustedPredecessor,
   LEGACY_PR_SOURCE_CUTOVER_REASON,
@@ -3117,6 +3118,380 @@ test("automatic scope lifecycle ignores a same-PR specialist root with a differe
   assert.equal(root.currentTarget.id, "developer");
   assert.equal(root.source.identity.targetRoleId, "developer");
   assert.equal(root.source.scope.active, true);
+});
+
+function specialistPrAssignment(sequence, roleId, relation = "authored", overrides = {}) {
+  const payload = roleId === "developer"
+    ? { relation, actionState: "action_now", nextAction: "address_review" }
+    : { relation, actionState: "waiting_other", nextAction: "wait_merge",
+        ...(relation === "authored" ? { reviewDecision: "APPROVED" } : { myReviewState: "APPROVED" }) };
+  const record = prAssignment(sequence, { gitFacts: { ...prGitFacts(PR_HEAD_A), ...payload }, ...overrides });
+  record.assignment.target = { type: "role", id: roleId };
+  record.assignment.ruleId = roleId === "developer" ? AUTHORED_PR_SELF_FIX_RULE_ID
+    : relation === "authored" ? AUTHORED_PR_APPROVED_RULE_ID : REVIEWED_PR_APPROVED_RULE_ID;
+  record.assignment.reason = `trusted-pr-${roleId}`;
+  return record;
+}
+
+for (const [roleId, relation] of [["developer", "authored"], ["tester", "authored"], ["tester", "review_requested"]]) {
+  test(`trusted ${relation} scope exit revokes the automatic ${roleId} without a PR engineer root`, async () => {
+    const fixture = await createFixture({ records: [specialistPrAssignment(1, roleId, relation)] });
+    await fixture.service.intake();
+    const before = (await fixture.service.listItems()).items[0];
+    const oldBinding = prExecutionBinding(before);
+    const leftEvent = prAssignment(2, { eventType: "pull_request.left_scope",
+      occurredAt: "2026-08-02T01:05:00.000Z", headRefOid: PR_HEAD_B,
+      gitFacts: { ...prGitFacts(PR_HEAD_B), relation } }).event;
+    fixture.source.records.push(prScopeLifecycleAssignment(2, leftEvent));
+    fixture.source.highWatermark = 2;
+
+    const intake = await fixture.service.intake();
+    const [inactive] = (await fixture.service.listItems()).items;
+
+    assert.equal(intake.cursor, 2);
+    assert.equal(inactive.currentTarget.id, roleId);
+    assert.equal(inactive.source.scope.active, false);
+    assert.equal(inactive.source.scope.lastLifecycleEventId, leftEvent.eventId);
+    assert.equal(inactive.source.current.headRefOid, PR_HEAD_A);
+    assert.equal(inactive.source.revisions.at(-1).disposition, "ignored_unproven_head");
+    assert.equal(inactive.status, "blocked");
+    assert.equal(inactive.statusReason, "pr_source_left_scope");
+    assert.equal(inactive.attempt, before.attempt);
+    await assert.rejects(fixture.service.verifyPullRequestExecutionBinding(oldBinding),
+      error => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE");
+  });
+}
+
+function persistConsumedPrLifecycle(fixture, record) {
+  const durable = fixture.store.stored();
+  durable.intakeCursor = record.sequence;
+  durable.sourceHighWatermark = record.sequence;
+  fixture.store.replaceStored(durable);
+}
+
+test("normal recovery retires a specialist scope exit already consumed by the legacy role lookup exactly once", async () => {
+  const fixture = await createFixture({ records: [specialistPrAssignment(1, "developer")] });
+  await fixture.service.intake();
+  const before = (await fixture.service.listItems()).items[0];
+  const leftEvent = prAssignment(2, { eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z", headRefOid: PR_HEAD_B,
+    gitFacts: { ...prGitFacts(PR_HEAD_B), relation: "authored" } }).event;
+  const exit = prScopeLifecycleAssignment(2, leftEvent);
+  fixture.source.records.push(exit);
+  fixture.source.highWatermark = 2;
+  persistConsumedPrLifecycle(fixture, exit);
+
+  const restarted = await createFixture({ store: fixture.store, source: fixture.source });
+  const [retired] = (await restarted.service.listItems()).items;
+  assert.equal(retired.source.scope.active, false);
+  assert.equal(retired.source.scope.lastLifecycleEventId, leftEvent.eventId);
+  assert.equal(retired.source.current.headRefOid, PR_HEAD_A);
+  assert.equal(retired.statusReason, "pr_source_left_scope");
+  assert.equal(retired.attempt, before.attempt);
+  assert.equal((await restarted.service.getSummary()).intakeCursor, 2);
+  const writes = fixture.store.writes.length;
+  const second = await createFixture({ store: fixture.store, source: fixture.source });
+  assert.deepEqual((await second.service.listItems()).items[0], retired);
+  assert.equal(fixture.store.writes.length, writes);
+});
+
+function specialistScopeExit(sequence, overrides = {}) {
+  return prScopeLifecycleAssignment(sequence, prAssignment(sequence, {
+    eventType: "pull_request.left_scope", occurredAt: "2026-08-02T01:05:00.000Z",
+    gitFacts: { ...prGitFacts(PR_HEAD_A), relation: "authored" }, ...overrides,
+  }).event);
+}
+
+for (const boundary of ["relation", "account", "branch", "discovery scope"]) {
+  test(`trusted specialist scope exit preserves a different ${boundary}`, async () => {
+    const fixture = await createFixture({ records: [specialistPrAssignment(1, "developer")] });
+    await fixture.service.intake();
+    const before = (await fixture.service.listItems()).items[0];
+    const exit = specialistScopeExit(2, boundary === "discovery scope" ? { sourceScopeId: "other-account" }
+      : { gitFacts: { ...prGitFacts(PR_HEAD_A, boundary === "account" ? { sourceAccountId: "other-user" }
+        : boundary === "branch" ? { headRefName: "other/branch" } : {}),
+      relation: boundary === "relation" ? "review_requested" : "authored" } });
+    fixture.source.records.push(exit);
+    fixture.source.highWatermark = 2;
+    await fixture.service.intake();
+    assert.deepEqual((await fixture.service.listItems()).items[0], before);
+  });
+}
+
+test("historical scope recovery reads a retained multi-page tail without moving the intake cursor", async () => {
+  const fixture = await createFixture({ records: [specialistPrAssignment(1, "developer")] });
+  await fixture.service.intake();
+  const exit = specialistScopeExit(152);
+  fixture.source.records = [...Array.from({ length: 100 }, (_, index) => assignment(index + 52)), exit];
+  fixture.source.oldestAvailableSequence = 52;
+  fixture.source.highWatermark = 152;
+  fixture.source.override = request => {
+    if (request.afterSequence < 51) {
+      throw Object.assign(new Error("Old assignments retained from 52"), { code: "WORKFLOW_ASSIGNMENT_GAP", details: {
+        afterSequence: request.afterSequence, expectedSequence: request.afterSequence + 1,
+        oldestAvailableSequence: 52, highWatermark: 152,
+      } });
+    }
+    const items = fixture.source.records.filter(record => record.sequence > request.afterSequence).slice(0, request.limit);
+    return { items, nextSequence: items.at(-1)?.sequence ?? request.afterSequence, highWatermark: 152, oldestAvailableSequence: 52 };
+  };
+  persistConsumedPrLifecycle(fixture, exit);
+  const recovered = await createFixture({ store: fixture.store, source: fixture.source });
+  const [root] = (await recovered.service.listItems()).items;
+  assert.equal(root.source.scope.active, false);
+  assert.equal(root.source.scope.lastLifecycleEventId, exit.event.eventId);
+  assert.equal((await recovered.service.getSummary()).intakeCursor, 152);
+  assert.deepEqual(fixture.source.calls.slice(-2), [{ afterSequence: 51, limit: 100 }, { afterSequence: 151, limit: 1 }]);
+});
+
+for (const failure of ["missing tail", "later page unavailable"]) {
+  test(`historical scope recovery makes no partial write on ${failure} and retries normal intake`, async () => {
+    const fixture = await createFixture({ records: [specialistPrAssignment(1, "developer")] });
+    await fixture.service.intake();
+    const before = (await fixture.service.listItems()).items[0];
+    const exit = specialistScopeExit(2);
+    fixture.source.records.push(exit, ...Array.from({ length: 150 }, (_, index) => assignment(index + 3)));
+    fixture.source.highWatermark = 152;
+    persistConsumedPrLifecycle(fixture, { sequence: 152 });
+    let tailReads = 0;
+    fixture.source.override = request => {
+      if (request.afterSequence >= 101 && request.afterSequence < 152) {
+        tailReads += 1;
+        if (tailReads > 1) throw new Error("Recovery repeated a non-advancing tail");
+        if (failure === "later page unavailable") throw new Error("Retained source unavailable");
+        return { items: [], nextSequence: request.afterSequence, highWatermark: 152, oldestAvailableSequence: 1 };
+      }
+      const items = fixture.source.records.filter(record => record.sequence > request.afterSequence).slice(0, request.limit);
+      return { items, nextSequence: items.at(-1)?.sequence ?? request.afterSequence, highWatermark: 152, oldestAvailableSequence: 1 };
+    };
+    const writes = fixture.store.writes.length;
+    const recovered = await createFixture({ store: fixture.store, source: fixture.source });
+    assert.deepEqual((await recovered.service.listItems()).items[0], before);
+    assert.equal(fixture.store.writes.length, writes);
+    assert.equal(tailReads, 1, "an empty or unavailable tail stops without looping");
+    fixture.source.override = null;
+    await recovered.service.intake();
+    assert.equal((await recovered.service.listItems()).items[0].source.scope.active, false);
+    assert.equal((await recovered.service.getSummary()).intakeCursor, 152);
+  });
+}
+
+test("historical scope recovery preserves a later trusted discovery reentry without granting authority", async () => {
+  const fixture = await createFixture({ records: [specialistPrAssignment(1, "developer")] });
+  await fixture.service.intake();
+  const before = (await fixture.service.listItems()).items[0];
+  const reentry = prScopeLifecycleAssignment(3, prAssignment(3, { eventType: "pull_request.created",
+    occurredAt: "2026-08-02T01:10:00.000Z", gitFacts: { ...prGitFacts(PR_HEAD_A), relation: "authored" } }).event);
+  fixture.source.records.push(specialistScopeExit(2), reentry);
+  fixture.source.highWatermark = 3;
+  persistConsumedPrLifecycle(fixture, reentry);
+  const writes = fixture.store.writes.length;
+  const recovered = await createFixture({ store: fixture.store, source: fixture.source });
+  assert.deepEqual((await recovered.service.listItems()).items[0], before);
+  assert.equal(fixture.store.writes.length, writes);
+});
+
+test("historical scope recovery cannot revoke a later specialist assignment when its old join history is missing", async () => {
+  const fixture = await createFixture({ records: [specialistPrAssignment(1, "developer"), assignment(2),
+    specialistPrAssignment(3, "developer", "authored", { occurredAt: "2026-08-02T01:10:00.000Z" })] });
+  await fixture.service.intake();
+  const before = (await fixture.service.listItems()).items.find(root => root.kind === "source_root");
+  assert.equal(before.source.bindings.at(-1).sourceSequence, 3);
+  // The retained lifecycle predates the root's latest bound assignment; the
+  // missing discovery join cannot be reconstructed into a fresh revocation.
+  fixture.source.records = [specialistScopeExit(2), fixture.source.records[2]];
+  fixture.source.oldestAvailableSequence = 2;
+  const writes = fixture.store.writes.length;
+  const recovered = await createFixture({ store: fixture.store, source: fixture.source });
+  assert.deepEqual((await recovered.service.listItems()).items.find(root => root.itemId === before.itemId), before);
+  assert.equal(fixture.store.writes.length, writes);
+});
+
+test("historical automatic scope retirement preserves explicit owner work and deliberately paused work", async () => {
+  const fixture = await createFixture({ records: [specialistPrAssignment(1, "developer"),
+    specialistPrAssignment(2, "developer", "authored", { pullRequestNumber: 43 })] });
+  await fixture.service.intake();
+  let paused = (await fixture.service.listItems()).items.find(root => root.source.identity.pullRequestNumber === 43);
+  paused = await fixture.service.controlModelRun({ itemId: paused.itemId,
+    expectedRevision: paused.revision, leaseId: null, command: "pause" });
+  fixture.source.records.push(ownerRequestedPrAssignment(3));
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+  const owner = (await fixture.service.listItems()).items.find(root => root.source.scope.kind === "owner_requested");
+  const exit = specialistScopeExit(4);
+  fixture.source.records.push(exit, specialistScopeExit(5, { pullRequestNumber: 43 }));
+  fixture.source.highWatermark = 5;
+  persistConsumedPrLifecycle(fixture, { sequence: 5 });
+  const recovered = await createFixture({ store: fixture.store, source: fixture.source });
+  const roots = (await recovered.service.listItems()).items;
+  assert.deepEqual(roots.find(root => root.itemId === owner.itemId), owner);
+  assert.deepEqual(roots.find(root => root.itemId === paused.itemId), paused);
+  const retired = roots.find(root => root.source.scope.kind === "automatic" && root.source.identity.pullRequestNumber === 42);
+  assert.equal(retired.source.scope.active, false);
+  assert.equal(retired.source.scope.lastLifecycleEventId, exit.event.eventId);
+});
+
+test("historical scope recovery keeps sealed unknown side effects fenced while revoking their source", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  const sealed = await stageSealedPrReview(fixture);
+  const before = (await fixture.service.listItems()).items[0];
+  const outbox = (await fixture.service.listOutbox()).items;
+  const oldBinding = prExecutionBinding(before);
+  const exit = prScopeLifecycleAssignment(2, prAssignment(2, { eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z", gitFacts: prGitFacts(PR_HEAD_A) }).event);
+  fixture.source.records.push(exit);
+  fixture.source.highWatermark = 2;
+  persistConsumedPrLifecycle(fixture, exit);
+  const recovered = await createFixture({ store: fixture.store, source: fixture.source });
+  const [root] = (await recovered.service.listItems()).items;
+  assert.equal(root.source.scope.active, false);
+  assert.equal(root.status, "dispatch_pending");
+  assert.equal(root.statusReason, "pr_source_left_scope_pending_settlement");
+  assert.equal(root.activeIntentId, sealed.outbox.intentId);
+  assert.equal(root.attempt, before.attempt);
+  assert.deepEqual((await recovered.service.listOutbox()).items, outbox);
+  await assert.rejects(recovered.service.verifyPullRequestExecutionBinding(oldBinding),
+    error => error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE");
+});
+
+for (const recoveredExit of [false, true]) {
+  test(`one trusted exit shared by automatic developer and tester preserves independent owner authority (recovery=${recoveredExit})`, async () => {
+    const fixture = await createFixture({ records: [specialistPrAssignment(1, "developer"),
+      specialistPrAssignment(2, "tester"), ownerRequestedPrAssignment(3)] });
+    await fixture.service.intake();
+    const owner = (await fixture.service.listItems()).items.find(root => root.source.scope.kind === "owner_requested");
+    const ownerBinding = prExecutionBinding(owner);
+    assert.deepEqual(await fixture.service.verifyPullRequestExecutionBinding(ownerBinding), ownerBinding);
+    const exit = specialistScopeExit(4, { headRefOid: PR_HEAD_B,
+      gitFacts: { ...prGitFacts(PR_HEAD_B), relation: "authored" } });
+    fixture.source.records.push(exit);
+    fixture.source.highWatermark = 4;
+    if (recoveredExit) persistConsumedPrLifecycle(fixture, exit);
+    else await fixture.service.intake();
+    const restarted = await createFixture({ store: fixture.store, source: fixture.source });
+    const roots = (await restarted.service.listItems()).items;
+    assert.equal(roots.filter(root => root.source.scope.kind === "automatic" && !root.source.scope.active).length, 2);
+    assert.deepEqual(roots.find(root => root.itemId === owner.itemId), owner);
+    assert.deepEqual(await restarted.service.verifyPullRequestExecutionBinding(ownerBinding), ownerBinding);
+  });
+}
+
+for (const limit of [1, 100]) for (const lifecycleFirst of [false, true]) for (const reentryHead of [PR_HEAD_A, PR_HEAD_B]) {
+test(`shared lifecycle history admits only proven routed reentry (limit=${limit}, lifecycleFirst=${lifecycleFirst}, proven=${reentryHead === PR_HEAD_A})`, async () => {
+  const fixture = await createFixture({ records: [specialistPrAssignment(1, "developer"), specialistPrAssignment(2, "tester")] });
+  await fixture.service.intake();
+  fixture.source.records.push(specialistScopeExit(3));
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+  const route = specialistPrAssignment(lifecycleFirst ? 5 : 4, "developer", "authored", {
+    eventType: "pull_request.created", occurredAt: "2026-08-02T01:20:00.000Z", headRefOid: reentryHead,
+    gitFacts: { ...prGitFacts(reentryHead), relation: "authored", actionState: "action_now", nextAction: "address_review" } });
+  const lifecycle = prScopeLifecycleAssignment(lifecycleFirst ? 4 : 5, route.event);
+  fixture.source.records.push(...(lifecycleFirst ? [lifecycle, route] : [route, lifecycle]));
+  fixture.source.highWatermark = 5;
+  await fixture.service.intake({ limit });
+  if (limit === 1) {
+    const intermediate = (await fixture.service.listItems()).items.find(item => item.currentTarget.id === "developer");
+    if (lifecycleFirst) assert.equal(intermediate.status, "blocked");
+    await assert.rejects(fixture.service.claim({ itemId: intermediate.itemId, expectedRevision: intermediate.revision,
+      workerId: "employee-developer", leaseDurationMs: 30_000 }));
+    await fixture.service.intake({ limit });
+  }
+  const root = (await fixture.service.listItems()).items.find(item => item.currentTarget.id === "developer");
+  const tester = (await fixture.service.listItems()).items.find(item => item.currentTarget.id === "tester");
+  assert.equal(tester.source.scope.active, false);
+  if (reentryHead !== PR_HEAD_A) {
+    assert.equal(root.source.scope.active, false);
+    assert.equal(root.source.current.headRefOid, PR_HEAD_A);
+    assert.equal(pullRequestHeadAdmission(fixture.store.stored(), root).current, false);
+    return;
+  }
+  assert.equal(root.status, "queued");
+  assert.equal(root.source.scope.active, true);
+  const binding = prExecutionBinding(root);
+  assert.deepEqual(await fixture.service.verifyPullRequestExecutionBinding(binding), binding);
+  const restarted = await createFixture({ store: fixture.store, source: fixture.source });
+  assert.deepEqual(await restarted.service.verifyPullRequestExecutionBinding(binding), binding);
+});
+}
+
+test("a new trusted lifecycle anchor recognizes identical legacy PR engineer history without rewriting it", async () => {
+  const engineer = prAssignment(3, { gitFacts: { ...prGitFacts(PR_HEAD_A), relation: "authored" } });
+  const fixture = await createFixture({ records: [specialistPrAssignment(1, "developer"),
+    specialistPrAssignment(2, "tester"), engineer, ownerRequestedPrAssignment(4)] });
+  await fixture.service.intake();
+  fixture.source.records.push(specialistScopeExit(5, { headRefOid: PR_HEAD_B,
+    gitFacts: { ...prGitFacts(PR_HEAD_B), relation: "authored" } }));
+  fixture.source.highWatermark = 5;
+  await fixture.service.intake();
+  const state = fixture.store.stored();
+  const legacy = state.items.find(item => item.source.scope.kind === "automatic" && item.currentTarget.id === "pr-engineer");
+  delete legacy.source.bindings.at(-1).scopeLifecycle;
+  const legacyBefore = clone(legacy);
+  const owner = state.items.find(item => item.source.scope.kind === "owner_requested");
+  assert.notEqual(pullRequestTrustedPredecessor(state, owner), null);
+  assert.equal(pullRequestHeadAdmission(state, owner).current, true);
+  assert.deepEqual(legacy, legacyBefore);
+  for (const invalidProof of ["all unmarked", "unmarked specialist", "duplicate role"]) {
+    const altered = clone(state);
+    const automatic = altered.items.filter(item => item.source.scope.kind === "automatic");
+    if (invalidProof === "all unmarked") for (const item of automatic) delete item.source.bindings.at(-1).scopeLifecycle;
+    if (invalidProof === "unmarked specialist") {
+      automatic.find(item => item.currentTarget.id === "pr-engineer").source.bindings.at(-1).scopeLifecycle = true;
+      delete automatic.find(item => item.currentTarget.id === "developer").source.bindings.at(-1).scopeLifecycle;
+    }
+    if (invalidProof === "duplicate role") altered.items.push(clone(automatic.find(item => item.currentTarget.id === "developer")));
+    assert.equal(pullRequestTrustedPredecessor(altered, owner), null, invalidProof);
+  }
+  const route = specialistPrAssignment(6, "developer", "authored", {
+    eventType: "pull_request.created", occurredAt: "2026-08-02T01:20:00.000Z" });
+  fixture.source.records.push(route, prScopeLifecycleAssignment(7, route.event));
+  fixture.source.highWatermark = 7;
+  await fixture.service.intake();
+  const reentered = fixture.store.stored();
+  const historicalEngineer = reentered.items.find(item => item.itemId === legacy.itemId);
+  delete historicalEngineer.source.bindings.find(binding => binding.eventId === legacy.source.scope.lastLifecycleEventId).scopeLifecycle;
+  const developer = reentered.items.find(item => item.currentTarget.id === "developer");
+  assert.notEqual(pullRequestTrustedPredecessor(reentered, developer), null);
+  assert.equal(pullRequestHeadAdmission(reentered, developer).current, true);
+});
+
+test("shared lifecycle proof keeps legacy bindings intact and rejects conflicting or unmarked duplicate sequences", async () => {
+  const fixture = await createFixture({ records: [specialistPrAssignment(1, "developer"),
+    specialistPrAssignment(2, "tester"), ownerRequestedPrAssignment(3)] });
+  await fixture.service.intake();
+  fixture.source.records.push(specialistScopeExit(4, { headRefOid: PR_HEAD_B,
+    gitFacts: { ...prGitFacts(PR_HEAD_B), relation: "authored" } }));
+  fixture.source.highWatermark = 4;
+  await fixture.service.intake();
+  const state = fixture.store.stored();
+  const automatic = state.items.filter(item => item.source.scope.kind === "automatic");
+  const owner = state.items.find(item => item.source.scope.kind === "owner_requested");
+  assert.notEqual(pullRequestTrustedPredecessor(state, owner), null);
+  for (const item of automatic) {
+    assert.equal(Object.hasOwn(item.source.bindings[0], "scopeLifecycle"), false);
+    assert.equal(item.source.bindings.at(-1).scopeLifecycle, true);
+  }
+  for (const tamper of ["unmarked", "assignment digest", "event digest", "owner scope"]) {
+    const altered = clone(state);
+    const source = altered.items.find(item => item.itemId === automatic[0].itemId).source;
+    if (tamper === "unmarked") delete source.bindings.at(-1).scopeLifecycle;
+    if (tamper === "assignment digest") source.bindings.at(-1).assignmentDigest = "f".repeat(64);
+    if (tamper === "event digest") source.revisions.at(-1).eventDigest = "f".repeat(64);
+    if (tamper === "owner scope") source.scope.kind = "owner_requested";
+    if (tamper === "assignment digest" || tamper === "event digest") {
+      assert.doesNotThrow(() => normalizePullRequestWorkSource(source), "the duplicate authority check owns this conflict");
+    }
+    assert.equal(pullRequestTrustedPredecessor(altered, altered.items.find(item => item.itemId === owner.itemId)), null, tamper);
+  }
+  for (const invalidMarker of [false, "unknown", { kind: "scope" }]) {
+    const source = clone(automatic[0].source);
+    source.bindings.at(-1).scopeLifecycle = invalidMarker;
+    assert.throws(() => normalizePullRequestWorkSource(source), error => error.code === "WORK_LEDGER_PR_SOURCE_INVALID");
+  }
+  const unknownField = clone(automatic[0].source);
+  unknownField.bindings.at(-1).unknownLifecycleProof = true;
+  assert.throws(() => normalizePullRequestWorkSource(unknownField), error => error.code === "WORK_LEDGER_PR_SOURCE_INVALID");
 });
 
 test("an authored PR can hand off from review to self-fix and then testing", async () => {

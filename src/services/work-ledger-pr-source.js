@@ -76,37 +76,39 @@ const AUTHORED_PR_SELF_FIX_ACTIONS = new Set([
   "continue_draft",
 ]);
 
-function isTrustedPrRoleAssignment(assignment, event) {
+function trustedPrRoleForEvent(event) {
   if (
     event?.source?.provider !== "github" ||
-    !["authored", "review_requested"].includes(event?.payload?.relation) ||
-    assignment?.target?.type !== "role"
+    !["authored", "review_requested"].includes(event?.payload?.relation)
   ) {
-    return false;
+    return null;
   }
   if (
-    assignment.ruleId === AUTHORED_PR_SELF_FIX_RULE_ID &&
-    assignment.target.id === "developer" &&
-    event.payload.relation === "authored"
+    event.payload.relation === "authored" &&
+    event.payload.actionState === "action_now" &&
+    AUTHORED_PR_SELF_FIX_ACTIONS.has(event.payload.nextAction)
   ) {
-    return event.payload.actionState === "action_now" &&
-      AUTHORED_PR_SELF_FIX_ACTIONS.has(event.payload.nextAction);
+    return { roleId: "developer", ruleId: AUTHORED_PR_SELF_FIX_RULE_ID };
   }
   const authoredApproved =
-    assignment.ruleId === AUTHORED_PR_APPROVED_RULE_ID &&
-    assignment.target.id === "tester" &&
     event.payload.relation === "authored" &&
     event.payload.actionState === "waiting_other" &&
     event.payload.nextAction === "wait_merge" &&
     event.payload.reviewDecision === "APPROVED";
   const reviewedApproved =
-    assignment.ruleId === REVIEWED_PR_APPROVED_RULE_ID &&
-    assignment.target.id === "tester" &&
     event.payload.relation === "review_requested" &&
     event.payload.actionState === "waiting_other" &&
     event.payload.nextAction === "wait_merge" &&
     event.payload.myReviewState === "APPROVED";
-  return authoredApproved || reviewedApproved;
+  if (authoredApproved) return { roleId: "tester", ruleId: AUTHORED_PR_APPROVED_RULE_ID };
+  if (reviewedApproved) return { roleId: "tester", ruleId: REVIEWED_PR_APPROVED_RULE_ID };
+  return null;
+}
+
+function isTrustedPrRoleAssignment(assignment, event) {
+  const role = trustedPrRoleForEvent(event);
+  return role !== null && assignment?.target?.type === "role" &&
+    assignment.target.id === role.roleId && assignment.ruleId === role.ruleId;
 }
 const CURRENT_KEYS = [
   "sourceSequence",
@@ -151,6 +153,7 @@ const BINDING_KEYS = [
   "eventId",
   "inputRevision",
 ];
+const SCOPE_LIFECYCLE_BINDING_KEYS = [...BINDING_KEYS, "scopeLifecycle"];
 const INPUT_BINDING_KEYS = [
   "kind",
   "rootItemId",
@@ -338,7 +341,7 @@ function sourceInputDigest(workKey, event) {
   return ledgerDigest({ workKey, event }, { maximumEntries: 30_000 });
 }
 
-function identityFor(assignment, event, trustedLifecycle = false) {
+function identityFor(assignment, event, trustedLifecycle = false, lifecycleRoleId = "pr-engineer") {
   let target;
   try {
     target = normalizeLedgerTarget(assignment.target);
@@ -375,7 +378,7 @@ function identityFor(assignment, event, trustedLifecycle = false) {
       event.subject.number,
       "pullRequestNumber",
     ),
-    targetRoleId: trustedLifecycle ? "pr-engineer" : target.id,
+    targetRoleId: trustedLifecycle ? lifecycleRoleId : target.id,
   };
 }
 
@@ -383,7 +386,7 @@ function workKeyFor(identity) {
   return `pr-work-${ledgerDigest(identity)}`;
 }
 
-function normalizedEnvelope(value) {
+function normalizedEnvelope(value, lifecycleRoleId = "pr-engineer") {
   const sequence = positiveInteger(value.sequence, "sourceSequence");
   const assignment = canonical(value.assignment, "assignment");
   const rawEvent = canonical(value.event, "event");
@@ -424,7 +427,7 @@ function normalizedEnvelope(value) {
   ) {
     return null;
   }
-  const identity = identityFor(assignment, event, trustedLifecycle);
+  const identity = identityFor(assignment, event, trustedLifecycle, lifecycleRoleId);
   if (identity === null) return null;
   const assignmentId = text(
     assignment.assignmentId,
@@ -484,6 +487,7 @@ function bindingFrom(input, inputRevision) {
     assignmentDigest: input.assignmentDigest,
     eventId: input.event.eventId,
     inputRevision,
+    ...(input.trustedLifecycle ? { scopeLifecycle: true } : {}),
   };
 }
 
@@ -501,6 +505,35 @@ function currentFrom(input) {
 
 export function pullRequestWorkDescriptor(envelope) {
   return normalizedEnvelope(envelope);
+}
+
+export function pullRequestScopeLifecycleTargetRole(envelope) {
+  const input = normalizedEnvelope(envelope);
+  if (input === null || !input.trustedLifecycle) return null;
+  return trustedPrRoleForEvent(input.event)?.roleId ?? "pr-engineer";
+}
+
+export function pullRequestScopeLifecycleMatchesSource(source, envelope) {
+  if (source?.kind !== "pull_request" || source.scope.kind !== "automatic") return false;
+  const event = envelope.event;
+  if (source.identity.provider !== event.source?.provider ||
+      source.identity.scopeId !== event.source?.scopeId ||
+      source.identity.subjectId !== event.subject?.id ||
+      source.identity.repository !== event.subject?.repository ||
+      source.identity.pullRequestNumber !== event.subject?.number) return false;
+  const input = normalizedEnvelope(envelope, source.identity.targetRoleId);
+  if (input === null || !input.trustedLifecycle || input.workKey !== source.workKey) return false;
+  const observed = latestObservedInput(source).event;
+  if (observed.payload.relation !== input.event.payload.relation) return false;
+  if (source.identity.targetRoleId === "pr-engineer") return true;
+  // Specialist routes share the discovery lane, not the PR engineer work key.
+  // Bind that lane to its account and refs without trusting a changed Head.
+  const previousTarget = observed.payload.gitTarget;
+  const lifecycleTarget = input.event.payload.gitTarget;
+  return ["authored", "review_requested"].includes(observed.payload.relation) &&
+    previousTarget !== undefined && lifecycleTarget !== undefined &&
+    ["sourceAccountId", "baseRepository", "baseRefName", "headRepository", "headRefName"]
+      .every(key => typeof previousTarget[key] === "string" && previousTarget[key] === lifecycleTarget[key]);
 }
 
 export function createPullRequestWorkSource(envelope) {
@@ -611,7 +644,7 @@ export function appendPullRequestWorkSource(
     ? null
     : head(causalHeadRefOid, "causalHeadRefOid");
   const source = normalizePullRequestWorkSource(value);
-  const input = normalizedEnvelope(envelope);
+  const input = normalizedEnvelope(envelope, source.identity.targetRoleId);
   if (input === null || input.workKey !== source.workKey) {
     throw invalid("PR 来源工作键不一致");
   }
@@ -733,13 +766,22 @@ export function appendPullRequestWorkSource(
   };
 }
 
+function acceptedCreatedLifecycleJoin(source, eventId) {
+  const revision = source.revisions[source.activeRevision - 1];
+  const previousLifecycle = source.revisions.find(candidate => candidate.eventId === source.scope.lastLifecycleEventId);
+  return source.scope.active === false && source.current.eventId === eventId &&
+    source.current.event.eventType === "pull_request.created" &&
+    revision.disposition === "accepted" && revision.authorityEpochChanged === true &&
+    previousLifecycle !== undefined && revision.revision > previousLifecycle.revision;
+}
+
 export function applyPullRequestScopeLifecycle(value, envelope, { attemptAtActivation } = {}) {
   const source = normalizePullRequestWorkSource(value);
-  const input = normalizedEnvelope(envelope);
+  const input = normalizedEnvelope(envelope, source.identity.targetRoleId);
   if (input === null || !input.trustedLifecycle) {
     throw invalid("PR 范围生命周期分派无效");
   }
-  if (input.workKey !== source.workKey) {
+  if (!pullRequestScopeLifecycleMatchesSource(source, envelope)) {
     throw invalid("PR 范围生命周期工作键不一致");
   }
   const active = input.event.eventType === "pull_request.created";
@@ -758,7 +800,8 @@ export function applyPullRequestScopeLifecycle(value, envelope, { attemptAtActiv
     appended.disposition !== "accepted";
   const appliedAuthorityChange =
     authorityChanged &&
-    (appended.disposition === "accepted" || rejectedRevocation);
+    (appended.disposition === "accepted" || rejectedRevocation ||
+      (appended.disposition === "bound_existing_event" && acceptedCreatedLifecycleJoin(source, input.event.eventId)));
   const revisions = rejectedRevocation
     ? [
         ...appended.source.revisions.slice(0, -1),
@@ -946,7 +989,10 @@ function applyLegacyAuthorityCutover(revisions) {
 }
 
 function normalizeBinding(value, revisionsByEvent, previousSequence) {
-  exact(value, BINDING_KEYS, "PR assignment binding");
+  const scopeLifecycle = hasExactLedgerKeys(value, SCOPE_LIFECYCLE_BINDING_KEYS);
+  if (scopeLifecycle) {
+    if (value.scopeLifecycle !== true) throw invalid("PR lifecycle binding 证明无效");
+  } else exact(value, BINDING_KEYS, "PR assignment binding");
   const sourceSequence = positiveInteger(
     value.sourceSequence,
     "binding.sourceSequence",
@@ -971,6 +1017,7 @@ function normalizeBinding(value, revisionsByEvent, previousSequence) {
     ),
     eventId,
     inputRevision,
+    ...(scopeLifecycle ? { scopeLifecycle: true } : {}),
   };
 }
 
@@ -1095,6 +1142,7 @@ export function normalizePullRequestWorkSource(value) {
   });
   if (
     bindings.length === 0 ||
+    (scope.kind !== "automatic" && bindings.some(binding => binding.scopeLifecycle === true)) ||
     new Set(bindings.map(({ assignmentId }) => assignmentId)).size !==
       bindings.length
   ) {
@@ -1450,6 +1498,7 @@ function subjectSourceObservations(item) {
       return {
         item,
         source,
+        binding,
         sourceSequence: binding.sourceSequence,
         revision,
         pointer,
@@ -1457,6 +1506,23 @@ function subjectSourceObservations(item) {
       };
     }),
   };
+}
+
+function samePullRequestLifecycleObservation(left, right) {
+  const leftMarked = left.binding.scopeLifecycle === true;
+  const rightMarked = right.binding.scopeLifecycle === true;
+  const trustedBindingProof = (leftMarked && rightMarked) ||
+    (leftMarked && !rightMarked && right.source.identity.targetRoleId === "pr-engineer") ||
+    (rightMarked && !leftMarked && left.source.identity.targetRoleId === "pr-engineer");
+  return left.source.scope.kind === "automatic" && right.source.scope.kind === "automatic" &&
+    trustedBindingProof &&
+    left.source.identity.targetRoleId !== right.source.identity.targetRoleId &&
+    ["provider", "scopeId", "subjectId", "repository", "pullRequestNumber"]
+      .every(key => left.source.identity[key] === right.source.identity[key]) &&
+    ["assignmentId", "assignmentDigest", "eventId"]
+      .every(key => left.binding[key] === right.binding[key]) &&
+    ["eventDigest", "occurredAt", "headRefOid", "previousHeadRefOid"]
+      .every(key => left.revision[key] === right.revision[key]);
 }
 
 function evaluatePullRequestSubjectAuthority(state, root, preserveInactiveHistory = true) {
@@ -1472,16 +1538,13 @@ function evaluatePullRequestSubjectAuthority(state, root, preserveInactiveHistor
   const observations = candidates
     .flatMap(({ observations: entries }) => entries)
     .sort((left, right) => left.sourceSequence - right.sourceSequence);
-  if (
-    observations.length === 0 ||
-    observations.some(
-      (observation, index) =>
-        index > 0 &&
-        observation.sourceSequence ===
-          observations[index - 1].sourceSequence,
-    )
-  ) {
-    return null;
+  if (observations.length === 0) return null;
+  const observationsBySequence = new Map();
+  for (const observation of observations) {
+    const sameSequence = observationsBySequence.get(observation.sourceSequence) ?? [];
+    if (sameSequence.some(previous => !samePullRequestLifecycleObservation(previous, observation))) return null;
+    sameSequence.push(observation);
+    observationsBySequence.set(observation.sourceSequence, sameSequence);
   }
   const markerRequired = candidates.some(({ source }) =>
     [source.current, source.pending]
@@ -1832,6 +1895,12 @@ function validPullRequestScopeTransition(previousSource, nextSource) {
     return isDeepStrictEqual(previousScope, nextScope);
   }
   const advances = nextScope.revision - previousScope.revision;
+  if (advances === 1 && nextScope.active === true &&
+      acceptedCreatedLifecycleJoin(previousSource, nextScope.lastLifecycleEventId) &&
+      nextSource.authorityEpoch === previousSource.authorityEpoch &&
+      nextSource.bindings.slice(previousSource.bindings.length).some(binding =>
+        binding.scopeLifecycle === true && binding.eventId === nextScope.lastLifecycleEventId &&
+        binding.inputRevision === previousSource.activeRevision)) return true;
   const appendedRevisions = nextSource.revisions.slice(
     previousSource.revisions.length,
   );
