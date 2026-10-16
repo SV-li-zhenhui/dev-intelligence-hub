@@ -77,8 +77,8 @@ function validRequest(message) {
 
 // The endpoint owns no filesystem/GitHub authority. Its opaque callbacks bind
 // every tool invocation to current durable job state and controlled execution.
-export async function createCodeJobExecutionMcp(context, { signal = null } = {}) {
-  const session = beginCodeExecutionSession(context, { signal });
+export async function createCodeJobExecutionMcp(context, { signal = null, watchdog = null } = {}) {
+  const session = beginCodeExecutionSession(context, { signal, watchdog });
   const endpointPath = `/code-execution/${randomBytes(32).toString("hex")}`;
   const mutations = new Map();
   const admittedResponses = new Set();

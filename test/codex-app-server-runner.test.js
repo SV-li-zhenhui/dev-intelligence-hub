@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -8,6 +10,8 @@ import { ManagedProcess } from '../src/lib/managed-process.js';
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { withTaskExecution } from '../src/lib/task-execution-context.js';
 import { createTestSupervisedProcessRunner } from '../src/lib/supervised-process-runner.js';
+import { createCodeExecutionWatchdog, closeCodeExecutionWatchdog } from '../src/lib/code-execution-watchdog.js';
+import { ContainedStdioProcess } from '../src/lib/contained-stdio-process.js';
 const threadId='01973bca-3d8b-7000-a000-123456789abc';
 
 test('late native activity after failure cannot change runtime receipts while reap drains',async()=>{
@@ -27,7 +31,7 @@ test('production app-server certifies invalid invocations as not started',async(
   const runner=new CodexAppServerRunner({materialize:async()=>assert.fail('must not materialize or spawn')});
   await assert.rejects(runner.run({}),error=>error.code==='STRUCTURED_PROVIDER_UNAVAILABLE' && didAppServerNotStart(error));
 });
-function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null,initializationFailure=false,codeJob=false,toolInventory=null,onInterrupt=null}={}) {
+function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null,initializationFailure=false,codeJob=false,toolInventory=null,onInterrupt=null,contained=false}={}) {
   let options; const calls=[]; let finish,interruptId,signalStopping;
   const stopping=new Promise(resolve=>{signalStopping=resolve;});
   const done = new Promise((r)=>{finish=r;});
@@ -55,16 +59,175 @@ function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=fals
     if(request.method==='turn/start' && !hold)queueMicrotask(complete);
     if(request.method==='turn/interrupt')queueMicrotask(()=>send({method:'turn/completed',params:{threadId,turn:{id:'turn-1',status:'interrupted'}}}));
   },async stop(){signalStopping();await stopGate?.promise;if(stopFailure)throw new Error('not confirmed');this.exited=true;finish({code:0,signal:null});}};
-  return {runner:new CodexAppServerRunner({processFactory:()=>process,materialize:async()=>({command:'codex',prefixArgs:[]})}),calls,complete,send,stopping,
+  let reaps = 0;
+  let runner = new CodexAppServerRunner({processFactory:()=>process,materialize:async()=>({command:'codex',prefixArgs:[]})});
+  if (contained) {
+    const child = new EventEmitter(); child.pid = 424242;
+    child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
+    options = { onLine: frame => child.stdout.write(frame.line + '\n') };
+    child.stdin.on('data', chunk => process.write(chunk.toString()));
+    child.stdin.on('finish', () => child.emit('close', 0, null));
+    const supervised = createTestSupervisedProcessRunner({ platform: 'linux', spawnImpl: () => child,
+      descriptorMaterializer: async () => ({ command: globalThis.process.execPath, prefixArgs: [] }),
+      treeTerminator: async () => { reaps++; child.emit('close', 0, null); } });
+    runner = new CodexAppServerRunner({ processFactory: () => new ContainedStdioProcess(supervised), materialize: async () => null });
+  }
+  return {runner,calls,complete,send,stopping,reaps:()=>reaps,
     acknowledgeInterrupt:()=>send({id:interruptId,result:{}}),
     interrupted:()=>send({method:'turn/completed',params:{threadId,turn:{id:'turn-1',status:'interrupted'}}})};
 }
 async function invocation(runner,execute=(run)=>run(),appServerOverrides={}) {
   const directory=await mkdtemp(path.join(tmpdir(),'dih-app-server-'));
+  const codeExecutionWatchdog = appServerOverrides.isolation?.channel === 'code-job' ? createCodeExecutionWatchdog({ startupMs: 1000 }) : null;
   try{return await execute(()=>runner.run({executable:{},args:['app-server'],cwd:directory,env:{},timeoutMs:1000,
+    ...(codeExecutionWatchdog ? { codeExecutionWatchdog } : {}),
     appServer:{input:'safe task',model:'test-model',schema:{type:'object'},previous:null,...appServerOverrides}}),directory);}
-  finally{await rm(directory,{recursive:true,force:true});}
+  finally{if (codeExecutionWatchdog) closeCodeExecutionWatchdog(codeExecutionWatchdog); await rm(directory,{recursive:true,force:true});}
 }
+
+for (const contained of [false, true]) test(`useful current-turn native code progress remains active beyond ten hours with contained supervision ${contained}`, async t => {
+  const f = fixture({ hold: true, codeJob: true, contained });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  await invocation(f.runner, async run => {
+    const running = run(); void running.catch(() => {});
+    for (let attempts = 0; attempts < 100 && !f.calls.some(call => call.method === 'turn/start'); attempts++) await new Promise(resolve => setImmediate(resolve));
+    if (!f.calls.some(call => call.method === 'turn/start')) await running;
+    await new Promise(resolve => setImmediate(resolve));
+    for (let index = 0; index < 61; index++) {
+      f.send({ method: 'item/agentMessage/delta', params: { threadId, turnId: 'turn-1', itemId: `reasoning-${index}`, delta: 'Verified a distinct task step.' } });
+      t.mock.timers.tick(10 * 60_000);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(await Promise.race([running.then(() => 'finished', () => 'failed'), Promise.resolve('running')]), 'running');
+    }
+    f.complete(); return running;
+  }, { isolation: { channel: 'code-job', execution: { url: 'http://127.0.0.1/private', revoke() {} } } });
+  if (contained) assert.equal(f.reaps(), 1, 'success retains actual tree-reap proof');
+});
+
+for (const [label, message] of [
+  ['unknown', { method: 'watchdog/heartbeat', params: { threadId, turnId: 'turn-1' } }],
+  ['ping', { method: 'ping', params: { threadId, turnId: 'turn-1' } }],
+  ['stale thread', { method: 'item/agentMessage/delta', params: { threadId: 'different', turnId: 'turn-1', itemId: 'message', delta: 'stale' } }],
+  ['stale turn', { method: 'item/agentMessage/delta', params: { threadId, turnId: 'turn-old', itemId: 'message', delta: 'stale' } }],
+  ['missing turn', { method: 'item/agentMessage/delta', params: { threadId, itemId: 'message', delta: 'unbound' } }],
+  ['empty reasoning', { method: 'item/reasoning/textDelta', params: { threadId, turnId: 'turn-1', itemId: 'reason', delta: '' } }],
+  ['malformed reasoning', { method: 'item/reasoning/textDelta', params: { threadId, turnId: 'turn-1', itemId: 'reason', contentIndex: '0', delta: 'unvalidated' } }],
+  ['native tool polling', { method: 'item/started', params: { threadId, turnId: 'turn-1', item: { id: 'poll', type: 'mcpToolCall', tool: 'get_state' } } }],
+  ['native MCP progress', { method: 'item/mcpToolCall/progress', params: { threadId, turnId: 'turn-1', itemId: 'poll', message: 'still polling' } }],
+]) test(`${label} native notifications cannot renew code execution inactivity`, async t => {
+  const f = fixture({ hold: true, codeJob: true });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  await assert.rejects(invocation(f.runner, async run => {
+    const running = run(); void running.catch(() => {});
+    while (!f.calls.some(call => call.method === 'turn/start')) await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    t.mock.timers.tick(14 * 60_000); f.send(message); t.mock.timers.tick(60_000);
+    return running;
+  }, { isolation: { channel: 'code-job', execution: { url: 'http://127.0.0.1/private', revoke() {} } } }),
+  error => error.code === 'STRUCTURED_PROVIDER_IDLE_TIMEOUT' && didAppServerReap(error));
+});
+
+for (const method of ['item/started', 'item/completed']) for (const type of ['reasoning', 'agentMessage']) {
+  const notification = id => ({ method, params: { threadId, turnId: 'turn-1', item: { id, type, text: 'Checked source evidence.' } } });
+  test(`fresh ${method} ${type} items renew code inactivity`, async t => {
+    const f = fixture({ hold: true, codeJob: true });
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    await invocation(f.runner, async run => {
+      const running = run(); let settled = false;
+      void running.then(() => { settled = true; }, () => { settled = true; });
+      while (!f.calls.some(call => call.method === 'turn/start')) await new Promise(resolve => setImmediate(resolve));
+      await new Promise(resolve => setImmediate(resolve));
+      for (const id of ['first', 'second']) {
+        t.mock.timers.tick(14 * 60_000); f.send(notification(id));
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(settled, false);
+      }
+      t.mock.timers.tick(14 * 60_000);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(settled, false);
+      f.complete(); return running;
+    }, { isolation: { channel: 'code-job', execution: { url: 'http://127.0.0.1/private', revoke() {} } } });
+  });
+  test(`repeated ${method} ${type} items cannot renew code inactivity`, async t => {
+    const f = fixture({ hold: true, codeJob: true });
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    await assert.rejects(invocation(f.runner, async run => {
+      const running = run(); void running.catch(() => {});
+      while (!f.calls.some(call => call.method === 'turn/start')) await new Promise(resolve => setImmediate(resolve));
+      await new Promise(resolve => setImmediate(resolve));
+      t.mock.timers.tick(14 * 60_000); f.send(notification('same'));
+      t.mock.timers.tick(14 * 60_000); f.send(notification('same'));
+      t.mock.timers.tick(60_000); return running;
+    }, { isolation: { channel: 'code-job', execution: { url: 'http://127.0.0.1/private', revoke() {} } } }),
+    error => error.code === 'STRUCTURED_PROVIDER_IDLE_TIMEOUT' && didAppServerReap(error));
+  });
+}
+
+test('changed native plan steps renew code inactivity', async t => {
+  const f = fixture({ hold: true, codeJob: true });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  await invocation(f.runner, async run => {
+    const running = run(); let settled = false;
+    void running.then(() => { settled = true; }, () => { settled = true; });
+    while (!f.calls.some(call => call.method === 'turn/start')) await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    for (const status of ['pending', 'inProgress', 'completed']) {
+      t.mock.timers.tick(14 * 60_000);
+      f.send({ method: 'turn/plan/updated', params: { threadId, turnId: 'turn-1', plan: [{ step: 'Verify repair', status }] } });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(settled, false);
+    }
+    t.mock.timers.tick(14 * 60_000);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, false);
+    f.complete(); return running;
+  }, { isolation: { channel: 'code-job', execution: { url: 'http://127.0.0.1/private', revoke() {} } } });
+});
+
+for (const [label, repeatedPlan] of [
+  ['identical', [{ step: 'Verify repair', status: 'pending' }]],
+  ['empty', []],
+  ['blank step', [{ step: ' ', status: 'inProgress' }]],
+  ['unknown status', [{ step: 'Verify repair', status: 'heartbeat' }]],
+]) test(`${label} native plans cannot renew code inactivity`, async t => {
+  const f = fixture({ hold: true, codeJob: true });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  await assert.rejects(invocation(f.runner, async run => {
+    const running = run(); void running.catch(() => {});
+    while (!f.calls.some(call => call.method === 'turn/start')) await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    t.mock.timers.tick(14 * 60_000);
+    f.send({ method: 'turn/plan/updated', params: { threadId, turnId: 'turn-1', plan: [{ step: 'Verify repair', status: 'pending' }] } });
+    t.mock.timers.tick(14 * 60_000);
+    f.send({ method: 'turn/plan/updated', params: { threadId, turnId: 'turn-1', plan: repeatedPlan } });
+    t.mock.timers.tick(60_000); return running;
+  }, { isolation: { channel: 'code-job', execution: { url: 'http://127.0.0.1/private', revoke() {} } } }),
+  error => error.code === 'STRUCTURED_PROVIDER_IDLE_TIMEOUT' && didAppServerReap(error));
+});
+
+test('ordinary native Review retains its elapsed request deadline and reap gate', async t => {
+  const f = fixture({ hold: true }); t.mock.timers.enable({ apis: ['setTimeout'] });
+  await assert.rejects(invocation(f.runner, async run => {
+    const running = run(); void running.catch(() => {});
+    while (!f.calls.some(call => call.method === 'turn/start')) await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve)); t.mock.timers.tick(1000); return running;
+  }), error => error.code === 'STRUCTURED_PROVIDER_TIMEOUT' && didAppServerReap(error));
+});
+
+test('code native channels reject missing, forged and serialized watchdogs before starting', async t => {
+  const watchdog = createCodeExecutionWatchdog({ startupMs: 1000 }); t.after(() => closeCodeExecutionWatchdog(watchdog));
+  let starts = 0;
+  const runner = new CodexAppServerRunner({ processFactory: () => { starts++; throw new Error('must not start'); } });
+  for (const value of [null, {}, structuredClone(watchdog)]) {
+    await assert.rejects(runner.run({ executable: {}, args: [], timeoutMs: 1000, codeExecutionWatchdog: value,
+      appServer: { isolation: { channel: 'code-job', execution: { url: 'http://127.0.0.1/private', revoke() {} } } } }),
+    error => error.code === 'STRUCTURED_PROVIDER_UNAVAILABLE' && didAppServerNotStart(error));
+  }
+  assert.equal(starts, 0);
+  const contained = new ContainedStdioProcess({ run() { starts++; throw new Error('must not start'); } });
+  await assert.rejects(contained.start({ codeExecutionWatchdog: structuredClone(watchdog) }), /watchdog is invalid/);
+  assert.equal(starts, 0);
+});
 test('app-server initializes, starts a bound turn, writes structured output and confirms exit',async()=>{
   const f=fixture();
   await invocation(f.runner,async(run,directory)=>{

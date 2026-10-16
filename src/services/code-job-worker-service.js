@@ -56,6 +56,44 @@ const TERMINAL_STATUSES = new Set([
   "failed",
   "fenced",
 ]);
+const CONTINUABLE_NATIVE_TIMEOUTS = new Set(["STRUCTURED_PROVIDER_TIMEOUT", "STRUCTURED_PROVIDER_IDLE_TIMEOUT"]);
+
+function semanticProgressFingerprint(job) {
+  const files = new Map();
+  const verifications = new Map();
+  const sortedFiles = () => [...files].sort(([left], [right]) => left.localeCompare(right));
+  for (const observation of job.execution.observations) {
+    if (observation.status !== "succeeded") continue;
+    const action = trustedObservationAction(observation);
+    const result = observation.detail?.result;
+    if (["read_text", "write_text"].includes(action.type) && typeof action.path === "string" &&
+        /^[a-f0-9]{64}$/u.test(result?.sha256)) files.set(action.path, result.sha256);
+    const profile = action.type === "run_profile" ? job.grant.requiredProfiles.find(({ id }) => id === action.profileId) : null;
+    if (profile && result?.exitCode === 0 && result.timedOut === false) {
+      const evidence = { profileId: action.profileId, profileFingerprint: profile.configDigest, files: sortedFiles() };
+      verifications.set(digestValue(evidence), evidence);
+    }
+  }
+  // Action IDs, timestamps, read counts and model heartbeats are not progress.
+  return digestValue({ files: sortedFiles(), verifications: [...verifications].sort(([left], [right]) => left.localeCompare(right)) });
+}
+
+function isSettledNativeTimeout(view, initial, runId, code) {
+  const receipt = view?.receipt;
+  const registeredAt = Date.parse(receipt?.registeredAt);
+  const modelStartedAt = Date.parse(receipt?.modelStartedAt);
+  const finishedAt = Date.parse(receipt?.finishedAt);
+  return typeof runId === "string" && view?.runId === runId && view.active === false &&
+    view.mode === "active" && view.pendingCommand === null && view.stopUnconfirmed !== true &&
+    receipt?.runId === runId && receipt.kind === "code-job" && receipt.taskId === initial.jobId &&
+    receipt.roleId === initial.grant.requestedBy.roleId && receipt.taskRevision === initial.revision &&
+    receipt.phase === "failed" && receipt.outcomeCode === code && receipt.stopConfirmed === true &&
+    // A reaped timeout may retain its last "running" native label. The durable
+    // terminal receipt and stop confirmation, not that label, prove settlement.
+    receipt.session?.transport === "app-server" &&
+    Number.isFinite(registeredAt) && Number.isFinite(modelStartedAt) && Number.isFinite(finishedAt) &&
+    registeredAt >= Date.parse(initial.updatedAt) && registeredAt <= modelStartedAt && modelStartedAt <= finishedAt;
+}
 
 function requirePort(value, methods, name) {
   if (!value || methods.some((method) => typeof value[method] !== "function")) {
@@ -251,6 +289,8 @@ export class CodeJobWorkerService {
   #preferReconcilable;
   #cancellationControllers;
   #continuousControllers;
+  #recordTimeoutContinuation;
+  #clock;
 
   constructor({
     jobStore,
@@ -266,6 +306,7 @@ export class CodeJobWorkerService {
     maxTurns = 64,
     observationLimit = 20,
     changePackageDeliveryEnabled = false,
+    clock = () => new Date(),
   } = {}) {
     this.#jobs = requirePort(
       jobStore,
@@ -307,6 +348,10 @@ export class CodeJobWorkerService {
       typeof brainDirectory?.describe === "function" ? ["decide", "describe"] : ["decide"],
       "code job brain");
     this.#taskRuns = taskRuns;
+    this.#recordTimeoutContinuation = typeof jobStore?.recordTimeoutContinuation === "function"
+      ? jobStore.recordTimeoutContinuation.bind(jobStore) : null;
+    if (typeof clock !== "function") throw new TypeError("code job worker clock is invalid");
+    this.#clock = clock;
     this.#reviewRepairContextReader = reviewRepairContextReader === undefined
       ? null : requirePort(reviewRepairContextReader, ["read"], "review repair context reader");
     this.#verifyGrant = requirePort(
@@ -550,6 +595,13 @@ export class CodeJobWorkerService {
     if (failedVerification !== null) {
       return this.#finishFailed(job, failedVerification);
     }
+    if (job.execution.timeoutContinuation !== undefined) {
+      const now = new Date(this.#clock()).getTime();
+      if (!Number.isFinite(now)) throw workerError("CODE_JOB_CLOCK_INVALID", "Code job worker clock is invalid");
+      if (Date.parse(job.execution.timeoutContinuation.retryAfter) > now) {
+        return { jobId, status: "active", actionType: null, code: "CODE_JOB_TIMEOUT_BACKOFF" };
+      }
+    }
 
     await this.#verifyAuthority(job.grant);
     let session = await this.#executor.view({ sessionId: job.jobId });
@@ -749,8 +801,10 @@ export class CodeJobWorkerService {
   async #runContinuous(initial) {
     const controller = new AbortController();
     const reads = new Map();
+    let lastSourceReadIdentity = null;
     let workspaceRevision = initial.execution.workspaceRevision;
     let fatal = null;
+    let invocationRunId = null;
     const feedback = await this.#readReviewRepairFeedback(initial);
     const closeReads = () => {
       for (const { reader } of reads.values()) { reader.revoke(); reader.close(); }
@@ -817,7 +871,13 @@ export class CodeJobWorkerService {
             actionId: observation.actionId, path: sourcePath, sha256: observation.detail?.result?.sha256 }) })) };
     };
     capability = createCodeExecutionContext({
+      sourceReadIdentity: () => lastSourceReadIdentity,
       getState,
+      progressFingerprint: async () => {
+        const current = await this.#jobs.getForWorker(initial.jobId);
+        if (current === null) throw workerError("CODE_JOB_NOT_FOUND", "Continuous code job no longer exists");
+        return semanticProgressFingerprint(current);
+      },
       performAction: async ({ decision: rawDecision }, options) => {
         const decision = normalizeStructuredCodeActionDecision(rawDecision);
         if (decision.action.type === "complete") throw workerError("CODE_EXECUTION_COMPLETE_NOT_ALLOWED", "Complete is a final decision, not a tool action");
@@ -845,11 +905,15 @@ export class CodeJobWorkerService {
           if (!currentRead) throw workerError("CODE_READ_DOCUMENT_NOT_FOUND", "Controlled source read did not succeed");
           const context = await this.#codeReadContext(state.job, { onlyPath: sourcePath });
           if (context === null) throw workerError("CODE_ARTIFACT_READ_INVALID", "Continuous execution requires audited source reading");
-          entry = { context, reader: beginCodeReadSession(context, options), actionId: currentRead.actionId };
+          // #codeReadContext has verified these audited bytes and SHA against
+          // the executor result. Keep content identity process-private.
+          entry = { context, reader: beginCodeReadSession(context, options), actionId: currentRead.actionId,
+            sha256: currentRead.detail.result.sha256 };
           reads.set(sourcePath, entry);
         }
         const page = entry.reader.readDocument(sourcePath, offset, length);
         entry.reader.commit();
+        lastSourceReadIdentity = { path: page.path, sha256: entry.sha256, totalLength: page.totalLength };
         return { ...page, sourceVersion: entry.actionId };
       },
       close: async () => {
@@ -859,6 +923,11 @@ export class CodeJobWorkerService {
     });
     const execute = async ({ instructions } = {}) => {
       try {
+        if (this.#taskRuns?.get) {
+          const running = await this.#taskRuns.get("code-job", initial.jobId);
+          if (running.active === true && running.kind === "code-job" && running.taskId === initial.jobId &&
+              running.roleId === initial.grant.requestedBy.roleId) invocationRunId = running.runId;
+        }
         const state = await snapshot();
         const subject = initial.grant.subject;
         const sessionKey = Number.isSafeInteger(subject?.number) && subject.number > 0
@@ -895,8 +964,49 @@ export class CodeJobWorkerService {
       return await (this.#taskRuns ? this.#taskRuns.run({ kind: "code-job", taskId: initial.jobId, roleId: initial.grant.requestedBy.roleId,
         title: initial.grant.objective, subject: initial.grant.repository, revision: initial.revision }, execute,
       { repeatOnInstruction: false, requireStopConfirmation: true }) : execute());
+    } catch (error) {
+      const continued = await this.#continueSettledNativeTimeout(initial, invocationRunId, error);
+      if (continued !== null) return continued;
+      throw error;
     } finally {
       if (this.#continuousControllers.get(initial.jobId) === controller) this.#continuousControllers.delete(initial.jobId);
+    }
+  }
+
+  async #continueSettledNativeTimeout(initial, runId, error) {
+    const code = safeErrorCode(error);
+    if (!CONTINUABLE_NATIVE_TIMEOUTS.has(code) || !this.#recordTimeoutContinuation || !this.#taskRuns?.get) return null;
+    let proof;
+    try { proof = await this.#taskRuns.get("code-job", initial.jobId); } catch { return null; }
+    if (!isSettledNativeTimeout(proof, initial, runId, code)) return null;
+    const current = await this.#jobs.getForWorker(initial.jobId);
+    if (current?.status !== "active" || current.execution.pendingAction !== null ||
+        current.execution.actionAdmission !== null || current.execution.uncertainty !== null ||
+        current.execution.pause !== null) return null;
+    await this.#verifyAuthority(current.grant);
+    const session = await this.#executor.view({ sessionId: current.jobId });
+    assertJobSessionBinding(current, session);
+    if (session.status !== "active" || session.cleanupPending === true ||
+        session.workspaceRevision !== current.execution.workspaceRevision) {
+      throw workerError("CODE_JOB_WORKSPACE_DIVERGED", "Timeout checkpoint no longer matches its active executor session");
+    }
+    try {
+      return await this.#actionAdmission(async () => {
+        const fresh = await this.#jobs.getForWorker(current.jobId);
+        if (!sameSessionTransitionFence(current, fresh)) return currentJobOutcome(initial.jobId, fresh);
+        await this.#verifyAuthority(fresh.grant);
+        const latestProof = await this.#taskRuns.get("code-job", initial.jobId);
+        if (!isSettledNativeTimeout(latestProof, initial, runId, code)) return null;
+        const changed = await this.#recordTimeoutContinuation({ jobId: fresh.jobId, expectedRevision: fresh.revision,
+          failedRunId: runId, errorCode: code, failedAt: latestProof.receipt.finishedAt,
+          baselineProgressFingerprint: semanticProgressFingerprint(initial), progressFingerprint: semanticProgressFingerprint(fresh) });
+        return { jobId: fresh.jobId, status: changed.job.status, actionType: null, code };
+      });
+    } catch (continuationError) {
+      if (["CODE_JOB_REVISION_CONFLICT", "CODE_JOB_TRANSITION_CONFLICT"].includes(continuationError?.code)) {
+        return currentJobOutcome(initial.jobId, await this.#jobs.getForWorker(initial.jobId));
+      }
+      throw continuationError;
     }
   }
 
@@ -1622,7 +1732,7 @@ export class CodeJobWorkerService {
       return this.#finishFailed(current, error);
     }
     if (
-      requiresOperatorPause(code) &&
+      (requiresOperatorPause(code) || code === "STRUCTURED_PROVIDER_IDLE_TIMEOUT") &&
       current &&
       !TERMINAL_STATUSES.has(current.status)
     ) {

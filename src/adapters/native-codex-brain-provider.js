@@ -18,6 +18,7 @@ import { describeCodeReadContext, revokeCodeReadContext } from "../lib/code-read
 import { createCodeJobExecutionMcp } from "./code-job-execution-mcp.js";
 import { closeCodeExecutionContext, revokeCodeExecutionContext } from "../lib/code-execution-context.js";
 import { currentTaskExecution } from "../lib/task-execution-context.js";
+import { createCodeExecutionWatchdog, codeExecutionWatchdogSignal, closeCodeExecutionWatchdog } from '../lib/code-execution-watchdog.js';
 import { acquireNativeAdmission, createNativeModelAdmission, currentNativeAdmission, withNativeAdmission } from '../lib/native-model-admission.js';
 import {createNativeExecLifecycle} from '../lib/native-exec-lifecycle.js';
 import {readNativeModelCapacity} from '../lib/native-model-capacity.js';
@@ -38,6 +39,7 @@ const DEFINITIONS = {
   STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE: [503, "Native Codex login is unavailable"],
   STRUCTURED_PROVIDER_CANCELLED: [499, "Native Codex request was cancelled"],
   STRUCTURED_PROVIDER_TIMEOUT: [504, "Native Codex request timed out"],
+  STRUCTURED_PROVIDER_IDLE_TIMEOUT: [504, "Native Codex code execution stopped making progress"],
   STRUCTURED_PROVIDER_QUEUE_TIMEOUT: [503, "Native Codex queue wait timed out before execution"],
   STRUCTURED_PROVIDER_BUSY: [503, "Native Codex capacity is occupied; work remains unclaimed"],
   STRUCTURED_PROVIDER_REQUEST_TOO_LARGE: [413, "Native Codex input exceeds its limit"],
@@ -92,6 +94,7 @@ function operationSignal(caller) {
   if (caller?.aborted) abort();
   let timer;
   return { signal: controller.signal, abort,
+    follow(signal) { clearTimeout(timer); const forward = () => controller.abort(signal.reason); signal.addEventListener('abort', forward, { once: true }); if (signal.aborted) forward(); return () => signal.removeEventListener('abort', forward); },
     deadline(timeoutMs, code) { clearTimeout(timer); timer = setTimeout(() => controller.abort(failure(code)),timeoutMs); },
     close() { clearTimeout(timer); caller?.removeEventListener("abort", abort); } };
 }
@@ -344,13 +347,13 @@ export class NativeCodexBrainProvider {
       'STRUCTURED_PROVIDER_PROCESS_FAILED', 'STRUCTURED_PROVIDER_PROCESS_EXITED'].includes(error?.code)) this.#state.lastStatus = null;
   }
 
-  #operation(signal, callback, timeoutMs = this.#options.timeoutMs, {entityKey = randomUUID(), exclusive = false, model = false,enforceEntity=false} = {}) {
+  #operation(signal, callback, timeoutMs = this.#options.timeoutMs, {entityKey = randomUUID(), exclusive = false, model = false,enforceEntity=false,codeExecution=false} = {}) {
     if (this.#closed) return Promise.reject(failure());
     const operation = operationSignal(signal);
     operation.deadline(this.#options.queueTimeoutMs, 'STRUCTURED_PROVIDER_QUEUE_TIMEOUT');
     this.#controllers.add(operation);
     const attempt = (async () => {
-      let token, borrowed = false, acquiredUse = false, detach;
+      let token, borrowed = false, acquiredUse = false, detach, watchdog, detachWatchdog;
       const context = model ? currentTaskExecution() : null;
       try {
         context?.reportModelState?.('waiting_model');
@@ -364,9 +367,12 @@ export class NativeCodexBrainProvider {
         acquiredUse = true;
         detach?.(); detach = null;
         operation.signal.throwIfAborted();
-        operation.deadline(timeoutMs, 'STRUCTURED_PROVIDER_TIMEOUT');
+        if (codeExecution) {
+          watchdog = createCodeExecutionWatchdog({ startupMs: timeoutMs, idleMs: Math.max(15 * 60_000, timeoutMs) });
+          detachWatchdog = operation.follow(codeExecutionWatchdogSignal(watchdog));
+        } else operation.deadline(timeoutMs, 'STRUCTURED_PROVIDER_TIMEOUT');
         context?.reportModelState?.('starting_model');
-        return await callback(operation.signal);
+        return await callback(operation.signal, watchdog);
       } catch (error) {
         if (!token && operation.signal.aborted) context?.confirmStopped?.();
         if (model) this.#invalidateAvailability(error);
@@ -374,6 +380,7 @@ export class NativeCodexBrainProvider {
         throw failure(error?.code);
       } finally {
         detach?.();
+        detachWatchdog?.(); if (watchdog) closeCodeExecutionWatchdog(watchdog);
         if (token && acquiredUse) { token.inUse = false; if (!borrowed || token.releaseRequested) token.release(); }
         operation.close(); this.#controllers.delete(operation);
       }
@@ -406,8 +413,8 @@ export class NativeCodexBrainProvider {
       (request.reviewTarget ? "Use pr_review MCP to read both complete review-manifest.json and review.diff, following nextOffset until null; read pinned related source as needed. Staged files are convenient previews; MCP reads establish completeness." : "") +
       (request.codeReadContext ? "Use the supplied read-only MCP tools to read code-read-manifest.json and the complete audited sources with read_source, following nextOffset until null. Inline code is only a preview. Before writing an existing listed file, read every page of that file; before completing, read every listed source. These immutable sources belong only to this controlled job and current workspace version." : ""), messages: request.messages, schema: request.schema });
     if (Buffer.byteLength(wireInput) > this.#options.maxRequestBytes) throw failure("STRUCTURED_PROVIDER_REQUEST_TOO_LARGE");
-    const timeoutMs = request.codeExecutionContext ? Math.max(15 * 60_000, this.#options.timeoutMs) : this.#options.timeoutMs;
-    const operation = this.#operation(signal, async (operationSignal) => {
+    const timeoutMs = this.#options.timeoutMs;
+    const operation = this.#operation(signal, async (operationSignal, watchdog) => {
       const prepare = await this.#prepare(operationSignal);
       const descriptor = await this.#dependencies.commandLocator.resolve("codex-cli", { signal: operationSignal });
       let reader;
@@ -425,7 +432,7 @@ export class NativeCodexBrainProvider {
           signal: operationSignal, ...(skill ? { skillDocuments: skill.documents } : {}),
         });
         if (request.codeReadContext) reader = await this.#dependencies.codeReaderFactory(request.codeReadContext, { signal: operationSignal });
-        if (request.codeExecutionContext) execution = await this.#dependencies.codeExecutionFactory(request.codeExecutionContext, { signal: operationSignal });
+        if (request.codeExecutionContext) execution = await this.#dependencies.codeExecutionFactory(request.codeExecutionContext, { signal: operationSignal, watchdog });
         directory = path.join(this.#root, `invocation-${randomUUID()}`);
         await prepare(directory);
         if (skill) {
@@ -461,7 +468,7 @@ export class NativeCodexBrainProvider {
               isolation:{reader:reader?{url:reader.url}:null,agentConfigPath,ephemeral:!request.sessionKey,
                 ...(execution?{channel:'code-job',execution:{url:execution.url,revoke:execution.revoke}}:{}),
                 ...(skill?{skill:{name:NATIVE_REVIEW_SKILL_NAME,path:path.join(directory,NATIVE_REVIEW_SKILL_FILE)}}:{})}}} : {}),
-            input: live?Buffer.from(wireInput):Buffer.alloc(0),...(lifecycle?{duplex:lifecycle.duplex}:{}), timeoutMs, maxStdoutBytes: reader || execution ? 64 * 1024 * 1024 : 1024 * 1024, maxStderrBytes: this.#options.maxResponseBytes }, operationSignal, this.#marker(), () => { processAttempted = true; }, live ? this.#dependencies.appServerRunner : this.#dependencies.processRunner);
+            input: live?Buffer.from(wireInput):Buffer.alloc(0),...(lifecycle?{duplex:lifecycle.duplex}:{}), ...(watchdog ? { codeExecutionWatchdog: watchdog } : {}), timeoutMs, maxStdoutBytes: reader || execution ? 64 * 1024 * 1024 : 1024 * 1024, maxStderrBytes: this.#options.maxResponseBytes }, operationSignal, this.#marker(), () => { processAttempted = true; }, live ? this.#dependencies.appServerRunner : this.#dependencies.processRunner);
           this.#state.lastStatus = status("available");
         } catch (failure) { processFailure = failure; this.#invalidateAvailability(failure); }
         finally {lifecycle?.close();}
@@ -520,7 +527,7 @@ export class NativeCodexBrainProvider {
       }
       if (error) throw error;
       return result;
-    }, timeoutMs, {entityKey: request.admissionEntityKey ? nativeCodexDigest(request.admissionEntityKey) : request.sessionKey ? nativeCodexDigest(request.sessionKey) : randomUUID(),model:true,enforceEntity:request.admissionEntityKey!==undefined});
+    }, timeoutMs, {entityKey: request.admissionEntityKey ? nativeCodexDigest(request.admissionEntityKey) : request.sessionKey ? nativeCodexDigest(request.sessionKey) : randomUUID(),model:true,enforceEntity:request.admissionEntityKey!==undefined,codeExecution:Boolean(request.codeExecutionContext)});
     if (!request.codeExecutionContext) return operation;
     // Queue/preparation failures happen before endpoint construction. They must
     // still revoke the opaque capability and release its host owner exactly once.

@@ -6,6 +6,7 @@ import { currentTaskExecution } from './task-execution-context.js';
 import { isNativeCodexThreadId } from '../adapters/codex-native-session-store.js';
 import { ContainedStdioProcess } from './contained-stdio-process.js';
 import { randomBytes } from 'node:crypto';
+import { codeExecutionWatchdogSignal, startCodeExecutionTurn, reportCodeExecutionActivity } from './code-execution-watchdog.js';
 import { threadConfiguration, assertEffectiveAppServerPolicy, NATIVE_CHANNEL_INSTRUCTIONS, CODE_EXECUTION_CHANNEL_INSTRUCTIONS, CODE_EXECUTION_TOOLS } from './codex-app-server-policy.js';
 
 const FAILURE_OUTPUT = new WeakMap();
@@ -17,7 +18,7 @@ export const didAppServerNotStart = (error) => NOT_STARTED.has(error);
 export const didAppServerNotStartModel = (error) => NO_MODEL_TURN.has(error);
 export const didAppServerReap = (error) => REAPED_FAILURES.has(error);
 function failure(code='STRUCTURED_PROVIDER_PROCESS_FAILED') {
-  return Object.assign(new Error(code),{code,statusCode:code==='STRUCTURED_PROVIDER_TIMEOUT'?504:502});
+  return Object.assign(new Error(code),{code,statusCode:['STRUCTURED_PROVIDER_TIMEOUT','STRUCTURED_PROVIDER_IDLE_TIMEOUT'].includes(code)?504:502});
 }
 function deferred() {
   let resolve,reject;
@@ -34,7 +35,7 @@ export class CodexAppServerRunner {
     this.supportsContainedExecution=!processFactory && process.platform==='win32';
   }
 
-  async run({executable,args,cwd,env,signal,timeoutMs,appServer}) {
+  async run({executable,args,cwd,env,signal,timeoutMs,appServer,codeExecutionWatchdog=null}) {
     // Protocol fixtures can inject a process. Production needs a contained,
     // bidirectional supervisor: a direct child's exit is not tree-reap proof.
     if ((!this.processFactory && !this.supportsContainedExecution) || !appServer ||
@@ -44,6 +45,12 @@ export class CodexAppServerRunner {
             typeof appServer.isolation.execution.revoke !== 'function' || appServer.isolation.reader || appServer.isolation.skill))) {
       const error=failure('STRUCTURED_PROVIDER_UNAVAILABLE');NOT_STARTED.add(error);throw error;
     }
+    let watchdogSignal;
+    try {
+      watchdogSignal = codeExecutionWatchdog === null ? null : codeExecutionWatchdogSignal(codeExecutionWatchdog);
+      if (Boolean(watchdogSignal) !== (appServer.isolation?.channel === 'code-job')) throw failure('STRUCTURED_PROVIDER_UNAVAILABLE');
+    } catch { const error = failure('STRUCTURED_PROVIDER_UNAVAILABLE'); NOT_STARTED.add(error); throw error; }
+    if (watchdogSignal) signal = signal ? AbortSignal.any([signal, watchdogSignal]) : watchdogSignal;
     let descriptor;
     try { if(this.processFactory)descriptor=await this.materialize(executable,{signal}); }
     catch(cause){const error=failure('STRUCTURED_PROVIDER_UNAVAILABLE');NOT_STARTED.add(error);throw error;}
@@ -55,6 +62,7 @@ export class CodexAppServerRunner {
     const revokeTools = () => appServer.isolation?.execution?.revoke();
     let sequence=0,started=false,initialized=false,terminal=false,accepting=true,interrupted=false,detach,output,error,turnAttempted=false;
     const earlyEvents=[];const streamedItems=new Set();let earlyBytes=0;
+    const activityItems = new Set(); let lastPlan = null;
     const request=(method,params)=>{
       if(process.exited) return Promise.reject(failure());
       const id=++sequence; const waiting=deferred();
@@ -96,7 +104,23 @@ export class CodexAppServerRunner {
         const eventTurn=params.turnId??params.turn?.id;
         if(eventTurn && eventTurn!==turnId)return;
         if(terminal)return;
-        context?.reportActivity?.();
+        if (codeExecutionWatchdog && eventTurn === turnId) {
+          const deltaEvent = message.method === 'item/agentMessage/delta' ||
+            (message.method === 'item/reasoning/textDelta' && Number.isSafeInteger(params.contentIndex) && params.contentIndex >= 0) ||
+            (message.method === 'item/reasoning/summaryTextDelta' && Number.isSafeInteger(params.summaryIndex) && params.summaryIndex >= 0);
+          let meaningful = deltaEvent &&
+            typeof params.itemId === 'string' && params.itemId.length > 0 && typeof params.delta === 'string' && params.delta.trim().length > 0;
+          if (['item/started', 'item/completed'].includes(message.method) && ['reasoning', 'agentMessage'].includes(params.item?.type) &&
+              typeof params.item.id === 'string' && params.item.id.length > 0) {
+            const key = `${message.method}:${params.item.id}`;
+            meaningful ||= !activityItems.has(key); activityItems.add(key);
+          }
+          if (message.method === 'turn/plan/updated' && Array.isArray(params.plan) && params.plan.length > 0 && params.plan.every(step =>
+            typeof step?.step === 'string' && step.step.trim() && ['pending', 'inProgress', 'completed'].includes(step.status))) {
+            const plan = JSON.stringify(params.plan); meaningful ||= plan !== lastPlan; lastPlan = plan;
+          }
+          if (meaningful) { reportCodeExecutionActivity(codeExecutionWatchdog); context?.reportActivity?.(); }
+        } else if (!codeExecutionWatchdog) context?.reportActivity?.();
         if(message.method==='item/completed' && params.item?.type==='agentMessage')text=params.item.text;
         if(message.method==='item/agentMessage/delta' && typeof params.delta==='string') {
           streamedItems.add(params.itemId);
@@ -132,13 +156,13 @@ export class CodexAppServerRunner {
         if(message.method==='error' && params.willRetry===false)fail(failure());
       }catch(cause){fail(cause);}
     };
-    const abort=()=>fail(failure('STRUCTURED_PROVIDER_CANCELLED'));
-    const deadline=setTimeout(()=>fail(failure('STRUCTURED_PROVIDER_TIMEOUT')),timeoutMs);
+    const abort=()=>fail(watchdogSignal?.aborted ? watchdogSignal.reason : failure('STRUCTURED_PROVIDER_CANCELLED'));
+    const deadline=watchdogSignal ? null : setTimeout(()=>fail(failure('STRUCTURED_PROVIDER_TIMEOUT')),timeoutMs);
     signal?.addEventListener('abort',abort,{once:true});
     try {
       started=true;
       await process.start({...(descriptor ? {command:descriptor.command,args:[...descriptor.prefixArgs,...args]} : {executable,args}),cwd,env,
-        timeoutMs,maxStdoutBytes:64*1024*1024,maxStderrBytes:1024*1024,
+        timeoutMs,...(codeExecutionWatchdog ? { codeExecutionWatchdog } : {}),maxStdoutBytes:64*1024*1024,maxStderrBytes:1024*1024,
         keepStdinOpen:true,onLine:receive,onError:fail,onLimit:()=>fail(failure('STRUCTURED_PROVIDER_OUTPUT_LIMIT')),
         onExit:()=>{if(!terminal)fail(failure(initialized ? 'STRUCTURED_PROVIDER_PROCESS_FAILED' : 'STRUCTURED_PROVIDER_UNAVAILABLE'));}});
       await request('initialize',{clientInfo:{name:'dev_intelligence_hub',version:'0.1.0'},capabilities:{experimentalApi:true}});
@@ -190,6 +214,7 @@ export class CodexAppServerRunner {
         approvalPolicy:'never',sandboxPolicy:{type:'readOnly',networkAccess:false}});
       if(typeof begun?.turn?.id!=='string' || !begun.turn.id || (turnId && turnId!==begun.turn.id))throw failure('STRUCTURED_PROVIDER_RESPONSE_INVALID');
       turnId=begun.turn.id;
+      if (codeExecutionWatchdog) startCodeExecutionTurn(codeExecutionWatchdog);
       context?.reportSession?.({transport:'app-server',threadId,turnId,status:'running'});
       for(const event of earlyEvents)receive(event);
       if(!terminal)detach=context?.registerLiveControl({

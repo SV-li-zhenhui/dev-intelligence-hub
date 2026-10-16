@@ -13,6 +13,7 @@ import { digestValue } from "../src/domain/code-executor-contract.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { beginCodeReadSession, createCodeReadContext, describeCodeReadContext } from "../src/lib/code-read-context.js";
 import { beginCodeExecutionSession } from "../src/lib/code-execution-context.js";
+import { createCodeExecutionWatchdog, codeExecutionWatchdogSignal, startCodeExecutionTurn, closeCodeExecutionWatchdog } from '../src/lib/code-execution-watchdog.js';
 import { OperationQueue } from "../src/lib/operation-queue.js";
 import { CodeJobStore } from "../src/services/code-job-store.js";
 import { CodeJobBrainDirectory } from "../src/services/code-job-brain-directory.js";
@@ -797,6 +798,72 @@ function continuousDecision(action) {
   return { schemaVersion: 1, confidence: 100, summary: "Controlled development", reason: "Current evidence", action };
 }
 
+test('repaging already consumed audited content cannot keep continuous code work alive for ten hours', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const watchdog = createCodeExecutionWatchdog({ startupMs: 1000 }); startCodeExecutionTurn(watchdog);
+  t.after(() => closeCodeExecutionWatchdog(watchdog));
+  let expiredAt = null, elapsed = 0;
+  const fixture = continuousFixture(async ({ codeExecutionContext }) => {
+    const tools = beginCodeExecutionSession(codeExecutionContext, { watchdog });
+    const full = await tools.invoke('read_source', { path: 'src/app.js', offset: 0, length: 500 });
+    assert.equal(full.text.length, 500); assert.equal(full.nextOffset, null);
+    for (let length = 1; length <= 61; length++) {
+      t.mock.timers.tick(10 * 60_000); elapsed += 10 * 60_000;
+      if (codeExecutionWatchdogSignal(watchdog).aborted) { expiredAt = elapsed; break; }
+      await tools.invoke('read_source', { path: 'src/app.js', offset: 0, length, sourceVersion: full.sourceVersion });
+    }
+    await tools.close();
+    if (codeExecutionWatchdogSignal(watchdog).aborted) throw codeExecutionWatchdogSignal(watchdog).reason;
+    return continuousDecision({ type: 'complete', outcome: 'all pages consumed', evidence: [] });
+  }, { content: 'x'.repeat(500) });
+  await fixture.worker.runCycle();
+  assert.equal(expiredAt, 20 * 60_000, 'known prefix reframing must not repeatedly renew the original15min idle allowance');
+  assert.equal(fixture.executor.calls.filter(({ method, value }) => method === 'perform' && value.action.type === 'read_text').length, 1);
+});
+
+test('new audited source ranges keep continuous code work healthy beyond ten virtual hours', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const watchdog = createCodeExecutionWatchdog({ startupMs: 1000 }); startCodeExecutionTurn(watchdog);
+  t.after(() => closeCodeExecutionWatchdog(watchdog));
+  const fixture = continuousFixture(async ({ codeExecutionContext }) => {
+    const tools = beginCodeExecutionSession(codeExecutionContext, { watchdog });
+    const first = await tools.invoke('read_source', { path: 'src/app.js', offset: 0, length: 1 });
+    for (let offset = 1; offset <= 61; offset++) {
+      t.mock.timers.tick(10 * 60_000);
+      assert.equal(codeExecutionWatchdogSignal(watchdog).aborted, false);
+      await tools.invoke('read_source', { path: 'src/app.js', offset, length: 1, sourceVersion: first.sourceVersion });
+    }
+    await tools.invoke('read_source', { path: 'src/app.js', offset: 0, length: 500, sourceVersion: first.sourceVersion });
+    await tools.close();
+    return continuousDecision({ type: 'complete', outcome: 'new source consumed', evidence: [] });
+  }, { content: 'x'.repeat(500) });
+  const result = await fixture.worker.runCycle();
+  assert.equal(result.outcomes[0].status, 'completed', JSON.stringify(result));
+  assert.equal(fixture.executor.calls.filter(({ method, value }) => method === 'perform' && value.action.type === 'read_text').length, 1);
+});
+
+test('a new durable read audit cannot reset watchdog coverage for unchanged source bytes', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const watchdog = createCodeExecutionWatchdog({ startupMs: 1000 }); startCodeExecutionTurn(watchdog);
+  t.after(() => closeCodeExecutionWatchdog(watchdog));
+  let changedAudit = false, expired = false;
+  const fixture = continuousFixture(async ({ codeExecutionContext }) => {
+    const tools = beginCodeExecutionSession(codeExecutionContext, { watchdog });
+    const first = await tools.invoke('read_source', { path: 'src/app.js', offset: 0, length: 500 });
+    t.mock.timers.tick(10 * 60_000);
+    await tools.invoke('perform_action', { decision: continuousDecision({ type: 'read_text', path: 'src/app.js' }) });
+    const page = await tools.invoke('read_source', { path: 'src/app.js', offset: 0, length: 100 });
+    changedAudit = first.sourceVersion !== page.sourceVersion;
+    t.mock.timers.tick(5 * 60_000); expired = codeExecutionWatchdogSignal(watchdog).aborted;
+    await tools.close();
+    if (expired) throw codeExecutionWatchdogSignal(watchdog).reason;
+    return continuousDecision({ type: 'complete', outcome: 'source audit replaced', evidence: [] });
+  }, { content: 'x'.repeat(500) });
+  await fixture.worker.runCycle();
+  assert.equal(changedAudit, true); assert.equal(expired, true);
+  assert.equal(fixture.executor.calls.filter(({ method, value }) => method === 'perform' && value.action.type === 'read_text').length, 2);
+});
+
 test("continuous tools require complete current pages and reject old source versions after writes", async () => {
   const content = "\uFEFF" + "字\\\"".repeat(24_000) + "TAIL";
   let actual = "";
@@ -936,6 +1003,347 @@ test("continuous model failure after a settled write preserves audit and resumes
       decide: async () => continuousDecision({ type: "complete", outcome: "done", evidence: [] }) }, grantVerifier: verifier([]) });
   assert.equal((await resumed.runCycle()).outcomes[0].status, "completed");
   assert.equal(fixture.executor.calls.filter(({ method, value }) => method === "perform" && value.action.type === "write_text").length, 1);
+});
+
+test("settled native timeout continues the same checkpoint after restart without replaying writes or profiles", async () => {
+  const fixture = await continuousTimeoutFixture(async ({ codeExecutionContext }) => {
+    const tools = beginCodeExecutionSession(codeExecutionContext);
+    await tools.invoke("read_source", { path: "src/app.js", offset: 0 });
+    await tools.invoke("perform_action", { decision: continuousDecision({ type: "write_text", path: "src/app.js", content: "fixed\n" }) });
+    await tools.invoke("perform_action", { decision: continuousDecision({ type: "run_profile" }) });
+    await tools.close();
+    throw fixture.nativeTimeout();
+  });
+  const first = await fixture.worker().runCycle();
+  assert.equal(first.outcomes[0].status, "active");
+  const checkpoint = await fixture.jobs.getForWorker(fixture.durableJob.jobId);
+  assert.equal(checkpoint.execution.turn, 3);
+  assert.equal(checkpoint.execution.timeoutContinuation.consecutiveNoProgress, 0);
+  assert.equal(checkpoint.execution.timeoutContinuation.failedRunId,
+    (await fixture.registry.get("code-job", checkpoint.jobId)).runId);
+  assert.equal((await fixture.worker().runCycle()).selected, 0, "backoff does not consume another native turn");
+  fixture.advance(11 * 60 * 60 * 1000);
+  const restarted = fixture.restartJobs();
+  await restarted.recover();
+  assert.deepEqual((await restarted.getForWorker(checkpoint.jobId)).execution, checkpoint.execution);
+  fixture.setDecide(async ({ codeExecutionContext, capabilities }) => {
+    assert.equal(capabilities.requiredProfilesRemaining, 0);
+    const tools = beginCodeExecutionSession(codeExecutionContext);
+    assert.equal((await tools.invoke("get_state", {})).turn, 3);
+    await tools.close();
+    return continuousDecision({ type: "complete", outcome: "done", evidence: [] });
+  });
+  const resumed = await fixture.worker({ jobStore: restarted }).runCycle();
+  assert.equal(resumed.outcomes[0].status, "completed", JSON.stringify(resumed));
+  assert.equal(fixture.executor.calls.filter(({ method, value }) => method === "perform" && value.action.type === "write_text").length, 1);
+  assert.equal(fixture.executor.calls.filter(({ method, value }) => method === "perform" && value.action.type === "run_profile").length, 1);
+});
+
+async function continuousTimeoutFixture(initialDecide, { timeoutCode = "STRUCTURED_PROVIDER_TIMEOUT" } = {}) {
+  let now = Date.parse("2026-08-02T08:00:00.000Z");
+  const clock = () => new Date(now);
+  const storage = new IntegrationMemoryStore();
+  const storeOptions = { store: storage, operationQueue: new OperationQueue(), exclusiveLease: { run: operation => operation() }, clock };
+  const { jobs, durableJob } = await createRealApprovedJob({
+    operation: "modify", allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify], writablePaths: ["src", "test"],
+  }, { storage, clock });
+  const executor = new FakeExecutor(durableJob);
+  const audited = new Map();
+  let content = "original\n";
+  const originalPerform = executor.perform.bind(executor);
+  executor.perform = async (value, options) => {
+    const result = await originalPerform(value, options);
+    if (value.action.type === "read_text") result.result = { path: value.action.path, content,
+      bytes: Buffer.byteLength(content), sha256: createHash("sha256").update(content).digest("hex") };
+    if (value.action.type === "write_text") {
+      content = value.action.content;
+      result.result.sha256 = createHash("sha256").update(content).digest("hex");
+    }
+    audited.set(value.action.actionId, structuredClone(result));
+    return result;
+  };
+  executor.getActionResult = async ({ actionId }) => structuredClone(audited.get(actionId));
+  const registry = new TaskRunRegistry({ store: new IntegrationMemoryStore(), receiptStore: new IntegrationMemoryStore(),
+    clock, settleControl: async () => {} });
+  let decide = initialDecide;
+  return {
+    jobs, durableJob, executor, registry,
+    advance(milliseconds) { now += milliseconds; },
+    restartJobs() { return new CodeJobStore(storeOptions); },
+    setDecide(value) { decide = value; },
+    nativeTimeout({ stopConfirmed = true, sessionStatus = "interrupted" } = {}) {
+      currentTaskExecution().reportSession({ transport: "app-server", threadId: "native-thread", turnId: "native-turn", status: sessionStatus });
+      if (stopConfirmed) currentTaskExecution().confirmStopped();
+      return Object.assign(new Error("native inactivity deadline"), { code: timeoutCode });
+    },
+    worker(overrides = {}) {
+      return new CodeJobWorkerService({ jobStore: jobs, executor, taskRuns: registry, grantVerifier: verifier([]), clock,
+        brainDirectory: { describe: () => ({ supportsCodeExecution: true, supportsCodeReading: true }),
+          async decide(input) {
+            currentTaskExecution().reportSession({ transport: "app-server", threadId: "native-thread", turnId: "native-turn", status: "running" });
+            return decide(input);
+          } }, ...overrides });
+    },
+  };
+}
+
+test("confirmed native idle timeout continues even when the last session label is still running", async () => {
+  const fixture = await continuousTimeoutFixture(async () => {
+    throw fixture.nativeTimeout({ sessionStatus: "running" });
+  }, { timeoutCode: "STRUCTURED_PROVIDER_IDLE_TIMEOUT" });
+  const outcome = (await fixture.worker().runCycle()).outcomes[0];
+  assert.equal(outcome.status, "active");
+  const current = await fixture.jobs.getForWorker(fixture.durableJob.jobId);
+  assert.equal(current.execution.timeoutContinuation.errorCode, "STRUCTURED_PROVIDER_IDLE_TIMEOUT");
+  assert.equal(current.execution.timeoutContinuation.consecutiveNoProgress, 1);
+});
+
+test("native timeout no-progress budget and backoff survive restart and a job older than eleven hours", async () => {
+  const fixture = await continuousTimeoutFixture(async ({ codeExecutionContext }) => {
+    const tools = beginCodeExecutionSession(codeExecutionContext);
+    await tools.invoke("read_source", { path: "src/app.js", offset: 0 });
+    await tools.invoke("perform_action", { decision: continuousDecision({ type: "list_files", path: "" }) });
+    await tools.invoke("perform_action", { decision: continuousDecision({ type: "search_text", query: "value", path: "src" }) });
+    await tools.close();
+    throw fixture.nativeTimeout();
+  });
+  for (const expected of [0, 1, 2]) {
+    const result = await fixture.worker().runCycle();
+    assert.equal(result.outcomes[0].status, "active", JSON.stringify(result));
+    const current = await fixture.jobs.getForWorker(fixture.durableJob.jobId);
+    assert.equal(current.execution.timeoutContinuation.consecutiveNoProgress, expected);
+    assert.equal(Date.parse(current.execution.timeoutContinuation.retryAfter) - Date.parse(current.execution.timeoutContinuation.recordedAt), expected === 2 ? 120_000 : 60_000);
+    fixture.advance(120_000);
+  }
+  const beforeRestart = await fixture.jobs.getForWorker(fixture.durableJob.jobId);
+  fixture.advance(11 * 60 * 60 * 1000);
+  const restarted = fixture.restartJobs();
+  await restarted.recover();
+  assert.deepEqual((await restarted.getForWorker(beforeRestart.jobId)).execution.timeoutContinuation,
+    beforeRestart.execution.timeoutContinuation);
+  const stopped = await fixture.worker({ jobStore: restarted }).runCycle();
+  assert.equal(stopped.outcomes[0].status, "paused", JSON.stringify(stopped));
+  const current = await restarted.getForWorker(beforeRestart.jobId);
+  assert.equal(current.execution.timeoutContinuation.consecutiveNoProgress, 3);
+  assert.match(current.execution.pause.reason, /连续 3 次.*保留断点/);
+  assert.equal((await fixture.worker({ jobStore: restarted }).runCycle()).selected, 0);
+  assert.ok(current.execution.turn > beforeRestart.execution.turn, "repeated query actions are audited but do not reset progress budget");
+});
+
+test("new trusted source and verification evidence reset consecutive inactivity while total job age remains unrestricted", async () => {
+  let phase = "idle";
+  const fixture = await continuousTimeoutFixture(async ({ codeExecutionContext }) => {
+    const tools = beginCodeExecutionSession(codeExecutionContext);
+    if (phase === "source") await tools.invoke("read_source", { path: "src/app.js", offset: 0 });
+    if (phase === "verification") await tools.invoke("perform_action", { decision: continuousDecision({ type: "run_profile" }) });
+    currentTaskExecution().reportActivity();
+    currentTaskExecution().reportEvent({ type: "message", text: "Still thinking", itemId: "unchanged-message" });
+    await tools.close();
+    throw fixture.nativeTimeout();
+  });
+  for (const expected of [1, 2]) {
+    assert.equal((await fixture.worker().runCycle()).outcomes[0].status, "active");
+    assert.equal((await fixture.jobs.getForWorker(fixture.durableJob.jobId)).execution.timeoutContinuation.consecutiveNoProgress, expected);
+    fixture.advance(120_000);
+  }
+  fixture.advance(72 * 60 * 60 * 1000);
+  phase = "source";
+  assert.equal((await fixture.worker().runCycle()).outcomes[0].status, "active");
+  assert.equal((await fixture.jobs.getForWorker(fixture.durableJob.jobId)).execution.timeoutContinuation.consecutiveNoProgress, 0);
+  fixture.advance(60_000);
+  phase = "idle";
+  assert.equal((await fixture.worker().runCycle()).outcomes[0].status, "active");
+  assert.equal((await fixture.jobs.getForWorker(fixture.durableJob.jobId)).execution.timeoutContinuation.consecutiveNoProgress, 1);
+  fixture.advance(60_000);
+  phase = "verification";
+  assert.equal((await fixture.worker().runCycle()).outcomes[0].status, "active");
+  assert.equal((await fixture.jobs.getForWorker(fixture.durableJob.jobId)).execution.timeoutContinuation.consecutiveNoProgress, 0);
+});
+
+test("native timeout continuation refuses absent, stale, unconfirmed and owner-held execution proofs", async (t) => {
+  const cases = [
+    ["no receipt", view => { delete view.receipt; }],
+    ["stop missing", view => { delete view.receipt.stopConfirmed; }],
+    ["stop false", view => { view.receipt.stopConfirmed = false; }],
+    ["model never started", view => { view.receipt.modelStartedAt = null; }],
+    ["finish unknown", view => { view.receipt.finishedAt = null; }],
+    ["wrong role", view => { view.receipt.roleId = "tester"; }],
+    ["wrong task", view => { view.receipt.taskId = "code-job-other"; }],
+    ["wrong kind", view => { view.receipt.kind = "work-ledger"; }],
+    ["wrong task revision", view => { view.receipt.taskRevision += 1; }],
+    ["stale run", view => { view.receipt.runId = "old-run"; view.runId = "old-run"; }],
+    ["active run", view => { view.active = true; }],
+    ["running phase", view => { view.receipt.phase = "running"; }],
+    ["owner held", view => { view.mode = "paused"; }],
+    ["pending control", view => { view.pendingCommand = "pause"; }],
+    ["stop unconfirmed", view => { view.stopUnconfirmed = true; }],
+    ["cleanup failure", view => { view.receipt.outcomeCode = "STRUCTURED_PROVIDER_CLEANUP_FAILED"; }],
+    ["non-native provider", view => { view.receipt.session = null; }],
+  ];
+  for (const [name, alter] of cases) await t.test(name, async () => {
+    const fixture = await continuousTimeoutFixture(async () => { throw fixture.nativeTimeout({ sessionStatus: "running" }); });
+    const taskRuns = {
+      run: fixture.registry.run.bind(fixture.registry), order: fixture.registry.order.bind(fixture.registry),
+      async get(...args) {
+        const view = await fixture.registry.get(...args);
+        if (!view.active) alter(view);
+        return view;
+      },
+    };
+    const outcome = (await fixture.worker({ taskRuns }).runCycle()).outcomes[0];
+    assert.equal(outcome.status, "paused", JSON.stringify(outcome));
+    assert.equal((await fixture.jobs.getForWorker(fixture.durableJob.jobId)).execution.timeoutContinuation, undefined);
+  });
+});
+
+test("native timeout continuation does not substitute an old run receipt during invocation registration", async () => {
+  const fixture = await continuousTimeoutFixture(async () => { throw fixture.nativeTimeout(); });
+  const taskRuns = { run: fixture.registry.run.bind(fixture.registry), order: fixture.registry.order.bind(fixture.registry),
+    async get(...args) {
+      const view = await fixture.registry.get(...args);
+      view.active = false;
+      return view;
+    } };
+  assert.equal((await fixture.worker({ taskRuns }).runCycle()).outcomes[0].status, "paused");
+  assert.equal((await fixture.jobs.getForWorker(fixture.durableJob.jobId)).execution.timeoutContinuation, undefined);
+});
+
+test("native timeout backoff is enforced even when a caller supplies an unfiltered runnable page", async () => {
+  const fixture = await continuousTimeoutFixture(async () => { throw fixture.nativeTimeout(); });
+  await fixture.worker().runCycle();
+  let calls = 0;
+  fixture.setDecide(async () => { calls++; throw fixture.nativeTimeout(); });
+  const unfiltered = new Proxy(fixture.jobs, { get(target, property) {
+    if (property === "listRunnable") return async () => ({ revision: 0, items: [await fixture.jobs.getForWorker(fixture.durableJob.jobId)] });
+    const value = Reflect.get(target, property);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+  const result = await fixture.worker({ jobStore: unfiltered }).runCycle();
+  assert.equal(result.outcomes[0].status, "active");
+  assert.equal(result.outcomes[0].code, "CODE_JOB_TIMEOUT_BACKOFF");
+  assert.equal(calls, 0);
+});
+
+test("native timeout continuation rechecks Head, configuration and session workspace authority", async (t) => {
+  await t.test("Head revoked after the failed turn", async () => {
+    let revoked = false;
+    const fixture = await continuousTimeoutFixture(async () => { revoked = true; throw fixture.nativeTimeout(); });
+    const grantVerifier = { async verify(value) {
+      if (revoked) throw Object.assign(new Error("PR Head changed"), { code: "INVALID_CODE_JOB_AUTHORITY" });
+      return structuredClone(value);
+    } };
+    assert.equal((await fixture.worker({ grantVerifier }).runCycle()).outcomes[0].status, "fenced");
+    assert.equal((await fixture.jobs.getForWorker(fixture.durableJob.jobId)).execution.timeoutContinuation, undefined);
+  });
+  await t.test("configuration changed before continuation admission", async () => {
+    const gate = readyActionAdmissionGate();
+    const fixture = await continuousTimeoutFixture(async () => {
+      await activateNextConfiguration(gate);
+      throw fixture.nativeTimeout();
+    });
+    const outcome = (await fixture.worker({ actionAdmissionGate: gate }).runCycle()).outcomes[0];
+    assert.equal(outcome.status, "restart_required");
+    assert.equal(outcome.code, "RUNTIME_RESTART_REQUIRED");
+    assert.equal((await fixture.jobs.getForWorker(fixture.durableJob.jobId)).execution.timeoutContinuation, undefined);
+  });
+  for (const [name, alter] of [
+    ["workspace changed", session => { session.workspaceRevision = REVISION_B; }],
+    ["session binding changed", session => { session.workspaceId = "other-workspace"; }],
+    ["session cleanup pending", session => { session.cleanupPending = true; }],
+  ]) await t.test(name, async () => {
+    const fixture = await continuousTimeoutFixture(async () => {
+      alter(fixture.executor.session);
+      throw fixture.nativeTimeout();
+    });
+    assert.equal((await fixture.worker().runCycle()).outcomes[0].status, "fenced");
+    assert.equal((await fixture.jobs.getForWorker(fixture.durableJob.jobId)).execution.timeoutContinuation, undefined);
+  });
+});
+
+test("owner pause and cancel win the native timeout continuation CAS without changing checkpoints", async (t) => {
+  for (const command of ["pause", "cancel"]) await t.test(command, async () => {
+    let failed = false, verified = 0;
+    const fixture = await continuousTimeoutFixture(async () => { failed = true; throw fixture.nativeTimeout(); });
+    const grantVerifier = { async verify(value) {
+      if (failed && ++verified === 2) {
+        const current = await fixture.jobs.getForWorker(fixture.durableJob.jobId);
+        await fixture.jobs[command]({ jobId: current.jobId, expectedRevision: current.revision, reason: `owner ${command}` });
+      }
+      return structuredClone(value);
+    } };
+    const outcome = (await fixture.worker({ grantVerifier }).runCycle()).outcomes[0];
+    assert.equal(outcome.status, command === "pause" ? "paused" : "cancelling");
+    const current = await fixture.jobs.getForWorker(fixture.durableJob.jobId);
+    assert.equal(current.execution.timeoutContinuation, undefined);
+    assert.equal(current.execution.turn, 0);
+    assert.equal(current.execution.pause?.reason ?? current.execution.result.detail.reason, `owner ${command}`);
+  });
+});
+
+test("native timeout leaves a pending or unknown executor action under existing reconciliation policy", async (t) => {
+  await t.test("prepared action", async () => {
+    const fixture = await continuousTimeoutFixture(async () => {
+      const current = await fixture.jobs.getForWorker(fixture.durableJob.jobId);
+      await fixture.jobs.prepareAction({ jobId: current.jobId, expectedRevision: current.revision,
+        action: { actionId: "pending-timeout-action", type: "list_files", path: "", expectedWorkspaceRevision: current.execution.workspaceRevision } });
+      throw fixture.nativeTimeout();
+    });
+    assert.equal((await fixture.worker().runCycle()).outcomes[0].status, "paused");
+    const current = await fixture.jobs.getForWorker(fixture.durableJob.jobId);
+    assert.notEqual(current.execution.pendingAction, null);
+    assert.equal(current.execution.timeoutContinuation, undefined);
+  });
+  await t.test("admitted action result unknown", async () => {
+    const fixture = await continuousTimeoutFixture(async ({ codeExecutionContext }) => {
+      const tools = beginCodeExecutionSession(codeExecutionContext);
+      await assert.rejects(tools.invoke("perform_action", { decision: continuousDecision({ type: "list_files", path: "" }) }));
+      throw fixture.nativeTimeout();
+    });
+    fixture.executor.perform = async () => { throw Object.assign(new Error("executor result lost"), { code: "STRUCTURED_PROVIDER_TIMEOUT" }); };
+    assert.equal((await fixture.worker().runCycle()).outcomes[0].status, "unknown");
+    const current = await fixture.jobs.getForWorker(fixture.durableJob.jobId);
+    assert.notEqual(current.execution.uncertainty, null);
+    assert.notEqual(current.execution.actionAdmission, null);
+    assert.equal(current.execution.timeoutContinuation, undefined);
+  });
+});
+
+test("manual provider pause remains paused and is never adopted by native timeout continuation", async () => {
+  const fixture = await continuousTimeoutFixture(async () => { throw new Error("must not run"); });
+  await fixture.jobs.claimStarting({ jobId: fixture.durableJob.jobId, expectedRevision: fixture.durableJob.revision });
+  const starting = await fixture.jobs.getForWorker(fixture.durableJob.jobId);
+  await fixture.jobs.activate({ jobId: starting.jobId, expectedRevision: starting.revision, workspaceRevision: REVISION_A });
+  const active = await fixture.jobs.getForWorker(starting.jobId);
+  await fixture.jobs.pause({ jobId: active.jobId, expectedRevision: active.revision, reason: "等待人工处理（STRUCTURED_PROVIDER_TIMEOUT）" });
+  const paused = await fixture.jobs.getForWorker(active.jobId);
+  assert.equal((await fixture.worker().runCycle()).selected, 0);
+  assert.deepEqual(await fixture.jobs.getForWorker(active.jobId), paused);
+});
+
+test("native timeout recovery fails closed without durable stop evidence or the continuation store port", async (t) => {
+  await t.test("native provider has not confirmed stop", async () => {
+    const fixture = await continuousTimeoutFixture(async () => { throw fixture.nativeTimeout({ stopConfirmed: false }); });
+    assert.equal((await fixture.worker().runCycle()).outcomes[0].status, "paused");
+    const receipt = await fixture.registry.get("code-job", fixture.durableJob.jobId);
+    assert.equal(receipt.receipt.stopConfirmed, false);
+    assert.equal((await fixture.jobs.getForWorker(fixture.durableJob.jobId)).execution.timeoutContinuation, undefined);
+  });
+  await t.test("registry has no durable receipt store", async () => {
+    const fixture = await continuousTimeoutFixture(async () => { throw fixture.nativeTimeout(); });
+    const taskRuns = new TaskRunRegistry({ store: new IntegrationMemoryStore(), settleControl: async () => {} });
+    assert.equal((await fixture.worker({ taskRuns }).runCycle()).outcomes[0].status, "paused");
+    assert.equal((await fixture.jobs.getForWorker(fixture.durableJob.jobId)).execution.timeoutContinuation, undefined);
+  });
+  await t.test("store does not support durable continuation", async () => {
+    const fixture = await continuousTimeoutFixture(async () => { throw fixture.nativeTimeout(); });
+    const jobStore = new Proxy(fixture.jobs, { get(target, property) {
+      if (property === "recordTimeoutContinuation") return undefined;
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+    assert.equal((await fixture.worker({ jobStore }).runCycle()).outcomes[0].status, "paused");
+    assert.equal((await fixture.jobs.getForWorker(fixture.durableJob.jobId)).execution.timeoutContinuation, undefined);
+  });
 });
 
 test("continuous live pause waits for an admitted profile and prevents a second tool", async () => {
@@ -2702,12 +3110,14 @@ test("pause during an admitted action stays pausing until result reconciliation"
   assert.equal(stored.execution.actionAdmission, null);
 });
 
-async function createRealApprovedJob(grantOverrides = {}) {
+async function createRealApprovedJob(grantOverrides = {}, {
+  storage = new IntegrationMemoryStore(), clock = () => new Date("2026-08-02T08:00:00.000Z"),
+} = {}) {
   const jobs = new CodeJobStore({
-    store: new IntegrationMemoryStore(),
+    store: storage,
     exclusiveLease: { run: (operation) => operation() },
     operationQueue: new OperationQueue(),
-    clock: () => new Date("2026-08-02T08:00:00.000Z"),
+    clock,
     memoryReceiptVerifier: {
       async verify(value) {
         return { ...structuredClone(value), persisted: true };
@@ -4102,6 +4512,7 @@ test("stable brain configuration failures pause instead of spinning forever", as
     "STRUCTURED_PROVIDER_UNAVAILABLE",
     "STRUCTURED_PROVIDER_CANCELLED",
     "STRUCTURED_PROVIDER_TIMEOUT",
+    "STRUCTURED_PROVIDER_IDLE_TIMEOUT",
     "STRUCTURED_PROVIDER_OUTPUT_LIMIT",
     "STRUCTURED_PROVIDER_PROCESS_FAILED",
     "STRUCTURED_PROVIDER_REAP_FAILED",

@@ -76,6 +76,9 @@ export function threadConfiguration(config,{reader,execution,channel='review',na
   if(endpoint && (!namespacePattern.test(namespace) || inherited.some(([name])=>name===namespace)))throw unavailable();
   const mcp_servers=Object.fromEntries(inherited.map(([name])=>[name,{enabled:false}]));
   if(endpoint)mcp_servers[namespace]={url:endpoint.url,enabled:true,required:true,
+    // Verified against the installed CLI's config/read schema. The host's
+    // callback/profile watchdog expires first and retains settlement authority.
+    ...(channel === 'code-job' ? { tool_timeout_sec: 2460 } : {}),
     enabled_tools:[...tools],
     tools:Object.fromEntries(tools.map(tool=>[tool,{approval_mode:'approve',output_token_limit:65536}]))};
   const agents=Object.fromEntries(inventory(config.agents).filter(([,value])=>value && typeof value==='object' && !Array.isArray(value))

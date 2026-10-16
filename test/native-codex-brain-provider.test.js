@@ -3,6 +3,8 @@ import { link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import test from "node:test";
 
 import { createNativeCodexBrainProvider } from "../src/adapters/native-codex-brain-provider.js";
@@ -17,6 +19,8 @@ import { withTaskExecution } from "../src/lib/task-execution-context.js";
 import {TaskRunRegistry} from '../src/services/task-run-registry.js';
 import {CodeJobBrainDirectory} from '../src/services/code-job-brain-directory.js';
 import {githubEntitySessionKey} from '../src/lib/session-key.js';
+import { startCodeExecutionTurn } from '../src/lib/code-execution-watchdog.js';
+import { ContainedStdioProcess } from '../src/lib/contained-stdio-process.js';
 
 const schema = { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false };
 const request = (overrides = {}) => ({ model: "gpt-6.1-sol", reasoningEffort: "high", messages: [{ role: "user", content: "PRIVATE_TASK_INPUT" }], schema, ...overrides });
@@ -256,7 +260,7 @@ test("native continuous execution keeps several host actions inside one invocati
   });
   const provider = f.create(() => assert.fail("continuous execution cannot use exec fallback"), {}, { appServerRunner: { async run(call) {
     invocations++;
-    assert.equal(call.timeoutMs, 900_000);
+    assert.equal(call.timeoutMs, options.timeoutMs, 'startup keeps its own bound; code jobs have no elapsed execution deadline');
     assert.equal(call.appServer.isolation.channel, "code-job");
     assert.equal(call.appServer.isolation.reader, null);
     assert.match(await readFile(path.join(call.cwd, "model-instructions.txt"), "utf8"), /one continuous controlled code job/);
@@ -276,6 +280,88 @@ test("native continuous execution keeps several host actions inside one invocati
   assert.equal(invocations, 1); assert.equal(closed, 1);
   assert.equal(await readFile(path.join(f.home, "auth.json"), "utf8"), "private-native-auth");
   assert.equal(await readFile(path.join(f.home, "config.toml"), "utf8"), 'model = "user-preferred-model"\n');
+  await provider.close();
+});
+
+test("continuous useful code work can exceed ten hours without an elapsed provider cutoff", async (t) => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = "app-server";
+  let actions = 0;
+  const context = createCodeExecutionContext({ performAction: async () => ({ turn: ++actions }),
+    progressFingerprint: async () => createHash('sha256').update(`verified-file-${actions}`).digest('hex'),
+    readSource: async () => ({ text: 'source', nextOffset: null }), getState: async () => ({}), close: async () => ({ settled: true }) });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const provider = f.create(result, {}, { appServerRunner: { async run(call) {
+    startCodeExecutionTurn(call.codeExecutionWatchdog);
+    for (let turn = 0; turn < 61; turn++) {
+      await executionTool(call.appServer.isolation.execution.url, turn + 1, 'perform_action', {
+        decision: codeDecision({ type: 'read_text', path: `src/file${turn}.cpp` }),
+      });
+      t.mock.timers.tick(10 * 60_000);
+      assert.equal(call.signal.aborted, false, `useful action ${turn + 1} must retain execution`);
+    }
+    await writeFile(path.join(call.cwd, 'last-message.json'), JSON.stringify({ result: JSON.stringify(codeDecision({ type: 'complete', outcome: 'done', evidence: [] })) }));
+    return success();
+  } } });
+  assert.equal(JSON.parse(await provider.generate(request({ codeExecutionContext: context }))).action.type, 'complete');
+  assert.equal(actions, 61);
+  await provider.close();
+});
+
+test('one host watchdog carries useful code progress beyond ten hours through the full native process chain', async t => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = 'app-server';
+  const child = new EventEmitter(); child.pid = 424242;
+  child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
+  const threadId = '01973bca-3d8b-7000-a000-123456789abc', entered = gate();
+  let namespace, sharedWatchdog, propagated = 0, reaps = 0, confirmed = 0, closed = false;
+  const send = message => child.stdout.write(JSON.stringify(message) + '\n');
+  const close = () => { if (!closed) { closed = true; child.emit('close', 0, null); } };
+  child.stdin.on('finish', close);
+  child.stdin.on('data', chunk => {
+    for (const line of chunk.toString().split('\n').filter(Boolean)) {
+      const message = JSON.parse(line); if (message.id === undefined) continue;
+      let result = {};
+      if (message.method === 'config/read') result = { config: {
+        features: { ...Object.fromEntries(['shell_tool','apps','browser_use','computer_use','image_generation','hooks','plugins','remote_plugin','plugin_sharing','skill_search','skill_mcp_dependency_install','goals','memories','workspace_dependencies','multi_agent_v2','code_mode','multi_agent'].map(name => [name, false])),
+          skip_host_skill_discovery: true, code_mode_host: true },
+        agents: { enabled: false }, web_search: 'disabled', approval_policy: 'never', sandbox_mode: 'read-only', model_provider: 'openai', notify: [], mcp_servers: {},
+      } };
+      if (message.method.startsWith('thread/')) {
+        namespace = Object.keys(message.params.config.mcp_servers).find(name => name.startsWith('dih_code_job_'));
+        result = { thread: { id: threadId }, approvalPolicy: 'never', sandbox: { type: 'readOnly', networkAccess: false } };
+      }
+      if (message.method === 'mcpServerStatus/list') result = { data: [{ name: namespace,
+        tools: Object.fromEntries(['perform_action', 'read_source', 'get_state'].map(name => [name, {}])) }], nextCursor: null };
+      if (message.method === 'turn/start') result = { turn: { id: 'turn-1' } };
+      send({ id: message.id, result });
+      if (message.method === 'turn/start') entered.resolve();
+    }
+  });
+  const supervised = createTestSupervisedProcessRunner({ platform: 'linux', spawnImpl: () => child,
+    descriptorMaterializer: async () => ({ command: process.execPath, prefixArgs: [] }), treeTerminator: async () => { reaps++; close(); } });
+  const runner = new CodexAppServerRunner({ materialize: async () => null,
+    processFactory: () => new ContainedStdioProcess({ run(call) {
+      assert.equal(call.codeExecutionWatchdog, sharedWatchdog, 'contained supervision must retain the same opaque capability');
+      propagated++; return supervised.run(call);
+    } }) });
+  const provider = f.create(result, {}, { appServerRunner: { run(call) {
+    sharedWatchdog = call.codeExecutionWatchdog; assert.ok(sharedWatchdog); return runner.run(call);
+  } } });
+  const context = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {}, close: async () => ({ settled: true }) });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const running = withTaskExecution({ reportProgress() {}, registerLiveControl() {}, confirmStopped() { confirmed++; } }, () => provider.generate(request({ codeExecutionContext: context })));
+  void running.catch(() => {}); await entered.promise; await new Promise(resolve => setImmediate(resolve));
+  for (let index = 0; index < 61; index++) {
+    send({ method: 'item/reasoning/textDelta', params: { threadId, turnId: 'turn-1', itemId: `reasoning-${index}`, contentIndex: 0, delta: 'Verified the next implementation step.' } });
+    t.mock.timers.tick(10 * 60_000);
+    await new Promise(resolve => setImmediate(resolve));
+    if (closed) await running;
+    assert.equal(closed, false, `native step ${index + 1} remains active`);
+  }
+  send({ method: 'item/completed', params: { threadId, turnId: 'turn-1', item: { id: 'answer', type: 'agentMessage',
+    text: JSON.stringify({ result: JSON.stringify(codeDecision({ type: 'complete', outcome: 'done', evidence: [] })) }) } } });
+  send({ method: 'turn/completed', params: { threadId, turn: { id: 'turn-1', status: 'completed' } } });
+  assert.equal(JSON.parse(await running).action.type, 'complete');
+  assert.equal(propagated, 1); assert.equal(reaps, 1); assert.equal(confirmed, 1);
   await provider.close();
 });
 
@@ -350,7 +436,7 @@ test("caller cancellation preserves explicit native reap proof through abort rem
   const provider = f.create(result, {}, { appServerRunner: { run(call) {
     // Policy isolation is tested separately; this fixture isolates the actual
     // runner's reap certificate and provider abort-reason translation.
-    return runner.run({ ...call, appServer: { ...call.appServer, isolation: undefined } });
+    return runner.run({ ...call, codeExecutionWatchdog: null, appServer: { ...call.appServer, isolation: undefined } });
   } } });
   const running = withTaskExecution({ confirmStopped() { confirmed++; } }, () => provider.generate(request({ codeExecutionContext: context, signal: controller.signal })));
   const stopped = assert.rejects(running, { code: "STRUCTURED_PROVIDER_CANCELLED" });

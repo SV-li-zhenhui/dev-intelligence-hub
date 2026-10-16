@@ -7,6 +7,7 @@ import { types as utilTypes } from "node:util";
 import { terminateProcessTree } from "./managed-process.js";
 import { materializeVerifiedCliDescriptor } from "./known-cli-locator.js";
 import { normalizeAbortSignal } from "./structured-provider-request.js";
+import { codeExecutionWatchdogSignal } from './code-execution-watchdog.js';
 
 const MAX_TIMEOUT_MS = 3_600_000;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
@@ -507,6 +508,7 @@ export class SupervisedProcessRunner {
     maxStdoutBytes,
     maxStderrBytes,
     duplex = null,
+    codeExecutionWatchdog = null,
   }, onSpawnAttempt) {
     const platform = this.#platform;
     const spawnImpl = this.#spawnImpl;
@@ -520,7 +522,9 @@ export class SupervisedProcessRunner {
       MAX_TIMEOUT_MS,
     );
     const startedAt = performance.now();
-    const externalSignal = normalizeAbortSignal(signal);
+    const watchdogSignal = codeExecutionWatchdog === null ? null : codeExecutionWatchdogSignal(codeExecutionWatchdog);
+    const callerSignal = normalizeAbortSignal(signal);
+    const externalSignal = watchdogSignal ? (callerSignal ? AbortSignal.any([callerSignal, watchdogSignal]) : watchdogSignal) : callerSignal;
     if (externalSignal?.aborted) throw cancelledError();
     if (requireDescriptorDigest && platform !== "win32") {
       throw unavailableError();
@@ -546,6 +550,7 @@ export class SupervisedProcessRunner {
       ),
     };
     if (duplex && normalizedInvocation.input.length !== 0) throw new TypeError("duplex input starts empty");
+    if (watchdogSignal && !duplex) throw new TypeError('Code execution watchdog requires contained duplex execution');
     let remainingMs = remainingRequestTime(startedAt, requestTimeoutMs);
     if (remainingMs <= 0) throw timeoutError();
     let descriptor;
@@ -731,7 +736,7 @@ export class SupervisedProcessRunner {
         return terminationPromise;
       };
       const onAbort = () => {
-        void terminate(cancelledError());
+        void terminate(watchdogSignal?.aborted ? watchdogSignal.reason : cancelledError());
       };
       const acceptOutput = (state, chunk, maximum, stream) => {
         if (settled || terminalError) return;
@@ -825,7 +830,7 @@ export class SupervisedProcessRunner {
         onAbort();
       } else if (processRemainingMs <= 0) {
         void terminate(timeoutError());
-      } else {
+      } else if (!watchdogSignal) {
         timer = setTimeout(
           () => void terminate(timeoutError()),
           Math.max(1, Math.ceil(processRemainingMs)),

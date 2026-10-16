@@ -1090,6 +1090,32 @@ function normalizeMemoryProjection(value, jobId, error) {
   };
 }
 
+export function codeJobTimeoutContinuationDelayMs(consecutiveNoProgress) {
+  return 60_000 * 2 ** Math.max(0, consecutiveNoProgress - 1);
+}
+
+export function normalizeCodeJobTimeoutContinuation(value, error = invalidJob()) {
+  const fields = exactObject(value, ["schemaVersion", "failedRunId", "errorCode", "failedAt", "recordedAt",
+    "retryAfter", "progressFingerprint", "consecutiveNoProgress"], error);
+  if (fields.get("schemaVersion") !== 1 ||
+      !["STRUCTURED_PROVIDER_TIMEOUT", "STRUCTURED_PROVIDER_IDLE_TIMEOUT"].includes(fields.get("errorCode"))) throw error;
+  const continuation = {
+    schemaVersion: 1,
+    failedRunId: safeId(fields.get("failedRunId"), "timeoutContinuation.failedRunId", error),
+    errorCode: fields.get("errorCode"),
+    failedAt: normalizeCodeJobTimestamp(fields.get("failedAt"), error),
+    recordedAt: normalizeCodeJobTimestamp(fields.get("recordedAt"), error),
+    retryAfter: normalizeCodeJobTimestamp(fields.get("retryAfter"), error),
+    progressFingerprint: sha256(fields.get("progressFingerprint"), "timeoutContinuation.progressFingerprint", error),
+    consecutiveNoProgress: safeInteger(fields.get("consecutiveNoProgress"), "timeoutContinuation.consecutiveNoProgress",
+      { minimum: 0, maximum: 3, error }),
+  };
+  const delay = codeJobTimeoutContinuationDelayMs(continuation.consecutiveNoProgress);
+  if (Date.parse(continuation.failedAt) > Date.parse(continuation.recordedAt) ||
+      Date.parse(continuation.retryAfter) !== Date.parse(continuation.recordedAt) + delay) throw error;
+  return continuation;
+}
+
 function emptyExecution() {
   return {
     sessionId: null,
@@ -1131,6 +1157,7 @@ function normalizeExecution(
   const admissionKeys = [...memoryKeys, "actionAdmission"];
   const currentKeys = [...admissionKeys, "uncertainty"];
   const settlementKeys = [...currentKeys, "cancellationSettlement"];
+  const hasTimeoutContinuation = executionKeys.includes("timeoutContinuation");
   const withoutMemory =
     executionKeys.length === baseKeys.length &&
     baseKeys.every((key) => executionKeys.includes(key));
@@ -1153,7 +1180,7 @@ function normalizeExecution(
           ? admissionKeys
           : withoutSettlement
             ? currentKeys
-            : settlementKeys,
+            : hasTimeoutContinuation ? [...settlementKeys, "timeoutContinuation"] : settlementKeys,
     error,
   );
   const sessionId = fields.get("sessionId") === null
@@ -1245,9 +1272,13 @@ function normalizeExecution(
     uncertainty,
     cancellationSettlement,
     memoryProjection,
+    ...(hasTimeoutContinuation ? { timeoutContinuation: normalizeCodeJobTimeoutContinuation(fields.get("timeoutContinuation"), error) } : {}),
   };
 
   if (
+    (hasTimeoutContinuation && (sessionId === null || workspaceRevision === null ||
+      Date.parse(execution.timeoutContinuation.failedAt) < Date.parse(createdAt) ||
+      Date.parse(execution.timeoutContinuation.recordedAt) > Date.parse(updatedAt))) ||
     observations.length !== turn ||
     observations.some(
       ({ actionType }) => !grant.allowedActions.includes(actionType),

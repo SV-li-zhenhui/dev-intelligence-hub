@@ -145,9 +145,31 @@ Structured results retain no action authority. No CLI version string is a gate.
 Code jobs on this route use one model turn for several audited executor actions.
 This capability is selected by the native App Server adapter without rewriting
 configuration, grants, models, effort, login, or retained session references.
-The per-turn timeout is at least 900,000 ms, or the longer configured provider
-timeout. Fixed test-profile timeouts and the job's action limit still apply.
+Continuous native code execution has no total wall-clock deadline. Useful
+current-turn progress renews a model inactivity watchdog; a task can keep working
+for more than ten hours. Startup, RPCs, individual host actions, fixed test
+profiles and process-tree cleanup retain their own bounds. Polling, stale events
+and repeated tool results do not prove new progress. The job's audited action
+limit still applies.
 Other transports retain the previous one-action model decisions.
+
+Model inactivity allows at least 15 minutes, or the longer configured provider
+timeout. A host callback has a separate 30-minute hang bound because it includes
+repeated authority checks and paginated repair feedback; a profile callback adds
+the existing ten-minute executor allowance. The native MCP tool deadline is
+41 minutes so it does not cut off those host bounds. These bounds do not extend
+the profile process's own timeout or guarantee arbitrary feedback pagination fits.
+
+After a native inactivity timeout, the worker can continue the same active job
+only when its durable receipt proves the native process and admitted host actions
+stopped, the checkpoint has no unresolved action, and current authority and
+workspace checks still pass. It preserves the job, observations, changes and
+successful verification results. Retry metadata and backoff survive restart;
+three consecutive timeouts without new source, workspace or verification evidence
+pause the task with an explanation. Elapsed task age does not consume this budget.
+Existing paused jobs are not automatically adopted: their records do not identify
+whether an operator intended the pause. User pause/cancel and uncertain side
+effects remain reconciliation holds.
 
 Monitor one actual job after deployment: it should keep one thread/turn while
 multiple action observations appear, then produce the normal result/memory/package

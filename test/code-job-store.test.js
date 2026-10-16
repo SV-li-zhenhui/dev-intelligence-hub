@@ -5,6 +5,7 @@ import {
   codeJobIdForGrant,
   createCodeJobGrant,
   normalizeCodeJobGrant,
+  normalizeCodeJob,
 } from "../src/domain/code-job-contract.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
@@ -318,6 +319,96 @@ async function readyStore({
   await jobs.recover();
   return { jobs, store, time, exclusiveLease };
 }
+
+async function activeTimeoutStore() {
+  const fixture = await readyStore();
+  const created = await fixture.jobs.createApprovedJob(approval());
+  const starting = await fixture.jobs.claimStarting({ jobId: created.job.jobId, expectedRevision: created.job.revision });
+  const activated = await fixture.jobs.activate({ jobId: starting.job.jobId, expectedRevision: starting.job.revision,
+    workspaceRevision: "4".repeat(64) });
+  return { ...fixture, active: activated.job };
+}
+
+function timeoutMutation(job, overrides = {}) {
+  return { jobId: job.jobId, expectedRevision: job.revision, failedRunId: "native-timeout-run-1",
+    errorCode: "STRUCTURED_PROVIDER_TIMEOUT", failedAt: job.updatedAt,
+    progressFingerprint: "6".repeat(64), baselineProgressFingerprint: "6".repeat(64), ...overrides };
+}
+
+test("timeout continuation is optional and old execution records retain their exact digest and shape", async () => {
+  const fixture = await activeTimeoutStore();
+  assert.equal(Object.hasOwn(fixture.active.execution, "timeoutContinuation"), false);
+  assert.deepEqual(normalizeCodeJob(fixture.active), fixture.active);
+  const writes = fixture.store.writeCount;
+  const recovered = await readyStore({ store: fixture.store, time: fixture.time });
+  assert.deepEqual(await recovered.jobs.getForWorker(fixture.active.jobId), fixture.active);
+  assert.equal(fixture.store.writeCount, writes);
+});
+
+test("timeout continuation CAS stores strict metadata, applies backoff and retains owner lifecycle authority", async (t) => {
+  for (const terminal of ["cancel", "fence"]) await t.test(terminal, async () => {
+    const fixture = await activeTimeoutStore();
+    let current = (await fixture.jobs.recordTimeoutContinuation(timeoutMutation(fixture.active))).job;
+    const checkpoint = structuredClone(current.execution.timeoutContinuation);
+    assert.equal(checkpoint.consecutiveNoProgress, 1);
+    assert.equal((await fixture.jobs.listRunnable()).items.length, 0);
+    fixture.time.advance(60_000);
+    assert.equal((await fixture.jobs.listRunnable()).items.length, 1);
+    const again = await fixture.jobs.recordTimeoutContinuation(timeoutMutation(current));
+    assert.equal(again.status, "already");
+    current = (await fixture.jobs.pause({ jobId: current.jobId, expectedRevision: current.revision, reason: "owner hold" })).job;
+    assert.deepEqual(current.execution.timeoutContinuation, checkpoint);
+    await assert.rejects(fixture.jobs.recordTimeoutContinuation(timeoutMutation(current, { failedRunId: "wrongly-adopt-paused" })),
+      { code: "CODE_JOB_TRANSITION_CONFLICT" });
+    current = (await fixture.jobs.resume({ jobId: current.jobId, expectedRevision: current.revision })).job;
+    assert.deepEqual(current.execution.timeoutContinuation, checkpoint);
+    current = (await fixture.jobs.recordTimeoutContinuation(timeoutMutation(current, { failedRunId: "native-timeout-run-2" }))).job;
+    assert.equal(current.execution.timeoutContinuation.consecutiveNoProgress, 2, "manual resume does not reset progress budget");
+    const lastCheckpoint = structuredClone(current.execution.timeoutContinuation);
+    if (terminal === "cancel") {
+      current = (await fixture.jobs.cancel({ jobId: current.jobId, expectedRevision: current.revision, reason: "owner cancelled" })).job;
+      current = (await fixture.jobs.finalizeCancellation({ jobId: current.jobId, expectedRevision: current.revision,
+        settlement: executorCancellationProof(current) })).job;
+      assert.equal(current.status, "cancelled");
+    } else {
+      current = (await fixture.jobs.fence({ jobId: current.jobId, expectedRevision: current.revision,
+        result: { code: "INVALID_CODE_JOB_AUTHORITY", message: "owner authority changed" } })).job;
+      assert.equal(current.status, "fenced");
+    }
+    assert.deepEqual(current.execution.timeoutContinuation, lastCheckpoint);
+    assert.deepEqual(normalizeCodeJob(current), current);
+    const recovered = await readyStore({ store: fixture.store, time: fixture.time });
+    assert.deepEqual(await recovered.jobs.getForWorker(current.jobId), current);
+  });
+});
+
+test("timeout continuation metadata rejects unsupported, malformed and rebound persisted records", async (t) => {
+  const fixture = await activeTimeoutStore();
+  const current = (await fixture.jobs.recordTimeoutContinuation(timeoutMutation(fixture.active))).job;
+  const badMutations = [
+    ["extra key", metadata => { metadata.unknownPolicy = true; }],
+    ["null", (_metadata, execution) => { execution.timeoutContinuation = null; }],
+    ["unsupported failure", metadata => { metadata.errorCode = "STRUCTURED_PROVIDER_CLEANUP_FAILED"; }],
+    ["negative budget", metadata => { metadata.consecutiveNoProgress = -1; }],
+    ["unbounded budget", metadata => { metadata.consecutiveNoProgress = 4; }],
+    ["fingerprint missing", metadata => { delete metadata.progressFingerprint; }],
+    ["arbitrary retry time", metadata => { metadata.retryAfter = "2099-01-01T00:00:00.000Z"; }],
+    ["failure before creation", metadata => { metadata.failedAt = "2000-01-01T00:00:00.000Z"; }],
+    ["session absent", (_metadata, execution) => { execution.sessionId = null; }],
+  ];
+  for (const [name, mutate] of badMutations) await t.test(name, () => {
+    const corrupted = structuredClone(current);
+    mutate(corrupted.execution.timeoutContinuation, corrupted.execution);
+    delete corrupted.recordDigest;
+    corrupted.recordDigest = digestValue(corrupted);
+    assert.throws(() => normalizeCodeJob(corrupted), { code: "INVALID_CODE_JOB" });
+  });
+  const writes = fixture.store.writeCount;
+  await assert.rejects(fixture.jobs.recordTimeoutContinuation(timeoutMutation(current,
+    { failedRunId: "native-timeout-unsupported", errorCode: "STRUCTURED_PROVIDER_REAP_FAILED" })),
+    { code: "INVALID_CODE_JOB_MUTATION" });
+  assert.equal(fixture.store.writeCount, writes);
+});
 
 async function completedDeliveryFixture(options = {}) {
   const {

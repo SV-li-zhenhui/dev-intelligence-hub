@@ -3,6 +3,7 @@ import test from "node:test";
 import { createCodeJobExecutionMcp } from "../src/adapters/code-job-execution-mcp.js";
 import { createCodeExecutionContext } from "../src/lib/code-execution-context.js";
 import { CODE_ACTION_DECISION_JSON_SCHEMA } from "../src/domain/structured-code-action-contract.js";
+import { createCodeExecutionWatchdog, codeExecutionWatchdogSignal, startCodeExecutionTurn, closeCodeExecutionWatchdog } from '../src/lib/code-execution-watchdog.js';
 
 function deferred() {
   let resolve;
@@ -50,6 +51,25 @@ test("execution MCP exposes exactly scoped semantic tools and marks only reads a
   await assert.rejects(tool(endpoint, "shell", {}), { code: "CODE_EXECUTION_TOOL_NOT_ALLOWED" });
   await assert.rejects(tool(endpoint, "perform_action", { decision: decision({ type: "complete", outcome: "done", evidence: [] }) }),
     { code: "CODE_EXECUTION_COMPLETE_NOT_ALLOWED" });
+});
+
+test('MCP ping, get_state and cached mutation replay cannot renew host inactivity', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const watchdog = createCodeExecutionWatchdog({ startupMs: 1000 }); startCodeExecutionTurn(watchdog);
+  t.after(() => closeCodeExecutionWatchdog(watchdog));
+  let writes = 0;
+  const endpoint = await fixture(t, { progressFingerprint: async () => String(writes).repeat(64),
+    performAction: async () => { writes++; return { material: 'saved' }; } }, { watchdog });
+  const args = { decision: decision({ type: 'write_text', path: 'src/file.cpp', content: 'new content' }) };
+  await tool(endpoint, 'perform_action', args, 'stable-mutation');
+  for (let index = 0; index < 14; index++) {
+    await rpc(endpoint, 'ping'); await tool(endpoint, 'get_state', {});
+    await tool(endpoint, 'perform_action', args, 'stable-mutation');
+    t.mock.timers.tick(60_000);
+  }
+  assert.equal(writes, 1); assert.equal(codeExecutionWatchdogSignal(watchdog).aborted, false);
+  t.mock.timers.tick(60_000);
+  assert.equal(codeExecutionWatchdogSignal(watchdog).reason.code, 'STRUCTURED_PROVIDER_IDLE_TIMEOUT');
 });
 
 test("mutating request IDs cache concurrent and reordered canonical replays without repeating actions", async (t) => {

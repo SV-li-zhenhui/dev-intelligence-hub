@@ -13,6 +13,7 @@ import {
   didSupervisedProcessNotStart,
   SupervisedProcessRunner,
 } from "../src/lib/supervised-process-runner.js";
+import { createCodeExecutionWatchdog, closeCodeExecutionWatchdog } from '../src/lib/code-execution-watchdog.js';
 
 const WINDOWS_JOB_OBJECT_SKIP = process.platform !== "win32"
   ? "requires Windows Job Object process supervision"
@@ -115,6 +116,18 @@ function request(cwd, script, overrides = {}) {
     ...overrides,
   };
 }
+
+test('supervision rejects serialized watchdog authority and keeps code management confined to duplex calls', async t => {
+  const directory = await temporaryDirectory(t, 'supervised-watchdog-authority-');
+  const watchdog = createCodeExecutionWatchdog({ startupMs: 1000 }); t.after(() => closeCodeExecutionWatchdog(watchdog));
+  const runner = testRunner({ spawnImpl: () => assert.fail('invalid authority cannot spawn') });
+  for (const value of [{}, structuredClone(watchdog)]) {
+    await assert.rejects(runner.run(request(directory, '', { codeExecutionWatchdog: value })),
+      error => /watchdog is invalid/.test(error.message) && didSupervisedProcessNotStart(error));
+  }
+  await assert.rejects(runner.run(request(directory, '', { codeExecutionWatchdog: watchdog })),
+    error => /duplex execution/.test(error.message) && didSupervisedProcessNotStart(error));
+});
 
 test("supervised runner delivers only the explicit cwd, environment, and stdin", async (t) => {
   const directory = await temporaryDirectory(t, "supervised-runner-io-");

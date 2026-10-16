@@ -1,5 +1,6 @@
 import { StringDecoder } from 'node:string_decoder';
 import { SupervisedProcessRunner, didSupervisedProcessNotStart } from './supervised-process-runner.js';
+import { codeExecutionWatchdogSignal } from './code-execution-watchdog.js';
 
 // Duplex protocol framing over the same Windows Job Object supervisor used by
 // one-shot CLI calls. A child exit alone never certifies process-tree cleanup.
@@ -10,8 +11,9 @@ export class ContainedStdioProcess {
     this.notStarted = false;
   }
 
-  async start({ executable, args, cwd, env, timeoutMs, maxStdoutBytes, maxStderrBytes,
+  async start({ executable, args, cwd, env, timeoutMs, codeExecutionWatchdog=null, maxStdoutBytes, maxStderrBytes,
     onLine, onError, onLimit, onExit }) {
+    if (codeExecutionWatchdog !== null) codeExecutionWatchdogSignal(codeExecutionWatchdog);
     const controller = new AbortController();
     this.controller = controller;
     let ready, rejectReady;
@@ -30,6 +32,7 @@ export class ContainedStdioProcess {
       if (Buffer.byteLength(state.text) > 16 * 1024 * 1024) onLimit();
     };
     this.done = this.runner.run({ executable, args, cwd, env, timeoutMs,
+      ...(codeExecutionWatchdog ? { codeExecutionWatchdog } : {}),
       maxStdoutBytes, maxStderrBytes, signal: controller.signal,
       duplex: { onReady: control => { this.control = control; ready(); }, onOutput: receive },
     }).then(result => {

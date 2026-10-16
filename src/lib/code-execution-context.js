@@ -1,4 +1,5 @@
 import { OperationQueue } from "./operation-queue.js";
+import { beginCodeExecutionHostOperation, codeExecutionWatchdogSignal } from './code-execution-watchdog.js';
 
 const contexts = new WeakMap();
 const CALLBACKS = new Map([
@@ -19,16 +20,18 @@ function stateFor(context) {
 
 // A serialized model input cannot recreate this authority. Callbacks retain
 // job ownership, workspace revision, audit and executor validation on the host.
-export function createCodeExecutionContext({ performAction, readSource, getState, close } = {}) {
+export function createCodeExecutionContext({ performAction, readSource, getState, close, progressFingerprint, sourceReadIdentity } = {}) {
   if ([performAction, readSource, getState].some((callback) => typeof callback !== "function") ||
-      (close !== undefined && typeof close !== "function")) {
+      (close !== undefined && typeof close !== "function") ||
+      (progressFingerprint !== undefined && typeof progressFingerprint !== 'function') ||
+      (sourceReadIdentity !== undefined && typeof sourceReadIdentity !== 'function')) {
     throw failure("CODE_EXECUTION_CONTEXT_INVALID");
   }
   const context = Object.freeze({});
   contexts.set(context, {
-    callbacks: { performAction, readSource, getState, close },
+    callbacks: { performAction, readSource, getState, close, progressFingerprint, sourceReadIdentity },
     controller: new AbortController(), started: false, revoked: false,
-    queue: new OperationQueue(), closing: null, removeParentAbort: null,
+    queue: new OperationQueue(), closing: null, removeParentAbort: null, pendingCallbacks: new Set(),
   });
   return context;
 }
@@ -57,6 +60,9 @@ export function closeCodeExecutionContext(context) {
   return state.closing ??= (async () => {
     try {
       await state.queue.tail;
+      // A deadline can stop waiting for an uncooperative callback, but cannot
+      // certify that its host action settled or release the workspace owner.
+      if (state.pendingCallbacks.size) throw failure('CODE_EXECUTION_UNSETTLED');
       return await state.callbacks.close?.();
     } finally {
       state.removeParentAbort?.();
@@ -64,15 +70,17 @@ export function closeCodeExecutionContext(context) {
   })();
 }
 
-export function beginCodeExecutionSession(context, { signal = null } = {}) {
+export function beginCodeExecutionSession(context, { signal = null, watchdog = null } = {}) {
   const state = stateFor(context);
   assertActive(state);
   if (state.started) throw failure("CODE_EXECUTION_SESSION_ALREADY_STARTED");
+  const watchdogSignal = watchdog === null ? null : codeExecutionWatchdogSignal(watchdog);
   state.started = true;
   const onAbort = () => revokeCodeExecutionContext(context, { abortActive: true });
   signal?.addEventListener("abort", onAbort, { once: true });
-  state.removeParentAbort = () => signal?.removeEventListener("abort", onAbort);
-  if (signal?.aborted) onAbort();
+  watchdogSignal?.addEventListener('abort', onAbort, { once: true });
+  state.removeParentAbort = () => { signal?.removeEventListener("abort", onAbort); watchdogSignal?.removeEventListener('abort', onAbort); };
+  if (signal?.aborted || watchdogSignal?.aborted) onAbort();
   return Object.freeze({
     assertActive: () => assertActive(state),
     invoke(name, args) {
@@ -82,7 +90,35 @@ export function beginCodeExecutionSession(context, { signal = null } = {}) {
         if (!callback) throw failure("CODE_EXECUTION_TOOL_NOT_ALLOWED");
         return state.queue.enqueue(async () => {
           assertActive(state);
-          return await state.callbacks[callback](args, { signal: state.controller.signal });
+          const finish = watchdog === null ? null : beginCodeExecutionHostOperation(watchdog, name, args);
+          let removeAbort;
+          const operation = Promise.resolve().then(async () => {
+            const fingerprint = name === 'perform_action' ? state.callbacks.progressFingerprint : null;
+            const before = await fingerprint?.();
+            // The trusted read can outlive cancellation or an idle deadline.
+            // Re-check admission before starting the side-effecting callback.
+            assertActive(state);
+            state.controller.signal.throwIfAborted();
+            const value = await state.callbacks[callback](args, { signal: state.controller.signal });
+            const after = await fingerprint?.();
+            const sourceIdentity = name === 'read_source' ? await state.callbacks.sourceReadIdentity?.() : null;
+            return { value, before, after, sourceIdentity };
+          });
+          state.pendingCallbacks.add(operation);
+          void operation.then(() => state.pendingCallbacks.delete(operation), () => state.pendingCallbacks.delete(operation));
+          try {
+            const aborted = watchdogSignal && new Promise((_, reject) => {
+              const onWatchdogAbort = () => reject(watchdogSignal.reason);
+              watchdogSignal.addEventListener('abort', onWatchdogAbort, { once: true });
+              removeAbort = () => watchdogSignal.removeEventListener('abort', onWatchdogAbort);
+              if (watchdogSignal.aborted) onWatchdogAbort();
+            });
+            const completed = await (aborted ? Promise.race([operation, aborted]) : operation);
+            finish?.(!state.revoked && !state.controller.signal.aborted, completed.value, {
+              before: completed.before, after: completed.after, sourceIdentity: completed.sourceIdentity,
+            });
+            return completed.value;
+          } finally { removeAbort?.(); finish?.(false); }
         });
       } catch (error) {
         return Promise.reject(error);

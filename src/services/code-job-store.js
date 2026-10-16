@@ -10,6 +10,8 @@ import {
   normalizeApprovedCodeJobRequest,
   normalizeCodeJob,
   normalizeCodeJobTimestamp,
+  normalizeCodeJobTimeoutContinuation,
+  codeJobTimeoutContinuationDelayMs,
   projectCodeJobForBrowser,
   updateCodeJobLifecycle,
 } from "../domain/code-job-contract.js";
@@ -3344,6 +3346,42 @@ export class CodeJobStore {
     });
   }
 
+  recordTimeoutContinuation(value) {
+    const request = normalizeMutationBase(value, ["failedRunId", "errorCode", "failedAt",
+      "progressFingerprint", "baselineProgressFingerprint"]);
+    const failedRunId = normalizeSafeId(value.failedRunId, request.error);
+    const failedAt = normalizeCodeJobTimestamp(value.failedAt, request.error);
+    const progressFingerprint = normalizeSha256(value.progressFingerprint, request.error);
+    const baselineProgressFingerprint = normalizeSha256(value.baselineProgressFingerprint, request.error);
+    return this.#mutate((state) => {
+      const { job, index } = this.#requireJob(state, request.jobId);
+      this.#assertJobRevision(job, request.expectedRevision);
+      if (job.status !== "active" || job.execution.pendingAction !== null ||
+          job.execution.actionAdmission !== null || job.execution.uncertainty !== null ||
+          job.execution.pause !== null || job.execution.sessionId !== job.jobId ||
+          job.execution.workspaceRevision === null) throw transitionConflict();
+      const previous = job.execution.timeoutContinuation;
+      if (previous?.failedRunId === failedRunId) {
+        if (previous.errorCode !== value.errorCode || previous.failedAt !== failedAt ||
+            previous.progressFingerprint !== progressFingerprint) throw transitionConflict();
+        return { state, value: workerMutationResult("already", job), write: false };
+      }
+      const madeProgress = progressFingerprint !== (previous?.progressFingerprint ?? baselineProgressFingerprint);
+      const consecutiveNoProgress = madeProgress ? 0 : Math.min(3, (previous?.consecutiveNoProgress ?? 0) + 1);
+      const exhausted = consecutiveNoProgress === 3;
+      const changed = this.#updateJob(state, index, exhausted ? "paused" : "active", (at) => ({
+        ...job.execution,
+        timeoutContinuation: normalizeCodeJobTimeoutContinuation({ schemaVersion: 1, failedRunId,
+          errorCode: value.errorCode, failedAt, recordedAt: at,
+          retryAfter: new Date(Date.parse(at) + codeJobTimeoutContinuationDelayMs(consecutiveNoProgress)).toISOString(),
+          progressFingerprint, consecutiveNoProgress }, request.error),
+        ...(exhausted ? { pause: { from: "active", at,
+          reason: `连续 ${consecutiveNoProgress} 次原生执行超时未获得新的源码、工作区变更或验证证据，已保留断点并暂停（${value.errorCode}）` } } : {}),
+      }));
+      return this.#appliedLifecycleChange(changed);
+    });
+  }
+
   pause(value) {
     const request = normalizeMutationBase(value, ["reason"]);
     const reason = normalizeReason(value.reason, request.error);
@@ -3925,20 +3963,25 @@ export class CodeJobStore {
 
   listRunnable(value = {}) {
     const { limit, roleId, afterSequence } = normalizeRunnableOptions(value);
-    return this.#query(() => ({
+    return this.#query(() => {
+      let continuationNow;
+      return {
       revision: this.state.revision,
       items: rotateWorkerCandidates(
         this.state.jobs
           .filter(
-            ({ status, grant }) =>
+            ({ status, grant, execution }) =>
               RUNNABLE_STATUSES.has(status) &&
+              (status !== "active" || execution.timeoutContinuation === undefined ||
+                Date.parse(execution.timeoutContinuation.retryAfter) <= (continuationNow ??= Date.parse(this.#now(this.state)))) &&
               (roleId === null || grant.requestedBy.roleId === roleId),
           )
           .sort((left, right) => left.sequence - right.sequence),
         afterSequence,
         limit,
       ).map(cloneCodeJobValue),
-    }));
+      };
+    });
   }
 
   listReconcilable(value = {}) {
