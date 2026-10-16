@@ -2643,6 +2643,30 @@ export class WorkLedgerService {
       }
       return this.#recordBatch(batch, now, nextDeniedCutoverProofs, scopeRecoveryRoots);
     }
+    if (scopeRecoveryRoots === null && batch.items.length > 1 &&
+        timelineEvents.length > this.limits.timelineLimit &&
+        timelineEvents.slice(0, timelineEvents.length - this.limits.timelineLimit).some(event => {
+          if (!["pr_source_revised", "pr_source_activated"].includes(event.type) ||
+              event.details?.decisionAttemptOffset === undefined) return false;
+          const previous = this.state.items.find(item => item.itemId === event.itemId);
+          const next = itemsById.get(event.itemId);
+          const budget = next?.source?.decisionBudget;
+          return previous?.source?.kind === "pull_request" && budget !== undefined &&
+            previous.source.current.headRefOid !== next.source.current.headRefOid &&
+            event.details.workKey === next.source.workKey &&
+            event.details.activeRevision === budget.activationRevision &&
+            event.details.headRefOid === next.source.current.headRefOid &&
+            event.details.previousHeadRefOid === previous.source.current.headRefOid &&
+            event.details.previousActiveRevision === previous.source.activeRevision &&
+            budget.previousActiveRevision === previous.source.activeRevision &&
+            event.details.decisionAttemptOffset === previous.attempt &&
+            budget.attemptOffset === previous.attempt;
+        })) {
+      // Nothing has been written. Replan a smaller feed prefix so its real
+      // activation receipt survives this commit; later intake consumes the rest.
+      const items = batch.items.slice(0, Math.floor(batch.items.length / 2));
+      return this.#recordBatch({ ...batch, items, nextSequence: items.at(-1).sequence }, now);
+    }
     const nextState = this.#candidateWithTimeline(
       {
         ...this.state,

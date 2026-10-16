@@ -1282,7 +1282,7 @@ export function currentWorkItemEvent(item) {
 
 // Keep the lifetime claim counter intact; only a proven accepted Head change
 // opens a new decision budget. Metadata-only and authority updates do not.
-export function pullRequestDecisionAttemptBudget(item, timeline) {
+export function pullRequestDecisionAttemptBudget(item, timeline, { initialActiveRevision = null } = {}) {
   const source = item?.source;
   if (item?.kind !== "source_root" || source?.kind !== "pull_request" ||
       !Array.isArray(timeline)) return null;
@@ -1292,7 +1292,9 @@ export function pullRequestDecisionAttemptBudget(item, timeline) {
   if (!accepted.some(revision => revision.headRefOid !== headRefOid)) return null;
   const ordered = timeline.filter((entry) => entry.itemId === item.itemId)
     .toSorted((left, right) => left.sequence - right.sequence);
-  let actualActive = null;
+  let actualActive = initialActiveRevision === null ? null :
+    accepted.find(revision => revision.revision === initialActiveRevision) ?? null;
+  if (initialActiveRevision !== null && actualActive === null) return null;
   let activation = null;
   let previous = null;
   for (const entry of ordered) {
@@ -1933,7 +1935,7 @@ function validPullRequestScopeTransition(previousSource, nextSource) {
   );
 }
 
-export function validatePullRequestSourceTransition(previousItems, nextItems, previousTimeline = []) {
+export function validatePullRequestSourceTransition(previousItems, nextItems, previousTimeline = [], nextTimeline = []) {
   const nextById = new Map(nextItems.map((item) => [item.itemId, item]));
   for (const previous of previousItems) {
     if (previous.source?.kind !== "pull_request") continue;
@@ -1948,8 +1950,20 @@ export function validatePullRequestSourceTransition(previousItems, nextItems, pr
     const headChanged = previousSource.current.headRefOid !== nextSource.current.headRefOid;
     let validBudget = isDeepStrictEqual(beforeBudget, afterBudget);
     if (headChanged) {
-      validBudget = afterBudget !== undefined && afterBudget.activationRevision === nextSource.activeRevision &&
-        afterBudget.previousActiveRevision === previousSource.activeRevision && afterBudget.attemptOffset === previous.attempt;
+      // One intake can activate a Head and then advance its metadata. The
+      // committed active pointer anchors the proof even after old timeline trim.
+      const proof = pullRequestDecisionAttemptBudget(next,
+        nextTimeline.filter(entry => entry.sequence > (previousTimeline.at(-1)?.sequence ?? 0)),
+        { initialActiveRevision: previousSource.activeRevision });
+      validBudget = afterBudget !== undefined &&
+        proof !== null && isDeepStrictEqual(afterBudget, proof.decisionBudget) &&
+        afterBudget.activationRevision > previousSource.activeRevision &&
+        afterBudget.activationRevision <= nextSource.activeRevision &&
+        afterBudget.previousActiveRevision === previousSource.activeRevision &&
+        afterBudget.attemptOffset === previous.attempt &&
+        nextSource.revisions.slice(afterBudget.activationRevision - 1, nextSource.activeRevision)
+          .every((revision) => revision.disposition !== "accepted" ||
+            revision.headRefOid === afterBudget.headRefOid);
     } else if (beforeBudget === undefined && afterBudget !== undefined) {
       const proof = pullRequestDecisionAttemptBudget(previous, previousTimeline);
       validBudget = next.status === "working" && next.revision === previous.revision + 1 &&

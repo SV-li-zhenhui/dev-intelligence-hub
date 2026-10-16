@@ -79,6 +79,7 @@ function initialSource() {
 function sourceItem(source) {
   return {
     itemId: "work-item-pr-42",
+    kind: "source_root",
     source,
     sourceQuarantine: null,
     attempt: 0,
@@ -203,6 +204,7 @@ test("source transitions accept pointer progress and reject history rewrites", (
     validatePullRequestSourceTransition(
       [sourceItem(pendingB)],
       [sourceItem(activeB)],
+      [], headActivationTimeline(sourceA, activeB),
     )
   );
 
@@ -218,6 +220,73 @@ test("source transitions accept pointer progress and reject history rewrites", (
     (error) => error.code === "WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID",
   );
 });
+
+function batchedHeadActivationSources({ legacy = false } = {}) {
+  const previous = initialSource();
+  if (legacy) delete previous.decisionBudget;
+  let next = appendPullRequestWorkSource(previous,
+    pullRequestEnvelope(2, HEAD_B, { previousHeadRefOid: HEAD_A }),
+    { attemptAtActivation: 14 }).source;
+  for (const sequence of [3, 4, 5, 6]) {
+    next = appendPullRequestWorkSource(next,
+      pullRequestEnvelope(sequence, HEAD_B),
+      { attemptAtActivation: 14, authorityEpochChanged: sequence === 5 }).source;
+  }
+  return { previous, next };
+}
+
+function headActivationTimeline(previous, next, attempt = 0) {
+  return next.revisions.slice(previous.activeRevision, next.activeRevision)
+    .filter(revision => revision.disposition === "accepted")
+    .map((revision, index) => ({
+      itemId: "work-item-pr-42", sequence: revision.revision, type: "pr_source_revised",
+      details: { workKey: next.workKey, activeRevision: revision.revision,
+        headRefOid: revision.headRefOid, headRevision: revision.headRevision,
+        ...(index === 0 ? { previousActiveRevision: previous.activeRevision,
+          previousHeadRefOid: previous.current.headRefOid, decisionAttemptOffset: attempt } : {}),
+      },
+    }));
+}
+
+for (const legacy of [false, true]) {
+  test(`source transition preserves the Head activation budget through batched metadata updates (${legacy ? "legacy" : "current"})`, () => {
+    // Sanitized shape of the outage: active 102 -> 107, Head activated at
+    // 103, authority-only advance at 106, and lifetime claim count 14.
+    const { previous, next } = batchedHeadActivationSources({ legacy });
+    assert.equal(next.activeRevision, 6);
+    assert.equal(next.decisionBudget.activationRevision, 2);
+    assert.equal(next.decisionBudget.attemptOffset, 14);
+    assert.equal(next.headRevision, 3);
+    assert.doesNotThrow(() => validatePullRequestSourceTransition(
+      [{ ...sourceItem(previous), attempt: 14 }],
+      [{ ...sourceItem(next), attempt: 14 }],
+      [], headActivationTimeline(previous, next, 14),
+    ));
+  });
+}
+
+for (const corruption of ["activation behind", "activation ahead", "wrong offset", "hidden Head change", "history rewrite"]) {
+  test(`batched metadata updates still reject ${corruption}`, () => {
+    const { previous, next } = batchedHeadActivationSources();
+    if (corruption === "activation behind") next.decisionBudget.activationRevision = 1;
+    if (corruption === "activation ahead") next.decisionBudget.activationRevision = 7;
+    if (corruption === "wrong offset") next.decisionBudget.attemptOffset = 13;
+    if (corruption === "history rewrite") next.revisions[0].inputDigest = "f".repeat(64);
+    if (corruption === "hidden Head change") {
+      const returned = appendPullRequestWorkSource(
+        appendPullRequestWorkSource(next, pullRequestEnvelope(7, HEAD_C,
+          { previousHeadRefOid: HEAD_B }), { attemptAtActivation: 14 }).source,
+        pullRequestEnvelope(8, HEAD_B, { previousHeadRefOid: HEAD_C }),
+        { attemptAtActivation: 14 }).source;
+      Object.assign(next, returned, { decisionBudget: next.decisionBudget });
+    }
+    assert.throws(() => validatePullRequestSourceTransition(
+      [{ ...sourceItem(previous), attempt: 14 }],
+      [{ ...sourceItem(next), attempt: 14 }],
+      [], headActivationTimeline(previous, next, 14),
+    ), (error) => ["WORK_LEDGER_PR_SOURCE_INVALID", "WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID"].includes(error.code));
+  });
+}
 
 test("execution authority keeps same-Head facts valid but rejects pending or changed Heads", () => {
   const itemA = sourceItem(initialSource());

@@ -349,6 +349,188 @@ test('a new accepted PR Head gets a separate decision budget after three old-Hea
   assert.equal((await recovered.service.listTimeline({ limit: 100 })).items.filter(e => e.type === 'claimed').length, 6);
 });
 
+async function batchedHeadActivationFixture({ candidateProcessor, legacy = true } = {}) {
+  const fixture = await createFixture({ records: [prAssignment(1)], candidateProcessor });
+  await fixture.service.intake();
+  const previous = fixture.store.stored();
+  if (legacy) {
+    delete previous.items[0].source.decisionBudget;
+    fixture.store.replaceStored(previous);
+    fixture.service = (await createFixture({ source: fixture.source, store: fixture.store,
+      time: fixture.time, candidateProcessor })).service;
+  }
+  fixture.source.records.push(prAssignment(2, { headRefOid: PR_HEAD_B,
+    previousHeadRefOid: PR_HEAD_A, changedFields: ['headRefOid'],
+    occurredAt: '2026-08-02T01:00:02.000Z' }));
+  for (const sequence of [3, 4, 5, 6]) {
+    fixture.source.records.push(prAssignment(sequence, { headRefOid: PR_HEAD_B,
+      occurredAt: `2026-08-02T01:00:0${sequence}.000Z`,
+      title: `Updated PR metadata ${sequence}` }));
+  }
+  fixture.source.highWatermark = 6;
+  return { ...fixture, previous };
+}
+
+for (const [processorName, createProcessor] of [
+  ['local', createLocalWorkLedgerCandidateProcessor],
+  ['worker', createWorkerWorkLedgerCandidateProcessor],
+]) {
+  test(`${processorName} intake claims a legacy PR after a Head activation and metadata updates in one batch`, async (t) => {
+    const processor = createProcessor();
+    t.after(() => processor.close());
+    const fixture = await batchedHeadActivationFixture({ candidateProcessor: processor });
+
+    const intake = await fixture.service.intake();
+    assert.equal(intake.cursor, 6);
+    const item = (await fixture.service.listClaimCandidates({ roleId: 'pr-engineer',
+      at: fixture.time.clock() })).items[0];
+    assert.equal(item.source.activeRevision, 6);
+    assert.deepEqual(item.source.decisionBudget, { headRefOid: PR_HEAD_B,
+      activationRevision: 2, previousActiveRevision: 1, attemptOffset: 0 });
+    assert.deepEqual(item.source.revisions[0], fixture.previous.items[0].source.revisions[0]);
+    const claimed = await fixture.service.claim({ itemId: item.itemId, expectedRevision: item.revision,
+      workerId: 'employee-pr-engineer', leaseDurationMs: 30_000 });
+    assert.equal(claimed.status, 'working');
+    assert.equal(claimed.attempt, 1);
+    assert.deepEqual(claimed.source.decisionBudget, item.source.decisionBudget);
+    assert.deepEqual(fixture.store.stored().outbox, fixture.previous.outbox);
+  });
+}
+
+for (const corruption of [3, 4, 5, 6, 'missing activation proof', 'wrong activation predecessor', 'history rewrite']) {
+  test(`prepared Head activation rejects ${corruption} against the actual activation timeline`, async (t) => {
+    const processor = createLocalWorkLedgerCandidateProcessor();
+    t.after(() => processor.close());
+    let captured;
+    const fixture = await batchedHeadActivationFixture({ candidateProcessor: {
+      async prepare(request) { captured = clone(request); return processor.prepare(request); },
+      commit: () => processor.commit(), discard: () => processor.discard(),
+    } });
+    await fixture.service.intake();
+    const candidate = prepareWorkLedgerCandidate(captured);
+    const { previousState, limits } = captured;
+    const before = clone(candidate);
+    const item = candidate.items[0];
+    if (typeof corruption === 'number') {
+      item.source.decisionBudget.activationRevision = corruption;
+      assert.deepEqual(candidate.timeline, before.timeline, 'keep the genuine activation timeline unchanged');
+    } else if (corruption === 'history rewrite') {
+      item.source.bindings[0].assignmentDigest = 'f'.repeat(64);
+    } else {
+      const activation = candidate.timeline.find(entry => entry.details.decisionAttemptOffset !== undefined);
+      if (corruption === 'missing activation proof') delete activation.details.decisionAttemptOffset;
+      else activation.details.previousHeadRefOid = PR_HEAD_C;
+      const { timelineId: _id, contentDigest: _digest, ...content } = activation;
+      activation.contentDigest = ledgerDigest(content);
+      activation.timelineId = `work-timeline-${activation.contentDigest}`;
+    }
+    assert.doesNotThrow(() => normalizeWorkLedgerPersistedState(candidate, limits));
+    const writes = fixture.store.writes.length;
+    assert.throws(() => prepareWorkLedgerCandidate({ previousState, candidate, limits,
+      appendGraphMemory: false }), error => error.code === 'WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID');
+    assert.equal(fixture.store.writes.length, writes);
+    assert.deepEqual(fixture.store.stored(), before);
+  });
+}
+
+test('prepared Head activation cannot hide an intermediate Head behind a later metadata budget', async () => {
+  let captured;
+  const fixture = await batchedHeadActivationFixture({ candidateProcessor: {
+    async prepare(request) { captured = clone(request); return prepareWorkLedgerCandidate(request); },
+    async commit() {}, async discard() {},
+  } });
+  fixture.source.records.push(
+    prAssignment(7, { headRefOid: PR_HEAD_C, previousHeadRefOid: PR_HEAD_B,
+      changedFields: ['headRefOid'], occurredAt: '2026-08-02T01:00:07.000Z' }),
+    prAssignment(8, { headRefOid: PR_HEAD_B, previousHeadRefOid: PR_HEAD_C,
+      changedFields: ['headRefOid'], occurredAt: '2026-08-02T01:00:08.000Z' }),
+  );
+  fixture.source.highWatermark = 8;
+  await assert.rejects(fixture.service.intake(), error => error.code === 'WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID');
+  const { previousState, limits } = captured;
+  const candidate = normalizeWorkLedgerPersistedState(
+    appendWorkGraphMemoryEvents(previousState, captured.candidate, limits), limits);
+  candidate.items[0].source.decisionBudget.previousActiveRevision = 1;
+  assert.equal(candidate.items[0].source.decisionBudget.activationRevision, 8);
+  assert.doesNotThrow(() => normalizeWorkLedgerPersistedState(candidate, limits));
+  assert.throws(() => prepareWorkLedgerCandidate({ previousState, candidate, limits,
+    appendGraphMemory: false }), error => error.code === 'WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID');
+  assert.deepEqual(fixture.store.stored(), fixture.previous);
+});
+
+test('Head activation uses the committed pointer after old source timeline entries are trimmed', async () => {
+  const fixture = await createFixture({ records: [prAssignment(1)], limits: { timelineLimit: 64 } });
+  await fixture.service.intake();
+  const original = fixture.store.stored().items[0];
+  fixture.source.records.push(...Array.from({ length: 70 }, (_, index) => assignment(index + 2)));
+  fixture.source.highWatermark = 71;
+  await fixture.service.intake({ limit: 100 });
+  assert.equal(fixture.store.stored().timeline.some(entry => entry.itemId === original.itemId), false);
+  fixture.source.records.push(prAssignment(72, { headRefOid: PR_HEAD_B, previousHeadRefOid: PR_HEAD_A,
+    changedFields: ['headRefOid'], occurredAt: '2026-08-02T01:01:00.000Z' }),
+  prAssignment(73, { headRefOid: PR_HEAD_B, title: 'Metadata after activation',
+    occurredAt: '2026-08-02T01:01:01.000Z' }));
+  fixture.source.highWatermark = 73;
+  await fixture.service.intake();
+  const updated = fixture.store.stored().items.find(item => item.itemId === original.itemId);
+  assert.deepEqual(updated.source.decisionBudget, { headRefOid: PR_HEAD_B,
+    activationRevision: 2, previousActiveRevision: 1, attemptOffset: 0 });
+  assert.equal(updated.source.activeRevision, 3);
+});
+
+for (const [processorName, createProcessor] of [
+  ['local', createLocalWorkLedgerCandidateProcessor],
+  ['worker', createWorkerWorkLedgerCandidateProcessor],
+]) {
+  test(`${processorName} intake preserves this mutation's activation proof when 70 unrelated assignments would trim it`, async (t) => {
+    const processor = createProcessor();
+    t.after(() => processor.close());
+    const fixture = await createFixture({ records: [prAssignment(1)],
+      limits: { timelineLimit: 64 }, candidateProcessor: processor });
+    await fixture.service.intake();
+    const previous = fixture.store.stored();
+    fixture.source.records.push(prAssignment(2, { headRefOid: PR_HEAD_B,
+      previousHeadRefOid: PR_HEAD_A, changedFields: ['headRefOid'],
+      occurredAt: '2026-08-02T01:00:02.000Z' }),
+    ...Array.from({ length: 70 }, (_, index) => assignment(index + 3)));
+    fixture.source.highWatermark = 72;
+
+    const writes = fixture.store.writes.length;
+    fixture.store.failNextWrite();
+    await assert.rejects(fixture.service.intake({ limit: 100 }),
+      error => error.code === 'WORK_LEDGER_STATE_WRITE_FAILED');
+    assert.equal(fixture.store.writes.length, writes, 'do not retry a failed durable write');
+    assert.deepEqual(fixture.store.stored(), previous);
+    const first = await fixture.service.intake({ limit: 100 });
+    assert(first.cursor >= 2 && first.cursor < 72, 'commit a proven prefix before the activation is trimmed');
+    assert.equal(first.highWatermark, 72);
+    const pages = [first];
+    fixture.service = (await createFixture({ source: fixture.source, store: fixture.store,
+      time: fixture.time, limits: { timelineLimit: 64 }, candidateProcessor: processor })).service;
+    while (pages.at(-1).cursor < 72 && pages.length < 5) {
+      const page = await fixture.service.intake({ limit: 100 });
+      assert(page.cursor > pages.at(-1).cursor);
+      pages.push(page);
+    }
+    assert.equal(pages.at(-1).cursor, 72);
+    assert.equal(pages.reduce((sum, page) => sum + page.received, 0), 71);
+    const durable = fixture.store.stored();
+    assert.equal(durable.timeline.length, 64);
+    const item = durable.items.find(item => item.itemId === previous.items[0].itemId);
+    assert.deepEqual(item.source.decisionBudget, { headRefOid: PR_HEAD_B,
+      activationRevision: 2, previousActiveRevision: 1, attemptOffset: 0 });
+    assert.deepEqual(item.source.revisions.slice(0, 1), previous.items[0].source.revisions);
+    assert.deepEqual(item.source.bindings.slice(0, 1), previous.items[0].source.bindings);
+    assert.equal(item.attempt, 0);
+    const claimed = await fixture.service.claim({ itemId: item.itemId, expectedRevision: item.revision,
+      workerId: 'employee-pr-engineer', leaseDurationMs: 30_000 });
+    assert.equal(claimed.status, 'working');
+    assert.equal(claimed.attempt, 1);
+    assert.deepEqual(claimed.source.decisionBudget, item.source.decisionBudget);
+    assert.deepEqual(fixture.store.stored().outbox, previous.outbox);
+  });
+}
+
 test('a deferred Head activation starts its budget only after an explicit time wait is satisfied', async () => {
   const fixture = await exhaustedOldHeadWaitsFixture({ conditionForWait: (turn) => turn === 3 ?
     { kind: 'time', notBefore: '2026-08-02T02:01:00.000Z' } :
