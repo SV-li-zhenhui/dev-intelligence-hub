@@ -2767,6 +2767,172 @@ test("quarantining an inactive source cannot lend its accepted history to a new 
   assert.equal(pullRequestHeadAdmission(state, inactive).current, false);
 });
 
+async function inactiveAutomaticUpdateFixture({ childWorking = false, ownerPaused = false, ownerResumed = false } = {}) {
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  await fixture.service.intake();
+  const automatic = (await fixture.service.listItems()).items[0];
+  const exit = prAssignment(2, { eventType: "pull_request.left_scope",
+    occurredAt: "2026-08-02T01:05:00.000Z", gitFacts: prGitFacts(PR_HEAD_A) });
+  fixture.source.records.push(prScopeLifecycleAssignment(2, exit.event));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  fixture.source.records.push(ownerRequestedPrAssignment(3, { headRefOid: PR_HEAD_B, gitFacts: prGitFacts(PR_HEAD_B) }));
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+  const owner = (await fixture.service.listItems()).items.find(item => item.source.scope.kind === "owner_requested");
+  await fixture.service.createGraphChild(prGraphChildCommand(owner, (await fixture.service.getSummary()).revision));
+  if (childWorking) {
+    const child = (await fixture.service.listItems()).items.find(item => item.graph?.parentItemId === owner.itemId);
+    await fixture.service.claim({ itemId: child.itemId, expectedRevision: child.revision,
+      workerId: "configured-developer", leaseDurationMs: 30_000 });
+  }
+  if (ownerPaused) {
+    const current = (await fixture.service.listItems()).items.find(item => item.itemId === owner.itemId);
+    await fixture.service.controlModelRun({ itemId: current.itemId, expectedRevision: current.revision,
+      leaseId: null, command: "pause" });
+    if (ownerResumed) {
+      const paused = (await fixture.service.listItems()).items.find(item => item.itemId === owner.itemId);
+      await fixture.service.controlModelRun({ itemId: paused.itemId, expectedRevision: paused.revision,
+        leaseId: null, command: "resume" });
+    }
+  }
+  fixture.time.advance(1000);
+  fixture.source.records.push(prAssignment(4, { occurredAt: "2026-08-02T01:20:00.000Z",
+    headRefOid: PR_HEAD_B, gitFacts: prGitFacts(PR_HEAD_B), changedFields: ["milestone"] }));
+  fixture.source.highWatermark = 4;
+  return { ...fixture, automatic, owner };
+}
+
+for (const childWorking of [false, true]) {
+  test(`an inactive automatic metadata update cannot retire the current owner Review (child working=${childWorking})`, async () => {
+    const fixture = await inactiveAutomaticUpdateFixture({ childWorking });
+    const before = fixture.store.stored();
+    await fixture.service.intake();
+    const state = fixture.store.stored();
+    const owner = state.items.find(item => item.itemId === fixture.owner.itemId);
+    const childBefore = before.items.find(item => item.graph?.parentItemId === owner.itemId);
+    const child = state.items.find(item => item.itemId === childBefore.itemId);
+    const automatic = state.items.find(item => item.itemId === fixture.automatic.itemId);
+    assert.deepEqual(owner, before.items.find(item => item.itemId === owner.itemId));
+    assert.deepEqual(child, childBefore);
+    assert.equal(pullRequestHeadAdmission(state, owner).current, true);
+    assert.equal(automatic.source.current.headRefOid, PR_HEAD_B);
+    assert.equal(automatic.source.scope.active, false);
+    assert.equal(automatic.status, "blocked");
+    await assert.rejects(fixture.service.claim({ itemId: automatic.itemId, expectedRevision: automatic.revision,
+      workerId: "employee-pr-engineer", leaseDurationMs: 30_000 }), error => error.code === "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING");
+    if (!childWorking) assert.equal((await fixture.service.claim({ itemId: child.itemId, expectedRevision: child.revision,
+      workerId: "configured-developer", leaseDurationMs: 30_000 })).status, "working");
+  });
+}
+
+async function legacyInactiveTakeoverFixture(options) {
+  const fixture = await inactiveAutomaticUpdateFixture(options);
+  await fixture.service.intake();
+  const state = fixture.store.stored();
+  const automatic = state.items.find(item => item.itemId === fixture.automatic.itemId);
+  const owner = state.items.find(item => item.itemId === fixture.owner.itemId);
+  const child = state.items.find(item => item.graph?.parentItemId === owner.itemId);
+  // Persist the state written by the old intake path; superseded work stays historical.
+  Object.assign(owner, { status: "blocked", statusReason: "pr_source_cross_root_cutover_retired",
+    revision: owner.revision + 1, updatedAt: automatic.updatedAt });
+  Object.assign(child, { status: "superseded", statusReason: "pr_head_superseded",
+    revision: child.revision + 1, updatedAt: automatic.updatedAt });
+  fixture.store.replaceStored(state);
+  return { ...fixture, state, owner, automatic, child };
+}
+
+test("normal recovery restores only the current Review retired by an inactive metadata update once", async () => {
+  const fixture = await legacyInactiveTakeoverFixture();
+  const recovered = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  const state = fixture.store.stored();
+  const owner = state.items.find(item => item.itemId === fixture.owner.itemId);
+  assert.equal(owner.status, "queued");
+  assert.equal(owner.statusReason, "pr_source_inactive_takeover_recovered");
+  assert.equal(owner.attempt, fixture.owner.attempt);
+  assert.deepEqual(owner.source, fixture.owner.source);
+  assert.deepEqual(state.items.find(item => item.itemId === fixture.child.itemId), fixture.child);
+  assert.equal(state.intakeCursor, fixture.state.intakeCursor);
+  assert.equal((await recovered.service.claim({ itemId: owner.itemId, expectedRevision: owner.revision,
+    workerId: "employee-orchestrator", leaseDurationMs: 30_000 })).status, "working");
+  const writes = fixture.store.writes.length;
+  await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  assert.equal(fixture.store.writes.length, writes);
+  assert.equal(fixture.store.stored().timeline.filter(entry => entry.itemId === owner.itemId &&
+    entry.details.reason === "pr_source_inactive_takeover_recovered").length, 1);
+});
+
+for (const status of ["paused", "cancelled", "completed", "superseded"]) {
+  test(`inactive takeover recovery preserves ${status} work`, async () => {
+    const fixture = await legacyInactiveTakeoverFixture();
+    const owner = fixture.state.items.find(item => item.itemId === fixture.owner.itemId);
+    owner.status = status;
+    owner.statusReason = status === "paused" ? "owner-paused" : owner.statusReason;
+    fixture.store.replaceStored(fixture.state);
+    await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+    assert.deepEqual(fixture.store.stored().items.find(item => item.itemId === owner.itemId), owner);
+  });
+}
+
+test("inactive takeover recovery requires the retained activation proof", async () => {
+  const fixture = await legacyInactiveTakeoverFixture();
+  fixture.state.timeline = [];
+  fixture.state.timelineStartSequence = fixture.state.nextTimelineSequence;
+  fixture.store.replaceStored(fixture.state);
+  await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  assert.deepEqual(fixture.store.stored().items.find(item => item.itemId === fixture.owner.itemId), fixture.owner);
+});
+
+for (const retainExitProof of [false, true]) {
+  test(`legacy unmarked scope exit requires its recorded revocation (proof retained=${retainExitProof})`, async () => {
+    const fixture = await legacyInactiveTakeoverFixture();
+    const automatic = fixture.state.items.find(item => item.itemId === fixture.automatic.itemId);
+    for (const binding of automatic.source.bindings) delete binding.scopeLifecycle;
+    if (!retainExitProof) {
+      const exitIndex = fixture.state.timeline.findLastIndex(entry => entry.itemId === automatic.itemId && entry.details.scopeActive === false);
+      fixture.state.timeline = fixture.state.timeline.slice(exitIndex + 1);
+      fixture.state.timelineStartSequence = fixture.state.timeline[0].sequence;
+    }
+    fixture.store.replaceStored(fixture.state);
+    await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+    assert.equal(fixture.store.stored().items.find(item => item.itemId === fixture.owner.itemId).status,
+      retainExitProof ? "queued" : "blocked");
+  });
+}
+
+test("inactive takeover recovery does not restart work with an unsettled child", async () => {
+  const fixture = await legacyInactiveTakeoverFixture();
+  const child = fixture.state.items.find(item => item.itemId === fixture.child.itemId);
+  child.status = "queued";
+  child.statusReason = null;
+  fixture.store.replaceStored(fixture.state);
+  await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  assert.deepEqual(fixture.store.stored().items.find(item => item.itemId === fixture.owner.itemId), fixture.owner);
+});
+
+test("inactive takeover recovery cannot resume an owner pause erased by the old retirement path", async () => {
+  const fixture = await legacyInactiveTakeoverFixture({ ownerPaused: true });
+  assert.equal(fixture.state.timeline.findLast(entry => entry.itemId === fixture.owner.itemId && entry.type === "transitioned").details.toStatus, "paused");
+  await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  assert.deepEqual(fixture.store.stored().items.find(item => item.itemId === fixture.owner.itemId), fixture.owner);
+});
+
+test("inactive takeover recovery honors an explicit owner resume before retirement", async () => {
+  const fixture = await legacyInactiveTakeoverFixture({ ownerPaused: true, ownerResumed: true });
+  await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  assert.equal(fixture.store.stored().items.find(item => item.itemId === fixture.owner.itemId).status, "queued");
+});
+
+test("inactive takeover recovery cannot infer runnable work after root history expires", async () => {
+  const fixture = await legacyInactiveTakeoverFixture();
+  const rootIndex = fixture.state.timeline.findLastIndex(entry => entry.itemId === fixture.owner.itemId);
+  fixture.state.timeline = fixture.state.timeline.slice(rootIndex + 1);
+  fixture.state.timelineStartSequence = fixture.state.timeline[0].sequence;
+  fixture.store.replaceStored(fixture.state);
+  await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  assert.deepEqual(fixture.store.stored().items.find(item => item.itemId === fixture.owner.itemId), fixture.owner);
+});
+
 test("a changed Head cannot restore automatic PR scope without causal proof", async () => {
   const initial = prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) });
   const fixture = await createFixture({ records: [initial] });

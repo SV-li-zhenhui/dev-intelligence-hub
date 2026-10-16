@@ -1,4 +1,5 @@
 import { scheduler } from "node:timers/promises";
+import { inactivePullRequestTakeoverRecoveryProof } from "./work-ledger-pr-retirement-recovery.js";
 import { createWorkIntentDispatchBinding } from "../domain/work-intent-dispatch-binding.js";
 import { planWorkItemRunControl } from './work-ledger-run-control.js';
 import {
@@ -196,6 +197,7 @@ function normalizeVersionedRead(result, expectedVersion) {
 }
 
 function canRequeueAdvancedPullRequestRoot(root, nextSource) {
+  if (nextSource.scope.active !== true) return false;
   const sameHead =
     root.source?.current?.headRefOid === nextSource?.current?.headRefOid;
   if (
@@ -270,6 +272,8 @@ function pullRequestRootsForLifecycle(itemsById, envelope) {
 }
 
 function operationalPullRequestPredecessor(itemsById, root, authority) {
+  // History from a source that left scope cannot take over live work.
+  if (root.source.scope.active !== true) return null;
   const canonicalItemId = authority?.canonicalRootItemId ??
     authority?.lastTrustedRootItemId ?? null;
   if (canonicalItemId === null || canonicalItemId === root.itemId) return null;
@@ -659,6 +663,7 @@ export class WorkLedgerService {
         try {
           this.state = await this.#readDurableState();
           await this.#reconcileRecoveredPullRequestScopes();
+          await this.#recoverInactivePullRequestTakeovers();
           await this.#reconcileRecoveredPullRequestAuthorityFences();
           await this.#reconcileRecoveredIssueScopes();
           this.ready = true;
@@ -2349,6 +2354,7 @@ export class WorkLedgerService {
         if (appended.disposition === "accepted") {
           const obsoletePendingRoots = [...itemsById.values()].filter(
             (candidate) =>
+              appended.source.scope.active === true &&
               candidate.itemId !== root.itemId &&
               samePullRequestSubject(candidate, root) &&
               crossRootPullRequestCutoverPredecessorId(candidate) !== null &&
@@ -2822,6 +2828,33 @@ export class WorkLedgerService {
       new Map([...latestByRoot].map(([itemId, envelope]) => [itemId, envelope.sequence])));
     }
     this.pullRequestScopeRecoveryPending = false;
+  }
+
+  async #recoverInactivePullRequestTakeovers() {
+    let items = this.state.items;
+    const timelineEvents = [];
+    const now = this.#now();
+    for (const item of this.state.items) {
+      const proof = inactivePullRequestTakeoverRecoveryProof(this.state, item);
+      if (proof === null) continue;
+      const transition = planWorkItemTransition({
+        state: { ...this.state, items },
+        input: {
+          itemId: item.itemId,
+          expectedRevision: item.revision,
+          leaseId: null,
+          actorId: "work-ledger-system",
+          toStatus: "queued",
+          reason: "pr_source_inactive_takeover_recovered",
+          details: { evidenceRefs: [proof.timelineId, proof.rootStateTimelineId, proof.inactiveRootItemId] },
+        },
+        clock: () => now,
+      });
+      items = transition.patch.items;
+      timelineEvents.push(...transition.timelineEvents);
+    }
+    if (timelineEvents.length === 0) return;
+    await this.#commitMutation({ patch: { items }, timelineEvents, result: null });
   }
 
   async #reconcileRecoveredPullRequestAuthorityFences() {
