@@ -5,8 +5,16 @@ import path from "node:path";
 import test from "node:test";
 
 import { createBackupManifest } from "../src/domain/backup-manifest.js";
-import { DataDirectoryCheckpointService } from "../src/services/data-directory-checkpoint-service.js";
+import { DataDirectoryCheckpointService, dataVolumeCapacitySeverity } from "../src/services/data-directory-checkpoint-service.js";
 import { OperationalQuiescenceGate } from "../src/services/operational-quiescence-gate.js";
+
+test("a mostly used large volume stays ready with ample space while a nearly full volume remains critical", () => {
+  assert.equal(dataVolumeCapacitySeverity(95.4, 42 * 1024 ** 3), "warning");
+  assert.equal(dataVolumeCapacitySeverity(99, 10 * 1024 ** 3), "warning");
+  assert.equal(dataVolumeCapacitySeverity(99, 9 * 1024 ** 3), "critical");
+  assert.equal(dataVolumeCapacitySeverity(80, 200 * 1024 ** 3), "warning");
+  assert.equal(dataVolumeCapacitySeverity(79, 200 * 1024 ** 3), null);
+});
 
 async function fixture(t) {
   const root = await mkdtemp(path.join(tmpdir(), "mydashboard-checkpoint-"));

@@ -24,6 +24,12 @@ const EXCLUDED_ROOT_DIRECTORIES = new Set([
   "validation-profile-probe",
 ]);
 const OPTION_KEYS = new Set(["sourceDirectory", "gate"]);
+const MINIMUM_CRITICAL_FREE_BYTES = 10 * 1024 ** 3;
+
+export function dataVolumeCapacitySeverity(usedPercent, availableBytes) {
+  if (usedPercent >= 95 && availableBytes < MINIMUM_CRITICAL_FREE_BYTES) return "critical";
+  return usedPercent >= 80 ? "warning" : null;
+}
 
 export class DataDirectoryCheckpointError extends Error {
   constructor(code, message, options) {
@@ -439,9 +445,7 @@ export class DataDirectoryCheckpointService {
         throw new TypeError("statfs result is invalid");
       }
       const usedPercent = Math.round((1 - available / total) * 1_000) / 10;
-      const severity = usedPercent >= 95
-        ? "critical"
-        : usedPercent >= 80 ? "warning" : null;
+      const severity = dataVolumeCapacitySeverity(usedPercent, available);
       return Object.freeze({
         warnings: severity === null
           ? Object.freeze([])

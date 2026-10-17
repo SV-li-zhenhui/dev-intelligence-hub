@@ -886,7 +886,9 @@ that uncertain state.
 ## Capacity and maintenance
 
 The readiness service warns when the active data volume reaches 80% usage and
-marks it critical at 95%. Make space using normal operating-system tools only
+marks it critical only when usage reaches 95% and available space falls below
+10 GiB. A large volume with ample remaining space stays ready with a warning.
+Make space using normal operating-system tools only
 after resolving exact paths. Do not recursively delete a computed project,
 home, runtime, data, backup, or restore directory. Prefer moving an old verified
 backup to separate trusted storage, verify the copy, and only then remove the
