@@ -1359,11 +1359,12 @@ test("triage-only PR promoter durably routes authored fixes to developer", async
   });
 });
 
-test("automatic own PR repair keeps legacy triage from creating competing owner requests", async () => {
+test("automatic own PR repair keeps legacy triage from creating competing owner requests", async (t) => {
+  for (const nextAction of ["address_review", "resolve_conflict"]) await t.test(nextAction, async () => {
   const owned = pullRequest({
     relation: "authored",
     author: "local-owner",
-    nextAction: "address_review",
+    nextAction,
   });
   const store = new MemoryStore({ snapshot: snapshot([owned]) });
   const service = createService({
@@ -1379,6 +1380,7 @@ test("automatic own PR repair keeps legacy triage from creating competing owner 
     assert.deepEqual(result.jobs, []);
     assert.equal(result.role.lastRun.newJobs, 0);
   }
+  });
 });
 
 test("automatic own PR repair retires pending legacy triage without pretending repair completed", async (t) => {

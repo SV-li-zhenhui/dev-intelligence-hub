@@ -79,6 +79,22 @@ test("live own feedback queries and returns the current Draft fact", async () =>
   assert.equal(queries.every((query) => query.includes("isDraft")), true);
 });
 
+test("own conflict admission reads fresh Base and merge state without paging review history", async () => {
+  let calls = 0;
+  const adapter = new GitHubAdapter({ run: async (_command, args) => {
+    if (args.at(-1) === "user") return { login: ACCOUNT };
+    calls += 1;
+    const query = args.find(value => value.startsWith("query="));
+    assert.match(query, /OwnPullRequestConflict/);
+    assert.doesNotMatch(query, /reviews\(|reviewThreads\(/);
+    return { data: { repository: { pullRequest: pullRequest({ isDraft: false, baseRefOid: "b".repeat(40), mergeStateStatus: "DIRTY" }) } } };
+  } });
+  const facts = await adapter.readOwnPullRequestConflict({ repository: "acme/repo", number: 42, account: ACCOUNT });
+  assert.equal(facts.baseRefOid, "b".repeat(40));
+  assert.equal(facts.mergeStateStatus, "DIRTY");
+  assert.equal(calls, 1);
+});
+
 for (const driftAt of ["Reviews", "Threads", "ThreadComments", "Identity"]) {
   test(`live own feedback rejects a Draft change during ${driftAt}`, async () => {
     const run = async (_command, args) => {

@@ -13,6 +13,7 @@ import { createChangePackageControlledCommitReceipt } from "../src/domain/change
 import { createPullRequestExternalActionConfirmationPlan } from "../src/domain/pull-request-external-action.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { AutomaticOwnPrRepair } from "../src/services/automatic-own-pr-repair.js";
+import { AutomaticOwnPrConflict } from "../src/services/automatic-own-pr-conflict.js";
 import { HistoricalControlledCommitReader } from "../src/services/historical-controlled-commit-reader.js";
 import { CodeActionProposalHandler } from "../src/services/code-action-proposal-handler.js";
 import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
@@ -30,7 +31,7 @@ import { OriginalRepairFeedbackReader } from "../src/services/original-repair-fe
 import { createOriginalRepairFeedbackSnapshot, createOriginalRepairFeedbackArchiveRecord,
   originalRepairFeedbackArchiveKey, originalRepairFeedbackArchiveReference } from "../src/domain/original-repair-feedback.js";
 import { currentWorkItemExecutionBinding } from "../src/services/work-ledger-pr-source.js";
-import { pullRequestExternalActionBinding } from "./support/pull-request-external-action-fixture.js";
+import { pullRequestExternalActionBinding, externalActionControlledCommit } from "./support/pull-request-external-action-fixture.js";
 
 const CREATED_AT = "2026-10-10T03:00:00.000Z";
 const ORIGINAL_FEEDBACK = { changeRequests: [{ id: "review-123", author: "reviewer", body: "Fix the reviewed race",
@@ -45,7 +46,7 @@ class MemoryStore {
   async write(key, value) { this.values.set(key, clone(value)); }
 }
 
-function codeProposal(binding) {
+function codeProposal(binding, conflict = false, operation = "modify") {
   return normalizeBoundWorkProposal({
     proposalId: "own-pr-repair-code-proposal", policyVersion: 7, kind: "code_action_proposal",
     requestedBy: { roleId: "developer", workItemId: binding.rootItemId },
@@ -54,10 +55,11 @@ function codeProposal(binding) {
       eventId: binding.eventId,
       subject: { id: binding.rootItemId, repository: binding.repository, number: binding.pullRequestNumber },
       repository: binding.repository, workspaceId: "repair-workspace", inputBinding: binding,
-      executionSource: createReviewRepairCodeExecutionSource({ inputBinding: binding, writablePaths: ["src", "test"] }),
+      ...(operation !== "modify" ? {} : { executionSource: conflict ? externalActionControlledCommit(binding).executionSource
+        : createReviewRepairCodeExecutionSource({ inputBinding: binding, writablePaths: ["src", "test"] }) }),
     },
     payload: {
-      operation: "modify", objective: "Fix the reviewed race and add a regression test",
+      operation, objective: conflict ? "Resolve the current PR merge conflict and verify the result" : "Fix the reviewed race and add a regression test",
       acceptanceCriteria: ["Configured regression profile passes"], evidence: ["review:123"],
       summary: "Repair my PR", reason: "An external reviewer identified a reproducible bug",
     },
@@ -66,13 +68,14 @@ function codeProposal(binding) {
 
 function grantFor(proposal) {
   return createCodeJobGrant({
-    schemaVersion: 3, proposalId: proposal.proposalId, contentDigest: proposal.contentDigest,
+    schemaVersion: proposal.binding.executionSource ? 3 : 2, proposalId: proposal.proposalId, contentDigest: proposal.contentDigest,
     policyVersion: proposal.policyVersion, requestedBy: proposal.requestedBy, source: proposal.source,
     subject: proposal.binding.subject, repository: proposal.binding.repository,
     workspaceId: proposal.binding.workspaceId, inputBinding: proposal.binding.inputBinding,
-    executionSource: proposal.binding.executionSource,
+    ...(proposal.binding.executionSource ? { executionSource: proposal.binding.executionSource } : {}),
     workspaceAuthorityDigest: "9".repeat(64), ...proposal.payload,
-    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify], writablePaths: ["src", "test"],
+    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION[proposal.payload.operation]], writablePaths: proposal.binding.executionSource?.kind === "conflict_preparation"
+      ? proposal.binding.executionSource.writeScope.paths : proposal.payload.operation === "modify" ? ["src", "test"] : [],
     requiredProfiles: [{ id: "node-tests", configDigest: "b".repeat(64) }], brainDigest: "c".repeat(64),
   });
 }
@@ -82,7 +85,8 @@ function queuedJob(grant) {
     jobId: codeJobIdForGrant(grant), status: "queued", revision: 1,
     proposalId: grant.proposalId, proposalContentDigest: grant.contentDigest, grantDigest: grant.grantDigest,
     requestedBy: grant.requestedBy, subject: grant.subject, repository: grant.repository,
-    workspaceId: grant.workspaceId, inputBinding: grant.inputBinding, executionSource: grant.executionSource,
+    workspaceId: grant.workspaceId, inputBinding: grant.inputBinding,
+    ...(grant.executionSource ? { executionSource: grant.executionSource } : {}),
     operation: grant.operation, objective: grant.objective, acceptanceCriteria: grant.acceptanceCriteria,
     evidence: grant.evidence, summary: grant.summary, reason: grant.reason, allowedActions: grant.allowedActions,
     writablePaths: grant.writablePaths, requiredProfiles: grant.requiredProfiles.map(({ id }) => id),
@@ -93,6 +97,8 @@ function queuedJob(grant) {
 }
 
 function controlledCommit(grant, overrides = {}) {
+  const conflict = grant.executionSource.kind === "conflict_preparation";
+  const changedPath = conflict ? grant.executionSource.writeScope.paths[0] : "src/value.js";
   const workspace = { id: grant.workspaceId, sourceRevision: "a".repeat(64), workspaceRevision: "b".repeat(64) };
   const artifact = (kind, marker) => ({ path: `repair/node-tests/${kind}.json`, sha256: marker.repeat(64), bytes: 12 });
   const manifest = createChangePackage({
@@ -104,28 +110,28 @@ function controlledCommit(grant, overrides = {}) {
       actionId: "action-node-tests", attemptNumber: 1, imageId: "sha256:image-node-tests",
       artifacts: { output: artifact("output", "c"), stdout: artifact("stdout", "d"), stderr: artifact("stderr", "e") },
     }],
-    created: [], modified: [{ path: "src/value.js", beforeSha256: "f".repeat(64), content: Buffer.from("fixed\n") }], deleted: [],
+    created: [], modified: [{ path: changedPath, beforeSha256: "f".repeat(64), content: Buffer.from("fixed\n") }], deleted: [],
     ...overrides,
   }).manifest;
   const identity = { name: "MyDashboard Developer", email: "developer@mydashboard.local", timestamp: Date.parse(CREATED_AT) / 1_000, timezone: "+0000" };
   const finalTreeOid = "5".repeat(40);
   return createControlledCommitEvidence({
     executionSource: grant.executionSource, manifest,
-    resolution: { resolvedPaths: ["src/value.js"], finalTreeOid },
+    resolution: { resolvedPaths: [changedPath], finalTreeOid },
     commit: {
       objectFormat: "sha1", oid: "6".repeat(40), treeOid: finalTreeOid,
-      parents: [grant.inputBinding.headRefOid], author: identity, committer: identity,
+      parents: conflict ? [grant.inputBinding.headRefOid, grant.inputBinding.gitTarget.baseRefOid] : [grant.inputBinding.headRefOid], author: identity, committer: identity,
       messageDigest: createHash("sha256").update(createControlledCommitMessage({ executionSource: grant.executionSource, manifest })).digest("hex"),
       objectSetDigest: "e".repeat(64),
     }, createdAt: CREATED_AT,
   });
 }
 
-async function fixture({ enabled = true, pushOutcome = "applied", store = new MemoryStore(), clock = () => new Date(CREATED_AT) } = {}) {
+async function fixture({ enabled = true, conflict = false, operation = "modify", pushOutcome = "applied", store = new MemoryStore(), clock = () => new Date(CREATED_AT) } = {}) {
   const binding = pullRequestExternalActionBinding({
     gitTarget: { headRepository: "acme/repo", headRefName: "fix/review-feedback" },
   });
-  const proposal = codeProposal(binding);
+  const proposal = codeProposal(binding, conflict, operation);
   const grant = grantFor(proposal);
   const config = {
     trackedRepositories: [binding.repository],
@@ -135,9 +141,11 @@ async function fixture({ enabled = true, pushOutcome = "applied", store = new Me
   };
   const item = { itemId: binding.rootItemId, event: {
     subject: { repository: binding.repository, number: binding.pullRequestNumber },
-    payload: { relation: "authored", nextAction: "address_review", reviewFeedbackDigest: FEEDBACK_DIGEST },
+    payload: { relation: "authored", nextAction: conflict ? "resolve_conflict" : "address_review",
+      mergeStateStatus: conflict ? "DIRTY" : "CLEAN", reviewFeedbackDigest: FEEDBACK_DIGEST },
   } };
   const facts = { state: "open", author: "runtime-user", headRefOid: binding.headRefOid,
+    mergeStateStatus: conflict ? "DIRTY" : "CLEAN", baseRefOid: binding.gitTarget.baseRefOid,
     reviewFeedbackAvailable: true, reviewFeedbackCount: 1, reviewFeedbackDigest: FEEDBACK_DIGEST, feedback: clone(ORIGINAL_FEEDBACK) };
   const context = { inputBinding: binding, author: "runtime-user" };
   const jobs = new Map();
@@ -168,13 +176,16 @@ async function fixture({ enabled = true, pushOutcome = "applied", store = new Me
   let service;
   let queue;
   let failNextPushEnqueue = false;
+  let interruptApprovalKind = null;
   let grantCurrent = true;
   const executor = {
     async execute(envelope) {
       if (envelope.kind === "local.code-job-create") {
+        if (!conflict) {
         const repair = (await store.read(STATE_KEY)).repairs.find((row) => row.jobId === codeJobIdForGrant(envelope.action.grant));
         assert.ok((await store.read(originalRepairFeedbackArchiveKey(repair.feedbackSnapshotId))).snapshot,
           "complete feedback must be durable before approving the modify job");
+        }
         codeJobApprovalCount += 1;
         const job = queuedJob(envelope.action.grant);
         jobs.set(job.jobId, job);
@@ -197,17 +208,23 @@ async function fixture({ enabled = true, pushOutcome = "applied", store = new Me
       }
       return queue.enqueue(plan);
     },
-    get: (...args) => queue.get(...args), approve: (...args) => queue.approve(...args),
+    get: (...args) => queue.get(...args), approve: async (...args) => {
+      if ((await queue.get(args[0])).kind === interruptApprovalKind) {
+        interruptApprovalKind = null;
+        throw new Error("approval interrupted before execution");
+      }
+      return queue.approve(...args);
+    },
     invalidate: (...args) => queue.invalidate(...args),
   };
   function makeQueue() {
     return new ConfirmationQueue({ store, executor, exclusiveLease: { run: (operation) => operation() }, clock });
   }
   function makeService() {
-    return new AutomaticOwnPrRepair({
+    const dependencies = {
       configurationReader: { async readActive() { return { configuration: config }; } }, store,
       ledger: { async readPullRequestExecutionContext() { return clone(context); }, async readItemForReconciliation() { return clone(item); } },
-      github: { async readOwnPullRequestFeedback() { return clone(facts); } }, confirmations: confirmationPort,
+      github: { async readOwnPullRequestFeedback() { return clone(facts); }, async readOwnPullRequestConflict() { return clone(facts); } }, confirmations: confirmationPort,
       codeJobReader: { async getDetail({ jobId }) { return clone(details.get(jobId) ?? null); } },
       controlledCommitReader: { async verify({ evidenceId }) { return clone(verified.get(evidenceId)); } },
       historicalControlledCommitReader: new HistoricalControlledCommitReader({ store,
@@ -222,7 +239,8 @@ async function fixture({ enabled = true, pushOutcome = "applied", store = new Me
         return { context: { schemaVersion: 1, headRefOid: inputBinding.headRefOid, reviewFeedbackDigest: feedbackDigest, feedback: clone(ORIGINAL_FEEDBACK) },
           provenance: { kind: "github_digest_matched_feedback", observedHeadRefOid: facts.headRefOid, observedAt: CREATED_AT } };
       } },
-    });
+    };
+    return new AutomaticOwnPrRepair({ ...dependencies, conflictRepair: new AutomaticOwnPrConflict(dependencies) });
   }
   queue = makeQueue(); await queue.recover();
   service = makeService(); await service.recover();
@@ -249,6 +267,7 @@ async function fixture({ enabled = true, pushOutcome = "applied", store = new Me
       return evidence;
     },
     crashBeforePushQueueWrite() { failNextPushEnqueue = true; },
+    interruptApproval(kind) { interruptApprovalKind = kind; },
     revokeGrant() { grantCurrent = false; },
     loseReviewAcknowledgement() { loseReviewAcknowledgement = true; },
     pauseReviewDelivery(value = true) { deliveryPaused = value; },
@@ -278,6 +297,108 @@ test("own PR feedback creates and publishes an approved repair through the real 
   assert.equal(await f.service.shouldRun(f.item), false);
   assert.equal(f.store.values.get(STATE_KEY).repairs[0].status, "published");
   assert.equal(f.store.values.get(STATE_KEY).published.length, 1);
+});
+
+test("automatic mode resolves and publishes own PR conflicts without an owner confirmation, including after restart", async () => {
+  const f = await fixture({ conflict: true });
+  f.facts.reviewFeedbackCount = 0;
+  const transition = await f.deliver();
+  assert.equal(transition.status, "running");
+  assert.equal(f.jobs.size, 1);
+  const evidence = f.completeJob();
+  await f.restart();
+  await f.service.runCycle();
+  assert.equal(f.pushes.length, 1);
+  assert.deepEqual(evidence.commit.parents, [f.binding.headRefOid, f.binding.gitTarget.baseRefOid]);
+  await f.service.runCycle();
+  await f.restart();
+  await f.service.runCycle();
+  assert.equal(f.pushes.length, 1, "the system never repeats the same publication after restart");
+  const history = await f.queue.list();
+  assert.equal(history.items.length, 2);
+  assert.ok(history.items.every(row => row.status === "completed" && row.automaticOwnPrRepair));
+});
+
+test("conflict checks and verification start automatically for orchestrator-assigned owner PR work", async () => {
+  for (const operation of ["inspect", "verify"]) {
+    const f = await fixture({ conflict: true, operation });
+    f.item.event = { ...f.item.event, source: { provider: "local-owner" }, eventType: "pull_request.owner_requested",
+      payload: { nextAction: "resolve_conflict", workType: "general" } };
+    f.context.author = null;
+    assert.equal((await f.deliver()).status, "running");
+    assert.equal(f.codeJobApprovalCount, 1);
+    assert.equal(f.pushes.length, 0);
+  }
+});
+
+test("conflict automation rejects disabled mode, another author, changed targets and cleared conflicts", async () => {
+  for (const change of [
+    f => { f.config.githubActions.automaticOwnPrRepair = false; },
+    f => { f.facts.author = "another-author"; },
+    f => { f.facts.headRefOid = "9".repeat(40); },
+    f => { f.facts.baseRefOid = "9".repeat(40); },
+    f => { f.facts.mergeStateStatus = "CLEAN"; },
+    f => { f.item.event.payload.nextAction = "wait_review"; },
+    f => { f.item.event.payload.relation = "review_requested"; },
+    f => { f.revokeGrant(); },
+  ]) {
+    const f = await fixture({ conflict: true });
+    change(f);
+    assert.equal((await f.deliver()).status, "waiting_confirmation");
+    assert.equal(f.codeJobApprovalCount, 0);
+    assert.equal(f.pushes.length, 0);
+  }
+});
+
+test("a conflict push with unknown remote outcome is never submitted again after restart", async () => {
+  const f = await fixture({ conflict: true, pushOutcome: "unknown" });
+  await f.deliver(); f.completeJob();
+  await f.service.runCycle();
+  assert.equal(f.pushes.length, 1);
+  await f.restart();
+  await f.service.runCycle(); await f.service.runCycle();
+  assert.equal(f.pushes.length, 1);
+  assert.equal(await f.service.shouldRun(f.item), false);
+});
+
+test("a changed Base revokes a completed conflict repair before automatic push", async () => {
+  const f = await fixture({ conflict: true });
+  await f.deliver(); f.completeJob();
+  f.facts.baseRefOid = "9".repeat(40);
+  assert.equal((await f.service.runCycle()).stale, 1);
+  assert.equal(f.pushes.length, 0);
+});
+
+test("review feedback and conflict repair cannot start competing work on the same PR", async () => {
+  for (const conflict of [false, true]) {
+    const f = await fixture({ conflict });
+    await f.deliver();
+    f.item.event.payload.nextAction = conflict ? "address_review" : "resolve_conflict";
+    assert.equal(await f.service.shouldRun(f.item), false);
+    await f.restart();
+    assert.equal(await f.service.shouldRun(f.item), false);
+  }
+});
+
+test("interrupted automatic conflict approvals release obsolete code and push tasks after Base drift", async () => {
+  for (const kind of ["local.code-job-create", "github.pull-request-push"]) {
+    const f = await fixture({ conflict: true });
+    if (kind === "local.code-job-create") {
+      f.interruptApproval(kind);
+      await assert.rejects(f.deliver(), /approval interrupted/);
+    } else {
+      await f.deliver(); f.completeJob();
+      f.interruptApproval(kind);
+      assert.equal((await f.service.runCycle()).failed, 1);
+    }
+    await f.restart();
+    f.facts.baseRefOid = "9".repeat(40);
+    assert.equal((await f.service.runCycle()).stale, 1);
+    assert.equal(await f.service.shouldRun(f.item), true);
+    const history = await f.queue.list();
+    assert.equal(history.items.find(row => row.kind === kind).status, "stale");
+    assert.equal(f.pushes.length, 0);
+  }
 });
 
 test("automatic modification captures original complete feedback before approval and exposes its immutable binding after publication", async () => {

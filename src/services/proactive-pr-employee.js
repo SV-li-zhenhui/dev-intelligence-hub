@@ -407,7 +407,7 @@ export class ProactivePrEmployeeService {
       this.config.triageOnly === true &&
       this.config.automaticOwnPrRepair === true &&
       item?.relation === "authored" &&
-      item.nextAction === "address_review"
+      ["address_review", "resolve_conflict"].includes(item.nextAction)
     ) {
       return false;
     }

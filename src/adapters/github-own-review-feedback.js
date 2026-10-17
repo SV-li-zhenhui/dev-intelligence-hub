@@ -31,6 +31,11 @@ const COMMENTS_QUERY = `query OwnReviewFeedbackThreadComments($id: ID!, $cursor:
 const IDENTITY_QUERY = `query OwnReviewFeedbackIdentity($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) { ${PR_IDENTITY} } }
 }`;
+const CONFLICT_QUERY = `query OwnPullRequestConflict($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    ${PR_IDENTITY} baseRefOid mergeStateStatus
+  } }
+}`;
 
 function invalid(message) {
   return new Error(`GitHub own PR feedback ${message}`);
@@ -226,4 +231,14 @@ export async function readOwnReviewFeedback(run, identity, options = {}) {
     reviewDecision: pr.reviewDecision || "",
     ...summarizeOwnReviewFeedback({ reviews, threads }, identity.account),
   };
+}
+
+export async function readOwnPullRequestConflict(run, identity, options = {}) {
+  const [owner, name] = identity.repository.split("/");
+  const result = await graphql(run, CONFLICT_QUERY, { owner, name, number: identity.number }, options);
+  const pr = assertPullRequest(result.repository?.pullRequest, identity);
+  if (typeof pr.isDraft !== "boolean" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(pr.baseRefOid) ||
+      typeof pr.mergeStateStatus !== "string") throw invalid("conflict identity is unavailable");
+  return { state: pr.state.toLowerCase(), isDraft: pr.isDraft, author: pr.author.login,
+    headRefOid: pr.headRefOid, baseRefOid: pr.baseRefOid, mergeStateStatus: pr.mergeStateStatus };
 }

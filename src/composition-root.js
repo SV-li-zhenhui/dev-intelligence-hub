@@ -50,6 +50,7 @@ import { ConfigurationActivationExecutor } from "./services/configuration-activa
 import { ConfigurationConfirmationRequester } from "./services/configuration-confirmation-requester.js";
 import { DeliveryEvidenceService } from "./services/delivery-evidence-service.js";
 import { createDailyWorkLedgerView } from "./services/daily-work-ledger-view.js";
+import { AutomaticOwnPrConflict } from "./services/automatic-own-pr-conflict.js";
 import { NotificationService } from "./services/notification-service.js";
 import { OwnerWorkRetryService } from "./services/owner-work-retry-service.js";
 import { EmployeeRegistry } from "./services/employee-registry.js";
@@ -1909,7 +1910,8 @@ export async function createApplication({
             pushAuthorization: {
               verifyPush(envelope) {
                 if (envelope.action?.controlledCommitEvidence?.executionSource?.kind !== "review_repair") {
-                  return explicitPullRequestActions.includes("push");
+                  return automaticOwnPrRepair === null ? explicitPullRequestActions.includes("push")
+                    : automaticOwnPrRepair.verifyPush(envelope).then(approved => approved || explicitPullRequestActions.includes("push"));
                 }
                 if (automaticOwnPrRepair === null) {
                   throw Object.assign(new Error("自动修复授权仍在恢复中"), {
@@ -1987,7 +1989,7 @@ export async function createApplication({
           !codeJobReader || !codeExecutorRuntime?.controlledCommitBuilder || !changePackageRuntime) {
         throw new Error("自动修复我的 PR 需要版本化配置、开发执行器、验证配置及受控提交链路");
       }
-      automaticOwnPrRepair = new AutomaticOwnPrRepair({
+      const ownPrRepairDependencies = {
         configurationReader: configurationRuntime.reader, store, ledger: workLedgerRuntime,
         github, confirmations: Object.freeze({ ...confirmationRuntime.producerQueue, ...confirmationRuntime.queue }), codeJobReader,
         controlledCommitReader: codeExecutorRuntime.controlledCommitBuilder,
@@ -2026,7 +2028,9 @@ export async function createApplication({
           },
         }),
         objectSync: trackRuntime(new OwnPrRepairObjectSync({ credentialSource: githubCredentialSource })),
-      });
+      };
+      automaticOwnPrRepair = new AutomaticOwnPrRepair({ ...ownPrRepairDependencies,
+        conflictRepair: new AutomaticOwnPrConflict(ownPrRepairDependencies) });
       await automaticOwnPrRepair.recover();
     }
     if (localCodeExecutionEnabled && !confirmationRuntime) {

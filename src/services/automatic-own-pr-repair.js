@@ -7,6 +7,7 @@ import { normalizePullRequestExecutionBinding, samePullRequestExecutionBinding }
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
 import { createPullRequestExternalActionConfirmationPlan } from "../domain/pull-request-external-action.js";
 import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
+import { approveOwnPrAction, repairCommitMatchesJob } from "./automatic-own-pr-repair-authorization.js";
 import { normalizeOwnerWorkRequest } from "../domain/owner-work-request.js";
 import { internalRepairReviewRequestId, normalizeInternalReviewMetadata } from "../domain/internal-repair-review.js";
 import { isOwnerPublicationId, normalizeObservedOwnerPublication } from "../domain/observed-owner-publication.js";
@@ -107,13 +108,14 @@ const normalizeState = normalizeAutomaticOwnPrRepairState;
 // A model cannot opt an unrelated task into unattended execution.
 export class AutomaticOwnPrRepair {
   #queue = new OperationQueue();
+  #approvalQueue = new OperationQueue();
   #state = null;
   #lastJobId = null;
   #lastPublishedId = null;
 
   constructor({ configurationReader, store, ledger, github, confirmations,
     codeJobReader = null, controlledCommitReader = null, objectSync = null, grantVerifier, ownerWorkRequests = null,
-    historicalRepairFeedbackReader = null, historicalControlledCommitReader = null, clock = () => new Date() }) {
+    historicalRepairFeedbackReader = null, historicalControlledCommitReader = null, conflictRepair = null, clock = () => new Date() }) {
     if (typeof grantVerifier?.verify !== "function") throw new TypeError("Automatic own PR repair requires current grant verification");
     this.configurationReader = configurationReader;
     this.store = store;
@@ -128,6 +130,7 @@ export class AutomaticOwnPrRepair {
     this.historicalRepairFeedbackReader = historicalRepairFeedbackReader;
     this.historicalControlledCommitReader = historicalControlledCommitReader;
     this.clock = clock;
+    this.conflictRepair = conflictRepair;
   }
 
   async recover() {
@@ -136,6 +139,7 @@ export class AutomaticOwnPrRepair {
     }));
     await validateOriginalRepairFeedbackArchives(this.store, state);
     this.#state = state;
+    await this.conflictRepair?.recover();
   }
 
   async #configuration() {
@@ -171,7 +175,9 @@ export class AutomaticOwnPrRepair {
   }
 
   async shouldRun(item) {
+    if (this.conflictRepair && !await this.conflictRepair.shouldRun(item)) return false;
     const event = currentWorkItemEvent(item);
+    if (event?.payload?.nextAction === "resolve_conflict" && this.#isInFlight(event.subject?.repository, event.subject?.number)) return false;
     if (event?.payload?.relation !== "authored" || event.payload.nextAction !== "address_review") return true;
     const config = await this.#configuration();
     if (config?.githubActions?.automaticOwnPrRepair !== true) return true;
@@ -186,6 +192,7 @@ export class AutomaticOwnPrRepair {
   }
 
   async #current(binding) {
+    if (this.conflictRepair?.isInFlight(binding)) return null;
     const config = await this.#configuration();
     if (config?.githubActions?.enabled !== true || config.githubActions.automaticOwnPrRepair !== true ||
         !config.trackedRepositories.includes(binding.repository)) return null;
@@ -220,6 +227,15 @@ export class AutomaticOwnPrRepair {
   }
 
   async approveCodeJob(item) {
+    return this.#approvalQueue.enqueue(() => this.#approveCodeJob(item));
+  }
+
+  async #approveCodeJob(item) {
+    const binding = item.display?.payload?.action?.grant?.inputBinding;
+    if (this.conflictRepair && (!binding || !this.#isInFlight(binding.repository, binding.pullRequestNumber))) {
+      const approved = await this.conflictRepair.approveCodeJob(item);
+      if (approved.status !== "pending") return approved;
+    }
     if (item.kind !== "local.code-job-create" || item.status !== "pending" || item.requestedBy.roleId !== "developer") return item;
     const grant = item.display?.payload?.action?.grant;
     if (!grant?.inputBinding || !["inspect", "modify", "verify"].includes(grant.operation) ||
@@ -258,14 +274,13 @@ export class AutomaticOwnPrRepair {
   }
 
   #approve(item) {
-    return this.confirmations.approve(item.id, {
-      requestId: `auto-own-pr-repair-v1-${digest(item.id + ":" + item.approvalBindingDigest).slice(0, 48)}`,
-      expectedQueueRevision: item.queueRevision, expectedItemRevision: item.itemRevision,
-      displayedPayloadDigest: item.displayedPayloadDigest, approvalBindingDigest: item.approvalBindingDigest,
-    });
+    return approveOwnPrAction(this.confirmations, item);
   }
 
   async verifyPush(envelope) {
+    if (envelope.action?.controlledCommitEvidence?.executionSource?.kind === "conflict_preparation") {
+      return this.conflictRepair === null ? false : this.conflictRepair.verifyPush(envelope);
+    }
     if (envelope.kind !== "github.pull-request-push" || envelope.requestedBy?.roleId !== "developer" ||
         envelope.action?.controlledCommitEvidence?.executionSource?.kind !== "review_repair") return false;
     const source = envelope.action.controlledCommitEvidence.executionSource;
@@ -305,6 +320,11 @@ export class AutomaticOwnPrRepair {
         }
       }
       await this.#reconcileReviews(limit, result);
+      if (this.conflictRepair) {
+        const conflicts = await this.conflictRepair.runCycle({ limit });
+        for (const key of ["scanned", "published", "failed", "stale"]) result[key] += conflicts[key];
+        if (conflicts.lastFailure) result.lastFailure = conflicts.lastFailure;
+      }
       return result;
     });
   }
@@ -372,17 +392,7 @@ export class AutomaticOwnPrRepair {
     const grant = codeItem.display.payload.action.grant;
     if (!await this.#grantCurrent(grant)) { await this.#update(record, { status: "stale" }); return "stale"; }
     const evidence = await this.controlledCommitReader.verify({ evidenceId: receipt.evidenceId });
-    if (evidence.evidenceDigest !== receipt.evidenceDigest || evidence.commit.oid !== receipt.commitOid ||
-        evidence.package.job.id !== record.jobId || evidence.executionSource.kind !== "review_repair" ||
-        codeJobIdForGrant(grant) !== record.jobId ||
-        evidence.package.grant.digest !== grant.grantDigest ||
-        evidence.package.proposal.id !== grant.proposalId || evidence.package.proposal.contentDigest !== grant.contentDigest ||
-        evidence.workspace.id !== grant.workspaceId || !isDeepStrictEqual(evidence.executionSource, grant.executionSource) ||
-        evidence.tests.profiles.length !== grant.requiredProfiles.length ||
-        !grant.requiredProfiles.every((required) => evidence.tests.profiles.some((profile) =>
-          profile.id === required.id && profile.configDigest === required.configDigest &&
-          profile.workspaceRevision === evidence.workspace.workspaceRevision)) ||
-        !samePullRequestExecutionBinding(evidence.executionSource.inputBinding, record.inputBinding)) {
+    if (!repairCommitMatchesJob({ evidence, receipt, record, grant, sourceKind: "review_repair" })) {
       throw repairError("OWN_PR_REPAIR_COMMIT_INVALID", "修复提交与代码任务不匹配");
     }
     const current = await this.#current(record.inputBinding);

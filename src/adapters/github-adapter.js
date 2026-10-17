@@ -2,7 +2,7 @@ import { types as utilTypes } from "node:util";
 
 import { runCommand, runJson } from "../lib/command-runner.js";
 import { INCOMING_REVIEW_QUERY, projectIncomingReview } from "./github-incoming-review.js";
-import { readOwnReviewFeedback } from "./github-own-review-feedback.js";
+import { readOwnReviewFeedback, readOwnPullRequestConflict } from "./github-own-review-feedback.js";
 import {
   applyGitHubCurrentPullRequestTarget,
   currentPullRequestTargetView,
@@ -1085,6 +1085,14 @@ export class GitHubAdapter {
     if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository) || !Number.isSafeInteger(number) || number < 1 || typeof account !== "string" || !account) throw new TypeError("Invalid own PR feedback target");
     if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
     const facts = await readOwnReviewFeedback(this.run, { repository, number, account }, options);
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    return facts;
+  }
+
+  async readOwnPullRequestConflict({ repository, number, account }, options = {}) {
+    if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository) || !Number.isSafeInteger(number) || number < 1 || typeof account !== "string" || !account) throw new TypeError("Invalid own PR conflict target");
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    const facts = await readOwnPullRequestConflict(this.run, { repository, number, account }, options);
     if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
     return facts;
   }

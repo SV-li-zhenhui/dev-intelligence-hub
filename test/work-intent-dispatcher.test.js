@@ -2123,6 +2123,23 @@ test("persisted conflict binding retries delivery without preparing a second sou
   assert.equal(proposals.calls.length, 1);
 });
 
+test("orchestrator owner conflict work seals the same conflict source without a copied dashboard status", async () => {
+  const pair = conflictWorkPair(6);
+  const { mergeStateStatus, ...payload } = pair.item.event.payload;
+  pair.item.event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.owner_requested",
+    occurredAt: "2026-08-02T03:00:00.000Z", source: { provider: "local-owner", scopeId: "owner-request:123e4567-e89b-42d3-a456-426614174000" },
+    subject: clone(pair.item.event.subject), payload: { ...clone(payload), title: "Resolve PR conflict", workType: "general",
+      suggestedCapability: "development", expectedHeadRefOid: payload.headRefOid } });
+  pair.item.source = createPullRequestWorkSource(prSourceEnvelope(6, pair.item.event, pair.item.assignmentId)).source;
+  let preparations = 0;
+  const { dispatcher, proposals } = fixture([pair], { conflictExecutionSourcePreparer: { async prepare(binding) {
+    preparations += 1; return conflictExecutionSource(binding);
+  } } });
+  assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  assert.equal(preparations, 1);
+  assert.equal(proposals.calls[0].binding.executionSource.kind, "conflict_preparation");
+});
+
 test("own review repair binds its trusted source once and resumes the persisted proposal", async () => {
   const pair = conflictWorkPair(6, codeIntent(), { mergeStateStatus: "CLEAN", relation: "authored", nextAction: "address_review" });
   const time = controlledClock();

@@ -510,10 +510,12 @@ function conflictPreparationRequirement(item, intent, inputBinding) {
   const payload = dataMap(event?.get("payload"));
   const dirty = payload?.get("mergeStateStatus") === "DIRTY";
   const resolveConflict = payload?.get("nextAction") === "resolve_conflict";
+  const ownerConflict = resolveConflict && event?.get("eventType") === "pull_request.owner_requested" &&
+    dataMap(event.get("source"))?.get("provider") === "local-owner";
   if (!dirty && !resolveConflict) return "none";
   if (
-    dirty !== resolveConflict ||
-    !ACTIVE_PULL_REQUEST_EVENTS.has(event?.get("eventType")) ||
+    (!ownerConflict && dirty !== resolveConflict) ||
+    (!ownerConflict && !ACTIVE_PULL_REQUEST_EVENTS.has(event?.get("eventType"))) ||
     inputBinding === null ||
     inputBinding.schemaVersion !== 2
   ) {
