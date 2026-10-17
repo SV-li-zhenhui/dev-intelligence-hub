@@ -13,7 +13,7 @@ const NULL_FILE = process.platform === "win32" ? "NUL" : "/dev/null";
 const MESSAGES = Object.freeze({
   OWN_PR_REPAIR_OBJECT_INPUT_INVALID: "自动修复 Git 对象请求无效",
   OWN_PR_REPAIR_OBJECT_PREFLIGHT_FAILED: "自动修复 Git 仓库可信边界预检失败",
-  OWN_PR_REPAIR_OBJECT_FETCH_FAILED: "自动修复无法获取指定 Head 的 Git 对象",
+  OWN_PR_REPAIR_OBJECT_FETCH_FAILED: "自动修复无法获取指定 Head/Base 的 Git 对象",
   OWN_PR_REPAIR_OBJECT_CREDENTIAL_FAILED: "自动修复 Git 对象凭证不可用",
   OWN_PR_REPAIR_OBJECT_TIMEOUT: "自动修复 Git 对象准备超时",
   OWN_PR_REPAIR_OBJECT_CANCELLED: "自动修复 Git 对象准备已取消",
@@ -220,9 +220,13 @@ export class OwnPrRepairObjectSync {
     const { binding, actorAccountId, gitCommand, sourceRoot, mirrorRoot, baseMirrorRoot, timeoutMs } = normalizeRequest(request);
     const controller = new AbortController();
     this.#activeController = controller;
-    const deadline = Date.now() + timeoutMs;
+    // Source, Head mirror and Base mirror each need preflight and may fetch.
+    // Keep each Git command bounded by timeoutMs without spending its network
+    // allowance on the preceding stores' metadata checks.
+    const preparationTimeoutMs = timeoutMs * 3;
+    const deadline = Date.now() + preparationTimeoutMs;
     let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, preparationTimeoutMs);
     const checkDeadline = () => {
       if (timedOut || Date.now() >= deadline) throw failure("OWN_PR_REPAIR_OBJECT_TIMEOUT");
       if (controller.signal.aborted) throw failure("OWN_PR_REPAIR_OBJECT_CANCELLED");

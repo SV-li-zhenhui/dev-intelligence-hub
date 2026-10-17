@@ -385,6 +385,25 @@ test("sanitizes credential and Git failures, clears ephemeral authentication and
   }
 });
 
+test("three-store preflight does not consume a later fetch command's configured timeout", realGit, async (t) => {
+  const s = await fixture(t);
+  s.configuration.codeExecutor.gitTimeoutMs = 1_000;
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  let delayed = false;
+  let fetches = 0;
+  const sync = new OwnPrRepairObjectSync({ ...s, processRunner: { async run(request) {
+    if (!delayed) { delayed = true; t.mock.timers.tick(800); }
+    if (request.args.includes("fetch")) {
+      fetches += 1;
+      assert.equal(request.timeoutMs, 1_000);
+    }
+    return s.processRunner.run(request);
+  } } });
+  await sync.prepare(s);
+  assert.equal(fetches, 2);
+  await sync.close();
+});
+
 test("bounds a managed child with the configured deadline and cancellation signal", realGit, async (t) => {
   const s = await fixture(t);
   s.configuration.codeExecutor.gitTimeoutMs = 200;
