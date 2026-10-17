@@ -64,7 +64,7 @@ export class AutomaticOwnPrConflict {
     return this.#state.records.some(record => active(record) && samePr(record.inputBinding, binding));
   }
 
-  async #current(binding) {
+  async #current(binding, { rejectChangedTarget = false } = {}) {
     const config = (await this.configurationReader.readActive())?.configuration;
     if (config?.githubActions?.enabled !== true || config.githubActions.automaticOwnPrRepair !== true ||
         !config.trackedRepositories.includes(binding.repository) ||
@@ -76,6 +76,10 @@ export class AutomaticOwnPrConflict {
     if (!conflictTask(event) || (event.payload.relation === "authored" && !sameLogin(context.author, config.githubActions.actorAccountId))) return null;
     const facts = await this.github.readOwnPullRequestConflict({ repository: binding.repository,
       number: binding.pullRequestNumber, account: config.githubActions.actorAccountId });
+    if (rejectChangedTarget && sameLogin(facts.author, config.githubActions.actorAccountId) &&
+        (facts.headRefOid !== binding.headRefOid || facts.baseRefOid !== binding.gitTarget.baseRefOid)) {
+      throw Object.assign(new Error("冲突任务绑定的远端 Head/Base 已变化"), { code: "OWN_PR_CONFLICT_TARGET_CHANGED" });
+    }
     if (facts.state !== "open" || facts.isDraft === true || facts.draft === true ||
         !sameLogin(facts.author, config.githubActions.actorAccountId) || facts.headRefOid !== binding.headRefOid ||
         facts.baseRefOid !== binding.gitTarget.baseRefOid || facts.mergeStateStatus !== "DIRTY") return null;
@@ -93,12 +97,20 @@ export class AutomaticOwnPrConflict {
     if (!grant?.inputBinding || !["inspect", "verify", "modify"].includes(grant.operation) ||
         (grant.operation === "modify" && (grant.executionSource?.kind !== "conflict_preparation" ||
           !samePullRequestExecutionBinding(grant.executionSource.inputBinding, grant.inputBinding)))) return item;
-    let config = await this.#current(grant.inputBinding);
-    if (!config || !await this.#grantCurrent(grant)) return item;
-    if (this.objectSync) {
-      await this.objectSync.prepare({ configuration: config, inputBinding: grant.inputBinding });
-      config = await this.#current(grant.inputBinding);
-      if (!config) return item;
+    let config;
+    try {
+      config = await this.#current(grant.inputBinding, { rejectChangedTarget: true });
+      if (!config || !await this.#grantCurrent(grant)) return item;
+      if (this.objectSync) {
+        await this.objectSync.prepare({ configuration: config, inputBinding: grant.inputBinding });
+        config = await this.#current(grant.inputBinding, { rejectChangedTarget: true });
+        if (!config) return item;
+      }
+    }
+    catch (error) {
+      if (error?.code !== "OWN_PR_CONFLICT_TARGET_CHANGED") throw error;
+      try { return await this.#invalidatePending(item); }
+      catch (invalidation) { if (invalidation?.code === "CONFIRMATION_NOT_INVALIDATABLE") return item; throw invalidation; }
     }
     if (grant.operation === "modify") {
       await this.#queue.enqueue(async () => {
@@ -209,14 +221,18 @@ export class AutomaticOwnPrConflict {
 
   async #retirePending(record, item) {
     try {
-      await this.confirmations.invalidate(item.id, { requestedBy: item.requestedBy,
-        approvalBindingDigest: item.approvalBindingDigest, reason: "authorization_changed" });
+      await this.#invalidatePending(item);
     } catch (error) {
       if (error?.code === "CONFIRMATION_NOT_INVALIDATABLE") return "waiting";
       throw error;
     }
     await this.#update(record, "stale");
     return "stale";
+  }
+
+  #invalidatePending(item) {
+    return this.confirmations.invalidate(item.id, { requestedBy: item.requestedBy,
+      approvalBindingDigest: item.approvalBindingDigest, reason: "authorization_changed" });
   }
 
   async #save(value) {

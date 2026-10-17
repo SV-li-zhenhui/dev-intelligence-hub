@@ -127,7 +127,7 @@ function controlledCommit(grant, overrides = {}) {
   });
 }
 
-async function fixture({ enabled = true, conflict = false, operation = "modify", pushOutcome = "applied", store = new MemoryStore(), clock = () => new Date(CREATED_AT) } = {}) {
+async function fixture({ enabled = true, conflict = false, operation = "modify", objectSync = null, pushOutcome = "applied", store = new MemoryStore(), clock = () => new Date(CREATED_AT) } = {}) {
   const binding = pullRequestExternalActionBinding({
     gitTarget: { headRepository: "acme/repo", headRefName: "fix/review-feedback" },
   });
@@ -222,6 +222,7 @@ async function fixture({ enabled = true, conflict = false, operation = "modify",
   }
   function makeService() {
     const dependencies = {
+      objectSync,
       configurationReader: { async readActive() { return { configuration: config }; } }, store,
       ledger: { async readPullRequestExecutionContext() { return clone(context); }, async readItemForReconciliation() { return clone(item); } },
       github: { async readOwnPullRequestFeedback() { return clone(facts); }, async readOwnPullRequestConflict() { return clone(facts); } }, confirmations: confirmationPort,
@@ -335,8 +336,6 @@ test("conflict automation rejects disabled mode, another author, changed targets
   for (const change of [
     f => { f.config.githubActions.automaticOwnPrRepair = false; },
     f => { f.facts.author = "another-author"; },
-    f => { f.facts.headRefOid = "9".repeat(40); },
-    f => { f.facts.baseRefOid = "9".repeat(40); },
     f => { f.facts.mergeStateStatus = "CLEAN"; },
     f => { f.item.event.payload.nextAction = "wait_review"; },
     f => { f.item.event.payload.relation = "review_requested"; },
@@ -350,6 +349,19 @@ test("conflict automation rejects disabled mode, another author, changed targets
   }
 });
 
+test("automatic owner conflict inspection retires its obsolete confirmation when the remote target advances", async () => {
+  for (const field of ["headRefOid", "baseRefOid"]) {
+    const f = await fixture({ conflict: true, operation: "inspect", enabled: false });
+    const waiting = await f.deliver();
+    assert.equal(waiting.status, "waiting_confirmation");
+    f.config.githubActions.automaticOwnPrRepair = true;
+    f.facts[field] = "9".repeat(40);
+    assert.equal((await f.resume(waiting)).status, "stale");
+    assert.equal((await f.queue.get(waiting.downstreamRef)).status, "stale");
+    assert.equal(f.codeJobApprovalCount, 0);
+  }
+});
+
 test("a conflict push with unknown remote outcome is never submitted again after restart", async () => {
   const f = await fixture({ conflict: true, pushOutcome: "unknown" });
   await f.deliver(); f.completeJob();
@@ -359,6 +371,15 @@ test("a conflict push with unknown remote outcome is never submitted again after
   await f.service.runCycle(); await f.service.runCycle();
   assert.equal(f.pushes.length, 1);
   assert.equal(await f.service.shouldRun(f.item), false);
+});
+
+test("target drift during object synchronization retires the obsolete conflict inspection", async () => {
+  let f;
+  f = await fixture({ conflict: true, operation: "inspect", objectSync: { async prepare() {
+    f.facts.baseRefOid = "9".repeat(40);
+  } } });
+  assert.equal((await f.deliver()).status, "stale");
+  assert.equal(f.codeJobApprovalCount, 0);
 });
 
 test("a changed Base revokes a completed conflict repair before automatic push", async () => {
