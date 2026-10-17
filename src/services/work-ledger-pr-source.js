@@ -1109,11 +1109,12 @@ export function normalizePullRequestWorkSource(value) {
     "pendingRevision",
   );
   const rawRevisions = plainArray(value.revisions, "revisions");
-  const hasIncompleteAuthorityHistory = rawRevisions.some(
-    (revision) => !hasExactLedgerKeys(revision, AUTHORITY_REVISION_KEYS) &&
-      !hasExactLedgerKeys(revision, REVISION_KEYS) &&
-      !hasExactLedgerKeys(revision, SCOPE_REVOCATION_REVISION_KEYS),
-  );
+  const hasIncompleteAuthorityHistory = rawRevisions.some((revision) => {
+    const { incomingReview, ...authority } = revision;
+    return !hasExactLedgerKeys(authority, AUTHORITY_REVISION_KEYS) &&
+      !hasExactLedgerKeys(authority, REVISION_KEYS) &&
+      !hasExactLedgerKeys(authority, SCOPE_REVOCATION_REVISION_KEYS);
+  });
   const revisions = rawRevisions.map(
     (revision, index) => normalizeRevision(revision, index + 1),
   );

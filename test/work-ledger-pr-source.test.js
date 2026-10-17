@@ -117,6 +117,20 @@ function executionBinding(item) {
   });
 }
 
+test("incoming Review receipts on a rejected snapshot cannot trigger legacy migration or rewrite accepted history", () => {
+  let source = initialSource();
+  source = appendPullRequestWorkSource(source, pullRequestEnvelope(2, HEAD_B, { previousHeadRefOid: HEAD_A })).source;
+  const previous = structuredClone(source);
+  const rejected = appendPullRequestWorkSource(source, pullRequestEnvelope(3, HEAD_C, { gitFacts: {
+    relation: "review_requested", reviewRequestEventId: "AE_2", reviewReceivedAt: "2026-08-02T01:00:00.000Z",
+  } }));
+  assert.equal(rejected.disposition, "ignored_unproven_head");
+  const normalized = normalizePullRequestWorkSource(rejected.source);
+  assert.equal(normalized.headRevision, previous.headRevision);
+  assert.deepEqual(normalized.revisions.slice(0, previous.revisions.length), previous.revisions);
+  assert.doesNotThrow(() => validatePullRequestSourceTransition([sourceItem(previous)], [sourceItem(normalized)]));
+});
+
 test("batch Head admission matches individual authority and refreshes after mutation", () => {
   const first = sourceItem(initialSource());
   const state = { items: [first] };
