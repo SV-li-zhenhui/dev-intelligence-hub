@@ -894,7 +894,7 @@ export class ProactiveWorkLoop {
       options.signal,
     );
     throwIfLoopAborted(options.signal);
-    await this.#recoverOldHeadDecisionExhaustion(options);
+    const recoveryOutcomes = await this.#recoverOldHeadDecisionExhaustion(options) ?? [];
     const candidateAt = normalizeLoopClock(this.clock);
     const candidateWindow = await this.#listCandidateWindow(
       options,
@@ -929,6 +929,7 @@ export class ProactiveWorkLoop {
     const outcomes = intake.error
       ? [{ status: "intake_deferred", code: intake.error.code }]
       : [];
+    outcomes.push(...recoveryOutcomes);
     let claimedCount = 0;
     let claimAttempts = 0;
     let workAttempts = 0;
@@ -1971,6 +1972,7 @@ export class ProactiveWorkLoop {
       cursor = result.nextCursor;
     }
     let recovered = 0;
+    const outcomes = [];
     for (const item of blocked) {
       if (recovered >= options.workLimit) break;
       const event = currentWorkItemEvent(item);
@@ -1979,7 +1981,9 @@ export class ProactiveWorkLoop {
           item.activeIntentId === null && item.ownerId === null && item.leaseId === null && item.leaseUntil === null &&
           item.sourceQuarantine === null && item.decisionContext?.source === "proposal" &&
           item.decisionContext.outcome === "succeeded" && item.decisionContext.value?.kind === "code_action_proposal") {
-        if (await this.#recoverConflictInspectionBlock(item, options)) recovered += 1;
+        const result = await this.#recoverConflictInspectionBlock(item, options);
+        if (result === true) recovered += 1;
+        else if (result?.code) outcomes.push({ itemId: item.itemId, status: "conflict_material_deferred", code: result.code });
         continue;
       }
       if (isInitialInternalReviewFactBlock(item)) {
@@ -2006,6 +2010,7 @@ export class ProactiveWorkLoop {
         // fresh snapshot on the next cycle, without replaying any action.
       }
     }
+    return outcomes;
   }
 
   async #recoverConflictInspectionBlock(item, options) {
@@ -2045,7 +2050,9 @@ export class ProactiveWorkLoop {
       if (!inspection || !samePullRequestExecutionBinding(inspection.inputBinding, binding) ||
           inspection.preparationBinding?.gitTarget?.headRefOid !== binding.headRefOid ||
           inspection.preparationBinding?.gitTarget?.baseRefOid !== binding.gitTarget.baseRefOid ||
-          !Array.isArray(inspection.conflicts) || inspection.conflicts.length === 0) return false;
+          !Array.isArray(inspection.conflicts) || inspection.conflicts.length === 0) {
+        return { code: "CONFLICT_INSPECTION_CONTEXT_MISSING" };
+      }
       throwIfLoopAborted(options.signal);
       await this.verifyPullRequestExecutionBinding(binding);
       await this.ledger.transition({ itemId: item.itemId, expectedRevision: item.revision,
@@ -2056,7 +2063,7 @@ export class ProactiveWorkLoop {
     } catch (error) {
       throwIfLoopAborted(options.signal);
       if (RUNTIME_ADMISSION_ERROR_CODES.has(stableFailureCode(error))) throw error;
-      return false;
+      return { code: stableFailureCode(error) };
     }
   }
 

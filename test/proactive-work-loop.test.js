@@ -467,7 +467,7 @@ function createLoop({ ledger, directory, time, ...options }) {
 }
 
 test("a conflict decision blocked without materials receives one bounded retry only after exact materials recover", async () => {
-  for (const variant of ["current", "trimmed", "already-recovered", "changed-target", "wrong-failure"]) {
+  for (const variant of ["current", "trimmed", "already-recovered", "changed-target", "wrong-failure", "preparation-failure"]) {
     const time = controlledClock();
     const item = workItem(42, { type: "role", id: "developer" });
     const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "runtime-user",
@@ -507,7 +507,10 @@ test("a conflict decision blocked without materials receives one bounded retry o
     };
     let preparations = 0;
     const loop = createLoop({ ledger, time,
-      automaticOwnPrRepair: { shouldRun: async () => true, conflictRepair: { prepareInspection: async () => { preparations += 1; } } },
+      automaticOwnPrRepair: { shouldRun: async () => true, conflictRepair: { prepareInspection: async () => {
+        preparations += 1;
+        if (variant === "preparation-failure") throw Object.assign(new Error("private diagnostic details"), { code: "OWN_PR_REPAIR_OBJECT_TIMEOUT" });
+      } } },
       directory: new FakeRoleDirectory({ developer: worker({ roleId: "developer",
       decide: async () => { throw Object.assign(new Error("subsequent model failure"), { code: "ROLE_DECISION_PR_REVIEW_REQUIRED" }); } }) }),
       roleContextAssembler: { async assemble({ item: current }) { assert.ok(preparations > 0); return { ...contextPacket(current, "developer"), context: { code: { conflictInspection: {
@@ -516,7 +519,13 @@ test("a conflict decision blocked without materials receives one bounded retry o
       } } } }; } }, orchestratorService: { async execute() {} } });
     const first = await loop.runCycle({ roleId: "developer" });
     assert.equal(first.claimed, variant === "current" ? 1 : 0, variant);
-    assert.equal(preparations, ["current", "changed-target"].includes(variant) ? 1 : 0, variant);
+    assert.equal(preparations, ["current", "changed-target", "preparation-failure"].includes(variant) ? 1 : 0, variant);
+    if (variant === "preparation-failure") {
+      assert.ok(first.outcomes.some(outcome => outcome.status === "conflict_material_deferred" &&
+        outcome.code === "OWN_PR_REPAIR_OBJECT_TIMEOUT"));
+      assert.equal(JSON.stringify(first).includes("private diagnostic details"), false);
+      assert.equal(ledger.calls.transition.length, 0);
+    }
     assert.equal(ledger.items[0].attempt, variant === "current" ? 7 : 6, variant);
     if (variant === "current") {
       assert.equal((await loop.runCycle({ roleId: "developer" })).claimed, 0);
