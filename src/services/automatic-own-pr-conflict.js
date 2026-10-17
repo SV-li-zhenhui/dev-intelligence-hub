@@ -40,6 +40,7 @@ export class AutomaticOwnPrConflict {
   #queue = new OperationQueue();
   #state;
   #lastJobId = null;
+  #inspections = new Map();
 
   constructor({ configurationReader, store, ledger, github, confirmations, codeJobReader,
     controlledCommitReader, objectSync, grantVerifier, conflictInspectionReader }) {
@@ -60,7 +61,12 @@ export class AutomaticOwnPrConflict {
     const event = currentWorkItemEvent(item);
     const target = { repository: binding?.repository ?? event?.subject?.repository,
       pullRequestNumber: binding?.pullRequestNumber ?? event?.subject?.number };
-    if (!this.isInFlight(target)) return true;
+    if (!this.isInFlight(target)) {
+      if (item.currentTarget?.id === "developer" && conflictTask(event) && this.conflictInspectionReader) {
+        await this.prepareInspection({ itemId: item.itemId, itemRevision: item.revision, inputDigest: item.inputDigest });
+      }
+      return true;
+    }
     const config = (await this.configurationReader.readActive())?.configuration;
     return config?.githubActions?.automaticOwnPrRepair !== true;
   }
@@ -70,6 +76,22 @@ export class AutomaticOwnPrConflict {
   }
 
   async readInspection({ itemId, itemRevision, inputDigest }) {
+    const cached = this.#inspections.get(itemId);
+    if (!cached) return null;
+    const configuration = (await this.configurationReader.readActive())?.configuration;
+    if (configuration?.githubActions?.enabled !== true || configuration.githubActions.automaticOwnPrRepair !== true ||
+        !sameLogin(configuration.githubActions.actorAccountId, cached.inputBinding.gitTarget.sourceAccountId) ||
+        !configuration.trackedRepositories.includes(cached.inputBinding.repository)) return null;
+    const item = await this.ledger.readItemForReconciliation({ itemId });
+    const binding = currentWorkItemExecutionBinding(item);
+    if (item.revision !== itemRevision || item.inputDigest !== inputDigest || item.currentTarget?.id !== "developer" ||
+        !conflictTask(currentWorkItemEvent(item)) || !binding || !samePullRequestExecutionBinding(cached.inputBinding, binding)) return null;
+    // These captured bytes describe an immutable preparation, not publication
+    // authority. Fresh facts, grant creation and execution recheck the target.
+    return structuredClone(cached);
+  }
+
+  async prepareInspection({ itemId, itemRevision, inputDigest }) {
     if (!this.conflictInspectionReader) return null;
     const item = await this.ledger.readItemForReconciliation({ itemId });
     if (item.revision !== itemRevision || item.inputDigest !== inputDigest ||
@@ -78,6 +100,8 @@ export class AutomaticOwnPrConflict {
     if (binding?.schemaVersion !== 2) return null;
     const configuration = await this.#current(binding);
     if (!configuration) return null;
+    const cached = this.#inspections.get(itemId);
+    if (cached && samePullRequestExecutionBinding(cached.inputBinding, binding)) return structuredClone(cached);
     await this.objectSync.prepare({ configuration, inputBinding: binding });
     const inspection = await this.conflictInspectionReader.read(binding);
     const latest = await this.ledger.readItemForReconciliation({ itemId });
@@ -85,7 +109,9 @@ export class AutomaticOwnPrConflict {
         latest.revision !== itemRevision || latest.inputDigest !== inputDigest || !await this.#current(binding)) {
       throw Object.assign(new Error("冲突检查材料在读取期间失效"), { code: "OWN_PR_CONFLICT_TARGET_CHANGED" });
     }
-    return inspection;
+    this.#inspections.set(itemId, structuredClone(inspection));
+    while (this.#inspections.size > 32) this.#inspections.delete(this.#inspections.keys().next().value);
+    return structuredClone(inspection);
   }
 
   async #current(binding, { rejectChangedTarget = false } = {}) {

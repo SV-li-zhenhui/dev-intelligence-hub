@@ -2036,6 +2036,10 @@ export class ProactiveWorkLoop {
       const binding = currentWorkItemExecutionBinding(item);
       if (binding?.schemaVersion !== 2) return false;
       await this.verifyPullRequestExecutionBinding(binding);
+      if (typeof this.automaticOwnPrRepair?.conflictRepair?.prepareInspection === "function") {
+        await this.automaticOwnPrRepair.conflictRepair.prepareInspection({ itemId: item.itemId,
+          itemRevision: item.revision, inputDigest: item.inputDigest });
+      }
       const packet = await this.#assembleContext(item, { roleId: "developer" }, options);
       const inspection = packet?.context?.code?.conflictInspection;
       if (!inspection || !samePullRequestExecutionBinding(inspection.inputBinding, binding) ||

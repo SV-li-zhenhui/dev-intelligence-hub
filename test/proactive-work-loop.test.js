@@ -505,14 +505,18 @@ test("a conflict decision blocked without materials receives one bounded retry o
       timeline.push({ sequence: 4, type: "transitioned", at: current.updatedAt, details: { reason: input.reason } });
       return clone(current);
     };
-    const loop = createLoop({ ledger, time, directory: new FakeRoleDirectory({ developer: worker({ roleId: "developer",
+    let preparations = 0;
+    const loop = createLoop({ ledger, time,
+      automaticOwnPrRepair: { shouldRun: async () => true, conflictRepair: { prepareInspection: async () => { preparations += 1; } } },
+      directory: new FakeRoleDirectory({ developer: worker({ roleId: "developer",
       decide: async () => { throw Object.assign(new Error("subsequent model failure"), { code: "ROLE_DECISION_PR_REVIEW_REQUIRED" }); } }) }),
-      roleContextAssembler: { async assemble({ item: current }) { return { ...contextPacket(current, "developer"), context: { code: { conflictInspection: {
+      roleContextAssembler: { async assemble({ item: current }) { assert.ok(preparations > 0); return { ...contextPacket(current, "developer"), context: { code: { conflictInspection: {
         inputBinding: variant === "changed-target" ? { ...binding, headRefOid: "9".repeat(40) } : binding,
         preparationBinding: { gitTarget, preparationId: "b".repeat(64) }, conflicts: [{ path: "src/app.js" }],
       } } } }; } }, orchestratorService: { async execute() {} } });
     const first = await loop.runCycle({ roleId: "developer" });
     assert.equal(first.claimed, variant === "current" ? 1 : 0, variant);
+    assert.equal(preparations, ["current", "changed-target"].includes(variant) ? 1 : 0, variant);
     assert.equal(ledger.items[0].attempt, variant === "current" ? 7 : 6, variant);
     if (variant === "current") {
       assert.equal((await loop.runCycle({ roleId: "developer" })).claimed, 0);

@@ -301,10 +301,24 @@ test("automatic conflict materials are synchronized and read only for a current 
     } };
     const request = { itemId: f.item.itemId, itemRevision: variant === "stale-item" ? 2 : 3, inputDigest: f.item.inputDigest };
     if (variant === "base-drift") {
-      await assert.rejects(f.service.conflictRepair.readInspection(request), error => error.code === "OWN_PR_CONFLICT_TARGET_CHANGED");
+      await assert.rejects(f.service.conflictRepair.prepareInspection(request), error => error.code === "OWN_PR_CONFLICT_TARGET_CHANGED");
     } else {
+      assert.equal(await f.service.conflictRepair.readInspection(request), null);
+      if (variant === "current") assert.equal(await f.service.shouldRun(f.item), true);
+      else await f.service.conflictRepair.prepareInspection(request);
       const result = await f.service.conflictRepair.readInspection(request);
       assert.equal(result !== null, variant === "current", variant);
+      if (variant === "current") {
+        const detached = await f.service.conflictRepair.readInspection(request);
+        detached.conflicts[0].path = "caller-mutated";
+        assert.equal((await f.service.conflictRepair.readInspection(request)).conflicts[0].path, "src/conflict.txt");
+        // A new claim may change the revision while immutable source binding stays exact.
+        f.item.revision += 1;
+        assert.equal(await f.service.conflictRepair.readInspection(request), null);
+        assert.ok(await f.service.conflictRepair.readInspection({ ...request, itemRevision: f.item.revision }));
+        f.config.githubActions.automaticOwnPrRepair = false;
+        assert.equal(await f.service.conflictRepair.readInspection({ ...request, itemRevision: f.item.revision }), null);
+      }
     }
     assert.equal(reads, ["current", "base-drift"].includes(variant) ? 1 : 0);
     assert.equal(syncs, reads);
