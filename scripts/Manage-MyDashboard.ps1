@@ -3081,9 +3081,11 @@ function Invoke-Launcher {
         MYDASHBOARD_MANAGED_TOKEN = $Token
         MYDASHBOARD_MANAGED_RUNTIME_DIRECTORY = $runtimeDirectory
         MYDASHBOARD_MANAGED_PROJECT_DIGEST = $projectDigest
-        MYDASHBOARD_MANAGED_CLAIM_TIMEOUT_MS = [string]([Math]::Max(
-            5000,
-            $TimeoutSeconds * 1000
+        # Startup may wait longer for durable state recovery. Once live, the
+        # child still requires an authenticated claim within the original cap.
+        MYDASHBOARD_MANAGED_CLAIM_TIMEOUT_MS = [string]([Math]::Min(
+            120000,
+            [Math]::Max(5000, $TimeoutSeconds * 1000)
         ))
         MYDASHBOARD_MANAGED_LOG_DIRECTORY = $runtimeLogDirectory
     }
