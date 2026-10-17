@@ -9,6 +9,9 @@ import { roleContextError } from "./role-context-error.js";
 const JOB_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const FAILURE_CODE = /^[A-Z][A-Z0-9_]{0,127}$/;
 const ACTION_TYPES = new Set(CODE_BRAIN_ACTION_TYPES);
+export const AUTOMATIC_INSPECTION_FAILURES = Object.freeze([
+  "GIT_HEAD_UNAVAILABLE", "GIT_SNAPSHOT_TIMEOUT",
+]);
 
 function portMethod(port, method) {
   let owner = port;
@@ -56,7 +59,7 @@ export class FailedCodeJobContextReader {
         entry.type === "transitioned" && (entry.actorId === "owner:local" ||
           (entry.actorId === "automatic-own-pr-inspection-recovery" &&
             entry.details?.reason === "automatic_inspection_objects_ready" &&
-            entry.details.context?.code === "GIT_HEAD_UNAVAILABLE")) &&
+            AUTOMATIC_INSPECTION_FAILURES.includes(entry.details.context?.code))) &&
         entry.details?.toStatus === "queued" &&
         entry.details.context?.downstreamRef === jobId &&
         Date.parse(entry.at) > Date.parse(observedAfter));
@@ -119,7 +122,8 @@ export class FailedCodeJobContextReader {
         note: retryNote(retry.details.context.note),
       } : null,
       automaticRecovery: retry?.actorId === "automatic-own-pr-inspection-recovery" &&
-        job.operation === "inspect" && failureCode === "GIT_HEAD_UNAVAILABLE" &&
+        job.operation === "inspect" && AUTOMATIC_INSPECTION_FAILURES.includes(failureCode) &&
+        retry.details.context.code === failureCode &&
         historyComplete && job.observationCount === 0 ? {
           at: retry.at, reason: "automatic_inspection_objects_ready", failureCode, jobId,
         } : null,

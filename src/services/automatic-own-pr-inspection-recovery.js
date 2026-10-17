@@ -1,7 +1,7 @@
 import { OperationQueue } from "../lib/operation-queue.js";
 import { normalizeCodeJobBrowserProjection } from "../domain/code-job-browser-projection.js";
 import { normalizePullRequestExecutionBinding, samePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
-import { FailedCodeJobContextReader } from "./failed-code-job-context-reader.js";
+import { AUTOMATIC_INSPECTION_FAILURES, FailedCodeJobContextReader } from "./failed-code-job-context-reader.js";
 
 const STATE_KEY = "automatic-own-pr-inspection-recovery-state";
 const MAX_RECOVERIES = 3;
@@ -77,7 +77,7 @@ export class AutomaticOwnPrInspectionRecovery {
     const attempts = Math.max(0, ...prior.map(record => record.attempt));
     if (!record && attempts >= MAX_RECOVERIES) return false;
     const failure = await this.failedContextReader.read({ itemId: item.itemId, inputBinding, decisionContext: item.decisionContext });
-    if (failure?.failureCode !== "GIT_HEAD_UNAVAILABLE" || failure.operation !== "inspect" ||
+    if (!AUTOMATIC_INSPECTION_FAILURES.includes(failure?.failureCode) || failure.operation !== "inspect" ||
         failure.historyComplete !== true || failure.observationCount !== 0 || failure.observedActions.length !== 0) return false;
     let configuration = await this.current(inputBinding);
     if (!configuration) return false;
@@ -93,7 +93,7 @@ export class AutomaticOwnPrInspectionRecovery {
     }
     await this.ledger.transition({ itemId: item.itemId, expectedRevision: latest.revision, leaseId: null,
       actorId: "automatic-own-pr-inspection-recovery", toStatus: "queued", reason: "automatic_inspection_objects_ready",
-      details: { code: "GIT_HEAD_UNAVAILABLE", downstreamRef: jobId } });
+      details: { code: failure.failureCode, downstreamRef: jobId } });
     await this.#save(this.#state.records.map(entry => entry.jobId === jobId ? { ...entry, status: "requeued" } : entry));
     return true;
   }

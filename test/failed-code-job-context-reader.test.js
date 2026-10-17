@@ -80,9 +80,18 @@ test("developer context identifies the system recovery of its exact zero-action 
     failureCode: "GIT_HEAD_UNAVAILABLE", jobId: f.detail.job.jobId });
 });
 
+test("snapshot timeout recovery context preserves its actual failure classification", async () => {
+  const f = fixture({ operation: "inspect", failureCode: "GIT_SNAPSHOT_TIMEOUT", actions: [] });
+  automaticRetry(f);
+  f.retry.details.context.code = "GIT_SNAPSHOT_TIMEOUT";
+  assert.equal((await f.reader.read(f.input)).automaticRecovery.failureCode, "GIT_SNAPSHOT_TIMEOUT");
+  f.retry.details.context.code = "GIT_HEAD_UNAVAILABLE";
+  assert.equal((await f.reader.read(f.input)).automaticRecovery, null);
+});
+
 test("automatic recovery context rejects mismatched, incomplete and non-inspection recovery evidence", async (t) => {
   for (const options of [
-    { operation: "modify" }, { failureCode: "GIT_SNAPSHOT_TIMEOUT" }, { actions: ["read_text"] },
+    { operation: "modify" }, { failureCode: "GIT_SNAPSHOT_PROCESS_FAILED" }, { actions: ["read_text"] },
     { mutate: f => { f.retry.actorId = "other-system"; } },
     { mutate: f => { f.retry.details.reason = "other-recovery"; } },
     { mutate: f => { f.retry.details.context.code = "OTHER_FAILURE"; } },
@@ -129,9 +138,23 @@ test("automatic inspection recovery prepares objects then requeues the same fail
   assert.equal(f.calls.length, 2);
 });
 
+test("zero-action snapshot timeouts share the existing automatic inspection recovery budget", async () => {
+  const f = await recoveryFixture({ failureCode: "GIT_SNAPSHOT_TIMEOUT" });
+  assert.equal((await f.service.runCycle()).requeued, 1);
+  assert.equal(f.calls[1].details.code, "GIT_SNAPSHOT_TIMEOUT");
+  f.item.status = "blocked";
+  assert.equal((await (await f.makeService()).runCycle()).requeued, 0);
+  const exhausted = await recoveryFixture({ failureCode: "GIT_SNAPSHOT_TIMEOUT" });
+  exhausted.state.set("automatic-own-pr-inspection-recovery-state", { schemaVersion: 1,
+    records: [1, 2, 3].map(attempt => ({ itemId: exhausted.item.itemId, jobId: `code-job-old-${attempt}`,
+      inputBinding: exhausted.input.inputBinding, attempt, status: "requeued" })) });
+  assert.equal((await (await exhausted.makeService()).runCycle()).requeued, 0);
+  assert.deepEqual(exhausted.calls, []);
+});
+
 test("automatic inspection recovery preserves failed modifications, observed actions and uncertain context", async (t) => {
   for (const scenario of [
-    { operation: "modify" }, { failureCode: "GIT_SNAPSHOT_TIMEOUT" }, { actions: ["read_text"] },
+    { operation: "modify" }, { failureCode: "GIT_SNAPSHOT_PROCESS_FAILED" }, { actions: ["read_text"] },
     { change: f => { f.item.leaseId = "active-lease"; } },
     { change: f => { f.item.activeIntentId = "active-intent"; } },
     { change: f => { f.item.graph.deliveries = [{ status: "submitted" }]; } },
