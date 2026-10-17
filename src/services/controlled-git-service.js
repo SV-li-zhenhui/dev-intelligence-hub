@@ -524,6 +524,37 @@ function normalizeConflictPath(value, limits) {
   return normalized;
 }
 
+function pathIdentity(relativePath) {
+  return process.platform === "win32" ? relativePath.toLowerCase() : relativePath;
+}
+
+function compareEvidencePaths(left, right) {
+  return pathIdentity(left.path).localeCompare(pathIdentity(right.path), "en");
+}
+
+function assertTreePathIdentities(entries, limits, code) {
+  const identities = new Map();
+  let directories = 0;
+  for (const { path: relativePath } of entries) {
+    const segments = relativePath.split("/");
+    for (let index = 0; index < segments.length; index += 1) {
+      const candidate = segments.slice(0, index + 1).join("/");
+      const kind = index === segments.length - 1 ? "file" : "directory";
+      const identity = pathIdentity(candidate);
+      const existing = identities.get(identity);
+      if (existing && (existing.path !== candidate || existing.kind !== kind || kind === "file")) {
+        throw controlledGitError(code, "Git tree 路径在目标文件系统中冲突");
+      }
+      if (!existing) {
+        identities.set(identity, { path: candidate, kind });
+        if (kind === "directory" && ++directories > limits.maxDirectories) {
+          throw controlledGitError(code, "Git tree 目录数量超过限制");
+        }
+      }
+    }
+  }
+}
+
 function parseMergeTree(bytes, exitCode, oidLength, limits) {
   const text = decodeUtf8(
     bytes,
@@ -583,13 +614,10 @@ function parseMergeTree(bytes, exitCode, oidLength, limits) {
     };
   });
   const conflicts = [];
-  let previousComparablePath = null;
+  let previousPath = null;
   for (let index = 0; index < parsed.length; index += 3) {
     const stages = parsed.slice(index, index + 3);
     const conflictPath = stages[0].path;
-    const comparablePath = process.platform === "win32"
-      ? conflictPath.toLowerCase()
-      : conflictPath;
     if (
       stages.some(
         (stage, stageIndex) =>
@@ -597,17 +625,19 @@ function parseMergeTree(bytes, exitCode, oidLength, limits) {
           stage.stage !== stageIndex + 1 ||
           stage.mode !== "100644",
       ) ||
-      (previousComparablePath !== null &&
-        comparablePath.localeCompare(previousComparablePath, "en") <= 0)
+      (previousPath !== null &&
+        Buffer.compare(Buffer.from(conflictPath), Buffer.from(previousPath)) <= 0)
     ) {
       throw controlledGitError(
         "CONTROLLED_GIT_UNSUPPORTED_CONFLICT",
         "仅支持排序后的 ordinary 100644 both-modified conflicts",
       );
     }
-    previousComparablePath = comparablePath;
+    previousPath = conflictPath;
     conflicts.push({ path: conflictPath, mode: "100644", stages });
   }
+  assertTreePathIdentities(conflicts, limits, "CONTROLLED_GIT_UNSUPPORTED_CONFLICT");
+  conflicts.sort(compareEvidencePaths);
   return { status: "conflicted", resultTreeOid, conflicts };
 }
 
@@ -772,18 +802,18 @@ function parseResultTree(bytes, oidLength, limits) {
   });
   let previous = null;
   for (const entry of entries) {
-    const comparable = process.platform === "win32"
-      ? entry.path.toLowerCase()
-      : entry.path;
-    if (previous !== null && comparable.localeCompare(previous, "en") <= 0) {
+    if (previous !== null && Buffer.compare(Buffer.from(entry.path), Buffer.from(previous)) <= 0) {
       throw controlledGitError(
         "CONTROLLED_GIT_UNSUPPORTED_TREE",
         "Result tree 路径排序或文件系统身份冲突",
       );
     }
-    previous = comparable;
+    previous = entry.path;
   }
-  return entries;
+  // Git orders UTF-8 bytes; host manifests use canonical evidence ordering.
+  // Filesystem aliases are a separate invariant and may be non-adjacent in Git.
+  assertTreePathIdentities(entries, limits, "CONTROLLED_GIT_UNSUPPORTED_TREE");
+  return entries.sort(compareEvidencePaths);
 }
 
 function gitBlobOid(objectFormat, bytes) {
@@ -3579,6 +3609,7 @@ export class ControlledGitService {
         "Conflict path 不属于 result tree",
       );
     }
+    assertTreePathIdentities(treeEntries, this.#limits, "CONTROLLED_GIT_PREPARATION_TAMPERED");
     const resultObjects = exactArray(
       manifest.resultObjects,
       "CONTROLLED_GIT_PREPARATION_TAMPERED",

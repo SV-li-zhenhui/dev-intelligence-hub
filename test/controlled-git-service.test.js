@@ -284,6 +284,24 @@ test("seals a both-modified conflict behind fixed Git commands and a content man
   });
 });
 
+test("Git byte ordering is distinct from canonical manifest ordering and filesystem aliases", async (t) => {
+  const records = ["README.md", "Z-notes.txt", "_notes.txt", "a-notes.txt"].map(name =>
+    `100644 blob ${README}\t${name}\0`);
+  const setup = await fixture(t, { treeOutput: Buffer.from(records.join("") + `100644 blob ${RESULT_CONFLICT}\tsrc/value.js\0`) });
+  const prepared = await setup.createService().inspectConflict(inspectionRequest(setup));
+  assert.equal((await setup.createService().verifyPreparation({ preparationId: prepared.preparationId })).preparationId, prepared.preparationId);
+  for (const names of [
+    ["Z-notes.txt", "README.md", "src/value.js"],
+    ["A", "A/child.txt", "src/value.js"],
+    ...(process.platform === "win32" ? [["A/first.txt", "Z.txt", "a/second.txt", "src/value.js"]] : []),
+  ]) {
+    const unsafe = await fixture(t, { treeOutput: Buffer.from(names.map(name =>
+      `100644 blob ${name === "src/value.js" ? RESULT_CONFLICT : README}\t${name}\0`).join("")) });
+    await assert.rejects(unsafe.createService().inspectConflict(inspectionRequest(unsafe)),
+      error => error.code === "CONTROLLED_GIT_UNSUPPORTED_TREE");
+  }
+});
+
 test("rejects widened/accessor/proxy requests and unsafe merge protocols", async (t) => {
   const setup = await fixture(t);
   const service = setup.createService();

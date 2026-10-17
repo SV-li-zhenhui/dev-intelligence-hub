@@ -303,6 +303,9 @@ async function createFixture(t, gitCommand, { fullRepository = false } = {}) {
     await writeFile(path.join(sourceRoot, "resource.bin"), resource);
     await writeFile(path.join(sourceRoot, "src", "removed.txt"), "obsolete\n");
     await writeFile(path.join(sourceRoot, "src", "rename-before.txt"), "unchanged renamed content\n");
+    await writeFile(path.join(sourceRoot, "Z-notes.txt"), "uppercase file\n");
+    await writeFile(path.join(sourceRoot, "a-notes.txt"), "lowercase file\n");
+    await writeFile(path.join(sourceRoot, "_notes.txt"), "punctuation file\n");
   }
   await git(gitCommand, sourceRoot, ["add", "--all"]);
   await git(gitCommand, sourceRoot, ["commit", "-m", "common ancestor"]);
@@ -365,6 +368,9 @@ test("controlled conflict repair preserves a bounded full repository with non-co
   await bundle.materializer.materialize({ binding: source.preparationBinding, targetRoot, excludePaths: [] });
   const resource = await readFile(path.join(targetRoot, "resource.bin"));
   assert.equal(resource.length, 9_000_000); assert.equal(resource[0], 0); assert.equal(resource.at(-1), 0xff);
+  assert.equal(await readFile(path.join(targetRoot, "Z-notes.txt"), "utf8"), "uppercase file\n");
+  assert.equal(await readFile(path.join(targetRoot, "a-notes.txt"), "utf8"), "lowercase file\n");
+  assert.equal(await readFile(path.join(targetRoot, "_notes.txt"), "utf8"), "punctuation file\n");
   assert.equal(await readFile(path.join(targetRoot, "src", "base-added.txt"), "utf8"), "base addition\n");
   assert.equal(await readFile(path.join(targetRoot, "src", "head-added.txt"), "utf8"), "head addition\n");
   await assert.rejects(lstat(path.join(targetRoot, "src", "removed.txt")), { code: "ENOENT" });
