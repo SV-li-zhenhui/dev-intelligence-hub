@@ -13,7 +13,7 @@ param(
     [string]$BackupId,
     [string]$RecoverySnapshotId,
     [switch]$OpenBrowser,
-    [ValidateRange(5, 120)]
+    [ValidateRange(5, 600)]
     [int]$TimeoutSeconds = 120
 )
 
