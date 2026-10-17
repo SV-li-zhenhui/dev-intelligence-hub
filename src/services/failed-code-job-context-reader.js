@@ -43,7 +43,7 @@ export class FailedCodeJobContextReader {
     this.#listTimeline = portMethod(ledger, "listTimeline");
   }
 
-  async #readOwnerRetry(itemId, jobId, observedAfter, signal) {
+  async #readRetry(itemId, jobId, observedAfter, signal) {
     let cursor;
     const seen = new Set();
     while (true) {
@@ -53,7 +53,10 @@ export class FailedCodeJobContextReader {
       signal?.throwIfAborted();
       if (!Array.isArray(page.items) || page.items.length > 100) throw stale();
       const retry = page.items.find((entry) => entry.itemId === itemId &&
-        entry.type === "transitioned" && entry.actorId === "owner:local" &&
+        entry.type === "transitioned" && (entry.actorId === "owner:local" ||
+          (entry.actorId === "automatic-own-pr-inspection-recovery" &&
+            entry.details?.reason === "automatic_inspection_objects_ready" &&
+            entry.details.context?.code === "GIT_HEAD_UNAVAILABLE")) &&
         entry.details?.toStatus === "queued" &&
         entry.details.context?.downstreamRef === jobId &&
         Date.parse(entry.at) > Date.parse(observedAfter));
@@ -82,7 +85,7 @@ export class FailedCodeJobContextReader {
     try {
       [detail, retry] = await Promise.all([
         this.#getDetail({ jobId, limit: 20 }),
-        this.#readOwnerRetry(itemId, jobId, decisionContext.observedAt, signal),
+        this.#readRetry(itemId, jobId, decisionContext.observedAt, signal),
       ]);
     } catch (cause) {
       signal?.throwIfAborted();
@@ -101,19 +104,25 @@ export class FailedCodeJobContextReader {
       return { actionType, status };
     });
     const failureCode = detail.terminalDetail?.code;
+    const historyComplete = detail.historyAvailable === true && detail.nextCursor === null &&
+      observedActions.length === job.observationCount;
     return {
       jobId, status: job.status, operation: job.operation,
       failureCode: typeof failureCode === "string" && FAILURE_CODE.test(failureCode) ? failureCode : null,
       observedAt: job.terminalResult.recordedAt,
       observationCount: job.observationCount,
       observedActions,
-      historyComplete: detail.historyAvailable === true && detail.nextCursor === null &&
-        observedActions.length === job.observationCount,
-      ownerRetry: retry ? {
+      historyComplete,
+      ownerRetry: retry?.actorId === "owner:local" ? {
         at: retry.at,
         reason: retryNote(retry.details.reason),
         note: retryNote(retry.details.context.note),
       } : null,
+      automaticRecovery: retry?.actorId === "automatic-own-pr-inspection-recovery" &&
+        job.operation === "inspect" && failureCode === "GIT_HEAD_UNAVAILABLE" &&
+        historyComplete && job.observationCount === 0 ? {
+          at: retry.at, reason: "automatic_inspection_objects_ready", failureCode, jobId,
+        } : null,
     };
   }
 }

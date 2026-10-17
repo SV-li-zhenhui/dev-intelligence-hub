@@ -65,6 +65,37 @@ test("failed repair context includes the actual failure and matching owner recov
   assert.deepEqual(f.calls, [{ jobId: f.detail.job.jobId, limit: 20 }, { itemId: f.input.itemId, limit: 100, order: "newest" }]);
 });
 
+function automaticRetry(f) {
+  f.retry.actorId = "automatic-own-pr-inspection-recovery";
+  f.retry.details.reason = "automatic_inspection_objects_ready";
+  f.retry.details.context = { downstreamRef: f.detail.job.jobId, code: "GIT_HEAD_UNAVAILABLE" };
+}
+
+test("developer context identifies the system recovery of its exact zero-action inspection", async () => {
+  const f = fixture({ operation: "inspect", failureCode: "GIT_HEAD_UNAVAILABLE", actions: [] });
+  automaticRetry(f);
+  const result = await f.reader.read(f.input);
+  assert.equal(result.ownerRetry, null);
+  assert.deepEqual(result.automaticRecovery, { at: f.retry.at, reason: "automatic_inspection_objects_ready",
+    failureCode: "GIT_HEAD_UNAVAILABLE", jobId: f.detail.job.jobId });
+});
+
+test("automatic recovery context rejects mismatched, incomplete and non-inspection recovery evidence", async (t) => {
+  for (const options of [
+    { operation: "modify" }, { failureCode: "GIT_SNAPSHOT_TIMEOUT" }, { actions: ["read_text"] },
+    { mutate: f => { f.retry.actorId = "other-system"; } },
+    { mutate: f => { f.retry.details.reason = "other-recovery"; } },
+    { mutate: f => { f.retry.details.context.code = "OTHER_FAILURE"; } },
+    { mutate: f => { f.retry.details.context.downstreamRef = "other-job"; } },
+    { mutate: f => { f.retry.at = f.input.decisionContext.observedAt; } },
+    { mutate: f => { f.detail.historyAvailable = false; } },
+  ]) await t.test(JSON.stringify(options), async () => {
+    const f = fixture({ operation: "inspect", failureCode: "GIT_HEAD_UNAVAILABLE", actions: [], ...options });
+    automaticRetry(f); options.mutate?.(f);
+    assert.equal((await f.reader.read(f.input)).automaticRecovery, null);
+  });
+});
+
 async function recoveryFixture(options = {}) {
   const f = fixture({ operation: "inspect", failureCode: "GIT_HEAD_UNAVAILABLE", actions: [], ...options });
   const state = new Map();
