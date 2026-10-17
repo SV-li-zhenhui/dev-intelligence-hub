@@ -1336,7 +1336,7 @@ class GitHubPullRequestActionTransport {
     let result;
     try {
       this.#assertOperationCurrent(operation, trust);
-      const timeoutMs = operation.deadline - this.#clock();
+      const timeoutMs = Math.min(this.#timeoutMs, operation.deadline - this.#clock());
       result = await this.#runner.run({
         command: this.#ghCommand,
         args: [

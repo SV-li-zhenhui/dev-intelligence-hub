@@ -7,7 +7,7 @@ import { normalizePullRequestExecutionBinding, samePullRequestExecutionBinding }
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
 import { createPullRequestExternalActionConfirmationPlan } from "../domain/pull-request-external-action.js";
 import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
-import { approveOwnPrAction, repairCommitMatchesJob } from "./automatic-own-pr-repair-authorization.js";
+import { approveOwnPrAction, repairCommitMatchesJob, planOwnPrPushRetry, retryOwnPrPush, validateOwnPrPushRetry } from "./automatic-own-pr-repair-authorization.js";
 import { normalizeOwnerWorkRequest } from "../domain/owner-work-request.js";
 import { internalRepairReviewRequestId, normalizeInternalReviewMetadata } from "../domain/internal-repair-review.js";
 import { isOwnerPublicationId, normalizeObservedOwnerPublication } from "../domain/observed-owner-publication.js";
@@ -62,6 +62,7 @@ export function normalizeAutomaticOwnPrRepairState(value) {
       throw repairError("OWN_PR_REPAIR_STATE_INVALID", "自动修复记录绑定无效");
     }
     ids.add(row.jobId);
+    validateOwnPrPushRetry(row.pushRetry);
     const snapshot = snapshotFor(row);
     if (row.feedbackSnapshotId !== undefined && (!snapshot || snapshot.originalHeadRefOid !== row.inputBinding.headRefOid ||
       snapshot.feedbackDigest !== row.feedbackDigest || snapshot.repository !== row.inputBinding.repository ||
@@ -140,6 +141,13 @@ export class AutomaticOwnPrRepair {
     await validateOriginalRepairFeedbackArchives(this.store, state);
     this.#state = state;
     await this.conflictRepair?.recover();
+    for (const record of this.#state.repairs) {
+      if (record.status !== "failed" || !record.pushConfirmationId || !this.confirmations.retry) continue;
+      let item;
+      try { item = await this.confirmations.get(record.pushConfirmationId); }
+      catch (error) { if (error?.code === "CONFIRMATION_NOT_FOUND") continue; throw error; }
+      if (planOwnPrPushRetry(record, item)) await this.#update(record, { status: "pushing" });
+    }
   }
 
   async #configuration() {
@@ -356,6 +364,16 @@ export class AutomaticOwnPrRepair {
         return "published";
       }
       if (push.status === "failed" && push.failure?.outcome === "unknown") return "waiting";
+      const retry = this.confirmations.retry && planOwnPrPushRetry(record, push);
+      if (retry) {
+        const codeItem = await this.confirmations.get(record.confirmationId);
+        if (!await this.#grantCurrent(codeItem.display.payload.action.grant) || !await this.#current(record.inputBinding)) {
+          await this.#update(record, { status: "stale" }); return "stale";
+        }
+        await this.#update(record, { pushRetry: retry });
+        await retryOwnPrPush(this.confirmations, push, retry);
+        return "waiting";
+      }
       if (["rejected", "stale", "failed"].includes(push.status)) {
         await this.#update(record, { status: push.status === "stale" ? "stale" : "failed" });
         return push.status === "stale" ? "stale" : "failed";

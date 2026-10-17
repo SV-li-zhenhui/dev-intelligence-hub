@@ -177,6 +177,7 @@ async function fixture({ enabled = true, conflict = false, operation = "modify",
   let queue;
   let failNextPushEnqueue = false;
   let interruptApprovalKind = null;
+  let interruptPushRetry = false;
   let grantCurrent = true;
   const executor = {
     async execute(envelope) {
@@ -194,11 +195,17 @@ async function fixture({ enabled = true, conflict = false, operation = "modify",
       assert.equal(envelope.kind, "github.pull-request-push");
       assert.equal(await service.verifyPush(envelope), true, "push must have current automatic repair authority");
       pushes.push(clone(envelope));
-      if (pushOutcome === "unknown") return { status: "unknown", code: "TEST_PUSH_UNKNOWN" };
+      const outcome = typeof pushOutcome === "function" ? pushOutcome(pushes.length) : pushOutcome;
+      if (outcome === "unknown") return { status: "unknown", code: "TEST_PUSH_UNKNOWN" };
+      if (outcome === "absent") return { status: "error", error: { code: "GITHUB_TIMEOUT", trust: "absent" } };
       facts.headRefOid = envelope.action.controlledCommitEvidence.commit.oid;
       return { status: "applied", receipt: { id: envelope.action.controlledCommitEvidence.commit.oid, createdAt: CREATED_AT } };
     },
-    async reconcile() { return { status: "unknown", code: "TEST_PUSH_UNKNOWN" }; },
+    async reconcile(envelope) {
+      if (pushOutcome === "unknown") return { status: "unknown", code: "TEST_PUSH_UNKNOWN" };
+      return facts.headRefOid === envelope.action.controlledCommitEvidence.commit.oid
+        ? { status: "already", receipt: { id: facts.headRefOid } } : { status: "absent", code: "GITHUB_PUSH_ABSENT" };
+    },
   };
   const confirmationPort = {
     async enqueue(plan) {
@@ -216,6 +223,10 @@ async function fixture({ enabled = true, conflict = false, operation = "modify",
       return queue.approve(...args);
     },
     invalidate: (...args) => queue.invalidate(...args),
+    retry: (...args) => {
+      if (interruptPushRetry) { interruptPushRetry = false; throw new Error("retry interrupted before execution"); }
+      return queue.retry(...args);
+    },
   };
   function makeQueue() {
     return new ConfirmationQueue({ store, executor, exclusiveLease: { run: (operation) => operation() }, clock });
@@ -269,6 +280,7 @@ async function fixture({ enabled = true, conflict = false, operation = "modify",
     },
     crashBeforePushQueueWrite() { failNextPushEnqueue = true; },
     interruptApproval(kind) { interruptApprovalKind = kind; },
+    interruptRetry() { interruptPushRetry = true; },
     revokeGrant() { grantCurrent = false; },
     loseReviewAcknowledgement() { loseReviewAcknowledgement = true; },
     pauseReviewDelivery(value = true) { deliveryPaused = value; },
@@ -467,6 +479,63 @@ test("a conflict push with unknown remote outcome is never submitted again after
   assert.equal(f.pushes.length, 1);
   assert.equal(await f.service.shouldRun(f.item), false);
 });
+
+for (const conflict of [false, true]) {
+  const stateKey = conflict ? "automatic-own-pr-conflict-state" : STATE_KEY;
+  const rows = state => conflict ? state.records : state.repairs;
+  test(`automatic push retries a confirmed absent timeout without another code job (conflict=${conflict})`, async () => {
+    const f = await fixture({ conflict, pushOutcome: attempt => attempt === 1 ? "absent" : "applied" });
+    await f.deliver(); f.completeJob(); await f.service.runCycle();
+    assert.equal(f.pushes.length, 1);
+    // Recover records already terminalized by the previous runtime as well.
+    const saved = await f.store.read(stateKey);
+    rows(saved)[0].status = "failed";
+    await f.store.write(stateKey, saved);
+    await f.restart(); await f.service.runCycle(); await f.service.runCycle();
+    assert.equal(f.pushes.length, 2);
+    assert.equal(f.codeJobApprovalCount, 1);
+    const record = rows(await f.store.read(stateKey))[0];
+    assert.equal(record.status, "published");
+    assert.equal(record.pushRetry.attempt, 1);
+    assert.equal((await f.queue.get(record.pushConfirmationId)).status, "completed");
+  });
+
+  test(`automatic absent push retry budget survives cycles and restart (conflict=${conflict})`, async () => {
+    const f = await fixture({ conflict, pushOutcome: "absent" });
+    await f.deliver(); f.completeJob(); await f.service.runCycle();
+    for (let i = 0; i < 7; i += 1) { await f.restart(); await f.service.runCycle(); }
+    assert.equal(f.pushes.length, 4, "one initial attempt and at most three retries");
+    assert.equal(rows(await f.store.read(stateKey))[0].status, "failed");
+  });
+
+  test(`retry intent is replayed once after acknowledgement loss (conflict=${conflict})`, async () => {
+    const f = await fixture({ conflict, pushOutcome: attempt => attempt === 1 ? "absent" : "applied" });
+    await f.deliver(); f.completeJob(); await f.service.runCycle();
+    f.interruptRetry(); await f.service.runCycle();
+    assert.equal(rows(await f.store.read(stateKey))[0].pushRetry.attempt, 1);
+    await f.restart(); await f.service.runCycle(); await f.service.runCycle();
+    assert.equal(f.pushes.length, 2);
+    assert.equal(rows(await f.store.read(stateKey))[0].pushRetry.attempt, 1);
+  });
+
+  test(`unknown result after an automatic retry remains fenced (conflict=${conflict})`, async () => {
+    const f = await fixture({ conflict, pushOutcome: attempt => attempt === 1 ? "absent" : "unknown" });
+    await f.deliver(); f.completeJob(); await f.service.runCycle(); await f.service.runCycle();
+    await f.restart(); await f.service.runCycle(); await f.service.runCycle();
+    assert.equal(f.pushes.length, 2);
+    assert.equal(await f.service.shouldRun(f.item), false);
+  });
+
+  test(`automatic retries recheck the target and current grant (conflict=${conflict})`, async () => {
+    for (const change of [f => { f.config.githubActions.automaticOwnPrRepair = false; },
+      f => { f.facts.headRefOid = "9".repeat(40); }, f => f.revokeGrant()]) {
+      const f = await fixture({ conflict, pushOutcome: "absent" });
+      await f.deliver(); f.completeJob(); await f.service.runCycle();
+      change(f); await f.service.runCycle(); await f.restart(); await f.service.runCycle();
+      assert.equal(f.pushes.length, 1);
+    }
+  });
+}
 
 test("target drift during object synchronization retires the obsolete conflict inspection", async () => {
   let f;

@@ -570,7 +570,7 @@ class PullRequestExternalActionExecutor {
       return errorResult(error);
     }
     if (!this.#isEnabled(envelope)) return { status: "stale" };
-    const operation = this.#beginOperation();
+    const operation = this.#beginOperation(envelope);
     try {
       try {
         if (!(await this.#controlledCommitCurrent(
@@ -673,7 +673,7 @@ class PullRequestExternalActionExecutor {
       }
       return { status: "stale" };
     }
-    const operation = this.#beginOperation();
+    const operation = this.#beginOperation(envelope);
     try {
       return await this.#withCredential(
         envelope,
@@ -709,11 +709,14 @@ class PullRequestExternalActionExecutor {
     return this.#enabledActions.has(ACTION_NAMES[envelope.action.type]);
   }
 
-  #beginOperation() {
+  #beginOperation(envelope) {
     const controller = new AbortController();
     this.#activeOperations.add(controller);
     if (this.#closed) controller.abort();
-    const deadline = this.#clock() + this.#timeoutMs;
+    // A push revalidates the sealed commit, versioned grant and remote target
+    // repeatedly. Each check remains bounded; their aggregate has its own cap.
+    const stages = envelope.action.type === "pull_request_push" ? 10 : 1;
+    const deadline = this.#clock() + Math.min(600_000, stages * this.#timeoutMs);
     const timer = setTimeout(
       () => controller.abort(),
       Math.max(0, deadline - this.#clock()),
@@ -831,6 +834,13 @@ class PullRequestExternalActionExecutor {
   async #awaitOperation(operation, callback, failureTrust = "absent") {
     this.#assertOperationCurrent(operation, failureTrust);
     let abort;
+    let timer;
+    const checkDeadline = Math.min(operation.deadline, this.#clock() + this.#timeoutMs);
+    const timedOut = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new PullRequestExternalActionTransportError("GITHUB_TIMEOUT", failureTrust)),
+        Math.max(0, checkDeadline - this.#clock()));
+      timer.unref?.();
+    });
     const aborted = new Promise((_, reject) => {
       abort = () => reject(this.#operationError(operation, failureTrust));
       operation.signal.addEventListener("abort", abort, { once: true });
@@ -841,10 +851,12 @@ class PullRequestExternalActionExecutor {
       return callback();
     });
     try {
-      const value = await Promise.race([work, aborted]);
+      const value = await Promise.race([work, aborted, timedOut]);
       this.#assertOperationCurrent(operation, failureTrust);
+      if (this.#clock() >= checkDeadline) throw new PullRequestExternalActionTransportError("GITHUB_TIMEOUT", failureTrust);
       return value;
     } finally {
+      clearTimeout(timer);
       operation.signal.removeEventListener("abort", abort);
     }
   }
@@ -876,7 +888,7 @@ class PullRequestExternalActionExecutor {
   #isOperationError(error, operation) {
     return error instanceof PullRequestExternalActionTransportError &&
       ["GITHUB_TIMEOUT", "GITHUB_UNAVAILABLE"].includes(error.code) &&
-      (operation.signal.aborted || this.#clock() >= operation.deadline);
+      (error.code === "GITHUB_TIMEOUT" || operation.signal.aborted || this.#clock() >= operation.deadline);
   }
 
   #transportInput(envelope, marker, credential) {

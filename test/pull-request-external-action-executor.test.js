@@ -303,6 +303,40 @@ test("one generic execution acquires, uses, and releases one actor-bound lease",
   assert.equal(JSON.stringify(result).includes(credential.token), false);
 });
 
+test("controlled push budgets repeated local verification without extending a single check", async () => {
+  const envelope = envelopeFor("push");
+  const transport = mutableTransport(envelope);
+  let now = 1_000_000;
+  const executor = executorFor(envelope, transport, {
+    clock: () => now, timeoutMs: 60_000,
+    controlledCommitVerifier: { async verify() {
+      now += 20_000;
+      return structuredClone(envelope.action.controlledCommitEvidence);
+    } },
+    pushAuthorization: { async verifyPush() { now += 20_000; return true; } },
+  });
+  assert.equal((await executor.execute(envelope)).status, "applied");
+  assert.ok(now > 1_060_000, "the bounded stages exceed a single request budget in aggregate");
+  assert.equal(transport.calls.filter(x => x.method === "perform").length, 1);
+});
+
+test("one slow controlled verification remains bounded within the aggregate push budget", async () => {
+  const envelope = envelopeFor("push");
+  const transport = mutableTransport(envelope);
+  const credential = recordingCredentialSource();
+  let now = 1_000_000;
+  const executor = executorFor(envelope, transport, {
+    credentialSource: credential.source, clock: () => now, timeoutMs: 60_000,
+    controlledCommitVerifier: { async verify() {
+      now += 60_001;
+      return structuredClone(envelope.action.controlledCommitEvidence);
+    } },
+  });
+  assert.deepEqual(await executor.execute(envelope), { status: "error", error: { code: "GITHUB_TIMEOUT", trust: "absent" } });
+  assert.equal(credential.calls.acquire.length, 0);
+  assert.deepEqual(transport.calls, []);
+});
+
 test("one generic reconcile acquires, uses, and releases one actor-bound lease", async () => {
   const envelope = envelopeFor("comment");
   const transport = mutableTransport(envelope);
@@ -761,8 +795,9 @@ test("pre-credential stale and verification errors clear operation timers", asyn
   });
   assert.equal(staleCredential.calls.acquire.length, 0);
   assert.equal(pushCredential.calls.acquire.length, 0);
-  assert.equal(timers.length, 2);
-  assert.deepEqual(cleared, timers);
+  assert.equal(timers.length, 4);
+  assert.equal(cleared.length, timers.length);
+  assert.deepEqual(new Set(cleared), new Set(timers));
 });
 
 test("lost response recovery proves completion after authority is revoked", async () => {

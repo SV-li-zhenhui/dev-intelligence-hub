@@ -289,6 +289,14 @@ test("one transport operation gives each subprocess only its remaining budget", 
   );
 });
 
+test("an aggregate push deadline preserves the configured per-request timeout", async () => {
+  const input = transportInput("push");
+  const runner = new FakeRunner([actorRecord(input), pullRequestRecord(input)]);
+  await actionTransport(runner, { clock: () => 1_000_000, timeoutMs: 60_000 })
+    .observe(input, operation(1_600_000));
+  assert.deepEqual(runner.calls.map(call => call.timeoutMs), [60_000, 60_000]);
+});
+
 test("satisfies the executor transport contract through a complete comment cycle", async () => {
   const directInput = transportInput("comment");
   const envelope = pullRequestExternalActionEnvelope(

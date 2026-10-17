@@ -6,7 +6,7 @@ import { normalizePullRequestExecutionBinding, samePullRequestExecutionBinding }
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
 import { createPullRequestExternalActionConfirmationPlan } from "../domain/pull-request-external-action.js";
 import { currentWorkItemEvent, currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
-import { approveOwnPrAction, repairCommitMatchesJob } from "./automatic-own-pr-repair-authorization.js";
+import { approveOwnPrAction, repairCommitMatchesJob, planOwnPrPushRetry, retryOwnPrPush, validateOwnPrPushRetry } from "./automatic-own-pr-repair-authorization.js";
 import { AutomaticOwnPrInspectionRecovery } from "./automatic-own-pr-inspection-recovery.js";
 
 const STATE_KEY = "automatic-own-pr-conflict-state";
@@ -30,6 +30,7 @@ function normalizeState(value) {
       throw new Error("自动冲突修复绑定无效");
     }
     ids.add(record.jobId);
+    validateOwnPrPushRetry(record.pushRetry);
     if (record.capabilityRecovery !== undefined && (record.capabilityRecovery?.capability !== "conflict-edit-and-source-v1" ||
         !Number.isSafeInteger(record.capabilityRecovery.pausedRevision) || record.capabilityRecovery.pausedRevision < 1 ||
         typeof record.capabilityRecovery.runId !== "string" || !record.capabilityRecovery.runId || record.capabilityRecovery.runId.length > 256)) {
@@ -64,6 +65,13 @@ export class AutomaticOwnPrConflict {
   async recover() {
     this.#state = normalizeState(await this.store.read(STATE_KEY, { schemaVersion: 1, records: [] }));
     await this.inspectionRecovery?.recover();
+    for (const record of this.#state.records) {
+      if (record.status !== "failed" || !record.pushConfirmationId || !this.confirmations.retry) continue;
+      let item;
+      try { item = await this.confirmations.get(record.pushConfirmationId); }
+      catch (error) { if (error?.code === "CONFIRMATION_NOT_FOUND") continue; throw error; }
+      if (planOwnPrPushRetry(record, item)) await this.#update(record, "pushing");
+    }
   }
 
   async shouldRun(item) {
@@ -229,6 +237,16 @@ export class AutomaticOwnPrConflict {
       if (!push) return this.#advance({ ...record, pushConfirmationId: null });
       if (push.status === "completed") { await this.#update(record, "published"); return "published"; }
       if (push.status === "failed" && push.failure?.outcome === "unknown") return "waiting";
+      const retry = this.confirmations.retry && planOwnPrPushRetry(record, push);
+      if (retry) {
+        if (!await this.#grantCurrent(grant) || !await this.#current(record.inputBinding)) {
+          await this.#update(record, "stale"); return "stale";
+        }
+        await this.#save({ ...this.#state, records: this.#state.records.map(row => row.jobId === record.jobId
+          ? { ...row, pushRetry: retry } : row) });
+        await retryOwnPrPush(this.confirmations, push, retry);
+        return "waiting";
+      }
       if (["stale", "rejected", "failed"].includes(push.status)) {
         const status = push.status === "stale" ? "stale" : "failed";
         await this.#update(record, status); return status;
