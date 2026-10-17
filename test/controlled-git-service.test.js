@@ -191,6 +191,13 @@ async function fixture(t, {
       }
       const catFile = request.args.indexOf("cat-file");
       if (catFile !== -1) {
+        if (request.args[catFile + 1] === "--batch") {
+          const oids = Buffer.from(request.input).toString("utf8").trim().split("\n");
+          return processResult(Buffer.concat(oids.map((oid) => {
+            const bytes = Buffer.from(blobs.get(oid));
+            return Buffer.concat([Buffer.from(`${oid} blob ${bytes.length}\n`), bytes, Buffer.from("\n")]);
+          })));
+        }
         return processResult(blobs.get(request.args[catFile + 2]));
       }
       throw new Error(`unexpected Git invocation: ${request.args.join(" ")}`);
@@ -748,7 +755,7 @@ test("rejects result-tree paths excluded by the Code Job execution policy", asyn
 test("rejects non-modification, mode, binary, and unsafe result-tree entries", async (t) => {
   const rename = await fixture(t, {
     headRaw: Buffer.from(
-      `:100644 100644 ${ANCESTOR} ${OURS} R100\0old.js\0new.js\0`,
+      `:100644 100644 ${ANCESTOR} ${OURS} R100\0src/value.js\0new.js\0`,
     ),
   });
   await assert.rejects(

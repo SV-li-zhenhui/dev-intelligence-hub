@@ -2030,7 +2030,8 @@ export async function createApplication({
         objectSync: trackRuntime(new OwnPrRepairObjectSync({ credentialSource: githubCredentialSource })),
       };
       automaticOwnPrRepair = new AutomaticOwnPrRepair({ ...ownPrRepairDependencies,
-        conflictRepair: new AutomaticOwnPrConflict(ownPrRepairDependencies) });
+        conflictRepair: new AutomaticOwnPrConflict({ ...ownPrRepairDependencies,
+          conflictInspectionReader: codeExecutorRuntime?.conflictInspectionReader }) });
       await automaticOwnPrRepair.recover();
     }
     if (localCodeExecutionEnabled && !confirmationRuntime) {
@@ -2519,6 +2520,9 @@ export async function createApplication({
         ),
         factSource,
         pullRequestContextReader,
+        ...(automaticOwnPrRepair?.conflictRepair ? { conflictInspectionReader: Object.freeze({
+          read: request => automaticOwnPrRepair.conflictRepair.readInspection(request),
+        }) } : {}),
         internalReviewHandoffReader: Object.freeze({
           read: (input) => workLedgerRuntime.readInternalReviewHandoff(input),
         }),

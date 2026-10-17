@@ -1,4 +1,5 @@
 import { normalizeWorkDecision } from "../domain/work-intent.js";
+import { samePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { TaskRunControlError } from './task-run-registry.js';
 import { automaticReviewEligibility, automaticReviewContinuationEligibility, automaticReviewWorkAdmission } from "../domain/automatic-review-policy.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
@@ -1972,6 +1973,15 @@ export class ProactiveWorkLoop {
     let recovered = 0;
     for (const item of blocked) {
       if (recovered >= options.workLimit) break;
+      const event = currentWorkItemEvent(item);
+      if (item.kind === "graph_task" && item.currentTarget?.id === "developer" && event?.payload?.nextAction === "resolve_conflict" &&
+          (item.graph?.deliveries ?? []).length === 0 &&
+          item.activeIntentId === null && item.ownerId === null && item.leaseId === null && item.leaseUntil === null &&
+          item.sourceQuarantine === null && item.decisionContext?.source === "proposal" &&
+          item.decisionContext.outcome === "succeeded" && item.decisionContext.value?.kind === "code_action_proposal") {
+        if (await this.#recoverConflictInspectionBlock(item, options)) recovered += 1;
+        continue;
+      }
       if (isInitialInternalReviewFactBlock(item)) {
         if (await this.#recoverInternalReviewFactBlock(item, options)) recovered += 1;
         continue;
@@ -1995,6 +2005,54 @@ export class ProactiveWorkLoop {
         // Changed authority or a competing worker must be reconciled from a
         // fresh snapshot on the next cycle, without replaying any action.
       }
+    }
+  }
+
+  async #recoverConflictInspectionBlock(item, options) {
+    if (this.roleContextAssembler === null) return false;
+    const timeline = [];
+    let cursor = null;
+    try {
+      for (let page = 0; page < MAX_PAGE_COUNT; page += 1) {
+        throwIfLoopAborted(options.signal);
+        const result = await this.listTimeline({ itemId: item.itemId, order: "newest", limit: PAGE_SIZE,
+          ...(cursor === null ? {} : { cursor }) });
+        timeline.push(...result.items);
+        if (!result.nextCursor) break;
+        if (result.nextCursor === cursor || page === MAX_PAGE_COUNT - 1) return false;
+        cursor = result.nextCursor;
+      }
+      timeline.sort((left, right) => left.sequence - right.sequence);
+      const creation = timeline[0];
+      const latest = timeline.at(-1);
+      if (creation?.type !== "graph_child_created" || creation.at !== item.createdAt ||
+          creation.details?.childTaskId !== item.itemId || creation.details.inputDigest !== item.inputDigest ||
+          latest?.at !== item.updatedAt || latest.type !== "transitioned" ||
+          latest.details?.context?.code !== "ROLE_DECISION_PR_REVIEW_REQUIRED" ||
+          latest.details.reason !== "decision_attempts_exhausted" ||
+          timeline.some(entry => entry.details?.reason === "conflict_inspection_material_recovered") ||
+          !timeline.some(entry => entry.type === "proposal_result_applied" &&
+            entry.details.proposalId === item.decisionContext.referenceId && entry.details.outcome === "succeeded")) return false;
+      const binding = currentWorkItemExecutionBinding(item);
+      if (binding?.schemaVersion !== 2) return false;
+      await this.verifyPullRequestExecutionBinding(binding);
+      const packet = await this.#assembleContext(item, { roleId: "developer" }, options);
+      const inspection = packet?.context?.code?.conflictInspection;
+      if (!inspection || !samePullRequestExecutionBinding(inspection.inputBinding, binding) ||
+          inspection.preparationBinding?.gitTarget?.headRefOid !== binding.headRefOid ||
+          inspection.preparationBinding?.gitTarget?.baseRefOid !== binding.gitTarget.baseRefOid ||
+          !Array.isArray(inspection.conflicts) || inspection.conflicts.length === 0) return false;
+      throwIfLoopAborted(options.signal);
+      await this.verifyPullRequestExecutionBinding(binding);
+      await this.ledger.transition({ itemId: item.itemId, expectedRevision: item.revision,
+        leaseId: null, actorId: "work-ledger-system", toStatus: "queued", reason: "conflict_inspection_material_recovered",
+        details: { evidenceRefs: [`conflict-preparation:${inspection.preparationBinding.preparationId}`,
+          `proposal:${item.decisionContext.referenceId}`, `head:${binding.headRefOid}`] } });
+      return true;
+    } catch (error) {
+      throwIfLoopAborted(options.signal);
+      if (RUNTIME_ADMISSION_ERROR_CODES.has(stableFailureCode(error))) throw error;
+      return false;
     }
   }
 

@@ -6,7 +6,9 @@ import {
 } from "../domain/git-tool-contract.js";
 import {
   createPullRequestExecutionBinding,
+  samePullRequestExecutionBinding,
 } from "../domain/pull-request-execution-binding.js";
+import { normalizeConflictPreparationBinding } from "../domain/conflict-preparation-binding.js";
 import { normalizeRepairFeedbackDescriptor } from "../domain/original-repair-feedback.js";
 import { normalizeWorkGraphSnapshot } from "../domain/work-graph-contract.js";
 import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
@@ -1246,6 +1248,7 @@ export class RoleContextAssembler {
   #failedCodeJobContextReader;
   #internalReviewHandoffReader;
   #originalRepairFeedbackReader;
+  #conflictInspectionReader;
 
   constructor({
     graphReader,
@@ -1256,6 +1259,7 @@ export class RoleContextAssembler {
     failedCodeJobContextReader,
     internalReviewHandoffReader,
     originalRepairFeedbackReader,
+    conflictInspectionReader,
   } = {}) {
     this.#graphReader = requireGraphReader(graphReader);
     this.#factSource = optionalFactSource(factSource);
@@ -1271,6 +1275,9 @@ export class RoleContextAssembler {
     });
     this.#originalRepairFeedbackReader = originalRepairFeedbackReader == null ? null : Object.freeze({
       readBinding: bindPortMethod(originalRepairFeedbackReader, "readBinding", "originalRepairFeedbackReader"),
+    });
+    this.#conflictInspectionReader = conflictInspectionReader == null ? null : Object.freeze({
+      read: bindPortMethod(conflictInspectionReader, "read", "conflictInspectionReader"),
     });
     this.#evidenceCatalogAdapter =
       createRoleContextEvidenceCatalogAdapter(evidenceCatalog);
@@ -1364,6 +1371,24 @@ export class RoleContextAssembler {
     if (internalReview !== null && internalReview.headRefOid !== item.event.payload?.headRefOid) {
       throw contextError("ROLE_CONTEXT_STALE", "内部复审交接已不属于当前 Head", 409);
     }
+    let conflictInspection = null;
+    if (roleId === "developer" && item.event.payload?.nextAction === "resolve_conflict" && this.#conflictInspectionReader) {
+      try {
+        conflictInspection = await this.#conflictInspectionReader.read({ itemId: item.taskId,
+          itemRevision: item.taskRevision, inputDigest: item.inputDigest });
+        signal?.throwIfAborted();
+        if (conflictInspection !== null) {
+          const expectedBinding = createPullRequestExecutionBinding({ sourceBinding: item.sourceBinding, event: item.event });
+          const preparation = normalizeConflictPreparationBinding(conflictInspection.preparationBinding);
+          if (!samePullRequestExecutionBinding(conflictInspection.inputBinding, expectedBinding) ||
+              !samePullRequestGitTarget(preparation.gitTarget, expectedBinding.gitTarget)) throw new TypeError("Conflict inspection binding changed");
+          conflictInspection = canonicalValue(conflictInspection);
+        }
+      } catch (cause) {
+        signal?.throwIfAborted();
+        throw contextError("ROLE_CONTEXT_CONFLICT_INSPECTION_UNAVAILABLE", "无法读取绑定的冲突检查材料", 503, { cause });
+      }
+    }
     let originalRepairFeedback = null;
     if (roleId === "pr-engineer" && item.eventType === "pull_request.internal_review_requested") {
       if (this.#originalRepairFeedbackReader === null) throw contextError("OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE", "内部修复复审需要完整原始反馈快照", 503);
@@ -1452,6 +1477,7 @@ export class RoleContextAssembler {
           ? {}
           : { decisionContext: proposalDecisionContext }),
         ...(failedExecution === null ? {} : { failedExecution }),
+        ...(conflictInspection === null ? {} : { conflictInspection }),
         ...(internalReview === null ? {} : { internalReview }),
         ...(originalRepairFeedback === null ? {} : { originalRepairFeedback }),
         ...(currentTaskRejection?.dataClass === "code"

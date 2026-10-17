@@ -34,6 +34,7 @@ const DEPENDENCY_KEYS = new Set([
   "mirrorInspector",
   "processRunner",
   "controlledGitServiceFactory",
+  "limits",
 ]);
 
 export class ControlledGitRuntimeError extends Error {
@@ -335,6 +336,13 @@ function normalizeDependencies(value) {
   const entries = dataEntries(value, error);
   if (entries.some(([key]) => !DEPENDENCY_KEYS.has(key))) throw error;
   const result = Object.fromEntries(entries);
+  if (Object.hasOwn(result, "limits")) {
+    const limits = dataEntries(result.limits, error);
+    const allowed = new Set(["maxFiles", "maxDirectories", "maxBlobBytes", "maxTotalBytes"]);
+    if (limits.some(([key, value]) => !allowed.has(key) || !Number.isSafeInteger(value) || value < 1)) throw error;
+    if ((result.limits.maxBlobBytes ?? 1_000_000) > (result.limits.maxTotalBytes ?? 8_000_000)) throw error;
+    result.limits = Object.freeze(Object.fromEntries(limits));
+  }
   if (
     Object.hasOwn(result, "controlledGitServiceFactory") &&
     (typeof result.controlledGitServiceFactory !== "function" ||
@@ -530,6 +538,7 @@ function createPorts(service, { baseMirrors, headMirrors }) {
     "ControlledGitService",
   );
   const inspectConflict = method(service, "inspectConflict", "ControlledGitService");
+  const readConflictInspection = method(service, "readConflictInspection", "ControlledGitService");
   const verifyConflictPreparation = method(
     service,
     "verifyConflictPreparation",
@@ -661,6 +670,11 @@ function createPorts(service, { baseMirrors, headMirrors }) {
     publisher,
     verifier,
     preparer,
+    inspectionReader: Object.freeze({ async read(inputBinding) {
+      const source = await preparer.prepare(inputBinding);
+      const inspection = await readConflictInspection({ binding: source.preparationBinding });
+      return Object.freeze({ ...inspection, inputBinding: source.inputBinding });
+    } }),
   });
 }
 
@@ -687,6 +701,7 @@ export async function createControlledGitRuntimeBundle(
       mirrorInspector,
       preparationRoot: normalized.preparationRoot,
       headMirrorsByRepository: Object.fromEntries(normalized.headMirrors),
+      ...(normalizedDependencies.limits ? { limits: normalizedDependencies.limits } : {}),
       ...(normalizedDependencies.processRunner
         ? { processRunner: normalizedDependencies.processRunner }
         : {}),

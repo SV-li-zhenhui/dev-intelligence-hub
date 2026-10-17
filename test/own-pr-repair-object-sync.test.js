@@ -42,6 +42,7 @@ async function fixture(t) {
   const remote = path.join(root, "remote");
   const sourceRoot = path.join(root, "source");
   const mirrorRoot = path.join(root, "mirror.git");
+  const baseMirrorRoot = path.join(root, "base.git");
   await mkdir(remote);
   await git(remote, ["init", "--initial-branch=main"]);
   await git(remote, ["config", "user.name", "Object Sync Test"]);
@@ -52,6 +53,7 @@ async function fixture(t) {
   const baseOid = (await git(remote, ["rev-parse", "HEAD"])).stdout.trim();
   await git(root, ["clone", "--no-hardlinks", remote, sourceRoot]);
   await git(root, ["clone", "--bare", "--no-hardlinks", remote, mirrorRoot]);
+  await git(root, ["clone", "--bare", "--no-hardlinks", remote, baseMirrorRoot]);
   await writeFile(path.join(remote, "tracked.txt"), "head objects\n");
   await git(remote, ["add", "tracked.txt"]);
   await git(remote, ["commit", "-m", "new head"]);
@@ -73,7 +75,8 @@ async function fixture(t) {
     codeExecutor: {
       gitCommand, gitTimeoutMs: 60_000,
       workspaces: [{ id: "repo", sourceRoot, gitHeadSnapshot: true }],
-      conflictPreparation: { enabled: true, headMirrorsByRepository: { "acme/repo": mirrorRoot } },
+      conflictPreparation: { enabled: true, headMirrorsByRepository: { "acme/repo": mirrorRoot },
+        baseMirrorsByRepository: { "acme/repo": baseMirrorRoot } },
     },
   };
   const inputBinding = pullRequestExternalActionBinding({ gitTarget: {
@@ -86,7 +89,7 @@ async function fixture(t) {
       calls.push({ ...request, args: [...request.args], env: { ...request.env } });
       if (!request.args.includes("fetch")) return managed.run(request);
       assert.equal(request.args.at(-2), REMOTE);
-      assert.equal(request.args.at(-1), headOid);
+      assert.equal(request.args.at(-1), request.cwd === baseMirrorRoot ? laterOid : headOid);
       // Only this test transport substitutes a local repository. Production
       // always uses the fixed HTTPS URL and disables the file protocol.
       return managed.run({ ...request, args: [
@@ -103,7 +106,7 @@ async function fixture(t) {
     leases.push(lease);
     return lease;
   } };
-  return { root, remote, sourceRoot, mirrorRoot, headOid, laterOid, configuration,
+  return { root, remote, sourceRoot, mirrorRoot, baseMirrorRoot, headOid, laterOid, configuration,
     inputBinding, calls, acquired, leases, processRunner, credentialSource };
 }
 
@@ -172,6 +175,22 @@ test("fetches exact Head into both local stores without changing checkout, index
   assert.equal(s.calls.slice(beforeRepeat).some(({ args }) => args.includes("fetch")), false);
   assert.equal(s.acquired.length, 1);
   await assert.rejects(s.leases[0].use(() => {}), /unavailable/u);
+});
+
+test("synchronizes the bound live Base into its separate mirror before automatic conflict repair", realGit, async (t) => {
+  const s = await fixture(t);
+  s.inputBinding = structuredClone(s.inputBinding);
+  s.inputBinding.gitTarget.baseRefOid = s.laterOid;
+  const before = { refs: (await git(s.baseMirrorRoot, ["show-ref", "--head"])).stdout,
+    config: await readFile(path.join(s.baseMirrorRoot, "config")), head: await readFile(path.join(s.baseMirrorRoot, "HEAD")) };
+  const sync = new OwnPrRepairObjectSync(s);
+  t.after(() => sync.close());
+  const result = await sync.prepare(s);
+  assert.ok(result.fetchedRoots.includes(s.baseMirrorRoot));
+  assert.equal((await git(s.baseMirrorRoot, ["cat-file", "-t", s.laterOid])).stdout.trim(), "commit");
+  assert.deepEqual({ refs: (await git(s.baseMirrorRoot, ["show-ref", "--head"])).stdout,
+    config: await readFile(path.join(s.baseMirrorRoot, "config")), head: await readFile(path.join(s.baseMirrorRoot, "HEAD")) }, before);
+  assert.deepEqual((await sync.prepare(s)).fetchedRoots, []);
 });
 
 test("fetches only the store missing the bound commit, including an explicitly configured fork", realGit, async (t) => {

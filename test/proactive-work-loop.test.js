@@ -113,6 +113,7 @@ import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { currentWorkItemExecutionBinding } from "../src/services/work-ledger-pr-source.js";
 import { RoleContextAssembler, RoleContextAssemblerError } from "../src/services/role-context-assembler.js";
 import { PrEngineerServiceError } from "../src/services/pr-engineer-service.js";
 import { OrchestratorServiceError } from "../src/services/orchestrator-service.js";
@@ -464,6 +465,61 @@ function createLoop({ ledger, directory, time, ...options }) {
     ...options,
   });
 }
+
+test("a conflict decision blocked without materials receives one bounded retry only after exact materials recover", async () => {
+  for (const variant of ["current", "trimmed", "already-recovered", "changed-target", "wrong-failure"]) {
+    const time = controlledClock();
+    const item = workItem(42, { type: "role", id: "developer" });
+    const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "runtime-user",
+      baseRepository: "acme/repo", headRepository: "acme/repo", baseRefName: "main", headRefName: "feature",
+      baseRefOid: "1".repeat(40), headRefOid: "2".repeat(40) };
+    item.event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.updated", occurredAt: item.createdAt,
+      source: { provider: "github", scopeId: "test" }, subject: { id: "github:pr:acme/repo#42", repository: "acme/repo", number: 42 },
+      payload: { title: "Conflict repair", relation: "authored", nextAction: "resolve_conflict", headRefOid: gitTarget.headRefOid,
+        mergeStateStatus: "DIRTY", gitTargetAvailable: true, gitTarget } });
+    Object.assign(item, { kind: "graph_task", sourceQuarantine: null, revision: 20, attempt: 6,
+      status: "blocked", statusReason: "decision_attempts_exhausted",
+      decisionContext: { source: "proposal", referenceId: "inspect-proposal", outcome: "succeeded", value: { kind: "code_action_proposal" } } });
+    item.assignment.graphTask = { sourceBinding: { kind: "pull_request", rootItemId: "pr-root", workKey: "pr-key",
+      inputRevision: 1, headRevision: 1, headRefOid: gitTarget.headRefOid, eventId: item.event.eventId,
+      eventDigest: item.event.contentDigest, inputDigest: "a".repeat(64) } };
+    const binding = currentWorkItemExecutionBinding(item);
+    assert.ok(binding);
+    const timeline = [
+      { sequence: 1, type: "graph_child_created", at: item.createdAt, details: { childTaskId: item.itemId, inputDigest: item.inputDigest } },
+      { sequence: 2, type: "proposal_result_applied", details: { proposalId: "inspect-proposal", outcome: "succeeded" } },
+      { sequence: 3, type: "transitioned", at: item.updatedAt, details: { reason: "decision_attempts_exhausted",
+        context: { code: variant === "wrong-failure" ? "OTHER_FAILURE" : "ROLE_DECISION_PR_REVIEW_REQUIRED" } } },
+    ];
+    if (variant === "trimmed") timeline.shift();
+    if (variant === "already-recovered") timeline.splice(1, 0, { sequence: 1.5, type: "transitioned", details: { reason: "conflict_inspection_material_recovered" } });
+    const ledger = new FakeLedger({ source: [item], time });
+    ledger.listTimeline = async () => ({ items: clone(timeline).reverse(), nextCursor: null });
+    ledger.verifyPullRequestExecutionBinding = async value => value;
+    const originalTransition = ledger.transition.bind(ledger);
+    ledger.transition = async input => {
+      if (input.toStatus !== "queued") return originalTransition(input);
+      const current = ledger.items[0];
+      assert.equal(input.expectedRevision, current.revision);
+      Object.assign(current, { status: "queued", statusReason: input.reason, revision: current.revision + 1 });
+      timeline.push({ sequence: 4, type: "transitioned", at: current.updatedAt, details: { reason: input.reason } });
+      return clone(current);
+    };
+    const loop = createLoop({ ledger, time, directory: new FakeRoleDirectory({ developer: worker({ roleId: "developer",
+      decide: async () => { throw Object.assign(new Error("subsequent model failure"), { code: "ROLE_DECISION_PR_REVIEW_REQUIRED" }); } }) }),
+      roleContextAssembler: { async assemble({ item: current }) { return { ...contextPacket(current, "developer"), context: { code: { conflictInspection: {
+        inputBinding: variant === "changed-target" ? { ...binding, headRefOid: "9".repeat(40) } : binding,
+        preparationBinding: { gitTarget, preparationId: "b".repeat(64) }, conflicts: [{ path: "src/app.js" }],
+      } } } }; } }, orchestratorService: { async execute() {} } });
+    const first = await loop.runCycle({ roleId: "developer" });
+    assert.equal(first.claimed, variant === "current" ? 1 : 0, variant);
+    assert.equal(ledger.items[0].attempt, variant === "current" ? 7 : 6, variant);
+    if (variant === "current") {
+      assert.equal((await loop.runCycle({ roleId: "developer" })).claimed, 0);
+      assert.equal(timeline.filter(entry => entry.details.reason === "conflict_inspection_material_recovered").length, 1);
+    }
+  }
+});
 
 test("a cycle reliably intakes, claims, decides, and only stages an intent", async () => {
   const time = controlledClock();

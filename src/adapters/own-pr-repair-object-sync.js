@@ -88,13 +88,15 @@ function normalizeRequest({ configuration, inputBinding }) {
   }
   const sourceRoot = absoluteLocalPath(workspaces[0].sourceRoot);
   const mirrorRoot = absoluteLocalPath(lookup(executor.conflictPreparation.headMirrorsByRepository, binding.gitTarget.headRepository));
+  const baseMirrorRoot = absoluteLocalPath(lookup(executor.conflictPreparation.baseMirrorsByRepository, binding.gitTarget.baseRepository));
   const gitCommand = absoluteLocalPath(executor.gitCommand);
   const timeoutMs = executor.gitTimeoutMs ?? 30_000;
+  const roots = [sourceRoot, mirrorRoot, baseMirrorRoot];
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000 ||
-      overlaps(sourceRoot, mirrorRoot) || overlaps(mirrorRoot, sourceRoot)) {
+      roots.some((left, index) => roots.slice(index + 1).some(right => overlaps(left, right) || overlaps(right, left)))) {
     throw failure("OWN_PR_REPAIR_OBJECT_INPUT_INVALID");
   }
-  return { binding, actorAccountId, gitCommand, sourceRoot, mirrorRoot, timeoutMs };
+  return { binding, actorAccountId, gitCommand, sourceRoot, mirrorRoot, baseMirrorRoot, timeoutMs };
 }
 
 function environment(gitCommand) {
@@ -215,7 +217,7 @@ export class OwnPrRepairObjectSync {
 
   async #prepare(request) {
     if (this.#closed) throw failure("OWN_PR_REPAIR_OBJECT_CANCELLED");
-    const { binding, actorAccountId, gitCommand, sourceRoot, mirrorRoot, timeoutMs } = normalizeRequest(request);
+    const { binding, actorAccountId, gitCommand, sourceRoot, mirrorRoot, baseMirrorRoot, timeoutMs } = normalizeRequest(request);
     const controller = new AbortController();
     this.#activeController = controller;
     const deadline = Date.now() + timeoutMs;
@@ -250,17 +252,21 @@ export class OwnPrRepairObjectSync {
       const mirror = await inspector.preflight({
         repository: binding.gitTarget.headRepository, mirrorRoot, expectedCommitOid: head,
       });
-      if (source.oidLength !== binding.headRefOid.length || mirror.oidLength !== binding.headRefOid.length) {
+      const base = await inspector.preflight({ repository: binding.gitTarget.baseRepository, mirrorRoot: baseMirrorRoot,
+        expectedCommitOid: await mirrorHead(baseMirrorRoot) });
+      if (source.oidLength !== binding.headRefOid.length || mirror.oidLength !== binding.headRefOid.length ||
+          base.oidLength !== binding.gitTarget.baseRefOid.length || base.objectFormat !== mirror.objectFormat) {
         throw failure("OWN_PR_REPAIR_OBJECT_PREFLIGHT_FAILED");
       }
       const stores = [
-        { root: sourceRoot, gitDir: source.absoluteGitDir },
-        { root: mirrorRoot, gitDir: mirror.canonicalRoot },
+        { root: sourceRoot, gitDir: source.absoluteGitDir, repository: binding.gitTarget.headRepository, oid: binding.headRefOid },
+        { root: mirrorRoot, gitDir: mirror.canonicalRoot, repository: binding.gitTarget.headRepository, oid: binding.headRefOid },
+        { root: baseMirrorRoot, gitDir: base.canonicalRoot, repository: binding.gitTarget.baseRepository, oid: binding.gitTarget.baseRefOid },
       ];
       const missing = [];
       for (const store of stores) {
         await rejectTransportConfiguration((args) => runGit(store.gitDir, args));
-        const type = await runGit(store.gitDir, ["cat-file", "-t", binding.headRefOid]);
+        const type = await runGit(store.gitDir, ["cat-file", "-t", store.oid]);
         if (type.exitCode === 0 && type.stdout.trim() !== "commit") throw failure("OWN_PR_REPAIR_OBJECT_PREFLIGHT_FAILED");
         if (type.exitCode !== 0) missing.push(store);
       }
@@ -280,14 +286,14 @@ export class OwnPrRepairObjectSync {
               const fetched = await runGit(store.gitDir, [
                 "fetch", "--no-write-fetch-head", "--no-tags", "--no-prune", "--no-prune-tags", "--no-recurse-submodules",
                 "--no-auto-maintenance", "--no-write-commit-graph", "--no-progress", "--refmap=", "--",
-                `https://github.com/${binding.gitTarget.headRepository}.git`, binding.headRefOid,
+                `https://github.com/${store.repository}.git`, store.oid,
               ], env);
               if (fetched.exitCode !== 0) throw failure(stage);
             } finally {
               delete env.GIT_CONFIG_VALUE_1;
               env.GIT_CONFIG_COUNT = "0";
             }
-            const type = await runGit(store.gitDir, ["cat-file", "-t", binding.headRefOid]);
+            const type = await runGit(store.gitDir, ["cat-file", "-t", store.oid]);
             if (type.exitCode !== 0 || type.stdout.trim() !== "commit") throw failure(stage);
           }
         });

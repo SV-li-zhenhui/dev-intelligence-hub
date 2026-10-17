@@ -5,7 +5,7 @@ import { codeJobIdForGrant } from "../domain/code-job-contract.js";
 import { normalizePullRequestExecutionBinding, samePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
 import { createPullRequestExternalActionConfirmationPlan } from "../domain/pull-request-external-action.js";
-import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
+import { currentWorkItemEvent, currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
 import { approveOwnPrAction, repairCommitMatchesJob } from "./automatic-own-pr-repair-authorization.js";
 import { AutomaticOwnPrInspectionRecovery } from "./automatic-own-pr-inspection-recovery.js";
 
@@ -42,9 +42,9 @@ export class AutomaticOwnPrConflict {
   #lastJobId = null;
 
   constructor({ configurationReader, store, ledger, github, confirmations, codeJobReader,
-    controlledCommitReader, objectSync, grantVerifier }) {
+    controlledCommitReader, objectSync, grantVerifier, conflictInspectionReader }) {
     Object.assign(this, { configurationReader, store, ledger, github, confirmations, codeJobReader,
-      controlledCommitReader, objectSync, grantVerifier });
+      controlledCommitReader, objectSync, grantVerifier, conflictInspectionReader });
     this.inspectionRecovery = objectSync && typeof ledger.listItems === "function" && typeof ledger.transition === "function" &&
       typeof codeJobReader?.getDetail === "function" && typeof ledger.listTimeline === "function"
       ? new AutomaticOwnPrInspectionRecovery({ store, ledger, codeJobReader, objectSync, current: binding => this.#current(binding) }) : null;
@@ -67,6 +67,25 @@ export class AutomaticOwnPrConflict {
 
   isInFlight(binding) {
     return this.#state.records.some(record => active(record) && samePr(record.inputBinding, binding));
+  }
+
+  async readInspection({ itemId, itemRevision, inputDigest }) {
+    if (!this.conflictInspectionReader) return null;
+    const item = await this.ledger.readItemForReconciliation({ itemId });
+    if (item.revision !== itemRevision || item.inputDigest !== inputDigest ||
+        item.currentTarget?.id !== "developer" || !conflictTask(currentWorkItemEvent(item))) return null;
+    const binding = currentWorkItemExecutionBinding(item);
+    if (binding?.schemaVersion !== 2) return null;
+    const configuration = await this.#current(binding);
+    if (!configuration) return null;
+    await this.objectSync.prepare({ configuration, inputBinding: binding });
+    const inspection = await this.conflictInspectionReader.read(binding);
+    const latest = await this.ledger.readItemForReconciliation({ itemId });
+    if (!samePullRequestExecutionBinding(inspection.inputBinding, binding) ||
+        latest.revision !== itemRevision || latest.inputDigest !== inputDigest || !await this.#current(binding)) {
+      throw Object.assign(new Error("冲突检查材料在读取期间失效"), { code: "OWN_PR_CONFLICT_TARGET_CHANGED" });
+    }
+    return inspection;
   }
 
   async #current(binding, { rejectChangedTarget = false } = {}) {

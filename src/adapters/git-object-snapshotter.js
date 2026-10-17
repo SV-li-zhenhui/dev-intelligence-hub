@@ -10,6 +10,7 @@ import {
   unlink,
 } from "node:fs/promises";
 import path from "node:path";
+import { MAX_BLOBS_PER_BATCH, parseGitBlobBatch } from "../lib/git-blob-batch.js";
 
 import {
   CodeExecutionPolicy,
@@ -18,7 +19,6 @@ import {
 
 const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const TREE_HEADER = /^(100644|100755|120000|160000) (blob|commit) ([a-f0-9]{40}|[a-f0-9]{64})$/;
-const BATCH_HEADER = /^([a-f0-9]{40}|[a-f0-9]{64}) blob ([1-9][0-9]*|0)$/;
 const CONTROL_CHARACTER = /[\p{Cc}\p{Cf}]/u;
 const WINDOWS_INVALID_CHARACTER = /[<>:"\\|?*]/u;
 const SAFE_ENV = Object.freeze({
@@ -47,7 +47,6 @@ const SAFE_GIT_PREFIX = Object.freeze([
 const MAX_PACK_DATABASE_ENTRIES = 100_000;
 const MAX_LOOSE_OBJECT_ENTRIES = 100_000;
 const MAX_GIT_EXECUTABLE_BYTES = 256 * 1024 * 1024;
-const MAX_BLOBS_PER_BATCH = 128;
 const DEFAULT_LIMITS = Object.freeze({
   maxFiles: 5_000,
   maxFileBytes: 1_000_000,
@@ -518,70 +517,21 @@ function parseTree(value, { headOid, limits, shouldInclude }) {
   return entries;
 }
 
-function readLine(value, offset) {
-  const end = value.indexOf(0x0a, offset);
-  if (end === -1) {
-    throw snapshotError(
-      "GIT_SNAPSHOT_PROTOCOL_ERROR",
-      "Git blob 输出不完整",
-    );
-  }
-  return {
-    line: decodeSingleLine(
-      value.subarray(offset, end),
-      "GIT_SNAPSHOT_PROTOCOL_ERROR",
-      "Git blob 输出无效",
-    ),
-    nextOffset: end + 1,
-  };
-}
-
 function parseBlobs(value, oids, limits, objectFormat) {
-  const blobs = new Map();
-  let offset = 0;
-  let totalBytes = 0;
-  for (const expectedOid of oids) {
-    const header = readLine(value, offset);
-    offset = header.nextOffset;
-    const match = BATCH_HEADER.exec(header.line);
-    if (!match || match[1] !== expectedOid) {
-      throw snapshotError(
-        "GIT_SNAPSHOT_PROTOCOL_ERROR",
-        "Git blob 身份无法验证",
-      );
-    }
-    const size = Number(match[2]);
-    if (!Number.isSafeInteger(size) || size > limits.maxFileBytes) {
-      throw snapshotError("FILE_SIZE_LIMIT", "文件超过大小限制");
-    }
-    totalBytes += size;
-    if (totalBytes > limits.maxTotalBytes) {
-      throw snapshotError("TOTAL_SIZE_LIMIT", "工作区总大小超过限制");
-    }
-    const end = offset + size;
-    if (end >= value.length || value[end] !== 0x0a) {
-      throw snapshotError(
-        "GIT_SNAPSHOT_PROTOCOL_ERROR",
-        "Git blob 输出不完整",
-      );
-    }
-    const content = Buffer.from(value.subarray(offset, end));
-    if (gitBlobOid(objectFormat, content) !== expectedOid) {
-      throw snapshotError(
-        "GIT_SNAPSHOT_OBJECT_MISMATCH",
-        "Git blob 内容与对象身份不一致",
-      );
-    }
-    blobs.set(expectedOid, content);
-    offset = end + 1;
+  try {
+    return parseGitBlobBatch(value, oids, {
+      objectFormat, maxBlobBytes: limits.maxFileBytes, maxTotalBytes: limits.maxTotalBytes,
+    });
+  } catch (cause) {
+    const codes = {
+      PROTOCOL_ERROR: ["GIT_SNAPSHOT_PROTOCOL_ERROR", "Git blob 输出无效"],
+      BLOB_SIZE_LIMIT: ["FILE_SIZE_LIMIT", "文件超过大小限制"],
+      TOTAL_SIZE_LIMIT: ["TOTAL_SIZE_LIMIT", "工作区总大小超过限制"],
+      OBJECT_MISMATCH: ["GIT_SNAPSHOT_OBJECT_MISMATCH", "Git blob 内容与对象身份不一致"],
+    };
+    const [code, message] = codes[cause.code] ?? codes.PROTOCOL_ERROR;
+    throw snapshotError(code, message, cause);
   }
-  if (offset !== value.length) {
-    throw snapshotError(
-      "GIT_SNAPSHOT_PROTOCOL_ERROR",
-      "Git blob 输出包含额外数据",
-    );
-  }
-  return blobs;
 }
 
 class BinaryExecFileRunner {

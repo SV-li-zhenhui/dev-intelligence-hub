@@ -15,6 +15,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
+import { MAX_BLOBS_PER_BATCH, parseGitBlobBatch } from "../lib/git-blob-batch.js";
 import { types as utilTypes } from "node:util";
 
 import {
@@ -619,7 +620,7 @@ function splitNullProtocol(bytes, code, message) {
   return records;
 }
 
-function parseRawDiff(bytes, oidLength, limits) {
+function parseRawDiff(bytes, oidLength, limits, conflictPaths) {
   const records = splitNullProtocol(
     bytes,
     "CONTROLLED_GIT_PROTOCOL_ERROR",
@@ -639,21 +640,33 @@ function parseRawDiff(bytes, oidLength, limits) {
       );
     }
     const [, oldMode, newMode, oldOid, newOid, status] = match;
+    const zeroOid = "0".repeat(oidLength);
+    const regularOld = oldMode === "100644" && oldOid !== zeroOid;
+    const regularNew = newMode === "100644" && newOid !== zeroOid;
+    const ordinaryModification = status === "M" && regularOld && regularNew;
+    const rename = /^R(?:100|0[0-9]{2})$/u.test(status) && regularOld && regularNew;
+    const addition = status === "A" && oldMode === "000000" && oldOid === zeroOid && regularNew;
+    const deletion = status === "D" && newMode === "000000" && newOid === zeroOid && regularOld;
     if (
-      status !== "M" ||
-      oldMode !== "100644" ||
-      newMode !== "100644" ||
-      !oidPattern(oidLength).test(oldOid) ||
-      !oidPattern(oidLength).test(newOid)
+      !(ordinaryModification || rename || addition || deletion) ||
+      !oidPattern(oidLength).test(oldOid) || !oidPattern(oidLength).test(newOid)
     ) {
       throw controlledGitError(
         "CONTROLLED_GIT_UNSUPPORTED_CHANGE",
-        "首版仅支持 ordinary 100644 content modifications",
+        "Git changes 必须是普通文件的内容修改、新增、删除或重命名",
       );
     }
-    const relativePath = normalizeConflictPath(records[index], limits);
-    index += 1;
-    changes.push({ path: relativePath, oldOid, newOid });
+    for (let pathIndex = 0; pathIndex < (rename ? 2 : 1); pathIndex += 1) {
+      if (index >= records.length) throw controlledGitError(
+        "CONTROLLED_GIT_PROTOCOL_ERROR", "Git rename record 不完整",
+      );
+      const relativePath = normalizeConflictPath(records[index], limits);
+      index += 1;
+      if (conflictPaths.has(relativePath) && !ordinaryModification) {
+        throw controlledGitError("CONTROLLED_GIT_UNSUPPORTED_CHANGE", "冲突路径仅允许普通文件内容修改");
+      }
+      changes.push({ path: relativePath, oldOid, newOid });
+    }
   }
   const paths = changes.map(({ path: relativePath }) => relativePath);
   if (new Set(paths).size !== paths.length || paths.length > limits.maxFiles) {
@@ -665,7 +678,7 @@ function parseRawDiff(bytes, oidLength, limits) {
   return changes;
 }
 
-function parseNumstat(bytes, limits) {
+function parseNumstat(bytes, limits, conflictPaths) {
   const records = splitNullProtocol(
     bytes,
     "CONTROLLED_GIT_PROTOCOL_ERROR",
@@ -679,7 +692,11 @@ function parseNumstat(bytes, limits) {
         "git diff --numstat record 无效",
       );
     }
+    const relativePath = normalizeConflictPath(match[3], limits);
     if (match[1] === "-" || match[2] === "-") {
+      if (match[1] === "-" && match[2] === "-" && !conflictPaths.has(relativePath)) {
+        return { path: relativePath, added: null, deleted: null };
+      }
       throw controlledGitError(
         "CONTROLLED_GIT_UNSUPPORTED_CHANGE",
         "Binary Git changes 不受支持",
@@ -694,7 +711,7 @@ function parseNumstat(bytes, limits) {
       );
     }
     return {
-      path: normalizeConflictPath(match[3], limits),
+      path: relativePath,
       added,
       deleted,
     };
@@ -702,10 +719,10 @@ function parseNumstat(bytes, limits) {
 }
 
 function assertMatchingChanges(rawChanges, numstatChanges) {
-  const rawPaths = rawChanges.map(({ path: relativePath }) => relativePath);
-  const numstatPaths = numstatChanges.map(({ path: relativePath }) => relativePath);
+  const rawPaths = rawChanges.map(({ path: relativePath }) => relativePath).sort();
+  const numstatPaths = numstatChanges.map(({ path: relativePath }) => relativePath).sort();
   if (
-    rawPaths.length !== numstatPaths.length ||
+    rawPaths.length !== numstatPaths.length || new Set(numstatPaths).size !== numstatPaths.length ||
     rawPaths.some((relativePath, index) => relativePath !== numstatPaths[index])
   ) {
     throw controlledGitError(
@@ -943,10 +960,10 @@ function assertSeparateBoundaries(
   }
 }
 
-function validatedBlob(bytes, oid, limits, objectFormat) {
+function validatedBlob(bytes, oid, limits, objectFormat, { textOnly = true } = {}) {
   if (
     bytes.length > limits.maxBlobBytes ||
-    bytes.includes(0) ||
+    (textOnly && bytes.includes(0)) ||
     gitBlobOid(objectFormat, bytes) !== oid
   ) {
     throw controlledGitError(
@@ -954,7 +971,7 @@ function validatedBlob(bytes, oid, limits, objectFormat) {
       "Conflict blob 是 binary 或超过限制",
     );
   }
-  decodeUtf8(
+  if (textOnly) decodeUtf8(
     bytes,
     "CONTROLLED_GIT_UNSUPPORTED_CONFLICT",
     "Conflict blob 不是 UTF-8",
@@ -1723,6 +1740,29 @@ export class ControlledGitService {
     return deepFreeze(expected);
   }
 
+  async readConflictInspection(value) {
+    const binding = await this.verifyConflictPreparation(value);
+    const manifest = await this.#verifiedManifest(binding.preparationId);
+    const directory = await this.#preparationDirectory(binding.preparationId);
+    let remainingCharacters = 12_000;
+    const conflicts = [];
+    for (const conflict of manifest.conflicts) {
+      const versions = [];
+      for (const evidence of [...conflict.stages, manifest.treeEntries.find(entry => entry.path === conflict.path)]) {
+        const bytes = await this.#readSealedBlob(directory, evidence, manifest.baseBoundary.objectFormat, { textOnly: true });
+        const text = bytes.toString("utf8");
+        const start = evidence.stage === undefined ? Math.max(0, text.indexOf("<<<<<<<") - 300) : 0;
+        const excerpt = text.slice(start, start + Math.min(2_000, remainingCharacters));
+        remainingCharacters -= excerpt.length;
+        versions.push({ stage: evidence.stage ?? "merged", oid: evidence.oid,
+          sha256: evidence.sha256, byteLength: evidence.byteLength,
+          excerpt, startLine: text.slice(0, start).split("\n").length, complete: excerpt.length === text.length });
+      }
+      conflicts.push({ path: conflict.path, mode: conflict.mode, versions });
+    }
+    return deepFreeze({ schemaVersion: 1, preparationBinding: binding, conflicts });
+  }
+
   async materializeConflictPreparationForCodeJob(value) {
     const fields = exactDataObject(value, [
       "binding",
@@ -2381,54 +2421,6 @@ export class ControlledGitService {
       mergeBaseOutput.exitCode,
       baseBoundary.oidLength,
     );
-    for (const tipOid of [gitTarget.headRefOid, gitTarget.baseRefOid]) {
-      const raw = parseRawDiff(
-        checkedProcessOutput(
-          await this.#runGit({
-            args: [
-              ...prefix,
-              "diff-tree",
-              "--no-commit-id",
-              "-r",
-              "--raw",
-              "-z",
-              "-M",
-              mergeBaseOid,
-              tipOid,
-            ],
-            cwd: scratchRoot,
-            env: environment,
-            maxOutputBytes: this.#limits.maxProtocolBytes,
-          }),
-          [0],
-          this.#limits.maxProtocolBytes,
-        ).stdout,
-        baseBoundary.oidLength,
-        this.#limits,
-      );
-      const numstat = parseNumstat(
-        checkedProcessOutput(
-          await this.#runGit({
-            args: [
-              ...prefix,
-              "diff",
-              "--numstat",
-              "-z",
-              "--no-renames",
-              mergeBaseOid,
-              tipOid,
-            ],
-            cwd: scratchRoot,
-            env: environment,
-            maxOutputBytes: this.#limits.maxProtocolBytes,
-          }),
-          [0],
-          this.#limits.maxProtocolBytes,
-        ).stdout,
-        this.#limits,
-      );
-      assertMatchingChanges(raw, numstat);
-    }
     const mergeTreeOutput = checkedProcessOutput(
       await this.#runGit({
         args: [
@@ -2454,6 +2446,57 @@ export class ControlledGitService {
       baseBoundary.oidLength,
       this.#limits,
     );
+    const conflictPaths = new Set(merge.conflicts.map(({ path }) => path));
+    for (const tipOid of [gitTarget.headRefOid, gitTarget.baseRefOid]) {
+      const raw = parseRawDiff(
+        checkedProcessOutput(
+          await this.#runGit({
+            args: [
+              ...prefix,
+              "diff-tree",
+              "--no-commit-id",
+              "-r",
+              "--raw",
+              "-z",
+              "-M",
+              mergeBaseOid,
+              tipOid,
+            ],
+            cwd: scratchRoot,
+            env: environment,
+            maxOutputBytes: this.#limits.maxProtocolBytes,
+          }),
+          [0],
+          this.#limits.maxProtocolBytes,
+        ).stdout,
+        baseBoundary.oidLength,
+        this.#limits,
+        conflictPaths,
+      );
+      const numstat = parseNumstat(
+        checkedProcessOutput(
+          await this.#runGit({
+            args: [
+              ...prefix,
+              "diff",
+              "--numstat",
+              "-z",
+              "--no-renames",
+              mergeBaseOid,
+              tipOid,
+            ],
+            cwd: scratchRoot,
+            env: environment,
+            maxOutputBytes: this.#limits.maxProtocolBytes,
+          }),
+          [0],
+          this.#limits.maxProtocolBytes,
+        ).stdout,
+        this.#limits,
+        conflictPaths,
+      );
+      assertMatchingChanges(raw, numstat);
+    }
     const conflicts = [];
     let totalBytes = 0;
     for (const conflict of merge.conflicts) {
@@ -2511,38 +2554,40 @@ export class ControlledGitService {
       this.#limits.maxProtocolBytes,
     );
     const treeEntries = [];
-    for (const entry of parseResultTree(
-      treeProtocol.stdout,
-      baseBoundary.oidLength,
-      this.#limits,
-    )) {
-      const output = checkedProcessOutput(
-        await this.#runGit({
-          args: [...prefix, "cat-file", "blob", entry.oid],
-          cwd: scratchRoot,
-          env: environment,
-          maxOutputBytes: this.#limits.maxBlobBytes,
-        }),
-        [0],
-        this.#limits.maxBlobBytes,
-      );
-      totalBytes += output.stdout.length;
-      if (totalBytes > this.#limits.maxTotalBytes) {
-        throw controlledGitError(
-          "CONTROLLED_GIT_UNSUPPORTED_TREE",
-          "Result tree blobs 超过总大小限制",
-        );
+    const parsedEntries = parseResultTree(treeProtocol.stdout, baseBoundary.oidLength, this.#limits);
+    const oids = [...new Set(parsedEntries.map(({ oid }) => oid))];
+    const blobs = new Map();
+    let uniqueBlobBytes = 0;
+    for (let offset = 0; offset < oids.length; offset += MAX_BLOBS_PER_BATCH) {
+      const batchOids = oids.slice(offset, offset + MAX_BLOBS_PER_BATCH);
+      const remainingBytes = this.#limits.maxTotalBytes - totalBytes - uniqueBlobBytes;
+      const outputLimit = Math.min(Number.MAX_SAFE_INTEGER, remainingBytes + batchOids.length * 160 + 1);
+      const output = checkedProcessOutput(await this.#runGit({
+        args: [...prefix, "cat-file", "--batch"], cwd: scratchRoot, env: environment,
+        input: Buffer.from(batchOids.map((oid) => `${oid}\n`).join("")), maxOutputBytes: outputLimit,
+      }), [0], outputLimit);
+      let batch;
+      try {
+        batch = parseGitBlobBatch(output.stdout, batchOids, {
+          objectFormat: baseBoundary.objectFormat, maxBlobBytes: this.#limits.maxBlobBytes,
+          maxTotalBytes: remainingBytes,
+        });
+      } catch (cause) {
+        throw controlledGitError("CONTROLLED_GIT_UNSUPPORTED_TREE", "Result tree blob batch 无效或超过限制", cause);
       }
-      const evidence = validatedBlob(
-        output.stdout,
-        entry.oid,
-        this.#limits,
-        baseBoundary.objectFormat,
-      );
-      await this.#sealBlob(blobDirectory, output.stdout);
+      for (const [oid, bytes] of batch) { blobs.set(oid, bytes); uniqueBlobBytes += bytes.length; }
+    }
+    for (const entry of parsedEntries) {
+      const bytes = blobs.get(entry.oid);
+      totalBytes += bytes.length;
+      if (totalBytes > this.#limits.maxTotalBytes) {
+        throw controlledGitError("CONTROLLED_GIT_UNSUPPORTED_TREE", "Result tree blobs 超过总大小限制");
+      }
+      const evidence = validatedBlob(bytes, entry.oid, this.#limits, baseBoundary.objectFormat,
+        { textOnly: conflictPaths.has(entry.path) });
+      await this.#sealBlob(blobDirectory, bytes);
       treeEntries.push(deepFreeze({ ...entry, ...evidence }));
     }
-    const conflictPaths = new Set(conflicts.map(({ path: relativePath }) => relativePath));
     const treePaths = new Set(treeEntries.map(({ path: relativePath }) => relativePath));
     if ([...conflictPaths].some((relativePath) => !treePaths.has(relativePath))) {
       throw controlledGitError(
@@ -3107,6 +3152,7 @@ export class ControlledGitService {
         directory,
         evidence,
         manifest.baseBoundary.objectFormat,
+        { textOnly: !Object.hasOwn(evidence, "path") || manifest.conflicts.some(({ path }) => path === evidence.path) },
       );
     }
     const actualBlobs = await this.#directoryEvidence(
@@ -3674,7 +3720,7 @@ export class ControlledGitService {
     return directory;
   }
 
-  async #readSealedBlob(preparationDirectory, evidence, objectFormat) {
+  async #readSealedBlob(preparationDirectory, evidence, objectFormat, { textOnly = false } = {}) {
     const target = path.join(
       preparationDirectory,
       "blobs",
@@ -3708,14 +3754,14 @@ export class ControlledGitService {
       !sameFileIdentity(initial, final) ||
       sha256(bytes) !== evidence.sha256 ||
       gitBlobOid(objectFormat, bytes) !== evidence.oid ||
-      bytes.includes(0)
+      (textOnly && bytes.includes(0))
     ) {
       throw controlledGitError(
         "CONTROLLED_GIT_PREPARATION_TAMPERED",
         "Sealed blob evidence 无效",
       );
     }
-    decodeUtf8(
+    if (textOnly) decodeUtf8(
       bytes,
       "CONTROLLED_GIT_PREPARATION_TAMPERED",
       "Sealed blob 不是 UTF-8",

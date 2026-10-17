@@ -379,6 +379,18 @@ function snapshotLimits(brokerLimits = {}) {
   );
 }
 
+function controlledGitDependencies(dependencies, brokerLimits = {}) {
+  const injected = ownDataValue(dependencies, "controlledGitDependencies") ?? {};
+  if (utilTypes.isProxy(injected)) throw invalidConfig();
+  assertRecord(injected);
+  if (Object.hasOwn(injected, "limits")) throw invalidConfig("Controlled Git 大小限制必须来自工作区 broker 配置");
+  const limits = Object.fromEntries(
+    Object.entries(snapshotLimits(brokerLimits)).map(([key, value]) =>
+      [key === "maxFileBytes" ? "maxBlobBytes" : key, value]),
+  );
+  return Object.defineProperties({ limits }, Object.getOwnPropertyDescriptors(injected));
+}
+
 function createChangePackageTargets(workspaces, authority) {
   const authorityByWorkspace = new Map(
     authority.workspaces.map((workspace) => [workspace.id, workspace]),
@@ -452,7 +464,9 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
   }
   const controlledGitRuntime = await createControlledGitRuntimeBundle(
     controlledGitConfig,
-    ownDataValue(dependencies, "controlledGitDependencies") ?? {},
+    controlledGitConfig?.enabled === true
+      ? controlledGitDependencies(dependencies, enabledConfig.brokerLimits)
+      : ownDataValue(dependencies, "controlledGitDependencies") ?? {},
   );
   const injectedConflictMaterializer =
     dependencies.conflictMaterializer === undefined
@@ -609,6 +623,8 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
       controlledGitRuntime?.verifier ?? null,
     conflictExecutionSourcePreparer:
       controlledGitRuntime?.preparer ?? null,
+    conflictInspectionReader:
+      controlledGitRuntime?.inspectionReader ?? null,
     controlledCommitBuilder:
       controlledGitRuntime?.commitBuilder ?? null,
     controlledCommitPublisher:

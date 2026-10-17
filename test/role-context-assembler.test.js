@@ -381,6 +381,7 @@ async function assemble(fixture, options = {}) {
       ? { failedCodeJobContextReader: options.failedCodeJobContextReader }
       : {}),
     ...(options.internalReviewHandoffReader ? { internalReviewHandoffReader: options.internalReviewHandoffReader } : {}),
+    ...(options.conflictInspectionReader ? { conflictInspectionReader: options.conflictInspectionReader } : {}),
   });
   const roleId = options.roleId ?? "developer";
   return assembler.assemble({
@@ -794,6 +795,22 @@ test("a PR source root binds context and facts to its active Head revision", asy
     sourceBinding: packet.binding.source,
     event: eventB,
   }]);
+});
+
+test("conflict material readers are scoped to developer conflict tasks and failures stay explicit", async () => {
+  const fixture = graphFixture({ pullRequest: true });
+  fixture.item.event.payload.nextAction = "resolve_conflict";
+  let calls = 0;
+  const conflictInspectionReader = { async read(input) {
+    calls += 1;
+    assert.deepEqual(input, { itemId: fixture.item.itemId, itemRevision: fixture.item.revision, inputDigest: fixture.item.inputDigest });
+    throw new Error("sealed material is unavailable");
+  } };
+  await assert.rejects(assemble(fixture, { conflictInspectionReader }),
+    error => error.code === "ROLE_CONTEXT_CONFLICT_INSPECTION_UNAVAILABLE");
+  fixture.item.event.payload.nextAction = "address_review";
+  await assemble(fixture, { conflictInspectionReader });
+  assert.equal(calls, 1);
 });
 
 test("PR review material is checked against the atomic target reconstructed from the source event", async () => {

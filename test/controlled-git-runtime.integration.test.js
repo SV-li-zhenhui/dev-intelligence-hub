@@ -284,7 +284,7 @@ function inputBinding({ baseOid, headOid }) {
   };
 }
 
-async function createFixture(t, gitCommand) {
+async function createFixture(t, gitCommand, { fullRepository = false } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "controlled-git-runtime-integration-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const sourceRoot = path.join(root, "source");
@@ -298,17 +298,33 @@ async function createFixture(t, gitCommand) {
   await mkdir(path.join(sourceRoot, "src"));
   await writeFile(path.join(sourceRoot, "src", "conflict.txt"), "common content\n");
   await writeFile(path.join(sourceRoot, "src", "untouched.txt"), "common file\n");
+  if (fullRepository) {
+    const resource = Buffer.alloc(9_000_000, 0x61); resource[0] = 0;
+    await writeFile(path.join(sourceRoot, "resource.bin"), resource);
+    await writeFile(path.join(sourceRoot, "src", "removed.txt"), "obsolete\n");
+    await writeFile(path.join(sourceRoot, "src", "rename-before.txt"), "unchanged renamed content\n");
+  }
   await git(gitCommand, sourceRoot, ["add", "--all"]);
   await git(gitCommand, sourceRoot, ["commit", "-m", "common ancestor"]);
 
   await git(gitCommand, sourceRoot, ["switch", "--create", "feature"]);
   await writeFile(path.join(sourceRoot, "src", "conflict.txt"), "head content\n");
+  if (fullRepository) {
+    await writeFile(path.join(sourceRoot, "src", "head-added.txt"), "head addition\n");
+    await git(gitCommand, sourceRoot, ["mv", "src/rename-before.txt", "src/rename-after.txt"]);
+  }
   await git(gitCommand, sourceRoot, ["add", "--all"]);
   await git(gitCommand, sourceRoot, ["commit", "-m", "head change"]);
   const headOid = (await git(gitCommand, sourceRoot, ["rev-parse", "HEAD"])).stdout.trim();
 
   await git(gitCommand, sourceRoot, ["switch", "main"]);
   await writeFile(path.join(sourceRoot, "src", "conflict.txt"), "base content\n");
+  if (fullRepository) {
+    const resource = await readFile(path.join(sourceRoot, "resource.bin")); resource[resource.length - 1] = 0xff;
+    await writeFile(path.join(sourceRoot, "resource.bin"), resource);
+    await rm(path.join(sourceRoot, "src", "removed.txt"));
+    await writeFile(path.join(sourceRoot, "src", "base-added.txt"), "base addition\n");
+  }
   await git(gitCommand, sourceRoot, ["add", "--all"]);
   await git(gitCommand, sourceRoot, ["commit", "-m", "base change"]);
   const baseOid = (await git(gitCommand, sourceRoot, ["rev-parse", "HEAD"])).stdout.trim();
@@ -327,6 +343,67 @@ async function createFixture(t, gitCommand) {
 }
 
 const gitCommand = locateGit();
+
+test("controlled conflict repair preserves a bounded full repository with non-conflicting binary additions and deletions", {
+  skip: gitCommand === null ? "trusted Git is unavailable" : false,
+}, async (t) => {
+  const setup = await createFixture(t, gitCommand, { fullRepository: true });
+  const config = { enabled: true, gitCommand, preparationRoot: setup.preparationRoot,
+    baseMirrorsByRepository: { "acme/runtime-test": setup.baseMirrorRoot },
+    headMirrorsByRepository: { "contributor/runtime-test": setup.headMirrorRoot } };
+  const dependencies = { limits: { maxBlobBytes: 10_000_000, maxTotalBytes: 12_000_000 } };
+  const bundle = await createControlledGitRuntimeBundle(config, dependencies);
+  const source = await bundle.preparer.prepare(inputBinding(setup));
+  assert.deepEqual(source.writeScope.paths, ["src/conflict.txt"]);
+  const inspection = await bundle.inspectionReader.read(inputBinding(setup));
+  assert.deepEqual(inspection.inputBinding, inputBinding(setup));
+  assert.deepEqual(inspection.conflicts.map(entry => entry.path), ["src/conflict.txt"]);
+  assert.deepEqual(inspection.conflicts[0].versions.slice(0, 3).map(entry => entry.excerpt),
+    ["common content\n", "head content\n", "base content\n"]);
+  assert.match(inspection.conflicts[0].versions[3].excerpt, /<<<<<<< /u);
+  const targetRoot = path.join(setup.root, "full-repository"); await mkdir(targetRoot);
+  await bundle.materializer.materialize({ binding: source.preparationBinding, targetRoot, excludePaths: [] });
+  const resource = await readFile(path.join(targetRoot, "resource.bin"));
+  assert.equal(resource.length, 9_000_000); assert.equal(resource[0], 0); assert.equal(resource.at(-1), 0xff);
+  assert.equal(await readFile(path.join(targetRoot, "src", "base-added.txt"), "utf8"), "base addition\n");
+  assert.equal(await readFile(path.join(targetRoot, "src", "head-added.txt"), "utf8"), "head addition\n");
+  await assert.rejects(lstat(path.join(targetRoot, "src", "removed.txt")), { code: "ENOENT" });
+  const workspaceRevision = "e".repeat(64);
+  const draft = { job: { id: "full-repo-job", revision: 3, recordDigest: "3".repeat(64) },
+    proposal: { id: "full-repo-proposal", contentDigest: "4".repeat(64) }, grant: { digest: "5".repeat(64) },
+    workspace: { id: "runtime-workspace", sourceRevision: "d".repeat(64), workspaceRevision },
+    passedProfiles: [passedProfile(workspaceRevision)], created: [], deleted: [],
+    modified: [{ path: "src/conflict.txt", beforeSha256: sha256(await readFile(path.join(targetRoot, "src", "conflict.txt"))),
+      content: Buffer.from("resolved both branches\n") }] };
+  const changePackage = createChangePackage(draft);
+  const request = { executionSource: source, manifest: changePackage.manifest,
+    blobs: changePackage.blobs.map(({ sha256, content }) => ({ sha256, content })), createdAt: "2026-10-17T08:00:00.000Z" };
+  const evidence = await bundle.commitBuilder.create(request);
+  const restarted = await createControlledGitRuntimeBundle(config, dependencies);
+  assert.deepEqual(await restarted.commitBuilder.verify({ evidenceId: evidence.evidenceId }), evidence);
+  const env = { ...process.env,
+    GIT_OBJECT_DIRECTORY: path.join(setup.preparationRoot, "commits", evidence.evidenceId, "objects"),
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: [path.join(setup.baseMirrorRoot, "objects"), path.join(setup.headMirrorRoot, "objects")].join(path.delimiter) };
+  const finalResource = await git(gitCommand, setup.headMirrorRoot,
+    ["show", `${evidence.commit.oid}:resource.bin`], { env, encoding: "buffer" });
+  assert.deepEqual(finalResource.stdout, resource);
+  const finalFiles = (await git(gitCommand, setup.headMirrorRoot,
+    ["ls-tree", "--name-only", "-r", evidence.commit.oid], { env })).stdout.split("\n");
+  assert.ok(finalFiles.includes("src/base-added.txt"));
+  assert.ok(finalFiles.includes("src/head-added.txt"));
+  assert.equal(finalFiles.includes("src/removed.txt"), false);
+  assert.ok(finalFiles.includes("src/rename-after.txt"));
+  assert.equal(finalFiles.includes("src/rename-before.txt"), false);
+  const changedResource = createChangePackage({ ...draft, modified: [{ path: "resource.bin", beforeSha256: sha256(resource), content: Buffer.from("unauthorized") }] });
+  await assert.rejects(restarted.commitBuilder.create({ ...request, manifest: changedResource.manifest,
+    blobs: changedResource.blobs.map(({ sha256, content }) => ({ sha256, content })) }),
+  error => error.code === "INVALID_CONTROLLED_GIT_REQUEST");
+  const sealedResource = path.join(setup.preparationRoot, "preparations",
+    source.preparationBinding.preparationId, "blobs", `${sha256(resource)}.blob`);
+  await writeFile(sealedResource, Buffer.alloc(resource.length));
+  await assert.rejects(restarted.preparer.prepare(inputBinding(setup)),
+    error => error.code === "CONTROLLED_GIT_PREPARATION_TAMPERED");
+});
 
 test("review repair builds a single-parent Head commit with creation and deletion, and publishes without force", {
   skip: gitCommand === null ? "trusted Git is unavailable" : false,

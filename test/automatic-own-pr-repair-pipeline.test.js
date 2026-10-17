@@ -279,6 +279,39 @@ async function fixture({ enabled = true, conflict = false, operation = "modify",
   };
 }
 
+test("automatic conflict materials are synchronized and read only for a current owned task", async () => {
+  for (const variant of ["current", "disabled", "stale-item", "base-drift"]) {
+    let syncs = 0;
+    const f = await fixture({ conflict: true, operation: "inspect", objectSync: { async prepare() { syncs += 1; } } });
+    const b = f.binding;
+    f.item.kind = "graph_task"; f.item.revision = 3; f.item.inputDigest = "e".repeat(64);
+    f.item.currentTarget = { type: "role", id: "developer" };
+    f.item.assignment = { graphTask: { sourceBinding: Object.fromEntries(
+      ["kind", "rootItemId", "workKey", "inputRevision", "headRevision", "headRefOid", "eventId", "eventDigest", "inputDigest"].map(key => [key, b[key]])) } };
+    f.item.event = { schemaVersion: 1, eventId: b.eventId, contentDigest: b.eventDigest,
+      occurredAt: CREATED_AT, eventType: "pull_request.updated", source: { provider: "github", scopeId: "test" },
+      subject: { id: `github:pr:${b.repository}#${b.pullRequestNumber}`, repository: b.repository, number: b.pullRequestNumber },
+      payload: { nextAction: "resolve_conflict", relation: "authored", headRefOid: b.headRefOid, gitTargetAvailable: true, gitTarget: b.gitTarget } };
+    f.config.githubActions.automaticOwnPrRepair = variant !== "disabled";
+    let reads = 0;
+    f.service.conflictRepair.conflictInspectionReader = { async read(inputBinding) {
+      reads += 1;
+      if (variant === "base-drift") f.facts.baseRefOid = "9".repeat(40);
+      return { inputBinding, conflicts: [{ path: "src/conflict.txt" }] };
+    } };
+    const request = { itemId: f.item.itemId, itemRevision: variant === "stale-item" ? 2 : 3, inputDigest: f.item.inputDigest };
+    if (variant === "base-drift") {
+      await assert.rejects(f.service.conflictRepair.readInspection(request), error => error.code === "OWN_PR_CONFLICT_TARGET_CHANGED");
+    } else {
+      const result = await f.service.conflictRepair.readInspection(request);
+      assert.equal(result !== null, variant === "current", variant);
+    }
+    assert.equal(reads, ["current", "base-drift"].includes(variant) ? 1 : 0);
+    assert.equal(syncs, reads);
+    assert.equal(f.codeJobApprovalCount, 0); assert.equal(f.pushes.length, 0);
+  }
+});
+
 test("own PR feedback creates and publishes an approved repair through the real confirmation and proposal pipeline", async () => {
   const f = await fixture();
   const transition = await f.deliver();

@@ -137,6 +137,7 @@ function fakeService(preparation) {
       calls.inspect.push(structuredClone(request));
       return structuredClone(preparation);
     },
+    async readConflictInspection({ binding }) { return { schemaVersion: 1, preparationBinding: binding, conflicts: [] }; },
     async verifyConflictPreparation(request) {
       calls.verify.push(structuredClone(request));
       return structuredClone(request.binding);
@@ -148,7 +149,27 @@ function fakeService(preparation) {
   };
 }
 
-test("one Controlled Git service is hidden behind five frozen least-authority ports", async (t) => {
+test("trusted runtime budgets are bounded data and passed to the service without new ports", async (t) => {
+  const setup = await fixture(t);
+  const service = fakeService(preparationFor(pullRequestBinding()));
+  const limits = { maxFiles: 10_000, maxBlobBytes: 20_000_000, maxTotalBytes: 150_000_000 };
+  let actual;
+  await createControlledGitRuntimeBundle(setup.config, { limits,
+    controlledGitServiceFactory(config) { actual = config.limits; return service; } });
+  assert.deepEqual(actual, limits);
+  assert.notEqual(actual, limits);
+  assert.equal(Object.isFrozen(actual), true);
+  let getterCalls = 0;
+  const accessor = { get maxFiles() { getterCalls += 1; return 100; } };
+  for (const invalid of [accessor, new Proxy({}, {}), { timeoutMs: 1 }, { maxFiles: 0 },
+    { maxFiles: Infinity }, { maxBlobBytes: 2_000_000, maxTotalBytes: 1_000_000 }]) {
+    await assert.rejects(createControlledGitRuntimeBundle(setup.config, { limits: invalid }),
+      error => error.code === "INVALID_CONTROLLED_GIT_RUNTIME_CONFIG");
+  }
+  assert.equal(getterCalls, 0);
+});
+
+test("one Controlled Git service is hidden behind frozen least-authority ports", async (t) => {
   const setup = await fixture(t);
   const inputBinding = pullRequestBinding();
   const service = fakeService(preparationFor(inputBinding));
@@ -167,6 +188,7 @@ test("one Controlled Git service is hidden behind five frozen least-authority po
     "publisher",
     "verifier",
     "preparer",
+    "inspectionReader",
   ]);
   assert.equal(Object.isFrozen(bundle), true);
   assert.deepEqual(Object.keys(bundle.commitBuilder), ["create", "find", "verify"]);
@@ -304,6 +326,7 @@ test("enabled runtime rejects incomplete, overlapping, accessor and incomplete-p
 
   for (const missingMethod of [
     "recoverControlledCommits",
+    "readConflictInspection",
     "createControlledCommit",
     "verifyControlledCommit",
     "publishControlledCommit",

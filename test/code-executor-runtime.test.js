@@ -20,6 +20,7 @@ import { createConflictPreparationBinding } from "../src/domain/conflict-prepara
 import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { mergeConfig } from "../src/lib/config.js";
 import { StateStore } from "../src/lib/state-store.js";
+import { ControlledGitService } from "../src/services/controlled-git-service.js";
 
 const image =
   "node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32";
@@ -407,11 +408,23 @@ test("configured Controlled Git exposes only frozen production ports", async (t)
   const config = enabledConfig(setup.root);
   Object.assign(config, await productionConflictGitConfig(setup));
 
+  config.brokerLimits = { maxFiles: 10_000, maxDirectories: 11_000, maxFileBytes: 20_000_000, maxTotalBytes: 150_000_000 };
+  let actualLimits;
   const runtime = await createCodeExecutorRuntime(config, {
     runtimeRoot: setup.runtimeRoot,
     sourceBaseRoot: setup.sourceBaseRoot,
     store: setup.store,
+    controlledGitDependencies: { controlledGitServiceFactory(settings) {
+      actualLimits = settings.limits;
+      return new ControlledGitService(settings);
+    } },
   });
+
+  assert.deepEqual(actualLimits, { maxFiles: 10_000, maxDirectories: 11_000, maxBlobBytes: 20_000_000, maxTotalBytes: 150_000_000 });
+  await assert.rejects(createCodeExecutorRuntime(config, {
+    runtimeRoot: setup.runtimeRoot, sourceBaseRoot: setup.sourceBaseRoot, store: setup.store,
+    controlledGitDependencies: { limits: { maxTotalBytes: 999_999_999 } },
+  }), error => error.code === "INVALID_CODE_EXECUTOR_CONFIG");
 
   assert.deepEqual(runtime.authority.workspaces[0].capabilities, [
     "directory_snapshot",
