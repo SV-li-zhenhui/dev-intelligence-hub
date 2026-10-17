@@ -685,6 +685,39 @@ test("structured PR triage creates exactly one child for its trusted capability"
   }
 });
 
+test("conflict triage replaces only cancelled development work without deliveries", async (t) => {
+  for (const scenario of [
+    ...["cancelled", "in_progress", "paused", "completed"].map(status => ({ status })),
+    { status: "cancelled", role: "pr-engineer" },
+    { status: "cancelled", delivered: true },
+  ]) {
+    const { status, role = "developer", delivered = false } = scenario;
+    await t.test(`${status}-${role}-${delivered}`, async () => {
+      const root = task({ taskId: "conflict-root" });
+      const child = task({ taskId: "conflict-root/old", parentTaskId: root.taskId, role, status });
+      if (delivered) child.deliveries = [{ revision: 1, contractRevision: 1, deliverableId: "implementation",
+        status: "submitted", summary: "Existing delivery", evidence: [workInputEvidence(child)] }];
+      const view = graphView([root, child], 3);
+      const event = structuredTriageEvent("development");
+      event.payload.nextAction = "resolve_conflict";
+      const packet = packetFor(view, root, { directChildren: [child], event });
+      const fakes = fakePorts({ packet, views: view });
+      const execute = () => serviceFrom(fakes, { development: "developer" }).execute({
+        worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+        item: itemFor(root), contextPacket: packet,
+        intent: orchestrate({ ...commonAction("decompose", root, view), childKey: "conflict-retry",
+          work: { title: "Retry conflict repair", description: "Use the current trusted target" },
+          capability: "development", dependsOn: [], acceptanceContract: contract() }),
+      });
+      if (status === "cancelled" && role === "developer" && !delivered) assert.equal((await execute()).action, "decompose");
+      else {
+        await assert.rejects(execute(), { code: "ORCHESTRATOR_AUTHORITY_DENIED" });
+        assertNoTrustedMutation(fakes.calls);
+      }
+    });
+  }
+});
+
 test("structured PR triage rejects capability drift, a second child, and premature control", async (t) => {
   const cases = [
     {

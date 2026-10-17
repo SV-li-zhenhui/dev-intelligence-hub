@@ -1797,6 +1797,7 @@ test("a configured root orchestrator receives exact direct-child coordination by
       "taskRevision",
       "status",
       "ledgerStatus",
+      "blockingCondition",
       "responsibility",
       "work",
       "directDependencyTaskIds",
@@ -1946,10 +1947,12 @@ test("root coordination distinguishes settled ledger work from coarse graph prog
       const child = fixture.snapshot.graph.tasks.find(({ taskId }) => taskId === "task-current");
       child.status = ledgerStatus === "queued" ? "pending" : "in_progress";
       fixture.snapshot.taskStates.find(({ taskId }) => taskId === child.taskId).ledgerStatus = ledgerStatus;
+      fixture.snapshot.taskStates.find(({ taskId }) => taskId === child.taskId).statusReason = "proposal_stale";
       const packet = await assemble(fixture, { roleId: "orchestrator" });
       const visible = packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === child.taskId);
       assert.equal(visible.status, child.status);
       assert.equal(visible.ledgerStatus, ledgerStatus);
+      assert.equal(visible.blockingCondition, ledgerStatus === "blocked" ? "proposal-stale" : null);
       assert.equal(Object.keys(visible).some((key) => ["ownerId", "leaseUntil", "statusReason"].includes(key)), false);
     });
   }
@@ -1958,6 +1961,15 @@ test("root coordination distinguishes settled ledger work from coarse graph prog
     delete fixture.snapshot.taskStates.find(({ taskId }) => taskId === "task-current").ledgerStatus;
     const packet = await assemble(fixture, { roleId: "orchestrator" });
     assert.equal(packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === "task-current").ledgerStatus, null);
+  });
+  await t.test("unknown raw blocking reasons stay private", async () => {
+    const fixture = rootOrchestratorFixture();
+    const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === "task-current");
+    state.ledgerStatus = "blocked";
+    state.statusReason = "proposal_stale\nPRIVATE-DIAGNOSTIC";
+    const packet = await assemble(fixture, { roleId: "orchestrator" });
+    assert.equal(packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === "task-current").blockingCondition, null);
+    assert.equal(JSON.stringify(packet).includes("PRIVATE-DIAGNOSTIC"), false);
   });
   for (const ledgerStatus of ["in_progress", "blocked\nSECRET-STATUS", {}]) {
     await t.test(`invalid ledger status ${JSON.stringify(ledgerStatus)}`, async () => {

@@ -627,6 +627,11 @@ function cancelledMalformedReviewChild(task) {
   return task.status === "cancelled" && malformedReviewChildWithSettledDeliveries(task);
 }
 
+function cancelledConflictChildWithoutDelivery(task) {
+  return task.status === "cancelled" && task.responsibility.type === "role" &&
+    task.responsibility.id === "developer" && task.deliveries.length === 0;
+}
+
 function assertStructuredPrTriageAction(packet, children, action, tasksById) {
   const triage = structuredPrTriage(packet);
   if (triage === null) return;
@@ -646,7 +651,10 @@ function assertStructuredPrTriageAction(packet, children, action, tasksById) {
     throw denied("Automatic rereview correction must preserve an intentionally paused Review child");
   }
   if (action.type !== "decompose") return;
-  if (children.size !== 0 && !(isExternalRereview(packet) &&
+  const replaceCancelledConflict = triage.nextAction === "resolve_conflict" &&
+    triage.suggestedCapability === "development" &&
+    [...children].every((taskId) => cancelledConflictChildWithoutDelivery(tasksById.get(taskId)));
+  if (children.size !== 0 && !replaceCancelledConflict && !(isExternalRereview(packet) &&
       [...children].every((taskId) => cancelledMalformedReviewChild(tasksById.get(taskId))))) {
     throw denied("Structured PR triage permits only one direct child");
   }

@@ -514,6 +514,8 @@ function normalizeSnapshot(value) {
         "taskState.taskRevision",
       ),
       ledgerStatus,
+      blockingCondition: ledgerStatus === "blocked" && fields.get("statusReason") === "proposal_stale"
+        ? "proposal-stale" : null,
       work: {
         title: nullableText(work.get("title"), "work.title", 256),
         description: nullableText(
@@ -889,6 +891,7 @@ function projectRootCoordination(roleId, currentTask, snapshot) {
       taskRevision: child.revision,
       status: child.status,
       ledgerStatus: taskState.ledgerStatus,
+      blockingCondition: taskState.blockingCondition,
       responsibility: { ...child.responsibility },
       work: {
         title: taskState.work.title,
