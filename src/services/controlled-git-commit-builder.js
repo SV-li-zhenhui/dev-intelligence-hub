@@ -236,7 +236,17 @@ export class ControlledGitCommitBuilder {
         preparation,
         scratchRoot,
       });
-      if (!sameControlledCommitEvidence(rebuilt, stored.evidence)) {
+      // Git can skip writes once fetched alternates contain these objects.
+      // #load already verifies the sealed physical object set; rebuilding must
+      // reproduce its semantic commit, independent of alternate-store growth.
+      const reconstructed = createControlledCommitEvidence({
+        executionSource: rebuilt.executionSource,
+        manifest: stored.manifest,
+        resolution: { resolvedPaths: [...rebuilt.resolution.resolvedPaths], finalTreeOid: rebuilt.resolution.finalTreeOid },
+        commit: { ...rebuilt.commit, objectSetDigest: stored.evidence.commit.objectSetDigest },
+        createdAt: rebuilt.createdAt,
+      });
+      if (!sameControlledCommitEvidence(reconstructed, stored.evidence)) {
         throw this.#fail(
           "CONTROLLED_GIT_COMMIT_TAMPERED",
           "Controlled commit evidence 无法从 sealed manifest 重建",
@@ -302,16 +312,20 @@ export class ControlledGitCommitBuilder {
   }) {
     const gitDirectory = path.join(scratchRoot, "git");
     const objectDirectory = path.join(scratchRoot, "objects");
+    const seedObjectDirectory = path.join(scratchRoot, "seed-objects");
     const blobDirectory = path.join(scratchRoot, "blobs");
     const indexFile = path.join(scratchRoot, "index");
     await Promise.all([
       mkdir(gitDirectory),
       mkdir(objectDirectory),
+      mkdir(seedObjectDirectory),
       mkdir(blobDirectory),
     ]);
     await Promise.all([
       mkdir(path.join(objectDirectory, "info")),
       mkdir(path.join(objectDirectory, "pack")),
+      mkdir(path.join(seedObjectDirectory, "info")),
+      mkdir(path.join(seedObjectDirectory, "pack")),
       mkdir(path.join(gitDirectory, "refs", "heads"), { recursive: true }),
       mkdir(path.join(gitDirectory, "refs", "tags"), { recursive: true }),
     ]);
@@ -340,6 +354,32 @@ export class ControlledGitCommitBuilder {
       createdAt,
     });
     const context = { gitDirectory, cwd: scratchRoot, environment };
+    // Git freshens existing alternate objects on writes. Write commands may
+    // read only the temporary seed, never the live mirrors.
+    const writeContext = { ...context, environment: {
+      ...environment, GIT_ALTERNATE_OBJECT_DIRECTORIES: seedObjectDirectory,
+    } };
+    const target = executionSource.inputBinding.gitTarget;
+    const parents = executionSource.kind === "review_repair"
+      ? [target.headRefOid] : [target.headRefOid, target.baseRefOid];
+    const treeRecords = await this.#git.listTrees({ ...context, treeOid: preparation.resultTreeOid });
+    const treeOids = treeRecords.toString("utf8").split("\0").filter(Boolean).map(record => {
+      const match = /^040000 tree ([a-f0-9]+)\t[^\0]+$/u.exec(record);
+      if (match?.[1].length !== preparation.baseBoundary.oidLength) {
+        throw this.#fail("CONTROLLED_GIT_COMMIT_PROTOCOL_ERROR", "Controlled commit tree 对象清单无效");
+      }
+      return match[1];
+    });
+    // Seed only trees and exact parents, never blobs or history. Otherwise
+    // cache-tree validation would rebuild every unchanged directory in a large
+    // repository when alternates are unavailable to the write commands.
+    const seed = await this.#git.packObjects({ ...context,
+      records: Buffer.from([...new Set([preparation.resultTreeOid, ...treeOids, ...parents])].join("\n") + "\n"),
+    });
+    await this.#git.indexPack({ ...writeContext, environment: {
+      ...environment, GIT_OBJECT_DIRECTORY: seedObjectDirectory,
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: "",
+    }, content: seed });
     await this.#git.readTree({
       ...context,
       treeOid: preparation.resultTreeOid,
@@ -351,7 +391,7 @@ export class ControlledGitCommitBuilder {
     const modes = new Map(preparation.treeEntries?.map(({ path, mode }) => [path, mode]) ?? []);
     for (const change of [...manifest.changes.created, ...manifest.changes.modified]) {
       const oid = await this.#git.hashObject({
-        ...context,
+        ...writeContext,
         content: contentByDigest.get(change.blob.sha256),
         oidLength: preparation.baseBoundary.oidLength,
       });
@@ -365,7 +405,7 @@ export class ControlledGitCommitBuilder {
       records: Buffer.from(records.join(""), "utf8"),
     });
     const finalTreeOid = await this.#git.writeTree({
-      ...context,
+      ...writeContext,
       oidLength: preparation.baseBoundary.oidLength,
     });
     if (finalTreeOid === preparation.resultTreeOid) {
@@ -374,11 +414,8 @@ export class ControlledGitCommitBuilder {
         "Controlled commit resolution 未改变 result tree",
       );
     }
-    const target = executionSource.inputBinding.gitTarget;
-    const parents = executionSource.kind === "review_repair"
-      ? [target.headRefOid] : [target.headRefOid, target.baseRefOid];
     const commitOid = await this.#git.commitTree({
-      ...context,
+      ...writeContext,
       treeOid: finalTreeOid,
       parents,
       message: Buffer.from(message, "utf8"),
@@ -425,6 +462,7 @@ export class ControlledGitCommitBuilder {
     }
     await Promise.all([
       rm(gitDirectory, { recursive: true, force: true }),
+      rm(seedObjectDirectory, { recursive: true, force: true }),
       rm(indexFile, { force: true }),
     ]);
     return evidence;

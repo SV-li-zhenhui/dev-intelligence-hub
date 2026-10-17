@@ -1563,6 +1563,12 @@ export class ControlledGitService {
           this.#runControlledCommitGit("read-tree", request),
         hashObject: (request) =>
           this.#runControlledCommitGit("hash-object", request),
+        listTrees: (request) =>
+          this.#runControlledCommitGit("list-trees", request),
+        packObjects: (request) =>
+          this.#runControlledCommitGit("pack-objects", request),
+        indexPack: (request) =>
+          this.#runControlledCommitGit("index-pack", request),
         updateIndex: (request) =>
           this.#runControlledCommitGit("update-index", request),
         writeTree: (request) =>
@@ -2845,12 +2851,23 @@ export class ControlledGitService {
         input = request.content;
         returnsOid = true;
         break;
+      case "list-trees":
+        args = [...prefix, "ls-tree", "-rtdz", "--full-tree", request.treeOid];
+        break;
+      case "pack-objects":
+        args = [...prefix, "pack-objects", "--stdout"];
+        input = request.records;
+        break;
+      case "index-pack":
+        args = [...prefix, "index-pack", "--stdin"];
+        input = request.content;
+        break;
       case "update-index":
         args = [...prefix, "update-index", "-z", "--index-info"];
         input = request.records;
         break;
       case "write-tree":
-        args = [...prefix, "write-tree"];
+        args = [...prefix, "write-tree", "--missing-ok"];
         returnsOid = true;
         break;
       case "commit-tree":
@@ -2869,7 +2886,9 @@ export class ControlledGitService {
           "Controlled commit Git operation 不在固定 allowlist",
         );
     }
-    const maximumBytes = returnsOid ? 256 : 64;
+    const maximumBytes = operation === "list-trees" ? this.#limits.maxProtocolBytes
+      : operation === "pack-objects" ? this.#limits.maxResultObjectBytes
+        : returnsOid || operation === "index-pack" ? 256 : 64;
     const output = checkedProcessOutput(
       await this.#runGit({
         args,
@@ -2887,7 +2906,7 @@ export class ControlledGitService {
           request.oidLength,
           "CONTROLLED_GIT_COMMIT_PROTOCOL_ERROR",
         )
-      : undefined;
+      : operation === "list-trees" || operation === "pack-objects" ? output : undefined;
   }
 
   async #runGit({ args, cwd, env, input, maxOutputBytes }) {
