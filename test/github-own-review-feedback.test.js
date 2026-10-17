@@ -86,8 +86,14 @@ test("own conflict admission reads fresh Base and merge state without paging rev
     calls += 1;
     const query = args.find(value => value.startsWith("query="));
     assert.match(query, /OwnPullRequestConflict/);
+    assert.match(query, /baseRef\s*\{/);
     assert.doesNotMatch(query, /reviews\(|reviewThreads\(/);
-    return { data: { repository: { pullRequest: pullRequest({ isDraft: false, baseRefOid: "b".repeat(40), mergeStateStatus: "DIRTY" }) } } };
+    return { data: { repository: { pullRequest: pullRequest({ isDraft: false,
+      baseRefOid: "c".repeat(40), baseRefName: "main",
+      baseRef: { name: "main", repository: { nameWithOwner: "acme/repo" }, target: { oid: "b".repeat(40) } },
+      headRefName: "fix/conflict", headRepository: { nameWithOwner: "acme/repo" },
+      headRef: { name: "fix/conflict", repository: { nameWithOwner: "acme/repo" }, target: { oid: HEAD } },
+      mergeStateStatus: "DIRTY" }) } } };
   } });
   const facts = await adapter.readOwnPullRequestConflict({ repository: "acme/repo", number: 42, account: ACCOUNT });
   assert.equal(facts.baseRefOid, "b".repeat(40));

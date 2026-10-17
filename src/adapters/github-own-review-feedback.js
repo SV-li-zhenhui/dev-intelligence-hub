@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { GITHUB_CURRENT_PULL_REQUEST_FIELDS, githubCurrentPullRequestGitTarget } from "./github-current-pull-request-target.js";
 
 const PR_IDENTITY = "number url author { login } state isDraft headRefOid reviewDecision updatedAt";
 const REVIEW_FIELDS = "id author { login } state submittedAt commit { oid } body url";
@@ -33,7 +34,7 @@ const IDENTITY_QUERY = `query OwnReviewFeedbackIdentity($owner: String!, $name: 
 }`;
 const CONFLICT_QUERY = `query OwnPullRequestConflict($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
-    ${PR_IDENTITY} baseRefOid mergeStateStatus
+    ${GITHUB_CURRENT_PULL_REQUEST_FIELDS} isDraft mergeStateStatus
   } }
 }`;
 
@@ -237,8 +238,10 @@ export async function readOwnPullRequestConflict(run, identity, options = {}) {
   const [owner, name] = identity.repository.split("/");
   const result = await graphql(run, CONFLICT_QUERY, { owner, name, number: identity.number }, options);
   const pr = assertPullRequest(result.repository?.pullRequest, identity);
-  if (typeof pr.isDraft !== "boolean" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(pr.baseRefOid) ||
-      typeof pr.mergeStateStatus !== "string") throw invalid("conflict identity is unavailable");
+  if (typeof pr.isDraft !== "boolean" || typeof pr.mergeStateStatus !== "string") throw invalid("conflict identity is unavailable");
+  const target = pr.state === "OPEN" ? githubCurrentPullRequestGitTarget(pr, {
+    baseRepository: identity.repository, sourceAccountId: identity.account,
+  }) : null;
   return { state: pr.state.toLowerCase(), isDraft: pr.isDraft, author: pr.author.login,
-    headRefOid: pr.headRefOid, baseRefOid: pr.baseRefOid, mergeStateStatus: pr.mergeStateStatus };
+    headRefOid: pr.headRefOid, baseRefOid: target?.baseRefOid ?? null, mergeStateStatus: pr.mergeStateStatus };
 }
