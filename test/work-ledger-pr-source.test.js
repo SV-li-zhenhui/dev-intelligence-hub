@@ -9,7 +9,8 @@ import {
   currentWorkItemEvent,
   currentWorkItemInputBinding,
   normalizePullRequestWorkSource,
-  pullRequestHeadAdmission,
+  pullRequestHeadAdmission as singlePullRequestHeadAdmission,
+  pullRequestHeadAdmissions,
   pullRequestTrustedPredecessorHead,
   verifyPullRequestExecutionBinding,
   validatePullRequestSourceTransition,
@@ -25,6 +26,12 @@ const activatePendingPullRequestWorkSource = (source, options = {}) =>
 const HEAD_A = "a".repeat(40);
 const HEAD_B = "b".repeat(40);
 const HEAD_C = "c".repeat(40);
+
+function pullRequestHeadAdmission(state, item) {
+  assert.deepEqual(pullRequestHeadAdmissions(state, state.items),
+    state.items.map(candidate => singlePullRequestHeadAdmission(state, candidate)));
+  return singlePullRequestHeadAdmission(state, item);
+}
 
 function pullRequestEnvelope(
   sequence,
@@ -92,6 +99,19 @@ function executionBinding(item) {
     event: currentWorkItemEvent(item),
   });
 }
+
+test("batch Head admission matches individual authority and refreshes after mutation", () => {
+  const first = sourceItem(initialSource());
+  const state = { items: [first] };
+  assert.deepEqual(pullRequestHeadAdmissions(state, state.items),
+    state.items.map(item => pullRequestHeadAdmission(state, item)));
+  first.source = appendPullRequestWorkSource(first.source,
+    pullRequestEnvelope(2, HEAD_B, { previousHeadRefOid: HEAD_A }),
+    { activate: false }).source;
+  assert.deepEqual(pullRequestHeadAdmissions(state, state.items),
+    state.items.map(item => pullRequestHeadAdmission(state, item)));
+  assert.equal(pullRequestHeadAdmissions(state, state.items)[0].pending, true);
+});
 
 test("deferred A to B keeps A active and records B as pending", () => {
   const sourceA = initialSource();

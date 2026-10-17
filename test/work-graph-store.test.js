@@ -622,6 +622,66 @@ test("staging an escalation atomically reuses the standard ask-user outbox", asy
   );
 });
 
+test("a PR source root supports scoped escalation without duplicate publication", async () => {
+  const event = normalizeWorkflowEvent({
+    schemaVersion: 1, eventType: "pull_request.updated",
+    occurredAt: "2026-08-03T00:00:00.000Z",
+    source: { provider: "github", scopeId: "test-dashboard" },
+    subject: { id: "github:pr:acme/dashboard#42", repository: "acme/dashboard", number: 42 },
+    payload: { title: "PR 42", headRefOid: "a".repeat(40) },
+  });
+  const record = assignment(1);
+  record.assignment.target = { type: "role", id: "pr-engineer" };
+  record.event = event;
+  record.assignment.eventId = event.eventId;
+  const { service } = await fixture(0, { records: [record] });
+  const item = (await service.listItems()).items[0];
+  assert.equal(item.kind, "source_root");
+  const { planner } = graphPorts(service, "employee-orchestrator", item.itemId);
+  const command = escalationCommand(item, 1);
+  const staged = await planner.stageEscalation(command);
+  assert.equal(staged.item.status, "dispatch_pending");
+  const replay = await planner.stageEscalation(command);
+  assert.equal(replay.applied, false);
+  assert.equal(replay.outbox.intentId, staged.outbox.intentId);
+});
+
+test("automatic orchestration cannot overwrite a pending PR source cutover", async () => {
+  const prRecord = (sequence, scopeId) => {
+    const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.updated",
+      occurredAt: `2026-08-03T00:00:0${sequence}.000Z`, source: { provider: "github", scopeId },
+      subject: { id: "github:pr:acme/dashboard#42", repository: "acme/dashboard", number: 42 },
+      payload: { title: "PR 42", headRefOid: "a".repeat(40) } });
+    const record = assignment(sequence);
+    record.event = event;
+    record.assignment.eventId = event.eventId;
+    record.assignment.target = { type: "role", id: "pr-engineer" };
+    return record;
+  };
+  const { service, store, source } = await fixture(0, { records: [prRecord(1, "github-primary")] });
+  const old = (await service.listItems()).items[0];
+  const staged = await graphPorts(service, "employee-orchestrator", old.itemId).planner.stageEscalation(escalationCommand(old, 1));
+  const dispatch = await service.claimIntent({ intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision, dispatcherId: "attention-dispatcher", leaseDurationMs: 30_000 });
+  await service.ackIntent({ intentId: dispatch.intentId, expectedRevision: dispatch.revision,
+    dispatchLeaseId: dispatch.dispatchLeaseId, itemExpectedRevision: staged.item.revision,
+    outcome: "delivered", nextStatus: "waiting_user", actorId: "attention-dispatcher",
+    details: { questionRef: `attention-${"d".repeat(64)}` } });
+  source.records.push(prRecord(2, "github-secondary"));
+  await service.intake();
+  const pending = (await service.listItems()).items.find(item => item.itemId !== old.itemId);
+  assert.match(pending.statusReason, /^pr_source_cross_root_cutover_pending:/);
+  const revision = (await service.getGraphSnapshot()).graph.revision;
+  const { planner } = graphPorts(service, "employee-orchestrator", pending.itemId);
+  const writes = store.writes.length;
+  await assert.rejects(planner.pauseTask(scopedTaskCommand(pending, revision)),
+    error => error.code === "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING");
+  await assert.rejects(planner.stageEscalation(escalationCommand(pending, revision)),
+    error => error.code === "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING");
+  assert.equal(store.writes.length, writes);
+  assert.equal((await service.listItems()).items.find(item => item.itemId === pending.itemId).statusReason, pending.statusReason);
+});
+
 test("a failed sealed escalation clears its policy binding before restaging", async () => {
   const { service } = await fixture(1);
   const item = (await service.listItems()).items[0];

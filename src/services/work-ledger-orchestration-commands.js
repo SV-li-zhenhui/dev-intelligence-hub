@@ -26,7 +26,7 @@ import {
   normalizeLedgerTarget,
   workLedgerError,
 } from "./work-ledger-values.js";
-import { currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
+import { currentWorkItemExecutionBinding, pullRequestHeadAdmission } from "./work-ledger-pr-source.js";
 import { AUTO_RESUME_ON_CHILD_DELIVERY } from "./work-graph-wait-marker.js";
 
 const PAUSABLE_STATUSES = new Set(["queued", "blocked"]);
@@ -158,13 +158,19 @@ function requireScopedTask(state, authority, taskId) {
   return item;
 }
 
-function assertCoordinatableTask(item) {
-  if (!["assignment", "graph_task"].includes(item.kind)) {
+function assertCoordinatableTask(item, state) {
+  if (!["assignment", "graph_task", "source_root"].includes(item.kind)) {
     throw workLedgerError(
       "WORK_LEDGER_GRAPH_TASK_CONFLICT",
       "系统工作项不能由任务图编排器修改",
       409,
     );
+  }
+  if (item.kind === "source_root") {
+    const admission = pullRequestHeadAdmission(state, item);
+    if (!admission.current || admission.pending) {
+      throw workLedgerError("WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING", "PR 来源正在切换，不能覆盖其编排状态", 409);
+    }
   }
 }
 
@@ -203,7 +209,7 @@ export function planWorkGraphTaskReassignment({ state, input, clock }) {
   const { authority, command } = normalizeReassignCommand(input);
   const item = requireScopedTask(state, authority, command.taskId);
   assertCommandCas(state, item, command);
-  assertCoordinatableTask(item);
+  assertCoordinatableTask(item, state);
   assertNoActiveSideEffects(item);
   if (
     item.status !== "queued" ||
@@ -255,7 +261,7 @@ export function planWorkGraphTaskPause({ state, input, clock }) {
   );
   const item = requireScopedTask(state, authority, command.taskId);
   assertCommandCas(state, item, command);
-  assertCoordinatableTask(item);
+  assertCoordinatableTask(item, state);
   assertNoActiveSideEffects(item);
   if (!PAUSABLE_STATUSES.has(item.status)) {
     throw workLedgerError(
@@ -316,7 +322,7 @@ export function planWorkGraphTaskResume({ state, input, clock }) {
   );
   const item = requireScopedTask(state, authority, command.taskId);
   assertCommandCas(state, item, command);
-  assertCoordinatableTask(item);
+  assertCoordinatableTask(item, state);
   assertNoActiveSideEffects(item);
   if (item.status !== "paused") {
     throw workLedgerError(
@@ -357,7 +363,7 @@ export function planScopedWorkGraphCancellation({ state, input, clock }) {
     "取消任务请求无效",
   );
   const item = requireScopedTask(state, authority, command.taskId);
-  assertCoordinatableTask(item);
+  assertCoordinatableTask(item, state);
   return planWorkGraphCancellation({
     state,
     clock,
@@ -465,7 +471,7 @@ export function planWorkGraphEscalation({ state, input, clock }) {
   }
 
   assertCommandCas(state, item, command);
-  assertCoordinatableTask(item);
+  assertCoordinatableTask(item, state);
   assertNoActiveSideEffects(item);
   if (!ESCALATABLE_STATUSES.has(item.status)) {
     throw workLedgerError(

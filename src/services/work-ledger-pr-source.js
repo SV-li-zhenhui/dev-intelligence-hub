@@ -1731,7 +1731,7 @@ export function pullRequestTrustedPredecessorHead(state, root) {
   return pullRequestTrustedPredecessor(state, root)?.headRefOid ?? null;
 }
 
-function headAdmission(state, item, preserveInactiveHistory) {
+function headAdmission(state, item, preserveInactiveHistory, canonicalRootFor = canonicalPullRequestSourceRoot) {
   const binding = currentWorkItemInputBinding(item);
   if (binding === null) {
     return Object.freeze({ applies: false, current: true, pending: false });
@@ -1746,7 +1746,7 @@ function headAdmission(state, item, preserveInactiveHistory) {
   const currentEvent = root?.source?.kind === "pull_request"
     ? currentWorkItemEvent(root)
     : null;
-  const canonicalRoot = canonicalPullRequestSourceRoot(state, root, preserveInactiveHistory);
+  const canonicalRoot = canonicalRootFor(state, root, preserveInactiveHistory);
   const crossRootCutoverPending = state.items.some(
     (candidate) =>
       samePullRequestSourceSubject(candidate, root) &&
@@ -1798,6 +1798,22 @@ function headAdmission(state, item, preserveInactiveHistory) {
 
 export function pullRequestHeadAdmission(state, item) {
   return headAdmission(state, item, true);
+}
+
+// Share subject evaluation only within one synchronous snapshot read. No cache
+// survives a ledger mutation, including changes to another root for the PR.
+export function pullRequestHeadAdmissions(state, items, { preserveInactiveHistory = true } = {}) {
+  const canonicalRoots = new Map();
+  const canonicalRootFor = (snapshot, root, preserve) => {
+    if (root?.source?.kind !== "pull_request") return null;
+    const identity = root.source.identity;
+    const key = JSON.stringify([identity.subjectId, identity.repository, identity.pullRequestNumber]);
+    if (!canonicalRoots.has(key)) {
+      canonicalRoots.set(key, canonicalPullRequestSourceRoot(snapshot, root, preserve));
+    }
+    return canonicalRoots.get(key);
+  };
+  return items.map(item => headAdmission(state, item, preserveInactiveHistory, canonicalRootFor));
 }
 
 // Only persisted schema 11 projection validation uses the former policy.

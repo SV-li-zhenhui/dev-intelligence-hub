@@ -17,6 +17,7 @@ import {
   currentWorkItemEvent,
   currentWorkItemInputBinding,
   pullRequestHeadAdmission,
+  pullRequestHeadAdmissions,
   pullRequestHeadAdmissionForSchema11Migration,
 } from "./work-ledger-pr-source.js";
 import {
@@ -176,9 +177,13 @@ export function workGraphMemoryAuthorityStateDigest(state) {
 
 function authorityStateDigestForAdmission(state, headAdmission) {
   const items = Array.isArray(state?.items) ? state.items : [];
+  const admissions = pullRequestHeadAdmissions(state, items, {
+    preserveInactiveHistory: headAdmission !== pullRequestHeadAdmissionForSchema11Migration,
+  });
+  const admissionByItem = new Map(items.map((item, index) => [item, admissions[index]]));
   return ledgerDigest(
     items.flatMap((item) => {
-      const authority = sourceAuthorityFor(state, item, { headAdmission });
+      const authority = sourceAuthorityFor(state, item, { headAdmission: (_state, candidate) => admissionByItem.get(candidate) });
       return authority.applies
         ? [{
             taskId: item.itemId,
@@ -812,7 +817,7 @@ function normalizeProjection(
   if (migratingAuthority && prAuthorityItem !== undefined) {
     const migrationAllowance = Math.max(
       1,
-      items.filter((item) => sourceAuthorityFor({ items }, item).applies).length,
+      items.filter((item) => currentWorkItemInputBinding(item) !== null).length,
     );
     value = eventForAuthorityObservation({
       projection: value,
@@ -912,7 +917,7 @@ function normalizeProjection(
   const itemById = new Map(items.map((item) => [item.itemId, item]));
   const migrationAllowance = Math.max(
     1,
-    items.filter((item) => sourceAuthorityFor({ items }, item).applies).length,
+    items.filter((item) => currentWorkItemInputBinding(item) !== null).length,
   );
   const policyObservationAllowance = headAdmission === pullRequestHeadAdmission &&
     pending.at(-1)?.kind === "authority_observed" ? 1 : 0;
