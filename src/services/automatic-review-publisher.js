@@ -1,16 +1,33 @@
 import { createHash } from "node:crypto";
-import { automaticReviewEligibility, automaticTestingOwner } from "../domain/automatic-review-policy.js";
+import { isDeepStrictEqual } from "node:util";
+import { automaticReviewEligibility, automaticReviewContinuationEligibility, automaticTestingOwner } from "../domain/automatic-review-policy.js";
 
 // Only the composition root receives this port. Model output cannot grant
 // automatic publication, choose arbitrary assignees, or execute other actions.
 export class AutomaticReviewPublisher {
-  constructor({ enabled = false, assignAfterReview = true, queue, github, testingOwnersByProduct = {}, clock = () => new Date() }) {
+  constructor({ enabled = false, assignAfterReview = true, queue, github, reviewAdmissionReader = null, testingOwnersByProduct = {}, clock = () => new Date() }) {
     this.enabled = enabled === true;
     this.assignAfterReview = assignAfterReview !== false;
     this.queue = queue;
     this.github = github;
     this.testingOwners = structuredClone(testingOwnersByProduct);
     this.clock = clock;
+    if (reviewAdmissionReader !== null && typeof reviewAdmissionReader?.read !== "function") throw new TypeError("reviewAdmissionReader is invalid");
+    this.readAdmission = reviewAdmissionReader?.read.bind(reviewAdmissionReader) ?? null;
+  }
+
+  async eligible(facts, item) {
+    if (facts.headRefOid !== item.target.version) return false;
+    if (this.readAdmission === null) return automaticReviewEligibility(facts, item.actor.accountId, this.clock()) === null;
+    const binding = (item.action ?? item.display?.payload?.action)?.inputBinding;
+    const resourceId = `${binding?.repository}#${binding?.pullRequestNumber}`;
+    if (binding?.schemaVersion !== 2 || resourceId !== item.target.resourceId || binding.headRefOid !== item.target.version ||
+        binding.gitTarget?.sourceAccountId?.toLowerCase() !== item.actor.accountId.toLowerCase()) return false;
+    let context;
+    try { context = await this.readAdmission(binding); }
+    catch { return false; }
+    return isDeepStrictEqual(context?.inputBinding, binding) && context?.admission !== null &&
+      automaticReviewContinuationEligibility(facts, item.actor.accountId, this.clock(), context?.admission) === null;
   }
 
   async publish(item) {
@@ -20,7 +37,7 @@ export class AutomaticReviewPublisher {
     const match = /^([^#]+)#([1-9]\d*)$/.exec(item.target.resourceId);
     if (!match) return item;
     const facts = await this.github.readIncomingReviewRequest({ repository: match[1], number: Number(match[2]), account: item.actor.accountId });
-    if (automaticReviewEligibility(facts, item.actor.accountId, this.clock()) !== null || facts.headRefOid !== item.target.version) return item;
+    if (!await this.eligible(facts, item)) return item;
     let reviewHandoff;
     if (this.assignAfterReview) {
       if (action.reviewEvent === "APPROVE") {
@@ -45,6 +62,6 @@ export class AutomaticReviewPublisher {
     const match = /^([^#]+)#([1-9]\d*)$/.exec(envelope.target.resourceId);
     if (!match) return false;
     const facts = await this.github.readIncomingReviewRequest({ repository: match[1], number: Number(match[2]), account: envelope.actor.accountId });
-    return facts.headRefOid === envelope.target.version && automaticReviewEligibility(facts, envelope.actor.accountId, this.clock()) === null;
+    return this.eligible(facts, envelope);
   }
 }

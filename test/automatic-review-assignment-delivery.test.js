@@ -5,6 +5,9 @@ import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
 import { AutomaticReviewPublisher } from "../src/services/automatic-review-publisher.js";
 import { ReviewHandoffReconciler } from "../src/services/review-handoff-reconciler.js";
 import { createGitHubActionExecutor } from "../src/adapters/github-action-adapter.js";
+import { WorkLedgerService } from "../src/services/work-ledger-service.js";
+import { currentWorkItemExecutionBinding } from "../src/services/work-ledger-pr-source.js";
+import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 
 const HEAD = "a".repeat(40), NOW = "2026-10-15T02:00:00.000Z";
 const clone = (value) => structuredClone(value);
@@ -21,22 +24,73 @@ function plan(reviewEvent = "REQUEST_CHANGES") {
     actor, target, action, display: { title: "Review", summary: "Review summary", actionLabel: "Publish", evidence: [], payload: { actor, target, action } } };
 }
 
-async function fixture({ reviewEvent = "REQUEST_CHANGES", automatic = true, legacyAutomatic = false } = {}) {
+async function fixture({ reviewEvent = "REQUEST_CHANGES", automatic = true, legacyAutomatic = false, continuation = null } = {}) {
   const store = new MemoryStore(); let publications = 0, localRequests = 0;
   const facts = { kind: "pull_request", state: "open", isDraft: false, author: "developer", currentUser: "review-account",
     headRefOid: HEAD, incomingReviewFactsAvailable: true, reviewRecipient: "review-account",
     reviewReceivedAt: "2026-10-15T01:30:00Z", reviewReceivedVia: "assignee", reviewReceivedFrom: "developer", reviewRequestEventId: "assignment-42",
     title: "Qt regression", labels: [] };
+  let ledger = null, binding = null;
+  if (continuation) {
+    facts.ciStatus = "FAILURE";
+    facts.reviewReceivedAt = "2026-10-13T01:30:00Z";
+    const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "review-account",
+      baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "d".repeat(40),
+      headRepository: "acme/repo", headRefName: "fix/review", headRefOid: HEAD };
+    const eventFacts = clone(facts);
+    delete eventFacts.kind;
+    delete eventFacts.currentUser;
+    const event = normalizeWorkflowEvent({ schemaVersion: 1,
+      eventType: continuation === "assigned" ? "pull_request.created" : "pull_request.owner_requested",
+      occurredAt: continuation === "assigned" ? "2026-10-13T01:40:00.000Z" : "2026-10-15T01:50:00.000Z",
+      source: continuation === "assigned" ? { provider: "github", scopeId: "github-dashboard" }
+        : { provider: "local-owner", scopeId: "owner-request:123e4567-e89b-42d3-a456-426614174000" },
+      subject: { id: "github:pr:acme/repo#42", repository: "acme/repo", number: 42 },
+      payload: { ...eventFacts, relation: "review_requested", workType: "pull_request", gitTargetAvailable: true, gitTarget } });
+    const record = { sequence: 1, event, assignment: { assignmentId: "assignment-work-42", eventId: event.eventId,
+      target: { type: "role", id: "pr-engineer" }, reason: "Review", createdAt: event.occurredAt } };
+    let sequence = 0;
+    const makeLedger = () => new WorkLedgerService({ store, exclusiveLease: { run: operation => operation() },
+      clock: () => event.occurredAt, idFactory: () => `review-fixture-${++sequence}`,
+      assignmentSource: { async readAssignmentBatch({ afterSequence }) { return {
+        items: afterSequence === 0 ? [record] : [], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1,
+      }; } } });
+    ledger = makeLedger(); await ledger.recover(); await ledger.intake();
+    binding = currentWorkItemExecutionBinding((await ledger.listItems()).items[0]);
+    ledger = makeLedger(); await ledger.recover();
+  }
   const assignees = new Set(["review-account"]), calls = [];
   const issue = () => ({ number: 42, state: facts.state, html_url: "https://github.com/acme/repo/pull/42",
     assignees: [...assignees].map((login) => ({ login })) });
+  const admissionReader = ledger && { read: input => ledger.readAutomaticReviewAdmission(input) };
+  const publisherOptions = { enabled: true, clock: () => new Date(NOW),
+    testingOwnersByProduct: { qt: ["tester"] }, github: { async readIncomingReviewRequest() { return facts; } },
+    ...(admissionReader ? { reviewAdmissionReader: admissionReader } : {}) };
+  let published = null;
   const adapter = createGitHubActionExecutor({ ghCommand: path.resolve("fictional-gh.exe"),
+    ...(ledger ? { inputAuthorityVerifier: { verify: input => ledger.verifyPullRequestExecutionBinding(input) },
+      automaticReviewGuard: new AutomaticReviewPublisher(publisherOptions) } : {}),
     credentialSource: Object.freeze({ async acquire() { return Object.freeze({ use: (callback) => callback("fixture-token"), release() {} }); } }),
     runner: { async run(input) {
       calls.push(clone(input)); const route = input.args.find((value) => value.startsWith("repos/"));
       const method = input.args[input.args.indexOf("--method") + 1];
       let value;
-      if (!route && input.args.at(-1) === "user") value = { login: "review-account" };
+      if (input.args.includes("graphql")) value = { data: { repository: { nameWithOwner: "acme/repo", pullRequest: {
+        number: 42, url: issue().html_url, state: "OPEN", author: { login: facts.author }, changedFiles: 1,
+        headRefOid: facts.headRefOid, baseRefName: "main", headRefName: "fix/review", headRepository: { nameWithOwner: "acme/repo" },
+        baseRef: { name: "main", repository: { nameWithOwner: "acme/repo" }, target: { oid: "d".repeat(40) } },
+        headRef: { name: "fix/review", repository: { nameWithOwner: "acme/repo" }, target: { oid: facts.headRefOid } },
+      } } } };
+      else if (!route && input.args.at(-1) === "user") value = { login: "review-account" };
+      else if (route?.includes("/reviews")) {
+        if (method === "POST") {
+          const request = JSON.parse(input.input); publications++;
+          published = { id: 42, user: { login: "review-account" }, body: request.body, commit_id: request.commit_id,
+            state: { APPROVE: "APPROVED", REQUEST_CHANGES: "CHANGES_REQUESTED", COMMENT: "COMMENTED" }[request.event],
+            html_url: "https://github.com/acme/repo/pull/42#pullrequestreview-42", submitted_at: NOW };
+          value = published;
+        } else return { exitCode: 0, signal: null, stdout: published ? JSON.stringify(published) : "", stderr: "", truncated: false };
+      }
       else if (route === "repos/acme/repo/pulls/42") value = { ...issue(), head: { sha: facts.headRefOid }, user: { login: facts.author } };
       else if (route === "repos/acme/repo/issues/42") value = issue();
       else if (route === "repos/acme/repo/issues/42/assignees") {
@@ -47,11 +101,13 @@ async function fixture({ reviewEvent = "REQUEST_CHANGES", automatic = true, lega
     } } });
   const makeQueue = () => new ConfirmationQueue({ store, exclusiveLease: { run: (operation) => operation() }, clock: () => new Date(NOW),
     reviewHandoffPolicy: { testingOwnersByProduct: { qt: ["tester"] } },
-    executor: { async execute() { publications++; return { status: "applied", receipt: { id: "review-42" } }; }, async reconcile() { assert.fail("must not republish Review"); } } });
-  let queue = makeQueue(); await queue.recover(); const queued = await queue.enqueue(plan(reviewEvent));
+    executor: ledger ? adapter : { async execute() { publications++; return { status: "applied", receipt: { id: "review-42" } }; }, async reconcile() { assert.fail("must not republish Review"); } } });
+  let queue = makeQueue(); await queue.recover();
+  const reviewPlan = plan(reviewEvent);
+  if (binding) { reviewPlan.action.inputBinding = binding; reviewPlan.requestedBy.workItemId = binding.rootItemId; }
+  const queued = await queue.enqueue(reviewPlan);
   if (automatic && !legacyAutomatic) {
-    await new AutomaticReviewPublisher({ enabled: true, queue, clock: () => new Date(NOW),
-      testingOwnersByProduct: { qt: ["tester"] }, github: { async readIncomingReviewRequest() { return facts; } } }).publish(queued);
+    await new AutomaticReviewPublisher({ ...publisherOptions, queue }).publish(queued);
   } else {
     await queue.approve(queued.id, { requestId: legacyAutomatic ? `auto-review-v1-${"f".repeat(48)}` : "manual-review-42", expectedQueueRevision: queued.queueRevision,
       expectedItemRevision: queued.itemRevision, displayedPayloadDigest: queued.displayedPayloadDigest,
@@ -64,6 +120,26 @@ async function fixture({ reviewEvent = "REQUEST_CHANGES", automatic = true, lega
   return { facts, calls, assignees, reconciler, get queue() { return queue; },
     get publications() { return publications; }, get localRequests() { return localRequests; },
     async restart() { queue = makeQueue(); await queue.recover(); } };
+}
+
+for (const continuation of ["assigned", "owner_requested"]) {
+  test(`system ${continuation} continuation publishes failed-CI Review and hands off automatically after restart`, async () => {
+    const f = await fixture({ continuation, reviewEvent: "COMMENT" });
+    assert.equal(f.publications, 1);
+    const history = (await f.queue.list({ automatic: true })).items;
+    assert.equal(history.length, 1);
+    assert.equal(history[0].status, "completed");
+    assert.equal(history[0].automaticReview.publishedUrl, "https://github.com/acme/repo/pull/42");
+    await f.restart();
+    assert.equal((await f.reconciler().runCycle())[0].status, "completed");
+    assert.deepEqual([...f.assignees], ["developer"]);
+    await f.restart(); await f.reconciler().runCycle();
+    assert.equal(f.publications, 1);
+    assert.equal(f.localRequests, 0);
+    const handoff = (await f.queue.list({ automatic: true })).items[0].reviewHandoff;
+    assert.equal(handoff.status, "completed");
+    assert.equal(handoff.assignedLogin, "developer");
+  });
 }
 
 for (const reviewEvent of ["REQUEST_CHANGES", "COMMENT"]) {

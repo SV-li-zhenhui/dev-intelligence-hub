@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { createPullRequestExecutionBinding } from "../src/domain/pull-request-execution-binding.js";
+import { automaticReviewWorkAdmission } from "../src/domain/automatic-review-policy.js";
 import {
   activatePendingPullRequestWorkSource as activatePendingPullRequestWorkSourceWithCounter,
   appendPullRequestWorkSource as appendPullRequestWorkSourceWithCounter,
@@ -82,6 +83,22 @@ function initialSource() {
     pullRequestEnvelope(1, HEAD_A),
   ).source;
 }
+
+test("replacement Assign intake survives source normalization and later CI snapshots", () => {
+  const facts = { relation: "review_requested", reviewRequestEventId: "event-2", reviewReceivedAt: "2026-08-03T01:00:00Z" };
+  const initial = pullRequestEnvelope(1, HEAD_A);
+  let source = createPullRequestWorkSource(initial).source;
+  source = appendPullRequestWorkSource(source, pullRequestEnvelope(2, HEAD_A,
+    { occurredAt: "2026-08-03T01:10:00.000Z", gitFacts: facts })).source;
+  source = normalizePullRequestWorkSource(source);
+  source = appendPullRequestWorkSource(source, pullRequestEnvelope(3, HEAD_A,
+    { occurredAt: "2026-08-05T01:10:00.000Z", gitFacts: { ...facts, ciStatus: "FAILURE" } })).source;
+  const root = { ...sourceItem(normalizePullRequestWorkSource(source)), event: initial.event, createdAt: initial.event.occurredAt };
+  assert.equal(automaticReviewWorkAdmission(root).admittedAt, "2026-08-03T01:10:00.000Z");
+  const forged = structuredClone(source);
+  forged.revisions.at(-1).incomingReview.eventId = "different-assign";
+  assert.throws(() => normalizePullRequestWorkSource(forged));
+});
 
 function sourceItem(source) {
   return {

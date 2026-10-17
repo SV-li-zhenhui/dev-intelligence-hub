@@ -2718,6 +2718,23 @@ test("automatic Review admits failed checks but skips old incoming work and a di
   }
 });
 
+test("an already admitted automatic failed-CI Review is still claimed after its Assign window expires", async () => {
+  const time = controlledClock();
+  const item = workItem(1, { type: "role", id: "pr-engineer" });
+  item.createdAt = "2026-07-31T07:05:00Z";
+  item.event.source = { provider: "github", scopeId: "github-dashboard" };
+  item.event.payload = { kind: "pull_request", relation: "review_requested", state: "open", isDraft: false, author: "dev",
+    headRefOid: "a".repeat(40), ciStatus: "FAILURE", incomingReviewFactsAvailable: true, reviewRecipient: "me",
+    reviewReceivedFrom: "dev", reviewReceivedVia: "assignee", reviewRequestEventId: "AE_1", reviewReceivedAt: "2026-07-31T07:00:00Z" };
+  item.sourceQuarantine = null;
+  item.source = { kind: "pull_request", identity: item.event.source, scope: { active: true, kind: "automatic" },
+    current: { event: clone(item.event) }, revisions: [], activeRevision: 1 };
+  const ledger = new FakeLedger({ source: [item], time });
+  const loop = createLoop({ ledger, time, directory: new FakeRoleDirectory({ "pr-engineer": worker({ roleId: "pr-engineer" }) }),
+    automaticReviewPolicy: { enabled: true, account: "me" } });
+  assert.equal((await loop.runCycle()).claimed, 1);
+});
+
 test("root context contention defers one item and continues the cycle", async (t) => {
   for (const failurePoint of ["assemble", "execute"]) {
     await t.test(failurePoint, async () => {

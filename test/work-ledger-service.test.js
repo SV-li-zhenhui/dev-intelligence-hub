@@ -1551,6 +1551,25 @@ const PR_HEAD_A = "a".repeat(40);
 const PR_HEAD_B = "b".repeat(40);
 const PR_HEAD_C = "c".repeat(40);
 
+test("automatic Review admission is recovered from verified durable PR roots and rejects stale bindings", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1, { ciStatus: "FAILURE", author: "developer",
+    gitFacts: { ...prGitFacts(PR_HEAD_A), relation: "review_requested", reviewRequestEventId: "AE_42",
+      reviewReceivedAt: "2026-08-02T01:00:00Z" } })] });
+  await fixture.service.intake();
+  const root = (await fixture.service.listItems()).items[0];
+  const binding = prExecutionBinding(root);
+  const result = await fixture.service.readAutomaticReviewAdmission(binding);
+  assert.deepEqual(result.inputBinding, binding);
+  assert.deepEqual(result.admission, { kind: "assigned", admittedAt: root.createdAt,
+    reviewRequestEventId: "AE_42", reviewReceivedAt: "2026-08-02T01:00:00Z" });
+  fixture.time.advance(48 * 60 * 60 * 1000);
+  const restarted = await createFixture({ store: fixture.store, source: fixture.source, time: fixture.time });
+  assert.deepEqual(await restarted.service.readAutomaticReviewAdmission(binding), result);
+  await assert.rejects(restarted.service.readAutomaticReviewAdmission({ ...binding, headRefOid: PR_HEAD_B,
+    gitTarget: { ...binding.gitTarget, headRefOid: PR_HEAD_B } }),
+    { code: "WORK_LEDGER_PR_EXECUTION_BINDING_STALE" });
+});
+
 function prGitFacts(headRefOid, overrides = {}) {
   return {
     gitTargetAvailable: true,

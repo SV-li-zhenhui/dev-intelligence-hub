@@ -1,6 +1,6 @@
 import { normalizeWorkDecision } from "../domain/work-intent.js";
 import { TaskRunControlError } from './task-run-registry.js';
-import { automaticReviewEligibility } from "../domain/automatic-review-policy.js";
+import { automaticReviewEligibility, automaticReviewContinuationEligibility, automaticReviewWorkAdmission } from "../domain/automatic-review-policy.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { brainFailureOwnerAttention } from "./brain-failure-policy.js";
 import { OrchestratorServiceError } from "./orchestrator-service.js";
@@ -991,8 +991,15 @@ export class ProactiveWorkLoop {
       if (this.automaticOwnPrRepair !== null && !(await this.automaticOwnPrRepair.shouldRun(item))) continue;
       if (this.automaticReviewPolicy !== null && item.currentTarget?.id === "pr-engineer") {
         const event = currentWorkItemEvent(item);
-        if (event.source?.provider === "github" && event.payload?.relation === "review_requested" &&
-            (!this.automaticReviewPolicy.enabled || automaticReviewEligibility({ ...event.payload, kind: "pull_request" }, this.automaticReviewPolicy.account, normalizeLoopClock(this.clock)) !== null)) continue;
+        if (event.source?.provider === "github" && event.payload?.relation === "review_requested") {
+          if (!this.automaticReviewPolicy.enabled) continue;
+          const admission = automaticReviewWorkAdmission(item);
+          const facts = { ...event.payload, kind: "pull_request" };
+          const eligibility = admission === null
+            ? automaticReviewEligibility(facts, this.automaticReviewPolicy.account, normalizeLoopClock(this.clock))
+            : automaticReviewContinuationEligibility(facts, this.automaticReviewPolicy.account, normalizeLoopClock(this.clock), admission);
+          if (eligibility !== null) continue;
+        }
       }
       if (
         !issueIsEligible(

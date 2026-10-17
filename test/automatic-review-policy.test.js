@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { automaticReviewEligibility, automaticTestingOwner } from "../src/domain/automatic-review-policy.js";
+import { automaticReviewEligibility, automaticReviewContinuationEligibility, automaticReviewWorkAdmission, automaticTestingOwner } from "../src/domain/automatic-review-policy.js";
 
 const now = "2026-10-09T10:00:00.000Z";
 const item = {
@@ -43,4 +43,59 @@ test("testing routing uses explicit product evidence and configured owners only"
   assert.deepEqual(automaticTestingOwner({ title: "B/S build", labels: [] }, owners), { login: "bs-tester", product: "bs" });
   assert.equal(automaticTestingOwner({ title: "ambiguous", labels: [] }, owners), null);
   assert.equal(automaticTestingOwner({ title: "Qt renderer" }, {}), null);
+});
+
+function admittedRoot({ createdAt = "2026-10-09T09:10:00Z", provider = "github", workType = "pull_request", facts = {} } = {}) {
+  const source = { provider, scopeId: provider === "github" ? "github-dashboard" : "owner-request:request-1" };
+  const event = { source, eventType: provider === "github" ? "pull_request.created" : "pull_request.owner_requested",
+    payload: { ...item, relation: "review_requested", workType, ...facts } };
+  return { createdAt, event, sourceQuarantine: null, source: { kind: "pull_request", identity: source,
+    scope: { active: true, kind: provider === "github" ? "automatic" : "owner_requested" }, activeRevision: 1,
+    current: { event }, revisions: [{ revision: 1, disposition: "accepted", occurredAt: createdAt }] } };
+}
+
+test("ledger intake proof survives later snapshots without moving the original Assign window", () => {
+  const root = admittedRoot();
+  const admission = automaticReviewWorkAdmission(root);
+  root.source.current = { event: { ...root.event, occurredAt: "2026-10-11T09:00:00Z", payload: { ...root.event.payload, ciStatus: "FAILURE" } } };
+  assert.deepEqual(automaticReviewWorkAdmission(root), admission);
+  const later = "2026-10-11T10:00:00Z";
+  assert.equal(automaticReviewEligibility(root.source.current.event.payload, "reviewer", later), "OUTSIDE_RECEIVED_WINDOW");
+  assert.equal(automaticReviewContinuationEligibility(root.source.current.event.payload, "reviewer", later, admission), null);
+});
+
+test("old first observations cannot claim prior admission, and a later Assign cannot borrow the first root's timestamp", () => {
+  const lateRoot = admittedRoot({ createdAt: "2026-10-11T09:10:00Z" });
+  assert.equal(automaticReviewContinuationEligibility(item, "reviewer", "2026-10-11T10:00:00Z",
+    automaticReviewWorkAdmission(lateRoot)), "OUTSIDE_RECEIVED_WINDOW");
+  const root = admittedRoot();
+  root.source.current = { event: { ...root.event, payload: { ...root.event.payload, reviewRequestEventId: "event-2", reviewReceivedAt: "2026-10-10T09:00:00Z" } } };
+  root.source.activeRevision = 2;
+  root.source.revisions.push({ revision: 2, disposition: "accepted", occurredAt: "2026-10-12T09:00:00Z" });
+  assert.equal(automaticReviewWorkAdmission(root).admittedAt, "2026-10-12T09:00:00.000Z");
+});
+
+test("only a current explicit Review root grants owner continuation, not general triage or retired work", () => {
+  const root = admittedRoot({ provider: "local-owner" });
+  assert.deepEqual(automaticReviewWorkAdmission(root), { kind: "owner_requested", admittedAt: root.createdAt });
+  assert.equal(automaticReviewWorkAdmission(admittedRoot({ provider: "local-owner", workType: "general" })), null);
+  root.source.scope.active = false;
+  assert.equal(automaticReviewWorkAdmission(root), null);
+  root.source.scope.active = true; root.sourceQuarantine = { reason: "stale" };
+  assert.equal(automaticReviewWorkAdmission(root), null);
+});
+
+test("replacement Assign retains its own timely intake across later snapshots", () => {
+  const root = admittedRoot();
+  const incomingReview = { eventId: "event-2", receivedAt: "2026-10-10T09:00:00Z" };
+  const facts = { ...item, relation: "review_requested", reviewRequestEventId: incomingReview.eventId, reviewReceivedAt: incomingReview.receivedAt };
+  root.source.current = { event: { ...root.event, payload: facts } };
+  root.source.activeRevision = 3;
+  root.source.revisions.push(
+    { revision: 2, disposition: "accepted", occurredAt: "2026-10-10T09:10:00Z", incomingReview },
+    { revision: 3, disposition: "accepted", occurredAt: "2026-10-12T09:10:00Z", incomingReview },
+  );
+  const admission = automaticReviewWorkAdmission(root);
+  assert.equal(admission.admittedAt, "2026-10-10T09:10:00.000Z");
+  assert.equal(automaticReviewContinuationEligibility(facts, "reviewer", "2026-10-12T10:00:00Z", admission), null);
 });

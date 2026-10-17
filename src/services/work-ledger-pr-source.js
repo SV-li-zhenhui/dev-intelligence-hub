@@ -476,6 +476,10 @@ function revisionFrom(
     causalHeadRefOid,
     authorityEpochChanged,
     authorityEpochCutover: false,
+    ...(input.event.source.provider === "github" && input.event.payload.relation === "review_requested" &&
+      input.event.payload.reviewRequestEventId && Number.isFinite(Date.parse(input.event.payload.reviewReceivedAt))
+      ? { incomingReview: { eventId: input.event.payload.reviewRequestEventId,
+        receivedAt: new Date(input.event.payload.reviewReceivedAt).toISOString() } } : {}),
     disposition,
   };
 }
@@ -845,6 +849,14 @@ function normalizeIdentity(value) {
 }
 
 function normalizeRevision(value, expectedRevision) {
+  let incomingReview;
+  if (Object.hasOwn(value, "incomingReview")) {
+    exact(value.incomingReview, ["eventId", "receivedAt"], "PR incoming Review");
+    incomingReview = { eventId: text(value.incomingReview.eventId, "incomingReview.eventId", 192),
+      receivedAt: timestamp(value.incomingReview.receivedAt, "incomingReview.receivedAt") };
+    const { incomingReview: omitted, ...revision } = value;
+    value = revision;
+  }
   const hasScopeRevocation = hasExactLedgerKeys(
     value,
     SCOPE_REVOCATION_REVISION_KEYS,
@@ -895,6 +907,7 @@ function normalizeRevision(value, expectedRevision) {
       ? value.authorityEpochCutover
       : undefined,
     ...(hasScopeRevocation ? { scopeRevocationApplied: true } : {}),
+    ...(incomingReview ? { incomingReview } : {}),
     disposition,
   };
 }
@@ -1055,6 +1068,9 @@ function normalizeEventPointer(
     current.occurredAt !== event.occurredAt ||
     current.headRefOid !== event.payload.headRefOid ||
     current.headRefOid !== revision.headRefOid
+    || (revision.incomingReview !== undefined &&
+      (revision.incomingReview.eventId !== event.payload.reviewRequestEventId ||
+       Date.parse(revision.incomingReview.receivedAt) !== Date.parse(event.payload.reviewReceivedAt)))
   ) {
     throw invalid("PR current input 绑定无效");
   }

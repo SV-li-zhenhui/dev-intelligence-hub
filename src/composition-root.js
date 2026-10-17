@@ -1973,6 +1973,9 @@ export async function createApplication({
           automaticReviewGuard: new AutomaticReviewPublisher({
             enabled: config.githubActions?.automaticReview === true,
             github,
+            ...(workLedgerRuntime === null ? {} : { reviewAdmissionReader: {
+              read: binding => workLedgerRuntime.readAutomaticReviewAdmission(binding),
+            } }),
             ...(workCoordinationDependencies.clock ? { clock: workCoordinationDependencies.clock } : {}),
           }),
         }),
@@ -2140,6 +2143,9 @@ export async function createApplication({
             assignAfterReview: config.githubActions.assignAfterAutomaticReview !== false,
             queue: confirmationRuntime.queue,
             github,
+            reviewAdmissionReader: {
+              read: binding => workLedgerRuntime.readAutomaticReviewAdmission(binding),
+            },
             testingOwnersByProduct: coordinationConfig.policy?.testingOwnersByProduct || {},
             ...(workCoordinationDependencies.clock ? { clock: workCoordinationDependencies.clock } : {}),
           }),

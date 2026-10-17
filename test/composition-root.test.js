@@ -617,6 +617,46 @@ test("review handoff admits the configured GitHub and local resolution budgets",
   } finally { await application.close(); }
 });
 
+test("automatic Review publication and final execution share the trusted ledger admission reader", async () => {
+  const calls = {}, closeCalls = [];
+  const config = workCoordinationConfig();
+  config.githubActions.automaticReview = true;
+  const stubs = localCoordinationStubs({ calls, closeCalls,
+    runners: { "github-review-runner": { async claim() {}, async advance() {} } } });
+  const ledger = await stubs.workLedgerRuntimeFactory({});
+  let reads = 0;
+  ledger.readAutomaticReviewAdmission = async inputBinding => {
+    reads++;
+    return { inputBinding, admission: { kind: "owner_requested", admittedAt: "2026-10-09T09:50:00Z" } };
+  };
+  const application = await createApplication({ config, store: memoryStore(), ...stubs,
+    workLedgerRuntimeFactory: async () => ledger,
+    workCoordinationDependencies: { clock: () => "2026-10-09T10:00:00.000Z" },
+    confirmationRuntimeFactory: async (_config, dependencies) => {
+      calls.guard = dependencies.automaticReviewGuard;
+      return { queue: confirmationQueuePort(), producerQueue: confirmationProducerPort(), async close() {} };
+    },
+    githubReviewProposalRunnerFactory: options => {
+      calls.publisher = options.automaticReviewPublisher;
+      return { async runCycle() {} };
+    },
+    workProposalRunnerGroupFactory: () => ({ async runCycle() {} }),
+  });
+  try {
+    const head = "a".repeat(40);
+    const binding = { schemaVersion: 2, repository: "acme/repo", pullRequestNumber: 42,
+      headRefOid: head, gitTarget: { sourceAccountId: "review-account" } };
+    const item = { actor: { accountId: "review-account" }, target: { resourceId: "acme/repo#42", version: head },
+      action: { inputBinding: binding } };
+    const facts = { kind: "pull_request", state: "open", isDraft: false, ciStatus: "FAILURE", author: "developer",
+      headRefOid: head, incomingReviewFactsAvailable: true, reviewRecipient: "review-account", reviewReceivedFrom: "developer",
+      reviewReceivedAt: "2026-10-01T09:00:00Z", reviewReceivedVia: "assignee", reviewRequestEventId: "AE_42" };
+    assert.equal(await calls.publisher.eligible(facts, item), true);
+    assert.equal(await calls.guard.eligible(facts, item), true);
+    assert.equal(reads, 2);
+  } finally { await application.close(); }
+});
+
 async function within(milliseconds, promise) {
   let timer;
   try {

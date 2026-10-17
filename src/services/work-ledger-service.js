@@ -1,4 +1,5 @@
 import { scheduler } from "node:timers/promises";
+import { automaticReviewWorkAdmission } from "../domain/automatic-review-policy.js";
 import { inactivePullRequestTakeoverRecoveryProof } from "./work-ledger-pr-retirement-recovery.js";
 import { createWorkIntentDispatchBinding } from "../domain/work-intent-dispatch-binding.js";
 import { planWorkItemRunControl } from './work-ledger-run-control.js';
@@ -1091,6 +1092,18 @@ export class WorkLedgerService {
           ledgerRevision: this.state.revision,
           current,
         });
+      }),
+    );
+  }
+
+  async readAutomaticReviewAdmission(input = {}) {
+    this.#assertReady();
+    return this.operationQueue.enqueue(() =>
+      this.exclusiveLease.run(async () => {
+        this.state = await this.#readDurableState();
+        const inputBinding = verifyPullRequestExecutionAuthority(this.state, input);
+        const root = this.state.items.find(item => item.itemId === inputBinding.rootItemId);
+        return cloneLedgerValue({ inputBinding, admission: automaticReviewWorkAdmission(root, inputBinding.inputRevision) });
       }),
     );
   }
