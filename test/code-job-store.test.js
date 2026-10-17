@@ -730,6 +730,32 @@ test("createApprovedJob persists one queued job with all four digest bindings", 
   assert.match(durable.recordDigest, /^[a-f0-9]{64}$/);
 });
 
+test("durable writes preserve bounded host-composed large files through observation and restart", async () => {
+  const fixture = await readyStore();
+  const created = await fixture.jobs.createApprovedJob(approval({ grant: grant({ operation: "modify",
+    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify], writablePaths: ["src"] }) }));
+  const starting = await fixture.jobs.claimStarting({ jobId: created.job.jobId, expectedRevision: created.job.revision });
+  const active = await fixture.jobs.activate({ jobId: created.job.jobId, expectedRevision: starting.job.revision, workspaceRevision: "4".repeat(64) });
+  const content = "preserve this large source line\n".repeat(5_000);
+  assert.ok(content.length > 128 * 1024);
+  const action = { type: "write_text", actionId: "large-host-write", path: "src/large.cpp", content,
+    expectedSha256: "3".repeat(64), expectedWorkspaceRevision: "4".repeat(64) };
+  const prepared = await fixture.jobs.prepareAction({ jobId: active.job.jobId, expectedRevision: active.job.revision, action });
+  const reopened = await readyStore({ store: fixture.store, time: fixture.time });
+  const persisted = await reopened.jobs.getForWorker(active.job.jobId);
+  assert.equal(persisted.execution.pendingAction.action.content, content);
+  const observed = await reopened.jobs.recordObservation({ jobId: persisted.jobId, expectedRevision: persisted.revision,
+    actionId: action.actionId, status: "succeeded", workspaceRevision: "5".repeat(64), detail: { result: { bytes: content.length } } });
+  assert.equal(observed.job.execution.observations[0].action.content, content);
+  assert.deepEqual(normalizeCodeJob(observed.job), observed.job);
+  const writes = fixture.store.writeCount;
+  await assert.rejects(reopened.jobs.prepareAction({ jobId: observed.job.jobId, expectedRevision: observed.job.revision,
+    action: { ...action, actionId: "too-large-host-write", expectedWorkspaceRevision: "5".repeat(64), content: "x".repeat(1024 * 1024 + 1) } }),
+  { code: "CODE_JOB_ACTION_TOO_LARGE" });
+  assert.equal(fixture.store.writeCount, writes);
+  assert.ok(prepared.job.execution.pendingAction);
+});
+
 test("live job detail paginates revision-bound sanitized observations", async () => {
   const fixture = await readyStore();
   const request = approval({

@@ -405,6 +405,11 @@ test("automatic conflict capability recovery resumes one settled system block ac
     if (changed === "revoked") f.revokeGrant();
     if (changed === "disabled") f.config.githubActions.automaticOwnPrRepair = false;
     if (changed === "other-run") proof.runId = "different-run";
+    if (changed === null) {
+      const state = await f.store.read("automatic-own-pr-conflict-state");
+      state.records[0].capabilityRecovery = { capability: "conflict-edit-and-source-v1", pausedRevision: 8, runId: "earlier-stopped-run" };
+      await f.store.write("automatic-own-pr-conflict-state", state);
+    }
     await f.restart();
     await f.service.runCycle();
     assert.equal(resumes, changed === null ? 1 : 0, String(changed));
@@ -415,7 +420,8 @@ test("automatic conflict capability recovery resumes one settled system block ac
       await f.service.runCycle();
       assert.equal(resumes, 1, "a second block cannot replay the one-time capability recovery");
       const state = await f.store.read("automatic-own-pr-conflict-state");
-      assert.equal(state.records[0].capabilityRecovery.pausedRevision, 12);
+      assert.equal(state.records[0].largeActionRecovery.pausedRevision, 12);
+      assert.equal(state.records[0].capabilityRecovery.runId, "earlier-stopped-run", "retain the earlier recovery audit");
     }
     assert.equal(f.pushes.length, 0);
   }

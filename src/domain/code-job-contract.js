@@ -49,7 +49,9 @@ const CANCELLABLE_JOB_STATUSES = new Set([
 const OBSERVATION_STATUSES = new Set(["succeeded", "failed", "interrupted"]);
 const MAX_OBSERVATIONS = 128;
 const MAX_DETAIL_BYTES = 128 * 1024;
-const MAX_PENDING_ACTION_BYTES = 128 * 1024;
+// Inline model replies keep their smaller transport bound. A trusted host
+// edit may preserve a larger file while still fitting this durable limit.
+export const CODE_JOB_MAXIMUM_ACTION_BYTES = 1024 * 1024;
 const MAX_JSON_DEPTH = 20;
 const MAX_JSON_COLLECTION_SIZE = 10_000;
 
@@ -729,7 +731,7 @@ function normalizePendingAction(value, sessionId, error) {
     throw error;
   }
   if (
-    Buffer.byteLength(JSON.stringify(action), "utf8") > MAX_PENDING_ACTION_BYTES
+    Buffer.byteLength(JSON.stringify(action), "utf8") > CODE_JOB_MAXIMUM_ACTION_BYTES
   ) {
     throw error;
   }
@@ -850,7 +852,7 @@ function normalizeObservation(value, sessionId, grant, error) {
   }
   if (
     Buffer.byteLength(JSON.stringify(action), "utf8") >
-      MAX_PENDING_ACTION_BYTES
+      CODE_JOB_MAXIMUM_ACTION_BYTES
   ) {
     throw error;
   }

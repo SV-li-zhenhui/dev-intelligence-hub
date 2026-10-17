@@ -1,5 +1,6 @@
 import {
   CODE_JOB_STATUSES,
+  CODE_JOB_MAXIMUM_ACTION_BYTES,
   cloneCodeJobValue,
   codeJobError,
   codeJobIdForGrant,
@@ -3026,6 +3027,9 @@ export class CodeJobStore {
       }
       if (!job.grant.allowedActions.includes(action.type)) {
         throw transitionConflict("可信动作超出代码任务授权范围");
+      }
+      if (Buffer.byteLength(JSON.stringify(action), "utf8") > CODE_JOB_MAXIMUM_ACTION_BYTES) {
+        throw storeError("CODE_JOB_ACTION_TOO_LARGE", "可信动作超过持久化大小上限", 413);
       }
       if (
         action.type === "run_profile" &&

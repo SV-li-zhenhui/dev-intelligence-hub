@@ -35,6 +35,11 @@ function normalizeState(value) {
         typeof record.capabilityRecovery.runId !== "string" || !record.capabilityRecovery.runId || record.capabilityRecovery.runId.length > 256)) {
       throw new Error("自动冲突修复恢复记录无效");
     }
+    if (record.largeActionRecovery !== undefined && (record.largeActionRecovery?.capability !== "conflict-large-action-v1" ||
+        !Number.isSafeInteger(record.largeActionRecovery.pausedRevision) || record.largeActionRecovery.pausedRevision < 1 ||
+        typeof record.largeActionRecovery.runId !== "string" || !record.largeActionRecovery.runId || record.largeActionRecovery.runId.length > 256)) {
+      throw new Error("自动冲突修复大文件恢复记录无效");
+    }
   }
   return structuredClone(value);
 }
@@ -286,7 +291,7 @@ export class AutomaticOwnPrConflict {
         job.pendingActionType !== null || job.uncertainty !== null ||
         job.pause?.reason !== "等待人工处理（CODE_BRAIN_COMPLETION_NOT_READY）" ||
         !samePullRequestExecutionBinding(job.inputBinding, record.inputBinding) ||
-        (record.capabilityRecovery && record.capabilityRecovery.pausedRevision !== job.revision)) return false;
+        (record.largeActionRecovery && record.largeActionRecovery.pausedRevision !== job.revision)) return false;
     const grant = codeItem.display.payload.action.grant;
     if (job.grantDigest !== grant.grantDigest || grant.executionSource?.kind !== "conflict_preparation" ||
         !await this.#current(record.inputBinding) || !await this.#grantCurrent(grant)) return false;
@@ -301,10 +306,10 @@ export class AutomaticOwnPrConflict {
         receipt.phase !== "failed" || receipt.outcomeCode !== "CODE_BRAIN_COMPLETION_NOT_READY" || receipt.stopConfirmed !== true ||
         typeof receipt.runId !== "string" || !receipt.runId || !Number.isFinite(finished) || !Number.isFinite(started) || !Number.isFinite(paused) ||
         started < Date.parse(job.createdAt) || started > finished || finished > paused ||
-        (record.capabilityRecovery && record.capabilityRecovery.runId !== receipt.runId)) return false;
-    if (!record.capabilityRecovery) {
+        (record.largeActionRecovery && record.largeActionRecovery.runId !== receipt.runId)) return false;
+    if (!record.largeActionRecovery) {
       await this.#save({ ...this.#state, records: this.#state.records.map(row => row.jobId === record.jobId ? {
-        ...row, capabilityRecovery: { capability: "conflict-edit-and-source-v1", pausedRevision: job.revision, runId: receipt.runId },
+        ...row, largeActionRecovery: { capability: "conflict-large-action-v1", pausedRevision: job.revision, runId: receipt.runId },
       } : row) });
     }
     // CAS protects concurrent controls. A durable owner pause in TaskRuns is
