@@ -105,6 +105,15 @@ test("own repair publication follows completed packages and remains outside inde
   assert.equal(calls.some(([name]) => name === "own_pr_repairs"), false);
 });
 
+test("automatic developer cycles advance admitted jobs and proposals without general memory scheduling", async () => {
+  const { service, calls } = fixture({
+    automaticOwnPrRepair: { async runCycle(options) { calls.push(["own_pr_repairs", options]); return {}; } },
+  });
+  await service.runCycle({ roleId: "developer" });
+  assert.deepEqual(calls.map(([name]) => name), ["code_jobs", "code_job_change_packages",
+    "proposal_execution", "proposals", "own_pr_repairs", "work", "dispatch"]);
+});
+
 test("the PR engineer publishes its Review without waiting for general code jobs", async () => {
   const calls = [];
   let reviewReady = false;

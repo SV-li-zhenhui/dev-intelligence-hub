@@ -3,8 +3,9 @@ import test from "node:test";
 import { createCodeJobGrant, createQueuedCodeJob, CODE_JOB_ACTIONS_BY_OPERATION } from "../src/domain/code-job-contract.js";
 import { projectNormalizedCodeJobForBrowser } from "../src/domain/code-job-browser-projection.js";
 import { FailedCodeJobContextReader } from "../src/services/failed-code-job-context-reader.js";
+import { AutomaticOwnPrInspectionRecovery } from "../src/services/automatic-own-pr-inspection-recovery.js";
 
-function fixture() {
+function fixture({ operation = "modify", failureCode = "GIT_SNAPSHOT_TIMEOUT", actions = ["read_text", "search_text", "read_text"] } = {}) {
   const itemId = "work-item-repair";
   const inputBinding = {
     schemaVersion: 1, kind: "pull_request", repository: "acme/widgets", pullRequestNumber: 17,
@@ -17,10 +18,10 @@ function fixture() {
     source: { assignmentId: "assignment-repair", eventId: "event-repair" },
     subject: { id: "github:pr:acme/widgets#17", repository: "acme/widgets", number: 17 },
     repository: "acme/widgets", workspaceId: "widgets-local", inputBinding,
-    workspaceAuthorityDigest: "9".repeat(64), operation: "modify", objective: "Repair the review feedback",
+    workspaceAuthorityDigest: "9".repeat(64), operation, objective: "Repair the review feedback",
     acceptanceCriteria: ["Cover each outstanding defect"], evidence: ["review-feedback"],
-    summary: "Repair feedback", reason: "Requested changes", allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify],
-    writablePaths: ["src"], requiredProfiles: [{ id: "tests", configDigest: "b".repeat(64) }], brainDigest: "c".repeat(64),
+    summary: "Repair feedback", reason: "Requested changes", allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION[operation]],
+    writablePaths: operation === "modify" ? ["src"] : [], requiredProfiles: [{ id: "tests", configDigest: "b".repeat(64) }], brainDigest: "c".repeat(64),
   });
   const raw = structuredClone(createQueuedCodeJob({
     confirmationId: "confirmation-repair", requestId: "request-repair-0001", grant,
@@ -28,11 +29,11 @@ function fixture() {
   }, { sequence: 1, revision: 1, createdAt: "2026-08-02T06:00:00.000Z" }));
   raw.status = "failed";
   raw.updatedAt = "2026-08-02T06:01:00.000Z";
-  raw.execution.turn = 3;
-  raw.execution.observations = ["read_text", "search_text", "read_text"].map((actionType) => ({
+  raw.execution.turn = actions.length;
+  raw.execution.observations = actions.map((actionType) => ({
     actionType, status: "succeeded", recordedAt: "2026-08-02T06:00:30.000Z",
   }));
-  raw.execution.result = { kind: "failed", detail: { code: "GIT_SNAPSHOT_TIMEOUT", message: "DO-NOT-EXPOSE-RAW-ERROR" }, recordedAt: raw.updatedAt };
+  raw.execution.result = { kind: "failed", detail: { code: failureCode, message: "DO-NOT-EXPOSE-RAW-ERROR" }, recordedAt: raw.updatedAt };
   raw.execution.memoryProjection = { memoryRecordId: `memory-${"f".repeat(64)}`, projectedAt: raw.updatedAt };
   const job = projectNormalizedCodeJobForBrowser(raw);
   const decisionContext = {
@@ -62,6 +63,99 @@ test("failed repair context includes the actual failure and matching owner recov
   assert.equal(result.ownerRetry.note, f.retry.details.context.note);
   assert.equal(JSON.stringify(result).includes("DO-NOT-EXPOSE-RAW-ERROR"), false);
   assert.deepEqual(f.calls, [{ jobId: f.detail.job.jobId, limit: 20 }, { itemId: f.input.itemId, limit: 100, order: "newest" }]);
+});
+
+async function recoveryFixture(options = {}) {
+  const f = fixture({ operation: "inspect", failureCode: "GIT_HEAD_UNAVAILABLE", actions: [], ...options });
+  const state = new Map();
+  const calls = [];
+  const item = { itemId: f.input.itemId, revision: 5, status: "blocked", statusReason: "proposal_failed",
+    currentTarget: { type: "role", id: "developer" }, activeIntentId: null, leaseId: null,
+    graph: { deliveries: [] }, decisionContext: structuredClone(f.input.decisionContext) };
+  const dependencies = {
+    store: { async read(key, fallback) { return structuredClone(state.get(key) ?? fallback); },
+      async write(key, value) { state.set(key, structuredClone(value)); } },
+    ledger: { async listItems() { return { items: [structuredClone(item)] }; },
+      async readItemForReconciliation() { return structuredClone(item); },
+      async transition(request) { calls.push(request); item.status = request.toStatus; item.revision += 1; } },
+    codeJobReader: { async get() { return f.detail.job; } }, failedContextReader: f.reader,
+    current: async () => ({}), objectSync: { async prepare() { calls.push("objects-ready"); } },
+  };
+  const makeService = async () => { const service = new AutomaticOwnPrInspectionRecovery(dependencies); await service.recover(); return service; };
+  return { ...f, item, state, calls, dependencies, makeService, service: await makeService() };
+}
+
+test("automatic inspection recovery prepares objects then requeues the same failed task with history intact", async () => {
+  const f = await recoveryFixture();
+  assert.equal((await f.service.runCycle()).requeued, 1);
+  assert.equal(f.calls[0], "objects-ready");
+  assert.deepEqual(f.calls[1], { itemId: f.item.itemId, expectedRevision: 5, leaseId: null,
+    actorId: "automatic-own-pr-inspection-recovery", toStatus: "queued", reason: "automatic_inspection_objects_ready",
+    details: { code: "GIT_HEAD_UNAVAILABLE", downstreamRef: f.detail.job.jobId } });
+  assert.deepEqual(f.item.decisionContext, f.input.decisionContext);
+  f.item.status = "blocked";
+  assert.equal((await (await f.makeService()).runCycle()).requeued, 0, "restart cannot replay a settled recovery");
+  assert.equal(f.calls.length, 2);
+});
+
+test("automatic inspection recovery preserves failed modifications, observed actions and uncertain context", async (t) => {
+  for (const scenario of [
+    { operation: "modify" }, { failureCode: "GIT_SNAPSHOT_TIMEOUT" }, { actions: ["read_text"] },
+    { change: f => { f.item.leaseId = "active-lease"; } },
+    { change: f => { f.item.activeIntentId = "active-intent"; } },
+    { change: f => { f.item.graph.deliveries = [{ status: "submitted" }]; } },
+    { change: f => { f.item.status = "paused"; } },
+    { change: f => { f.detail.historyAvailable = false; } },
+    { change: f => { f.dependencies.current = async () => null; } },
+    { change: f => { f.dependencies.objectSync.prepare = async () => { throw Object.assign(new Error(), { code: "OBJECTS_NOT_READY" }); }; } },
+  ]) await t.test(JSON.stringify(scenario), async () => {
+    const f = await recoveryFixture(scenario);
+    scenario.change?.(f);
+    f.service = await f.makeService();
+    assert.equal((await f.service.runCycle()).requeued, 0);
+    assert.equal(f.item.status === "queued", false);
+    assert.equal(f.calls.some(value => typeof value === "object"), false);
+  });
+});
+
+test("automatic inspection recovery retains its durable three-attempt budget", async () => {
+  const f = await recoveryFixture();
+  f.state.set("automatic-own-pr-inspection-recovery-state", { schemaVersion: 1,
+    records: [1, 2, 3].map(attempt => ({ itemId: f.item.itemId, jobId: `code-job-old-${attempt}`,
+      inputBinding: f.input.inputBinding, attempt, status: "requeued" })) });
+  assert.equal((await (await f.makeService()).runCycle()).requeued, 0);
+  assert.deepEqual(f.calls, []);
+});
+
+test("inspection recovery rechecks the target and task after synchronization", async (t) => {
+  for (const change of [
+    f => { f.dependencies.current = async () => null; },
+    f => { f.item.revision += 1; },
+    f => { f.item.leaseId = "new-lease"; },
+  ]) await t.test(change.toString(), async () => {
+    const f = await recoveryFixture();
+    f.dependencies.objectSync.prepare = async () => { change(f); };
+    // Resolve the latest authority on each check, as the production callback does.
+    const original = f.dependencies.current;
+    f.dependencies.current = async (...args) => original(...args);
+    const current = (...args) => f.dependencies.current(...args);
+    f.service = new AutomaticOwnPrInspectionRecovery({ ...f.dependencies, current });
+    await f.service.recover();
+    assert.equal((await f.service.runCycle()).requeued, 0);
+    assert.equal(f.item.status, "blocked");
+  });
+});
+
+test("inspection recovery resumes a prepared transition after restart without consuming another attempt", async () => {
+  const f = await recoveryFixture();
+  const transition = f.dependencies.ledger.transition;
+  f.dependencies.ledger.transition = async () => { throw Object.assign(new Error(), { code: "WORK_LEDGER_REVISION_MISMATCH" }); };
+  assert.equal((await f.service.runCycle()).requeued, 0);
+  assert.equal(f.state.get("automatic-own-pr-inspection-recovery-state").records[0].attempt, 1);
+  f.dependencies.ledger.transition = transition;
+  assert.equal((await (await f.makeService()).runCycle()).requeued, 1);
+  assert.equal(f.state.get("automatic-own-pr-inspection-recovery-state").records.length, 1);
+  assert.equal(f.state.get("automatic-own-pr-inspection-recovery-state").records[0].attempt, 1);
 });
 
 test("a failed repair context rejects another job, Head, authority epoch or memory receipt", async (t) => {

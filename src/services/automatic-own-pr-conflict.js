@@ -7,6 +7,7 @@ import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js"
 import { createPullRequestExternalActionConfirmationPlan } from "../domain/pull-request-external-action.js";
 import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
 import { approveOwnPrAction, repairCommitMatchesJob } from "./automatic-own-pr-repair-authorization.js";
+import { AutomaticOwnPrInspectionRecovery } from "./automatic-own-pr-inspection-recovery.js";
 
 const STATE_KEY = "automatic-own-pr-conflict-state";
 const STATUSES = new Set(["working", "pushing", "published", "failed", "stale"]);
@@ -44,10 +45,14 @@ export class AutomaticOwnPrConflict {
     controlledCommitReader, objectSync, grantVerifier }) {
     Object.assign(this, { configurationReader, store, ledger, github, confirmations, codeJobReader,
       controlledCommitReader, objectSync, grantVerifier });
+    this.inspectionRecovery = objectSync && typeof ledger.listItems === "function" && typeof ledger.transition === "function" &&
+      typeof codeJobReader?.getDetail === "function" && typeof ledger.listTimeline === "function"
+      ? new AutomaticOwnPrInspectionRecovery({ store, ledger, codeJobReader, objectSync, current: binding => this.#current(binding) }) : null;
   }
 
   async recover() {
     this.#state = normalizeState(await this.store.read(STATE_KEY, { schemaVersion: 1, records: [] }));
+    await this.inspectionRecovery?.recover();
   }
 
   async shouldRun(item) {
@@ -144,11 +149,13 @@ export class AutomaticOwnPrConflict {
 
   runCycle({ limit = 10 } = {}) {
     return this.#queue.enqueue(async () => {
+      const inspectionRecovery = await this.inspectionRecovery?.runCycle({ limit });
       const pending = this.#state.records.filter(active);
       const start = pending.findIndex(record => record.jobId === this.#lastJobId) + 1;
       const candidates = [...pending.slice(start), ...pending.slice(0, start)].slice(0, limit);
       this.#lastJobId = candidates.at(-1)?.jobId ?? null;
-      const result = { scanned: candidates.length, published: 0, failed: 0, stale: 0 };
+      const result = { scanned: candidates.length, published: 0, failed: 0, stale: 0,
+        ...(inspectionRecovery ? { inspectionRecovery } : {}) };
       for (const record of candidates) {
         try { const status = await this.#advance(record); if (Object.hasOwn(result, status)) result[status] += 1; }
         catch (error) { result.failed += 1; result.lastFailure = error?.code ?? "OWN_PR_CONFLICT_PROGRESS_UNAVAILABLE"; }

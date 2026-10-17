@@ -528,6 +528,17 @@ export class WorkCoordinationService {
               signal: options.signal,
             })],
         ]
+      : options.roleId === "developer" && this.#runOwnPrRepairs !== null
+        // Housekeeping owns global memory projection. Result reconciliation
+        // still requires its receipts, without blocking other developer work.
+        ? [
+            ["code_jobs", () => this.#runCodeJobs({ limit: this.#defaults.codeJobLimit })],
+            ["code_job_change_packages", () => this.#dispatchCodeJobChangePackages({ limit: this.#defaults.codeJobLimit })],
+            ["proposal_execution", () => this.#runProposals({ limit: this.#defaults.proposalLimit,
+              ...(options.signal === null ? {} : { signal: options.signal }) })],
+            ["proposal_results", () => this.#reconcileProposals({ limit: this.#defaults.proposalLimit })],
+            ["own_pr_repairs", () => this.#runOwnPrRepairs({ limit: this.#defaults.codeJobLimit })],
+          ]
       : options.roleId === "pr-engineer"
         ? [["attention_results", () =>
             this.#reconcileAttention({ limit: this.#defaults.attentionLimit })]]
