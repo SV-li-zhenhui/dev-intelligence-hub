@@ -2698,13 +2698,13 @@ test("own PR repair decisions receive complete feedback before choosing an actio
   }
 });
 
-test("automatic Review skips old incoming work and a disabled switch without consuming claims", async () => {
+test("automatic Review admits failed checks but skips old incoming work and a disabled switch", async () => {
   for (const enabled of [true, false]) {
     const time = controlledClock();
     const source = [1, 2].map((number) => {
       const item = workItem(number, { type: "role", id: "pr-engineer" });
       item.event.source = { provider: "github", scopeId: "github-dashboard" };
-      item.event.payload = { relation: "review_requested", state: "open", isDraft: false, author: "dev", headRefOid: "a".repeat(40),
+      item.event.payload = { relation: "review_requested", state: "open", isDraft: false, author: "dev", headRefOid: "a".repeat(40), ciStatus: "FAILURE",
         incomingReviewFactsAvailable: true, reviewRecipient: "me", reviewReceivedFrom: "dev", reviewReceivedVia: "assignee", reviewRequestEventId: "AE_1",
         reviewReceivedAt: number === 1 ? "2026-07-01T00:00:00Z" : "2026-08-02T07:00:00Z" };
       return item;

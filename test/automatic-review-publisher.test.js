@@ -34,6 +34,19 @@ test("comment prepares the same durable author handoff as request_changes", asyn
   assert.equal((await publisher.publish(item)).status, "completed");
   assert.deepEqual(calls[0][1].reviewHandoff, { workType: "assignment", responsiblePerson: null });
 });
+
+test("failed checks publish every evidence-based verdict and retain its normal handoff", async () => {
+  for (const ciStatus of ["FAILURE", "ERROR"]) {
+    for (const event of ["APPROVE", "REQUEST_CHANGES", "COMMENT"]) {
+      const { publisher, item, calls } = fixture({ event, facts: { ciStatus } });
+      assert.equal(await publisher.verify({ ...item, action: item.display.payload.action }), true);
+      assert.equal((await publisher.publish(item)).status, "completed");
+      assert.deepEqual(calls[0][1].reviewHandoff, event === "APPROVE"
+        ? { workType: "testing", responsiblePerson: { login: "tester", product: "qt" } }
+        : { workType: "assignment", responsiblePerson: null });
+    }
+  }
+});
 test("disabled, old, changed, revoked, already published and unknown outcomes never auto approve", async () => {
   for (const options of [ { enabled: false }, { facts: { reviewReceivedAt: "2026-10-01T09:00:00Z" } },
     { facts: { headRefOid: "d".repeat(40) } }, { facts: { reviewRecipient: null } },

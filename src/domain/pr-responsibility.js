@@ -51,15 +51,6 @@ function assessAssignedReview(item) {
     );
   }
 
-  if (["FAILURE", "ERROR"].includes(item.ciStatus)) {
-    return assessment(
-      ACTION_STATES.WAITING_OTHER,
-      "author",
-      "wait_author_ci",
-      "等待作者处理检查失败",
-    );
-  }
-
   if (item.ciStatus === "PENDING") {
     return assessment(
       ACTION_STATES.WAITING_OTHER,
@@ -321,7 +312,11 @@ export function assessPullRequestResponsibility(
   }
 
   if (item.relation === "review_requested") {
-    return assessAssignedReview(item);
+    const result = assessAssignedReview(item);
+    if (result.actionState === ACTION_STATES.ACTION_NOW && ["FAILURE", "ERROR"].includes(item.ciStatus)) {
+      result.actionReasons.push("检查失败，需在 Review 中核查原因并提醒作者");
+    }
+    return result;
   }
 
   if (item.relation === "authored") {

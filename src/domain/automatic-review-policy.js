@@ -7,7 +7,7 @@ const sameLogin = (left, right) => typeof left === "string" && typeof right === 
 export function automaticReviewEligibility(item, account, now = new Date()) {
   if (!LOGIN.test(account || "") || item?.kind !== "pull_request") return "INVALID_TARGET";
   if (item.state?.toLowerCase() !== "open" || item.isDraft !== false) return "PR_NOT_READY";
-  if (item.ciStatus && !["NONE", "SUCCESS"].includes(item.ciStatus)) return "CI_NOT_READY";
+  if (item.ciStatus && !["NONE", "SUCCESS", "FAILURE", "ERROR"].includes(item.ciStatus)) return "CI_NOT_READY";
   if (!LOGIN.test(item.author || "") || sameLogin(item.author, account)) return "SELF_AUTHORED";
   if (item.incomingReviewFactsAvailable !== true || !sameLogin(item.reviewRecipient, account) ||
       !LOGIN.test(item.reviewReceivedFrom || "") || sameLogin(item.reviewReceivedFrom, account) ||

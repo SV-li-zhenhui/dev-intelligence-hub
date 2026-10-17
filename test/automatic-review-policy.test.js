@@ -22,9 +22,15 @@ test("missing, revoked, self-authored, draft and already reviewed heads do not a
     { reviewReceivedVia: "reviewer" },
     { author: "REVIEWER" }, { reviewReceivedFrom: "reviewer" }, { state: "merged" },
     { isDraft: true }, { myReviewState: "APPROVED", myReviewCommitOid: item.headRefOid },
-    { ciStatus: "PENDING" }, { ciStatus: "FAILURE" },
+    { ciStatus: "PENDING" }, { ciStatus: "UNKNOWN" },
   ]) assert.ok(automaticReviewEligibility({ ...item, ...patch }, "reviewer", now));
   assert.equal(automaticReviewEligibility({ ...item, myReviewState: "CHANGES_REQUESTED", myReviewCommitOid: "b".repeat(40) }, "reviewer", now), null);
+});
+
+test("failed checks remain eligible for evidence-based automatic Review", () => {
+  for (const ciStatus of ["FAILURE", "ERROR"]) {
+    assert.equal(automaticReviewEligibility({ ...item, ciStatus }, "reviewer", now), null);
+  }
 });
 
 test("a published Review consumes its assignment until a later Assign arrives", () => {

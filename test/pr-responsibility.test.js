@@ -135,7 +135,7 @@ test("changes I requested without a new commit are waiting on the author", () =>
   assert.equal(result.nextAction, "wait_author_changes");
 });
 
-test("an assigned draft or broken head waits on the author before review", () => {
+test("an assigned draft or conflicting head waits on the author before review", () => {
   const draft = assess({
     relation: "review_requested",
     author: "contributor",
@@ -146,16 +146,22 @@ test("an assigned draft or broken head waits on the author before review", () =>
     author: "contributor",
     mergeStateStatus: "DIRTY",
   });
-  const failed = assess({
-    relation: "review_requested",
-    author: "contributor",
-    ciStatus: "FAILURE",
-  });
-
   assert.equal(draft.actionState, ACTION_STATES.WAITING_OTHER);
   assert.equal(conflict.actionState, ACTION_STATES.WAITING_OTHER);
-  assert.equal(failed.actionState, ACTION_STATES.WAITING_OTHER);
   assert.equal(draft.nextActor, "author");
+});
+
+test("failed checks still require Review and a warning to the author", () => {
+  for (const ciStatus of ["FAILURE", "ERROR"]) {
+    const input = { relation: "review_requested", author: "contributor", ciStatus };
+    const result = assess(input);
+    assert.equal(result.actionState, ACTION_STATES.ACTION_NOW);
+    assert.equal(result.nextActor, "me");
+    assert.equal(result.nextAction, "review");
+    assert.ok(result.actionReasons.some(reason => reason.includes("检查失败")));
+    const approved = assess({ ...input, myReviewState: "APPROVED", myReviewCommitOid: "head-2" });
+    assert.equal(approved.nextAction, "wait_merge", "failed CI does not erase a completed review");
+  }
 });
 
 test("an authored PR with unresolved review feedback needs my action", () => {
