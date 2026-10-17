@@ -24,6 +24,8 @@ import {
 import {
   attentionResultInputBinding,
   planAttentionBatchApplication,
+  planSystemMaintenanceRetry,
+  systemMaintenanceRetirement,
 } from "./work-ledger-attention-commands.js";
 import { planProposalBatchApplication } from "./work-ledger-proposal-commands.js";
 import { planConditionWake } from "./work-ledger-condition-commands.js";
@@ -1138,6 +1140,10 @@ export class WorkLedgerService {
     const state = await this.#readAttentionAuthorityState();
     const item = state.items.find((candidate) => candidate.itemId === input.producer.workItemId);
     const intent = state.outbox.find((candidate) => candidate.intentId === input.requestKey);
+    const maintenance = systemMaintenanceRetirement(intent);
+    if (item && intent?.itemId === item.itemId && intent.requestedBy.roleId === input.producer.roleId && maintenance !== null) {
+      return { status: "retry_wait", workItemRevision: maintenance.workItemRevision, reason: maintenance.reason };
+    }
     if (
       !item || !["cancelled", "completed", "superseded"].includes(item.status) ||
       item.activeIntentId !== null || intent?.itemId !== item.itemId ||
@@ -1577,6 +1583,10 @@ export class WorkLedgerService {
 
   async applyAttentionBatch(input = {}) {
     return this.#executeCommand(planAttentionBatchApplication, input);
+  }
+
+  async retrySystemMaintenanceQuestions(input = {}) {
+    return this.#executeCommand(planSystemMaintenanceRetry, input);
   }
 
   async applyProposalBatch(input = {}) {

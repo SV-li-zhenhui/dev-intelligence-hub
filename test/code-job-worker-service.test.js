@@ -4499,7 +4499,10 @@ test("deterministic context overflow fails once instead of retrying forever", as
   assert.equal((await store.getForWorker(initial.jobId)).status, "failed");
 });
 
-test("stable brain configuration failures pause instead of spinning forever", async (t) => {
+test("known infrastructure failures retry between actions while other brain failures preserve pause policy", async (t) => {
+  const automaticCodes = new Set(["BRAIN_CREDENTIAL_UNAVAILABLE", "BRAIN_PROVIDER_NOT_CONFIGURED", "REMOTE_DATA_NOT_AUTHORIZED",
+    "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE", "STRUCTURED_PROVIDER_UNAVAILABLE",
+    "STRUCTURED_PROVIDER_REAP_FAILED", "STRUCTURED_PROVIDER_CLEANUP_FAILED", "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED"]);
   for (const code of [
     "BRAIN_CREDENTIAL_UNAVAILABLE",
     "BRAIN_PROVIDER_NOT_CONFIGURED",
@@ -4522,6 +4525,7 @@ test("stable brain configuration failures pause instead of spinning forever", as
     "STRUCTURED_PROVIDER_RESPONSE_TOO_LARGE",
     "STRUCTURED_PROVIDER_RESPONSE_INVALID",
     "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+    "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
   ]) {
     await t.test(code, async () => {
       const initial = job({
@@ -4544,21 +4548,31 @@ test("stable brain configuration failures pause instead of spinning forever", as
       const failure = Object.assign(new Error("brain needs operator action"), {
         code,
       });
+      let now = Date.parse("2026-08-02T02:00:00.000Z");
       const worker = new CodeJobWorkerService({
         jobStore: store,
         executor,
-        brainDirectory: brain([failure], brainCalls),
+        brainDirectory: brain([failure, failure], brainCalls),
         grantVerifier: verifier([]),
+        clock: () => new Date(now),
       });
 
       const first = await worker.runCycle();
       const second = await worker.runCycle();
 
-      assert.equal(first.outcomes[0].status, "paused");
+      const automatic = automaticCodes.has(code);
+      assert.equal(first.outcomes[0].status, automatic ? "retry" : "paused");
       assert.equal(first.outcomes[0].code, code);
-      assert.equal(second.selected, 0);
-      assert.equal((await store.getForWorker(initial.jobId)).status, "paused");
+      assert.equal(second.selected, automatic ? 1 : 0);
+      assert.equal((await store.getForWorker(initial.jobId)).status, automatic ? "active" : "paused");
       assert.equal(brainCalls.length, 1);
+      if (automatic) {
+        assert.equal(second.outcomes[0].code, "CODE_JOB_MAINTENANCE_BACKOFF");
+        now += 60_000;
+        assert.equal((await worker.runCycle()).outcomes[0].status, "retry");
+        assert.equal(brainCalls.length, 2);
+        assert.equal((await store.getForWorker(initial.jobId)).status, "active");
+      }
     });
   }
 });

@@ -122,6 +122,8 @@ export class AttentionInbox {
     this.readRetirement = typeof authority?.readAttentionRequestRetirement === "function"
       ? authority.readAttentionRequestRetirement.bind(authority)
       : async () => null;
+    this.retryMaintenance = typeof authority?.retrySystemMaintenanceQuestions === "function"
+      ? authority.retrySystemMaintenanceQuestions.bind(authority) : async () => ({ retried: 0 });
     this.state = defaultAttentionState();
     this.ready = false;
   }
@@ -286,6 +288,17 @@ export class AttentionInbox {
       if (archived > 0) this.#assertCapacity(candidate);
       return { state: candidate, value: { archived }, write: archived > 0 };
     });
+  }
+
+  retrySystemQuestions(options = {}) {
+    const { limit } = normalizeCursor(options);
+    // Keep answer persistence and automatic retirement mutually exclusive.
+    // The ledger never calls the inbox while holding its mutation lease.
+    return this.#mutate(async state => ({ state, write: false,
+      value: await this.retryMaintenance({ limit,
+        requestKeys: state.items.filter(item => item.status === "pending" && /^work-intent-[a-f0-9]{64}$/.test(item.requestKey))
+          .map(item => item.requestKey) }),
+    }));
   }
 
   readOutbox(options = {}) {

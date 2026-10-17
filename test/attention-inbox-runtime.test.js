@@ -52,7 +52,7 @@ test("runtime exposes separate least-authority producer, browser, and consumer p
   assert.deepEqual(Object.keys(runtime.producer), ["create"]);
   assert.deepEqual(Object.keys(runtime.browser).sort(), ["answer", "later", "listMaintenance", "next", "reject"]);
   assert.deepEqual(Object.keys(runtime.consumer), ["readOutbox"]);
-  assert.deepEqual(Object.keys(runtime.maintenance), ["archiveRetired"]);
+  assert.deepEqual(Object.keys(runtime.maintenance), ["archiveRetired", "retrySystemQuestions"]);
   assert.equal(Object.isFrozen(runtime), true);
   assert.equal(Object.isFrozen(runtime.browser), true);
   assert.equal(guard.options.name, "mydashboard-attention-inbox-v1");

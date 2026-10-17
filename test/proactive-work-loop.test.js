@@ -2499,7 +2499,7 @@ test("specialist delivery exhaustion remains distinct from decision exhaustion",
   );
 });
 
-test("delivery attention staging exhaustion remains delivery-classified", async () => {
+test("delivery infrastructure failures wait automatically without exhausting delivery attempts", async () => {
   const time = controlledClock();
   const source = workItem(73, { type: "role", id: "developer" });
   const ledger = new FakeLedger({ source: [source], time });
@@ -2531,19 +2531,16 @@ test("delivery attention staging exhaustion remains delivery-classified", async 
   ledger.stageFailure = "before_write";
   const first = await loop.runCycle({ roleId: "developer" });
   assert.equal(first.retried, 1);
-  assert.equal(ledger.items[0].statusReason, "delivery_failed");
-  time.advance(1_000);
+  assert.equal(ledger.items[0].statusReason, "system_maintenance_auto_retry");
+  time.advance(60_000);
 
   ledger.stageFailure = "before_write";
   const second = await loop.runCycle({ roleId: "developer" });
-  assert.equal(second.blocked, 1);
-  assert.equal(ledger.items[0].statusReason, "delivery_attempts_exhausted");
-  assert.equal(ledger.calls.stageIntent.length, 2);
-  assert.equal(ledger.calls.scheduleRetry[0].reason, "delivery_failed");
-  assert.equal(
-    ledger.calls.transition[0].reason,
-    "delivery_attempts_exhausted",
-  );
+  assert.equal(second.retried, 1);
+  assert.equal(ledger.items[0].statusReason, "system_maintenance_auto_retry");
+  assert.equal(ledger.calls.stageIntent.length, 0);
+  assert.equal(ledger.calls.scheduleRetry[0].consumeAttempt, false);
+  assert.equal(ledger.calls.transition.length, 0);
 });
 
 test("trusted specialist generic decisions retain the durable stage path", async () => {
@@ -2577,7 +2574,7 @@ test("trusted specialist generic decisions retain the durable stage path", async
   assert.equal(ledger.calls.stageIntent.length, 1);
 });
 
-test("task-brain owner decisions enter one durable attention request without fallback", async (t) => {
+test("task-brain configuration failures retry automatically without fallback or owner questions", async (t) => {
   for (const code of [
     "ROLE_TASK_BRAIN_NOT_CONFIGURED",
     "BRAIN_PROVIDER_NOT_CONFIGURED",
@@ -2612,14 +2609,13 @@ test("task-brain owner decisions enter one durable attention request without fal
 
       const cycle = await loop.runCycle({ roleId: "developer" });
 
-      assert.equal(cycle.staged, 1);
+      assert.equal(cycle.retried, 1);
       assert.equal(decisions, 1);
-      assert.equal(ledger.calls.scheduleRetry.length, 0);
+      assert.equal(ledger.calls.scheduleRetry.length, 1);
       assert.equal(ledger.calls.transition.length, 0);
-      assert.equal(ledger.outbox.length, 1);
-      assert.equal(ledger.outbox[0].intent.type, "ask_user");
-      assert.match(ledger.outbox[0].intent.reason, new RegExp(code));
-      assert.equal(ledger.outbox[0].intent.choices[0].id, "configured-retry");
+      assert.equal(ledger.outbox.length, 0);
+      assert.equal(ledger.calls.scheduleRetry[0].consumeAttempt, false);
+      assert.equal(ledger.calls.scheduleRetry[0].details.code, code);
     });
   }
 });
@@ -3033,30 +3029,6 @@ test("cycle cancellation takes precedence over a wrapped stale PR fact", async (
   assert.equal(ledger.calls.claim.length, 0);
 });
 
-function assertSafeOwnerAttention({ ledger, roleId, code, remediation }) {
-  assert.equal(ledger.outbox.length, 1);
-  const intent = ledger.outbox[0].intent;
-  assert.equal(intent.type, "ask_user");
-  assert.match(intent.summary, new RegExp(roleId));
-  assert.match(intent.reason, new RegExp(code));
-  assert.match(intent.question, remediation);
-  assert.equal(intent.choices[0].id, "configured-retry");
-  if (code === "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED") {
-    assert.equal(intent.choices[0].label, "修复后重试");
-    assert.match(intent.question, /系统会话保存或恢复故障/);
-    assert.match(intent.question, /不会修复会话/);
-  }
-  const publicCopy = JSON.stringify(intent);
-  for (const secret of [
-    "raw stderr",
-    "provider stderr",
-    "sk-owner-secret",
-    "C:\\\\private\\\\codex.exe",
-  ]) {
-    assert.equal(publicCopy.includes(secret), false);
-  }
-}
-
 test("a configured root closes a terminal PR task instead of retrying it", async () => {
   const time = controlledClock();
   const root = workItem(801, { type: "role", id: "orchestrator" });
@@ -3125,225 +3097,58 @@ test("a specialist closes a terminal PR task without consuming retry attempts", 
   });
 });
 
-test("structured brain failures create one safe owner attention for a configured specialist", async (t) => {
-  for (const { code, failurePoint, remediation } of STRUCTURED_BRAIN_ATTENTION_CASES) {
-    await t.test(`${failurePoint}:${code}`, async () => {
-      const time = controlledClock();
-      const source = workItem(81, { type: "role", id: "developer" });
-      const ledger = new FakeLedger({ source: [source], time });
-      let decisionCalls = 0;
-      let serviceCalls = 0;
-      const loop = createLoop({
-        ledger,
-        directory: new FakeRoleDirectory({
-          developer: worker({
-            roleId: "developer",
-            decide: async () => {
-              decisionCalls += 1;
+test("automatic infrastructure recovery retries both role paths without questions or business exhaustion", async (t) => {
+  for (const roleId of ["developer", "orchestrator"]) {
+    for (const { code, failurePoint } of STRUCTURED_BRAIN_ATTENTION_CASES) {
+      await t.test(`${roleId}:${code}`, async () => {
+        const time = controlledClock();
+        const source = workItem(81, { type: "role", id: roleId });
+        const ledger = new FakeLedger({ source: [source], time });
+        const loop = createLoop({ ledger, time, maxAttempts: 2,
+          directory: new FakeRoleDirectory({ [roleId]: worker({ roleId,
+            workerId: `employee-${roleId}`, async decide() {
               if (failurePoint === "brain") throw structuredBrainFailure(code);
               return completeDecision();
-            },
-          }),
-        }),
-        time,
-        roleContextAssembler: {
-          async assemble({ roleId, item }) {
+            } }) }),
+          roleContextAssembler: { async assemble({ roleId, item }) {
             if (failurePoint === "context") throw structuredBrainFailure(code);
             return contextPacket(item, roleId);
-          },
-        },
-        orchestratorService: {
-          async execute() {
-            serviceCalls += 1;
-          },
-        },
+          } }, orchestratorService: { async execute() { assert.fail("No execution after provider failure"); } },
+        });
+        for (let turn = 0; turn < 5; turn += 1) {
+          const cycle = await loop.runCycle({ roleId });
+          assert.equal(cycle.retried, 1);
+          assert.equal(cycle.outcomes[0].code, code);
+          assert.equal(ledger.items[0].status, "retry_wait");
+          assert.equal(ledger.items[0].attempt, 0);
+          assert.equal(ledger.calls.scheduleRetry.at(-1).consumeAttempt, false);
+          assert.equal(Date.parse(ledger.items[0].availableAt) > Date.parse(time.clock()), true);
+          assert.equal((await loop.runCycle({ roleId })).claimed, 0);
+          time.advance(60_000);
+        }
+        assert.equal(ledger.outbox.length, 0);
+        assert.equal(ledger.calls.stageIntent.length, 0);
+        assert.equal(ledger.calls.transition.length, 0);
+        assert.equal(JSON.stringify(ledger.calls.scheduleRetry).includes("sk-owner-secret"), false);
       });
-
-      const first = await loop.runCycle({ roleId: "developer" });
-      const second = await loop.runCycle({ roleId: "developer" });
-
-      assert.equal(first.staged, 1);
-      assert.equal(second.staged, 0);
-      assert.equal(ledger.items[0].status, "dispatch_pending");
-      assert.equal(ledger.calls.claim.length, 1);
-      assert.equal(ledger.calls.stageIntent.length, 1);
-      assert.equal(ledger.calls.stageIntent[0].roleId, "developer");
-      assert.equal(ledger.calls.stageIntent[0].actorId, "employee-developer");
-      assert.equal(ledger.calls.scheduleRetry.length, 0);
-      assert.equal(ledger.calls.transition.length, 0);
-      assert.equal(decisionCalls, failurePoint === "brain" ? 1 : 0);
-      assert.equal(serviceCalls, 0);
-      assertSafeOwnerAttention({ ledger, roleId: "developer", code, remediation });
-    });
+    }
   }
 });
 
-test("structured brain failures make a configured root claim and stage one safe owner attention", async (t) => {
-  for (const { code, failurePoint, remediation } of STRUCTURED_BRAIN_ATTENTION_CASES) {
-    await t.test(`${failurePoint}:${code}`, async () => {
-      const time = controlledClock();
-      const root = workItem(82, { type: "role", id: "orchestrator" });
-      const ledger = new FakeLedger({ source: [root], time });
-      const order = [];
-      const originalClaim = ledger.claim.bind(ledger);
-      const originalStage = ledger.stageIntent.bind(ledger);
-      ledger.claim = async (input) => {
-        order.push("claim");
-        return originalClaim(input);
-      };
-      ledger.stageIntent = async (input) => {
-        order.push("stage");
-        return originalStage(input);
-      };
-      let decisionCalls = 0;
-      let serviceCalls = 0;
-      const loop = createLoop({
-        ledger,
-        directory: new FakeRoleDirectory({
-          orchestrator: worker({
-            roleId: "orchestrator",
-            workerId: "employee-orchestrator",
-            decide: async () => {
-              order.push("decide");
-              decisionCalls += 1;
-              if (failurePoint === "brain") throw structuredBrainFailure(code);
-              return completeDecision();
-            },
-          }),
-        }),
-        time,
-        roleContextAssembler: {
-          async assemble({ roleId, item }) {
-            order.push("assemble");
-            if (failurePoint === "context") throw structuredBrainFailure(code);
-            return contextPacket(item, roleId);
-          },
-        },
-        orchestratorService: {
-          async execute() {
-            serviceCalls += 1;
-          },
-        },
-      });
-
-      const first = await loop.runCycle({ roleId: "orchestrator" });
-      const second = await loop.runCycle({ roleId: "orchestrator" });
-
-      assert.equal(first.claimed, 1);
-      assert.equal(first.staged, 1);
-      assert.equal(second.claimed, 0);
-      assert.equal(ledger.items[0].status, "dispatch_pending");
-      assert.deepEqual(
-        order,
-        failurePoint === "brain"
-          ? ["assemble", "decide", "claim", "stage"]
-          : ["assemble", "claim", "stage"],
-      );
-      assert.equal(ledger.calls.claim.length, 1);
-      assert.equal(ledger.calls.stageIntent.length, 1);
-      assert.equal(ledger.calls.stageIntent[0].roleId, "orchestrator");
-      assert.equal(ledger.calls.stageIntent[0].actorId, "employee-orchestrator");
-      assert.equal(ledger.calls.scheduleRetry.length, 0);
-      assert.equal(ledger.calls.transition.length, 0);
-      assert.equal(decisionCalls, failurePoint === "brain" ? 1 : 0);
-      assert.equal(serviceCalls, 0);
-      assertSafeOwnerAttention({ ledger, roleId: "orchestrator", code, remediation });
-    });
-  }
-});
-
-test("configured-root owner attention recovers lost claim and stage acknowledgements", async (t) => {
-  for (const failureMode of ["claim_after_write", "stage_after_write"]) {
-    await t.test(failureMode, async () => {
-      const time = controlledClock();
-      const root = workItem(
-        failureMode === "claim_after_write" ? 83 : 84,
-        { type: "role", id: "orchestrator" },
-      );
-      const ledger = new FakeLedger({ source: [root], time });
-      if (failureMode === "claim_after_write") {
-        ledger.claimFailure = "after_write";
-      } else {
-        ledger.stageFailure = "after_write";
-      }
-      const loop = createLoop({
-        ledger,
-        directory: new FakeRoleDirectory({
-          orchestrator: worker({
-            roleId: "orchestrator",
-            workerId: "employee-orchestrator",
-            decide: async () => {
-              throw structuredBrainFailure("STRUCTURED_PROVIDER_UNAVAILABLE");
-            },
-          }),
-        }),
-        time,
-        roleContextAssembler: {
-          async assemble({ roleId, item }) {
-            return contextPacket(item, roleId);
-          },
-        },
-        orchestratorService: { async execute() {} },
-      });
-
-      const cycle = await loop.runCycle({ roleId: "orchestrator" });
-
-      assert.equal(cycle.claimed, 1);
-      assert.equal(
-        cycle.outcomes[0].status,
-        failureMode === "stage_after_write" ? "stage_recovered" : "staged",
-      );
-      assert.equal(ledger.items[0].status, "dispatch_pending");
-      assert.equal(ledger.outbox.length, 1);
-      assert.equal(ledger.calls.claim.length, 1);
-      assert.equal(ledger.calls.stageIntent.length, 1);
-      assert.equal(ledger.calls.scheduleRetry.length, 0);
-      assert.equal(ledger.calls.transition.length, 0);
-    });
-  }
-});
-
-test("configured-root owner attention retries a stage failure only until one durable write", async () => {
+test("automatic root recovery tolerates a lost claim acknowledgement", async () => {
   const time = controlledClock();
-  const root = workItem(85, { type: "role", id: "orchestrator" });
-  const ledger = new FakeLedger({ source: [root], time });
-  ledger.stageFailure = "before_write";
-  let decisions = 0;
-  const loop = createLoop({
-    ledger,
-    directory: new FakeRoleDirectory({
-      orchestrator: worker({
-        roleId: "orchestrator",
-        workerId: "employee-orchestrator",
-        decide: async () => {
-          decisions += 1;
-          throw structuredBrainFailure("STRUCTURED_PROVIDER_UNAVAILABLE");
-        },
-      }),
-    }),
-    time,
-    roleContextAssembler: {
-      async assemble({ roleId, item }) {
-        return contextPacket(item, roleId);
-      },
-    },
+  const ledger = new FakeLedger({ source: [workItem(83, { type: "role", id: "orchestrator" })], time });
+  ledger.claimFailure = "after_write";
+  const loop = createLoop({ ledger, time,
+    directory: new FakeRoleDirectory({ orchestrator: worker({ roleId: "orchestrator", workerId: "employee-orchestrator",
+      async decide() { throw structuredBrainFailure("STRUCTURED_PROVIDER_UNAVAILABLE"); } }) }),
+    roleContextAssembler: { async assemble({ roleId, item }) { return contextPacket(item, roleId); } },
     orchestratorService: { async execute() {} },
   });
-
-  const first = await loop.runCycle({ roleId: "orchestrator" });
-  time.advance(1_000);
-  const second = await loop.runCycle({ roleId: "orchestrator" });
-  const third = await loop.runCycle({ roleId: "orchestrator" });
-
-  assert.equal(first.retried, 1);
-  assert.equal(second.staged, 1);
-  assert.equal(third.staged, 0);
-  assert.equal(decisions, 2);
-  assert.equal(ledger.items[0].status, "dispatch_pending");
-  assert.equal(ledger.outbox.length, 1);
-  assert.equal(ledger.calls.stageIntent.length, 2);
-  assert.equal(ledger.calls.scheduleRetry.length, 1);
-  assert.equal(ledger.calls.transition.length, 0);
+  assert.equal((await loop.runCycle({ roleId: "orchestrator" })).retried, 1);
+  assert.equal(ledger.items[0].status, "retry_wait");
+  assert.equal(ledger.calls.claim.length, 1);
+  assert.equal(ledger.outbox.length, 0);
 });
 
 test("unclassified structured failures preserve generic specialist behavior and defer invalid root output", async (t) => {

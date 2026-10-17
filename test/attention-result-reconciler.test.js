@@ -15,14 +15,15 @@ test("reconciler archives retired questions only after applying recorded answers
   const calls = [];
   const reconciler = new AttentionResultReconciler({
     attentionConsumer: { readOutbox: async () => batch() },
-    attentionMaintenance: { archiveRetired: async () => { calls.push("archive"); } },
+    attentionMaintenance: { archiveRetired: async () => { calls.push("archive"); },
+      retrySystemQuestions: async () => { calls.push("retry"); } },
     ledger: {
       getSummary: async () => ({ attentionCursor: 0 }),
       applyAttentionBatch: async () => { calls.push("apply"); return { applied: 1 }; },
     },
   });
   assert.deepEqual(await reconciler.runCycle(), { applied: 1 });
-  assert.deepEqual(calls, ["apply", "archive"]);
+  assert.deepEqual(calls, ["apply", "retry", "archive"]);
 });
 
 test("reconciler releases the attention read before mutating the ledger", async () => {

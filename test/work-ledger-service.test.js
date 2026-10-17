@@ -13682,6 +13682,7 @@ async function prepareAttentionResult(
   {
     workerId = "employee-pr-reviewer",
     roleId = "pr-reviewer",
+    intent = askUserIntent(),
   } = {},
 ) {
   await fixture.service.intake();
@@ -13692,7 +13693,6 @@ async function prepareAttentionResult(
     workerId,
     leaseDurationMs: 30_000,
   });
-  const intent = askUserIntent();
   const staged = await fixture.service.stageIntent({
     itemId: item.itemId,
     expectedRevision: item.revision,
@@ -13744,6 +13744,110 @@ async function prepareAttentionResult(
     1,
   ).outbox;
 }
+
+function systemMaintenanceIntent(roleId) {
+  return {
+    schemaVersion: 1, type: "ask_user",
+    summary: `岗位 CLI 会话进度未能安全归档（${roleId}）`,
+    reason: "真实任务不得回退到例行大脑；系统已安全停止（STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED）",
+    question: "保留会话历史，修复后重试",
+    choices: [{ id: "configured-retry", label: "修复后重试", description: "重新排队" }],
+  };
+}
+
+test("system maintenance questions retry without an owner answer and discard a raced result", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const intent = systemMaintenanceIntent("pr-reviewer");
+  const raced = await prepareAttentionResult(fixture, { type: "choice", choiceId: "configured-retry" }, { intent });
+  const waiting = (await fixture.service.listItems()).items[0];
+  const authority = { requestKey: waiting.activeIntentId,
+    producer: { roleId: "pr-reviewer", workItemId: waiting.itemId } };
+  const delivered = structuredClone(fixture.store.stored().outbox[0]);
+  assert.equal((await fixture.service.retrySystemMaintenanceQuestions({ limit: 10, requestKeys: fixture.store.stored().outbox.map(entry => entry.intentId) })).retried, 1);
+  const retrying = (await fixture.service.listItems()).items[0];
+  assert.equal(retrying.status, "retry_wait");
+  assert.equal(retrying.activeIntentId, null);
+  assert.equal(retrying.attempt, waiting.attempt - 1);
+  assert.equal(retrying.decisionContext, waiting.decisionContext);
+  assert.equal(await fixture.service.isAttentionRequestCurrent(authority), false);
+  assert.deepEqual(await fixture.service.readAttentionRequestRetirement(authority), {
+    status: "retry_wait", workItemRevision: retrying.revision, reason: "system_maintenance_auto_retry",
+  });
+  assert.equal((await fixture.service.retrySystemMaintenanceQuestions({ limit: 10, requestKeys: fixture.store.stored().outbox.map(entry => entry.intentId) })).retried, 0);
+  assert.equal(fixture.store.stored().outbox[0].intentId, delivered.intentId);
+  assert.deepEqual(fixture.store.stored().outbox[0].intent, delivered.intent);
+  assert.equal(fixture.store.stored().outbox[0].outcome.details.resultAttestation, undefined);
+  await fixture.service.applyAttentionBatch({ items: [raced], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+  assert.equal((await fixture.service.getSummary()).attentionCursor, 1);
+  assert.equal((await fixture.service.listItems()).items[0].status, "retry_wait");
+  assert.equal(fixture.store.stored().timeline.at(-1).type, "stale_result_discarded");
+  const restarted = await createFixture({ store: fixture.store, source: fixture.source, time: fixture.time });
+  assert.deepEqual(await restarted.service.readAttentionRequestRetirement(authority), {
+    status: "retry_wait", workItemRevision: retrying.revision, reason: "system_maintenance_auto_retry",
+  });
+});
+
+test("automatic maintenance settles an old PR question through cross-root pending Head activation and restart", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  const raced = await prepareAttentionResult(fixture, { type: "choice", choiceId: "configured-retry" }, {
+    workerId: "employee-pr-engineer", roleId: "pr-engineer", intent: systemMaintenanceIntent("pr-engineer"),
+  });
+  const old = (await fixture.service.listItems()).items[0];
+  const authority = { requestKey: old.activeIntentId, producer: { roleId: "pr-engineer", workItemId: old.itemId } };
+  fixture.source.records.push(prAssignment(2, { sourceScopeId: "github-secondary", gitFacts: prGitFacts(PR_HEAD_A),
+    occurredAt: "2026-08-02T02:05:00.000Z" }),
+  prAssignment(3, { sourceScopeId: "github-secondary", headRefOid: PR_HEAD_B, previousHeadRefOid: PR_HEAD_A,
+    changedFields: ["headRefOid"], gitFacts: prGitFacts(PR_HEAD_B), occurredAt: "2026-08-02T02:06:00.000Z" }));
+  fixture.source.highWatermark = 3;
+  fixture.time.advance(600_000);
+  await fixture.service.intake();
+  let replacement = (await fixture.service.listItems()).items.find(item => item.itemId !== old.itemId);
+  assert.equal(replacement.source.current.headRefOid, PR_HEAD_A);
+  assert.equal(replacement.source.pending.headRefOid, PR_HEAD_B);
+  assert.equal((await fixture.service.retrySystemMaintenanceQuestions({ limit: 10, requestKeys: fixture.store.stored().outbox.map(entry => entry.intentId) })).retried, 1);
+  const activated = await fixture.service.reconcilePullRequestSource({ itemId: replacement.itemId,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision, expectedRevision: replacement.revision,
+    expectedPendingRevision: replacement.source.pendingRevision });
+  assert.equal(activated.applied, true);
+  replacement = (await fixture.service.listItems()).items.find(item => item.itemId === replacement.itemId);
+  assert.equal(replacement.status, "queued");
+  assert.equal(replacement.source.current.headRefOid, PR_HEAD_B);
+  assert.deepEqual(replacement.source.decisionBudget, { headRefOid: PR_HEAD_B, activationRevision: 2,
+    previousActiveRevision: 1, attemptOffset: replacement.attempt });
+  const restarted = await createFixture({ store: fixture.store, source: fixture.source, time: fixture.time });
+  assert.equal((await restarted.service.readAttentionRequestRetirement(authority)).reason, "system_maintenance_auto_retry");
+  await restarted.service.applyAttentionBatch({ items: [raced], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+  assert.equal((await restarted.service.getSummary()).attentionCursor, 1);
+  const claimable = (await restarted.service.listItems()).items.find(item => item.itemId === replacement.itemId);
+  const claimed = await restarted.service.claim({ itemId: claimable.itemId, expectedRevision: claimable.revision,
+    workerId: "employee-pr-engineer", leaseDurationMs: 30_000 });
+  assert.equal(claimed.status, "working");
+});
+
+test("automatic maintenance never releases a business question or an applied rejection", async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const result = await prepareAttentionResult(fixture, { type: "reject", reason: "stop" });
+  assert.equal((await fixture.service.retrySystemMaintenanceQuestions({ limit: 10, requestKeys: fixture.store.stored().outbox.map(entry => entry.intentId) })).retried, 0);
+  await fixture.service.applyAttentionBatch({ items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+  assert.equal((await fixture.service.retrySystemMaintenanceQuestions({ limit: 10, requestKeys: fixture.store.stored().outbox.map(entry => entry.intentId) })).retried, 0);
+  assert.equal((await fixture.service.listItems()).items[0].statusReason, "attention_rejected");
+});
+
+test("retiring a historical infrastructure question restores the complete business decision budget", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  await prepareAttentionResult(fixture, { type: "choice", choiceId: "configured-retry" }, {
+    workerId: "employee-pr-engineer", roleId: "pr-engineer", intent: systemMaintenanceIntent("pr-engineer"),
+  });
+  await fixture.service.retrySystemMaintenanceQuestions({ limit: 10,
+    requestKeys: fixture.store.stored().outbox.map(entry => entry.intentId) });
+  fixture.time.advance(60_000);
+  for (let turn = 1; turn <= 3; turn += 1) {
+    const cycle = await decisionBudgetLoop(fixture, { maxAttempts: 3, assemble: unavailablePrContext }).runCycle();
+    assert.equal(turn < 3 ? cycle.retried : cycle.blocked, 1);
+    assert.equal((await fixture.service.listItems()).items[0].attempt, turn);
+    fixture.time.advance(60_000);
+  }
+});
 
 test("orchestrator takeover question stays answerable for an unconfigured target", async () => {
   for (const target of [

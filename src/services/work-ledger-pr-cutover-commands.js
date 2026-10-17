@@ -927,6 +927,11 @@ function planCrossRootPullRequestSourceReconciliation({
       headRevision: next.source.headRevision,
       headRefOid: next.source.current.headRefOid,
       predecessorItemId,
+      ...(root.source.current.headRefOid === next.source.current.headRefOid ? {} : {
+        previousHeadRefOid: root.source.current.headRefOid,
+        previousActiveRevision: root.source.activeRevision,
+        decisionAttemptOffset: root.attempt,
+      }),
     },
   });
   if (!arePullRequestCutoverProofsRetained({

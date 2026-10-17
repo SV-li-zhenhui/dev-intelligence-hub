@@ -4,6 +4,7 @@ import { beginCodeReadSession, createCodeReadContext, hasCompleteCodeRead } from
 import { createCodeExecutionContext, closeCodeExecutionContext, revokeCodeExecutionContext } from "../lib/code-execution-context.js";
 import { normalizeStructuredCodeActionDecision } from "../domain/structured-code-action-contract.js";
 import { TaskRunControlError } from './task-run-registry.js';
+import { brainFailureOwnerAttention } from "./brain-failure-policy.js";
 import { currentTaskExecution } from '../lib/task-execution-context.js';
 import { digestValue } from "../domain/code-executor-contract.js";
 import {
@@ -291,6 +292,7 @@ export class CodeJobWorkerService {
   #continuousControllers;
   #recordTimeoutContinuation;
   #clock;
+  #maintenanceRetryNotBefore = new Map();
 
   constructor({
     jobStore,
@@ -408,6 +410,11 @@ export class CodeJobWorkerService {
   }
 
   async #runCycle(options) {
+    const now = new Date(this.#clock()).getTime();
+    if (!Number.isFinite(now)) throw workerError("CODE_JOB_CLOCK_INVALID", "Code job worker clock is invalid");
+    for (const [jobId, notBefore] of this.#maintenanceRetryNotBefore) {
+      if (notBefore <= now) this.#maintenanceRetryNotBefore.delete(jobId);
+    }
     const query = {
       limit: options.limit,
       ...(options.roleId === null ? {} : { roleId: options.roleId }),
@@ -439,6 +446,10 @@ export class CodeJobWorkerService {
     if (lastRunnable) this.#runnableCursor = lastRunnable.sequence;
     const outcomes = [];
     for (const selectedJob of selected.items) {
+      if (selectedJob.status === "active" && this.#maintenanceRetryNotBefore.has(selectedJob.jobId)) {
+        outcomes.push({ jobId: selectedJob.jobId, status: "retry", actionType: null, code: "CODE_JOB_MAINTENANCE_BACKOFF" });
+        continue;
+      }
       try {
         outcomes.push(await this.#process(selectedJob.jobId));
       } catch (error) {
@@ -1730,6 +1741,18 @@ export class CodeJobWorkerService {
       !TERMINAL_STATUSES.has(current.status)
     ) {
       return this.#finishFailed(current, error);
+    }
+    // A failed brain request between executor actions can retry from the same
+    // checkpoint. An admitted or uncertain action still follows reconciliation.
+    if (brainFailureOwnerAttention(code) !== null && current?.status === "active" &&
+        current.execution.pendingAction === null && current.execution.actionAdmission === null) {
+      const now = new Date(this.#clock()).getTime();
+      if (!Number.isFinite(now)) throw workerError("CODE_JOB_CLOCK_INVALID", "Code job worker clock is invalid");
+      if (this.#maintenanceRetryNotBefore.size >= 1_024) {
+        this.#maintenanceRetryNotBefore.delete(this.#maintenanceRetryNotBefore.keys().next().value);
+      }
+      this.#maintenanceRetryNotBefore.set(jobId, now + 60_000);
+      return { jobId, status: "retry", actionType: null, code };
     }
     if (
       (requiresOperatorPause(code) || code === "STRUCTURED_PROVIDER_IDLE_TIMEOUT") &&

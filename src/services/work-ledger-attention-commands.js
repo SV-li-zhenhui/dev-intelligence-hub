@@ -22,8 +22,10 @@ import {
 import { createWorkDecisionContext } from "./work-ledger-state.js";
 import { moveWorkItem } from "./work-ledger-transitions.js";
 import { isSettledIssueReason } from "./work-ledger-issue-lifecycle.js";
+import { automaticBrainRetryCode } from "./brain-failure-policy.js";
 import {
   boundedLedgerString,
+  ledgerDigest,
   hasExactLedgerKeys,
   normalizeLedgerTimestamp,
   workLedgerError,
@@ -34,6 +36,74 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const REQUEST_ID = /^attention-[a-f0-9]{64}$/;
 const RESULT_ID = /^attention-result-[a-f0-9]{64}$/;
 const OUTBOX_ID = /^attention-outbox-[a-f0-9]{64}$/;
+
+export function systemMaintenanceRetirement(outbox) {
+  const proof = outbox?.outcome?.details?.maintenanceRetirement;
+  if (!hasExactLedgerKeys(proof, ["schemaVersion", "intentId", "questionRef", "workItemRevision", "reason", "code", "inputBinding", "digest"]) ||
+      proof.schemaVersion !== 1 || proof.intentId !== outbox.intentId ||
+      proof.questionRef !== outbox.outcome.details.questionRef ||
+      proof.reason !== "system_maintenance_auto_retry" ||
+      proof.code !== automaticBrainRetryCode(outbox.intent) || proof.code === null ||
+      !Number.isSafeInteger(proof.workItemRevision) || proof.workItemRevision < 1 ||
+      outbox.status !== "delivered" || outbox.outcome.status !== "delivered") return null;
+  const { digest, ...core } = proof;
+  if (ledgerDigest(core) !== digest) return null;
+  if (outbox.sourceBinding === null) return proof.inputBinding === null ? proof : null;
+  try {
+    const binding = normalizePullRequestExecutionBinding(proof.inputBinding);
+    if (["rootItemId", "workKey", "inputRevision", "headRevision", "headRefOid", "eventId", "eventDigest", "inputDigest"]
+      .some(key => binding[key] !== outbox.sourceBinding[key])) return null;
+  } catch { return null; }
+  return proof;
+}
+
+export function planSystemMaintenanceRetry({ state, input, clock }) {
+  if (!hasExactLedgerKeys(input, ["limit", "requestKeys"]) || !Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100 ||
+      !Array.isArray(input.requestKeys) || input.requestKeys.length > 1_000 ||
+      input.requestKeys.some(key => typeof key !== "string" || !/^work-intent-[a-f0-9]{64}$/.test(key))) {
+    throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "自动故障恢复批量参数无效");
+  }
+  if (state.attentionCursor < state.attentionHighWatermark) return { write: false, result: { retried: 0 } };
+  const now = clock();
+  const pendingRequests = new Set(input.requestKeys);
+  const outboxById = new Map(state.outbox.map(outbox => [outbox.intentId, outbox]));
+  const updatedItems = new Map();
+  const updatedOutboxes = new Map();
+  const timelineEvents = [];
+  for (const item of state.items) {
+    if (updatedItems.size >= input.limit) break;
+    if (item.status !== "waiting_user" || !pendingRequests.has(item.activeIntentId) || item.sourceQuarantine !== null ||
+        item.ownerId !== null || item.leaseId !== null || item.leaseUntil !== null) continue;
+    const outbox = outboxById.get(item.activeIntentId);
+    const code = automaticBrainRetryCode(outbox?.intent);
+    if (code === null || outbox.itemId !== item.itemId || outbox.status !== "delivered" ||
+        outbox.outcome?.status !== "delivered" || outbox.outcome.details?.resultAttestation ||
+        typeof outbox.outcome.details?.questionRef !== "string") continue;
+    const inputBinding = attentionResultInputBinding(state, item, outbox);
+    if (inputBinding === undefined) continue;
+    const updated = moveWorkItem(item, { status: "retry_wait", now,
+      reason: "system_maintenance_auto_retry", activeIntentId: null,
+      availableAt: new Date(Date.parse(now) + 60_000).toISOString() });
+    updated.attempt = Math.max(item.source?.decisionBudget?.attemptOffset ?? 0, item.attempt - 1);
+    const core = { schemaVersion: 1, intentId: outbox.intentId,
+      questionRef: outbox.outcome.details.questionRef, workItemRevision: updated.revision,
+      reason: "system_maintenance_auto_retry", code, inputBinding };
+    updatedItems.set(item.itemId, updated);
+    updatedOutboxes.set(outbox.intentId, { ...outbox, revision: outbox.revision + 1, updatedAt: now,
+      outcome: { ...outbox.outcome, details: { ...outbox.outcome.details,
+        maintenanceRetirement: { ...core, digest: ledgerDigest(core) } } } });
+    timelineEvents.push({ itemId: item.itemId, type: "intent_superseded", at: now,
+      actorId: "work-ledger-system", details: { intentId: outbox.intentId,
+        reason: core.reason, code, inputBinding, workItemRevision: updated.revision, inputDigest: outbox.inputDigest } });
+    timelineEvents.push({ itemId: item.itemId, type: "retry_scheduled", at: now,
+      actorId: "work-ledger-system", details: { fromStatus: item.status,
+        availableAt: updated.availableAt, reason: core.reason, code, restoredAttempts: item.attempt - updated.attempt } });
+  }
+  if (updatedItems.size === 0) return { write: false, result: { retried: 0 } };
+  return { patch: { items: state.items.map(item => updatedItems.get(item.itemId) ?? item),
+    outbox: state.outbox.map(outbox => updatedOutboxes.get(outbox.intentId) ?? outbox) },
+    timelineEvents, result: { retried: updatedItems.size } };
+}
 
 function invalid(message = "内部请示结果批次无效") {
   return workLedgerError("WORK_LEDGER_ATTENTION_BATCH_INVALID", message, 502);
@@ -366,6 +436,7 @@ function requireBoundAskUser(state, entry) {
     (candidate) => candidate.intentId === entry.requestKey,
   );
   const outcome = outbox?.outcome;
+  const maintenanceRetirement = systemMaintenanceRetirement(outbox);
   const waitingForResult =
     item.status === "waiting_user" && item.activeIntentId === outbox?.intentId;
   const durablyQuarantined =
@@ -383,7 +454,7 @@ function requireBoundAskUser(state, entry) {
     (outbox?.dispatchBinding !== null &&
       outbox?.dispatchBinding !== undefined &&
       Object.hasOwn(outbox.dispatchBinding, "boundIntent"));
-  const inputBinding = outbox === undefined
+  const inputBinding = maintenanceRetirement !== null ? maintenanceRetirement.inputBinding : outbox === undefined
     ? undefined
     : attentionResultInputBinding(state, item, outbox);
   if (
@@ -393,7 +464,7 @@ function requireBoundAskUser(state, entry) {
     outbox.status !== "delivered" ||
     outbox.intent.type !== "ask_user" ||
     outbox.requestedBy.roleId !== entry.producer.roleId ||
-    (!waitingForResult && !quarantinedSettlement && !closedIssueSettlement) ||
+    (!waitingForResult && !quarantinedSettlement && !closedIssueSettlement && maintenanceRetirement === null) ||
     outcome?.status !== "delivered" ||
     outcome.details?.questionRef !== entry.requestId
   ) {
@@ -408,6 +479,7 @@ function requireBoundAskUser(state, entry) {
     outbox,
     inputBinding,
     discardClosedIssueResult: closedIssueSettlement,
+    maintenanceRetirement,
     discardUnsealedLegacyResult:
       durablyQuarantined && !sealedQuarantinedSettlement,
   };
@@ -439,6 +511,7 @@ export function planAttentionBatchApplication({ state, input, clock }) {
       outbox,
       inputBinding,
       discardClosedIssueResult,
+      maintenanceRetirement,
       discardUnsealedLegacyResult,
     } =
       requireBoundAskUser(workingState, entry);
@@ -468,7 +541,7 @@ export function planAttentionBatchApplication({ state, input, clock }) {
       });
       continue;
     }
-    if (discardClosedIssueResult) {
+    if (discardClosedIssueResult || maintenanceRetirement !== null) {
       appliedItemIds.push(item.itemId);
       timelineEvents.push({
         itemId: item.itemId,
@@ -479,7 +552,7 @@ export function planAttentionBatchApplication({ state, input, clock }) {
           source: "attention",
           intentId: outbox.intentId,
           resultRef: entry.result.resultId,
-          reason: item.statusReason,
+          reason: maintenanceRetirement?.reason ?? item.statusReason,
         },
       });
       continue;

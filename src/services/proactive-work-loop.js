@@ -616,32 +616,6 @@ function completeInternalReviewFactFailureHistory(item, timeline) {
   return true;
 }
 
-function ownerBrainAttentionDecision(error, roleId) {
-  const code = stableFailureCode(error);
-  const attention = brainFailureOwnerAttention(code);
-  if (!attention) return null;
-  const summary = `${attention.summary}（${roleId}）`;
-  return {
-    schemaVersion: 1,
-    confidence: 100,
-    summary,
-    intent: {
-      schemaVersion: 1,
-      type: "ask_user",
-      summary,
-      reason: `真实任务不得回退到例行大脑；系统已安全停止（${attention.code}）`,
-      question: `${attention.remediation}。完成后请选择“${attention.retryLabel}”；驳回请示会将原任务转入阻塞。`,
-      choices: [
-        {
-          id: "configured-retry",
-          label: attention.retryLabel,
-          description: "重新唤醒原任务，并再次核验任务大脑和授权。",
-        },
-      ],
-    },
-  };
-}
-
 function timeoutError(code) {
   return Object.assign(new Error(code), { code });
 }
@@ -1663,8 +1637,7 @@ export class ProactiveWorkLoop {
           },
         };
       }
-      const attention = ownerBrainAttentionDecision(error, worker.roleId);
-      if (attention === null) throw error;
+      if (brainFailureOwnerAttention(code) === null) throw error;
       const claim = await this.#claim(item, worker, options);
       if (!claim.item) {
         return {
@@ -1676,11 +1649,11 @@ export class ProactiveWorkLoop {
       return {
         claimAttempted: true,
         claimed: true,
-        outcome: await this.#stageDecision(
+        outcome: await this.#recordFailure(
           claim.item,
-          worker,
+          worker.workerId,
+          error,
           options,
-          attention,
         ),
       };
     }
@@ -1819,16 +1792,6 @@ export class ProactiveWorkLoop {
         // Configuration cutover is not an employee failure. Keep the durable
         // claim intact so the item can be recomputed after restart.
         throw error;
-      }
-      const attention = ownerBrainAttentionDecision(error, worker.roleId);
-      if (attention !== null) {
-        return this.#stageDecision(
-          item,
-          worker,
-          options,
-          attention,
-          failureReasons,
-        );
       }
       return this.#recordFailure(
         item,
@@ -2079,6 +2042,8 @@ export class ProactiveWorkLoop {
     if (error instanceof TaskRunControlError) return {status:error.code === 'TASK_RUN_CANCELLED' ? 'cancelled' : error.code === 'TASK_RUN_CONTROL_PENDING' ? 'control_pending' : 'paused',workerId:actorId,code:error.code};
     const code = stableFailureCode(error);
     const contention = isContextContention(error);
+    const infrastructure = brainFailureOwnerAttention(code) !== null;
+    const restoreAttempt = contention || infrastructure;
     const budget = contention ? null : persistedPullRequestDecisionAttemptBudget(item);
     const attempt = budget?.attempt ?? item.attempt;
     const input = {
@@ -2087,13 +2052,13 @@ export class ProactiveWorkLoop {
       leaseId: item.leaseId,
       actorId,
       reason:
-        contention ? "context_changed" : attempt >= this.maxAttempts
+        infrastructure ? "system_maintenance_auto_retry" : contention ? "context_changed" : attempt >= this.maxAttempts
           ? reasons.exhausted
           : reasons.retry,
     };
     try {
       throwIfLoopAborted(options.signal);
-      if (!contention && attempt >= this.maxAttempts) {
+      if (!restoreAttempt && attempt >= this.maxAttempts) {
         await this.ledger.transition({
           ...input,
           toStatus: "blocked",
@@ -2105,11 +2070,11 @@ export class ProactiveWorkLoop {
       const exponent = contention ? 0 : Math.min(Math.max(attempt - 1, 0), 30);
       const delay = Math.min(
         this.retryMaxMs,
-        this.retryBaseMs * 2 ** exponent,
+        infrastructure ? Math.max(this.retryBaseMs, 60_000) : this.retryBaseMs * 2 ** exponent,
       );
       await this.ledger.scheduleRetry({
         ...input,
-        ...(contention ? { consumeAttempt: false } : {}),
+        ...(restoreAttempt ? { consumeAttempt: false } : {}),
         details: { code },
         availableAt: new Date(
           Date.parse(normalizeLoopClock(this.clock)) + delay,

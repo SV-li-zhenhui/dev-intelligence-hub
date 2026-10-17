@@ -58,7 +58,8 @@ export async function createAttentionInboxRuntime({
       consumer: frozenPort({
         readOutbox: (options) => inbox.readOutbox(options),
       }),
-      maintenance: frozenPort({ archiveRetired: () => inbox.archiveRetired() }),
+      maintenance: frozenPort({ archiveRetired: () => inbox.archiveRetired(),
+        retrySystemQuestions: (options) => inbox.retrySystemQuestions(options) }),
       close,
     });
   } catch (error) {

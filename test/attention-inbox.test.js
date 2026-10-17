@@ -189,6 +189,52 @@ test("temporary authority loss and unavailable retirement evidence do not archiv
   }
 });
 
+test("automatic maintenance retry archives the question without inventing an answer", async () => {
+  const retirement = { status: "retry_wait", workItemRevision: 17, reason: "system_maintenance_auto_retry" };
+  const authority = { isCurrent: async () => false, readAttentionRequestRetirement: async () => retirement };
+  const { inbox, store } = await readyInbox({ authority });
+  await inbox.create(attentionRequest());
+  const original = structuredClone(store.value.items[0]);
+  assert.deepEqual(await inbox.archiveRetired(), { archived: 1 });
+  assert.equal(store.value.items[0].question, original.question);
+  assert.equal(store.value.items[0].result, null);
+  assert.equal(store.value.items[0].archive.reason, retirement.reason);
+  assert.equal((await inbox.readOutbox()).items.length, 0);
+  await readyInbox({ store, authority });
+  assert.equal(store.value.items[0].status, "archived");
+});
+
+test("automatic retirement holds the inbox lease and preserves a rejection committed before it", async () => {
+  let startRetry, finishRetry;
+  const entered = new Promise(resolve => { startRetry = resolve; });
+  const finish = new Promise(resolve => { finishRetry = resolve; });
+  let current = true;
+  let keys;
+  const authority = { isCurrent: async () => current,
+    async retrySystemMaintenanceQuestions({ requestKeys }) {
+      keys = requestKeys;
+      startRetry();
+      await finish;
+      current = false;
+      return { retried: requestKeys.length };
+    },
+  };
+  const { inbox, store } = await readyInbox({ authority });
+  const rejected = await inbox.create(attentionRequest({ requestKey: `work-intent-${"a".repeat(64)}` }));
+  const pending = await inbox.create(attentionRequest({ requestKey: `work-intent-${"b".repeat(64)}` }));
+  await inbox.reject(response(rejected, { type: "reject", reason: "stop" }));
+  const before = structuredClone(store.value.items[0]);
+  const retry = inbox.retrySystemQuestions({ limit: 10 });
+  await entered;
+  const lateRejection = inbox.reject(response(pending, { type: "reject", reason: "late" }));
+  finishRetry();
+  assert.deepEqual(await retry, { retried: 1 });
+  await assert.rejects(lateRejection, { code: "ATTENTION_REQUEST_STALE" });
+  assert.deepEqual(keys, [`work-intent-${"b".repeat(64)}`]);
+  assert.deepEqual(store.value.items[0], before);
+  assert.equal((await inbox.readOutbox()).items.length, 1);
+});
+
 test("failed archive persistence preserves pending questions and permits a safe retry", async () => {
   const authority = {
     isCurrent: async () => false,
