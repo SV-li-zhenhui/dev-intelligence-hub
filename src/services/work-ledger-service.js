@@ -1980,7 +1980,10 @@ export class WorkLedgerService {
             });
             continue;
           }
-          const applied = applyPullRequestScopeLifecycle(root.source, envelope, { attemptAtActivation: root.attempt });
+          const previousActiveRevision = root.source.activeRevision;
+          const previousActiveHeadRefOid = root.source.current.headRefOid;
+          const previousAttempt = root.attempt;
+          const applied = applyPullRequestScopeLifecycle(root.source, envelope, { attemptAtActivation: previousAttempt });
           if (isIgnoredProtectedPullRequestReentry(root, envelope, applied)) {
             ignoreProtectedPullRequestReentry(root, envelope, assignmentItem, applied.disposition, false);
             continue;
@@ -2066,6 +2069,11 @@ export class WorkLedgerService {
               disposition: applied.disposition,
               scopeActive: active,
               authorityEpoch: root.source.authorityEpoch,
+              ...(previousActiveHeadRefOid !== root.source.current.headRefOid ? {
+                previousHeadRefOid: previousActiveHeadRefOid,
+                previousActiveRevision,
+                decisionAttemptOffset: previousAttempt,
+              } : {}),
             },
           });
         }

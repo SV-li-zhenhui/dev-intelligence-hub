@@ -3340,6 +3340,31 @@ test("a batch of old completed PR roots leaves scope with mixed Head proof", asy
   assert.equal(unproven.statusReason, "pr_source_left_scope");
 });
 
+test("scope exit with a proven new Head preserves activation proof and does not block later intake", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  await stageSealedPrReview(fixture);
+  const initial = (await fixture.service.listItems()).items[0];
+  fixture.source.records.push(prAssignment(2, { occurredAt: "2026-08-02T01:04:00.000Z",
+    headRefOid: PR_HEAD_B, previousHeadRefOid: PR_HEAD_A, changedFields: ["headRefOid"], gitFacts: prGitFacts(PR_HEAD_B) }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  assert.equal((await fixture.service.listItems()).items.find(root => root.itemId === initial.itemId).source.pendingRevision, 2);
+  const exit = prAssignment(3, { eventType: "pull_request.left_scope", occurredAt: "2026-08-02T01:05:00.000Z",
+    headRefOid: PR_HEAD_B, gitFacts: prGitFacts(PR_HEAD_B) }).event;
+  fixture.source.records.push(prScopeLifecycleAssignment(3, exit),
+    prAssignment(4, { pullRequestNumber: 43, occurredAt: "2026-08-02T01:06:00.000Z", gitFacts: prGitFacts(PR_HEAD_A) }));
+  fixture.source.highWatermark = 4;
+  assert.equal((await fixture.service.intake()).cursor, 4);
+  const roots = (await fixture.service.listItems()).items;
+  const retired = roots.find(root => root.itemId === initial.itemId);
+  assert.equal(retired.source.scope.active, false);
+  assert.equal(retired.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(retired.source.decisionBudget.attemptOffset, 1);
+  assert.equal(roots.find(root => root.source.identity.pullRequestNumber === 43).status, "queued");
+  const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  assert.equal((await restarted.service.intake()).received, 0);
+});
+
 test("an explicit owner PR source survives automatic left-scope and never reuses its old binding", async () => {
   const initial = prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) });
   const fixture = await createFixture({ records: [initial] });
