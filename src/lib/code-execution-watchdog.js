@@ -85,7 +85,7 @@ export function reportCodeExecutionActivity(watchdog) {
 export function beginCodeExecutionHostOperation(watchdog, name, args) {
   const state = stateFor(watchdog);
   state.controller.signal.throwIfAborted();
-  if (state.closed || state.hostActive || !['perform_action', 'read_source', 'get_state'].includes(name)) throw new TypeError('Code execution host operation is invalid');
+  if (state.closed || state.hostActive || !['perform_action', 'edit_source', 'read_source', 'read_conflict_source', 'get_state'].includes(name)) throw new TypeError('Code execution host operation is invalid');
   state.hostActive = true;
   // Polling never suspends or refreshes model inactivity. The callback still
   // has its own bound so an unresponsive store cannot mask a hang.
@@ -104,9 +104,9 @@ export function beginCodeExecutionHostOperation(watchdog, name, args) {
       let fresh = false;
       if (succeeded) {
         try {
-          if (name === 'read_source') {
+          if (['read_source', 'read_conflict_source'].includes(name)) {
             fresh = consumeSourceRange(state, result, progress?.sourceIdentity);
-          } else if (name === 'perform_action' && /^[a-f0-9]{64}$/u.test(progress?.before) && /^[a-f0-9]{64}$/u.test(progress?.after)) {
+          } else if (['perform_action', 'edit_source'].includes(name) && /^[a-f0-9]{64}$/u.test(progress?.before) && /^[a-f0-9]{64}$/u.test(progress?.after)) {
             state.completedOperations.add(progress.before);
             fresh = progress.before !== progress.after && !state.completedOperations.has(progress.after);
             state.completedOperations.add(progress.after);

@@ -330,7 +330,7 @@ test('one host watchdog carries useful code progress beyond ten hours through th
         result = { thread: { id: threadId }, approvalPolicy: 'never', sandbox: { type: 'readOnly', networkAccess: false } };
       }
       if (message.method === 'mcpServerStatus/list') result = { data: [{ name: namespace,
-        tools: Object.fromEntries(['perform_action', 'read_source', 'get_state'].map(name => [name, {}])) }], nextCursor: null };
+        tools: Object.fromEntries(['perform_action', 'read_source', 'edit_source', 'get_state', 'read_conflict_source'].map(name => [name, {}])) }], nextCursor: null };
       if (message.method === 'turn/start') result = { turn: { id: 'turn-1' } };
       send({ id: message.id, result });
       if (message.method === 'turn/start') entered.resolve();

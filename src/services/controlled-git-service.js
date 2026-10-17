@@ -1739,6 +1739,10 @@ export class ControlledGitService {
   }
 
   async verifyConflictPreparation(value) {
+    return (await this.#verifiedConflictManifest(value)).binding;
+  }
+
+  async #verifiedConflictManifest(value) {
     const fields = exactDataObject(value, ["binding"]);
     let binding;
     try {
@@ -1767,12 +1771,11 @@ export class ControlledGitService {
         "Conflict preparation binding 与 sealed evidence 不一致",
       );
     }
-    return deepFreeze(expected);
+    return { binding: deepFreeze(expected), manifest };
   }
 
   async readConflictInspection(value) {
-    const binding = await this.verifyConflictPreparation(value);
-    const manifest = await this.#verifiedManifest(binding.preparationId);
+    const { binding, manifest } = await this.#verifiedConflictManifest(value);
     const directory = await this.#preparationDirectory(binding.preparationId);
     let remainingCharacters = 12_000;
     const conflicts = [];
@@ -1791,6 +1794,21 @@ export class ControlledGitService {
       conflicts.push({ path: conflict.path, mode: conflict.mode, versions });
     }
     return deepFreeze({ schemaVersion: 1, preparationBinding: binding, conflicts });
+  }
+
+  async readConflictSources(value) {
+    const { binding, manifest } = await this.#verifiedConflictManifest(value);
+    const directory = await this.#preparationDirectory(binding.preparationId);
+    const versions = ["ancestor", "head", "base"];
+    const documents = [];
+    for (const conflict of manifest.conflicts) {
+      for (const evidence of conflict.stages) {
+        const bytes = await this.#readSealedBlob(directory, evidence, manifest.baseBoundary.objectFormat, { textOnly: true });
+        documents.push({ path: conflict.path, version: versions[evidence.stage - 1],
+          oid: evidence.oid, sha256: evidence.sha256, bytes: bytes.length, content: bytes.toString("utf8") });
+      }
+    }
+    return deepFreeze(documents);
   }
 
   async materializeConflictPreparationForCodeJob(value) {

@@ -670,6 +670,12 @@ function createPorts(service, { baseMirrors, headMirrors }) {
     publisher,
     verifier,
     preparer,
+    sourceReader: typeof service.readConflictSources !== "function" ? null : Object.freeze({ async read(value) {
+      const source = normalizeCodeExecutionSource(value);
+      if (source.kind !== "conflict_preparation") throw runtimeError("INVALID_CONFLICT_PREPARATION_INPUT", "Conflict source requires a sealed conflict preparation");
+      const documents = await service.readConflictSources({ binding: source.preparationBinding });
+      return deepFreeze({ inputBinding: source.inputBinding, preparationBinding: source.preparationBinding, documents });
+    } }),
     inspectionReader: Object.freeze({ async read(inputBinding) {
       const source = await preparer.prepare(inputBinding);
       const inspection = await readConflictInspection({ binding: source.preparationBinding });

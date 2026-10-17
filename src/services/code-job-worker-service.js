@@ -6,6 +6,7 @@ import { normalizeStructuredCodeActionDecision } from "../domain/structured-code
 import { TaskRunControlError } from './task-run-registry.js';
 import { brainFailureOwnerAttention } from "./brain-failure-policy.js";
 import { currentTaskExecution } from '../lib/task-execution-context.js';
+import { normalizeCodeSourceEdits, applyCodeSourceEdits } from '../lib/code-source-edits.js';
 import { digestValue } from "../domain/code-executor-contract.js";
 import {
   canCreateCodeJobChangePackageEvent,
@@ -293,6 +294,7 @@ export class CodeJobWorkerService {
   #recordTimeoutContinuation;
   #clock;
   #maintenanceRetryNotBefore = new Map();
+  #conflictSourceReader;
 
   constructor({
     jobStore,
@@ -300,6 +302,7 @@ export class CodeJobWorkerService {
     brainDirectory,
     taskRuns = null,
     reviewRepairContextReader,
+    conflictSourceReader,
     grantVerifier,
     actionAdmissionGate = DIRECT_ACTION_ADMISSION,
     operationQueue = new OperationQueue(),
@@ -356,6 +359,7 @@ export class CodeJobWorkerService {
     this.#clock = clock;
     this.#reviewRepairContextReader = reviewRepairContextReader === undefined
       ? null : requirePort(reviewRepairContextReader, ["read"], "review repair context reader");
+    this.#conflictSourceReader = conflictSourceReader == null ? null : requirePort(conflictSourceReader, ["read"], "conflict source reader");
     this.#verifyGrant = requirePort(
       grantVerifier,
       ["verify"],
@@ -816,6 +820,7 @@ export class CodeJobWorkerService {
     let workspaceRevision = initial.execution.workspaceRevision;
     let fatal = null;
     let invocationRunId = null;
+    let conflictReads = null;
     const feedback = await this.#readReviewRepairFeedback(initial);
     const closeReads = () => {
       for (const { reader } of reads.values()) { reader.revoke(); reader.close(); }
@@ -884,6 +889,45 @@ export class CodeJobWorkerService {
     capability = createCodeExecutionContext({
       sourceReadIdentity: () => lastSourceReadIdentity,
       getState,
+      readConflictSource: async ({ path: sourcePath, version, offset, length, sourceVersion }, options) => {
+        await snapshot();
+        if (!this.#conflictSourceReader || initial.grant.executionSource?.kind !== "conflict_preparation") {
+          throw workerError("CODE_READ_DOCUMENT_NOT_FOUND", "No sealed conflict versions are available");
+        }
+        const expectedVersion = initial.grant.executionSource.preparationBinding.preparationId;
+        if ((sourceVersion !== undefined && sourceVersion !== expectedVersion) || (offset !== 0 && sourceVersion !== expectedVersion)) {
+          throw workerError("CODE_READ_REVISION_INVALID", "Conflict pages require their sealed preparation version");
+        }
+        conflictReads ??= await this.#openConflictReads(initial, options);
+        await snapshot();
+        const key = `conflict-versions/${version}/${sourcePath}`;
+        const document = conflictReads.documents.get(key);
+        if (!document) throw workerError("CODE_READ_DOCUMENT_NOT_FOUND", "Path/version is outside the sealed conflicts");
+        const page = conflictReads.reader.readDocument(key, offset, length);
+        conflictReads.requested.add(key);
+        lastSourceReadIdentity = { path: key, sha256: document.sha256, totalLength: page.totalLength };
+        return { ...page, sourcePath, version, sourceVersion: expectedVersion };
+      },
+      editSource: async (value, options) => {
+        const request = normalizeCodeSourceEdits(value);
+        const state = await snapshot();
+        const entry = reads.get(request.path);
+        if (!entry || entry.actionId !== request.sourceVersion || latestRead(state.job, request.path)?.actionId !== entry.actionId) {
+          throw workerError("CODE_READ_REVISION_INVALID", "Edits require the current audited source version");
+        }
+        entry.reader.assertComplete();
+        const parts = [];
+        let page;
+        do {
+          page = entry.reader.readDocument(request.path, page?.nextOffset ?? 0);
+          parts.push(page.text);
+        } while (page.nextOffset !== null);
+        const content = applyCodeSourceEdits(parts.join(""), request.edits);
+        // Host composition reuses the audited SHA, sealed write scope, action
+        // budget and executor limits of a normal write_text action.
+        await perform({ action: { type: "write_text", path: request.path, content } }, state, options);
+        return getState();
+      },
       progressFingerprint: async () => {
         const current = await this.#jobs.getForWorker(initial.jobId);
         if (current === null) throw workerError("CODE_JOB_NOT_FOUND", "Continuous code job no longer exists");
@@ -959,6 +1003,7 @@ export class CodeJobWorkerService {
           if (!entry || entry.actionId !== latest.actionId) throw workerError("CODE_ARTIFACT_READ_INCOMPLETE", "Current audited source was not fully read");
           entry.reader.assertComplete();
         }
+        conflictReads?.reader.assertComplete([...conflictReads.requested]);
         await assertFeedback();
         const taskExecution = currentTaskExecution();
         if (taskExecution?.beginCompletion && !(await taskExecution.beginCompletion())) {
@@ -980,8 +1025,33 @@ export class CodeJobWorkerService {
       if (continued !== null) return continued;
       throw error;
     } finally {
+      conflictReads?.reader.revoke();
+      conflictReads?.reader.close();
       if (this.#continuousControllers.get(initial.jobId) === controller) this.#continuousControllers.delete(initial.jobId);
     }
+  }
+
+  async #openConflictReads(job, options) {
+    const source = job.grant.executionSource;
+    const result = await this.#conflictSourceReader.read(structuredClone(source));
+    if (!sameValue(result.inputBinding, job.grant.inputBinding) || !sameValue(result.preparationBinding, source.preparationBinding)) {
+      throw workerError("CODE_JOB_AUDIT_RESULT_INVALID", "Conflict source binding changed");
+    }
+    const expected = new Set(source.preparationBinding.conflicts.flatMap(({ path }) =>
+      ["ancestor", "head", "base"].map(version => `conflict-versions/${version}/${path}`)));
+    const documents = new Map();
+    if (!Array.isArray(result.documents) || result.documents.length !== expected.size) {
+      throw workerError("CODE_JOB_AUDIT_RESULT_INVALID", "Conflict source set is incomplete");
+    }
+    for (const entry of result.documents) {
+      const key = `conflict-versions/${entry.version}/${entry.path}`;
+      if (!expected.delete(key)) throw workerError("CODE_JOB_AUDIT_RESULT_INVALID", "Unexpected conflict source");
+      documents.set(key, { actionId: `conflict-read-${digestValue({ path: key, sha256: entry.sha256 })}`,
+        path: key, sha256: entry.sha256, bytes: entry.bytes, content: entry.content });
+    }
+    const context = createCodeReadContext({ jobId: job.jobId,
+      workspaceRevision: source.preparationBinding.evidenceDigest, documents: [...documents.values()] });
+    return { reader: beginCodeReadSession(context, options), documents, requested: new Set() };
   }
 
   async #continueSettledNativeTimeout(initial, runId, error) {

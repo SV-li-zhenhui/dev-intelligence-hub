@@ -557,6 +557,14 @@ test(
     const verified = await bundle.verifier.verify(source.preparationBinding);
     assert.deepEqual(verified, source.preparationBinding);
 
+    const originals = await bundle.sourceReader.read(source);
+    assert.deepEqual(originals.inputBinding, binding);
+    assert.deepEqual(originals.preparationBinding, source.preparationBinding);
+    assert.deepEqual(originals.documents.map(({ path, version }) => ({ path, version })),
+      ["ancestor", "head", "base"].map(version => ({ path: "src/conflict.txt", version })));
+    assert.equal(originals.documents.find(({ version }) => version === "head").content, "head content\n");
+    assert.equal(originals.documents.find(({ version }) => version === "base").content, "base content\n");
+
     const targetRoot = path.join(path.dirname(setup.preparationRoot), "materialized");
     await mkdir(targetRoot);
     const receipt = await bundle.materializer.materialize({

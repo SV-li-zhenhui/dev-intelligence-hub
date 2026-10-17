@@ -625,6 +625,8 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
       controlledGitRuntime?.preparer ?? null,
     conflictInspectionReader:
       controlledGitRuntime?.inspectionReader ?? null,
+    conflictSourceReader:
+      controlledGitRuntime?.sourceReader ?? null,
     controlledCommitBuilder:
       controlledGitRuntime?.commitBuilder ?? null,
     controlledCommitPublisher:

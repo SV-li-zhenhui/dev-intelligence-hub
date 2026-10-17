@@ -1690,6 +1690,8 @@ export async function createApplication({
                   coordinationConfig.codeJobObservationLimit,
               }),
         },
+        // This read-only port does not alter permissions in the job grant.
+        conflictSourceReader: codeExecutorRuntime.conflictSourceReader ?? null,
         ...(codeJobChangePackageDeliveryEnabled
           ? {
               completedChangeExporter: frozenPort(
@@ -2031,7 +2033,8 @@ export async function createApplication({
       };
       automaticOwnPrRepair = new AutomaticOwnPrRepair({ ...ownPrRepairDependencies,
         conflictRepair: new AutomaticOwnPrConflict({ ...ownPrRepairDependencies,
-          conflictInspectionReader: codeExecutorRuntime?.conflictInspectionReader }) });
+          conflictInspectionReader: codeExecutorRuntime?.conflictInspectionReader,
+          ...(codeExecutorRuntime?.conflictSourceReader ? { codeJobControl, taskRuns } : {}) }) });
       await automaticOwnPrRepair.recover();
     }
     if (localCodeExecutionEnabled && !confirmationRuntime) {

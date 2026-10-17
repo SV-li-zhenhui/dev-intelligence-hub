@@ -769,9 +769,10 @@ class FakeExecutor {
   }
 }
 
-function continuousFixture(decide, { content = "\uFEFForiginal\n", maxTurns = 64, requiredProfiles = [] } = {}) {
+function continuousFixture(decide, { content = "\uFEFForiginal\n", maxTurns = 64, requiredProfiles = [], executionSource, conflictSourceReader } = {}) {
   const initial = currentReadJob([]);
   initial.grant.requiredProfiles = requiredProfiles;
+  if (executionSource) Object.assign(initial.grant, { schemaVersion: 3, executionSource, inputBinding: executionSource.inputBinding });
   const jobs = new FakeJobStore([initial]);
   const executor = new FakeExecutor(initial);
   const perform = executor.perform.bind(executor);
@@ -788,6 +789,7 @@ function continuousFixture(decide, { content = "\uFEFForiginal\n", maxTurns = 64
   executor.getActionResult = async ({ actionId }) => structuredClone(audited.get(actionId));
   let calls = 0;
   const createWorker = () => new CodeJobWorkerService({ jobStore: jobs, executor, maxTurns,
+    conflictSourceReader,
     brainDirectory: { describe: () => ({ supportsCodeExecution: true, supportsCodeReading: true }),
       async decide(input, authorization) { calls++; await authorization.beforeGenerate(); return decide(input); } },
     grantVerifier: verifier([]) });
@@ -891,6 +893,69 @@ test("continuous tools require complete current pages and reject old source vers
   assert.equal(actual, content);
   assert.equal(fixture.calls(), 1);
   assert.deepEqual(fixture.executor.calls.filter(({ method }) => method === "perform").map(({ value }) => value.action.type), ["read_text", "write_text", "complete"]);
+});
+
+test("continuous bounded edits preserve a large audited file and reject stale or ambiguous replacements", async () => {
+  const original = "unchanged prefix\n".repeat(9_000) + "replace exactly once\n" + "unchanged suffix\n";
+  const fixture = continuousFixture(async ({ codeExecutionContext }) => {
+    const tools = beginCodeExecutionSession(codeExecutionContext);
+    let page = await tools.invoke("read_source", { path: "src/app.js", offset: 0, length: 1 });
+    const sourceVersion = page.sourceVersion;
+    const edit = { path: "src/app.js", sourceVersion, edits: [{ oldText: "replace exactly once", newText: "resolved" }] };
+    await assert.rejects(tools.invoke("edit_source", edit), { code: "CODE_ARTIFACT_READ_INCOMPLETE" });
+    while (page.nextOffset !== null) page = await tools.invoke("read_source", {
+      path: "src/app.js", offset: page.nextOffset, sourceVersion,
+    });
+    await assert.rejects(tools.invoke("edit_source", { ...edit, edits: [{ oldText: "unchanged prefix", newText: "wrong" }] }),
+      { code: "CODE_EDIT_MATCH_NOT_UNIQUE" });
+    await assert.rejects(tools.invoke("edit_source", { ...edit, sourceVersion: "stale" }), { code: "CODE_READ_REVISION_INVALID" });
+    await tools.invoke("edit_source", edit);
+    await assert.rejects(tools.invoke("edit_source", edit), { code: "CODE_READ_REVISION_INVALID" });
+    await tools.close();
+    return continuousDecision({ type: "complete", outcome: "resolved", evidence: [] });
+  }, { content: original });
+  const result = await fixture.worker.runCycle();
+  assert.equal(result.outcomes[0].status, "completed", JSON.stringify(result));
+  const writes = fixture.executor.calls.filter(({ method, value }) => method === "perform" && value.action.type === "write_text");
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].value.action.content, original.replace("replace exactly once", "resolved"));
+  assert.ok(writes[0].value.action.content.length > 96 * 1024);
+  assert.equal(writes[0].value.action.expectedSha256, createHash("sha256").update(original).digest("hex"));
+});
+
+test("continuous conflict versions are complete sealed reference pages and cannot authorize workspace edits", async () => {
+  const executionSource = conflictExecutionSource(conflictInputBinding());
+  const contents = { ancestor: "original\n".repeat(20_000), head: "head\n", base: "base\n" };
+  let readCalls = 0;
+  const fixture = continuousFixture(async ({ codeExecutionContext }) => {
+    const tools = beginCodeExecutionSession(codeExecutionContext);
+    let page = await tools.invoke("read_conflict_source", { path: "src/app.js", version: "ancestor", offset: 0 });
+    let actual = page.text;
+    await assert.rejects(tools.invoke("read_conflict_source", { path: "src/app.js", version: "ancestor", offset: page.nextOffset, sourceVersion: "stale" }),
+      { code: "CODE_READ_REVISION_INVALID" });
+    await assert.rejects(tools.invoke("edit_source", { path: "src/app.js", sourceVersion: page.sourceVersion,
+      edits: [{ oldText: "original", newText: "wrong" }] }), { code: "CODE_READ_REVISION_INVALID" });
+    while (page.nextOffset !== null) {
+      page = await tools.invoke("read_conflict_source", { path: "src/app.js", version: "ancestor", offset: page.nextOffset, sourceVersion: page.sourceVersion });
+      actual += page.text;
+    }
+    assert.equal(actual, contents.ancestor);
+    for (const version of ["head", "base"]) assert.equal((await tools.invoke("read_conflict_source", {
+      path: "src/app.js", version, offset: 0,
+    })).text, contents[version]);
+    await assert.rejects(tools.invoke("read_conflict_source", { path: "Other/app.js", version: "head", offset: 0 }),
+      { code: "CODE_READ_DOCUMENT_NOT_FOUND" });
+    await tools.close();
+    return continuousDecision({ type: "complete", outcome: "reference inspected", evidence: [] });
+  }, { executionSource, conflictSourceReader: { async read(source) {
+    readCalls++;
+    return { inputBinding: source.inputBinding, preparationBinding: source.preparationBinding,
+      documents: Object.entries(contents).map(([version, content]) => ({ path: "src/app.js", version, content,
+        bytes: Buffer.byteLength(content), sha256: createHash("sha256").update(content).digest("hex") })) };
+  } } });
+  assert.equal((await fixture.worker.runCycle()).outcomes[0].status, "completed");
+  assert.equal(readCalls, 1);
+  assert.equal(fixture.executor.calls.filter(({ method }) => method === "perform").length, 1, "only final completion reaches the executor");
 });
 
 test("continuous final completion checks current required profiles and current full reads", async (t) => {

@@ -105,6 +105,7 @@ function fakeService(preparation) {
     inspect: [],
     verify: [],
     materialize: [],
+    readSources: [],
     createCommit: [],
     findCommit: [],
     verifyCommit: [],
@@ -138,6 +139,7 @@ function fakeService(preparation) {
       return structuredClone(preparation);
     },
     async readConflictInspection({ binding }) { return { schemaVersion: 1, preparationBinding: binding, conflicts: [] }; },
+    async readConflictSources(request) { calls.readSources.push(request); return []; },
     async verifyConflictPreparation(request) {
       calls.verify.push(structuredClone(request));
       return structuredClone(request.binding);
@@ -188,6 +190,7 @@ test("one Controlled Git service is hidden behind frozen least-authority ports",
     "publisher",
     "verifier",
     "preparer",
+    "sourceReader",
     "inspectionReader",
   ]);
   assert.equal(Object.isFrozen(bundle), true);
@@ -196,6 +199,8 @@ test("one Controlled Git service is hidden behind frozen least-authority ports",
   assert.deepEqual(Object.keys(bundle.publisher), ["publish"]);
   assert.deepEqual(Object.keys(bundle.verifier), ["verify"]);
   assert.deepEqual(Object.keys(bundle.preparer), ["prepare"]);
+  assert.deepEqual(Object.keys(bundle.sourceReader), ["read"]);
+  assert.equal(Object.isFrozen(bundle.sourceReader), true);
   assert.equal(Object.isFrozen(bundle.materializer), true);
   assert.equal(Object.isFrozen(bundle.publisher), true);
   assert.equal(Object.isFrozen(bundle.verifier), true);
@@ -223,6 +228,9 @@ test("one Controlled Git service is hidden behind frozen least-authority ports",
   });
   assert.equal(Object.isFrozen(executionSource), true);
   assert.equal(Object.isFrozen(executionSource.preparationBinding), true);
+  assert.deepEqual(await bundle.sourceReader.read(executionSource), { inputBinding,
+    preparationBinding: executionSource.preparationBinding, documents: [] });
+  assert.deepEqual(service.calls.readSources, [{ binding: executionSource.preparationBinding }]);
 
   await bundle.verifier.verify(executionSource.preparationBinding);
   await bundle.materializer.materialize({

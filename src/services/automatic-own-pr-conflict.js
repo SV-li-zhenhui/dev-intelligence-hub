@@ -30,6 +30,11 @@ function normalizeState(value) {
       throw new Error("自动冲突修复绑定无效");
     }
     ids.add(record.jobId);
+    if (record.capabilityRecovery !== undefined && (record.capabilityRecovery?.capability !== "conflict-edit-and-source-v1" ||
+        !Number.isSafeInteger(record.capabilityRecovery.pausedRevision) || record.capabilityRecovery.pausedRevision < 1 ||
+        typeof record.capabilityRecovery.runId !== "string" || !record.capabilityRecovery.runId || record.capabilityRecovery.runId.length > 256)) {
+      throw new Error("自动冲突修复恢复记录无效");
+    }
   }
   return structuredClone(value);
 }
@@ -43,9 +48,9 @@ export class AutomaticOwnPrConflict {
   #inspections = new Map();
 
   constructor({ configurationReader, store, ledger, github, confirmations, codeJobReader,
-    controlledCommitReader, objectSync, grantVerifier, conflictInspectionReader }) {
+    controlledCommitReader, objectSync, grantVerifier, conflictInspectionReader, codeJobControl, taskRuns }) {
     Object.assign(this, { configurationReader, store, ledger, github, confirmations, codeJobReader,
-      controlledCommitReader, objectSync, grantVerifier, conflictInspectionReader });
+      controlledCommitReader, objectSync, grantVerifier, conflictInspectionReader, codeJobControl, taskRuns });
     this.inspectionRecovery = objectSync && typeof ledger.listItems === "function" && typeof ledger.transition === "function" &&
       typeof codeJobReader?.getDetail === "function" && typeof ledger.listTimeline === "function"
       ? new AutomaticOwnPrInspectionRecovery({ store, ledger, codeJobReader, objectSync, current: binding => this.#current(binding) }) : null;
@@ -242,6 +247,9 @@ export class AutomaticOwnPrConflict {
       }
       return "waiting";
     }
+    if (detail.job.status === "paused") {
+      return await this.#recoverCapabilityBlock(record, codeItem, detail.job) ? "working" : "waiting";
+    }
     if (["failed", "cancelled", "fenced"].includes(detail.job.status)) { await this.#update(record, "failed"); return "failed"; }
     const receipt = detail.changePackage?.receipt?.controlledCommit;
     if (detail.job.status !== "completed" || !receipt) return "waiting";
@@ -269,6 +277,40 @@ export class AutomaticOwnPrConflict {
 
   async #update(record, status) {
     await this.#save({ ...this.#state, records: this.#state.records.map(row => row.jobId === record.jobId ? { ...row, status } : row) });
+  }
+
+  async #recoverCapabilityBlock(record, codeItem, job) {
+    if (!this.codeJobControl?.resume || !this.taskRuns?.get || record.status !== "working" ||
+        codeItem.status !== "completed" ||
+        codeItem.receipt?.id !== record.jobId || job.jobId !== record.jobId || job.operation !== "modify" ||
+        job.pendingActionType !== null || job.uncertainty !== null ||
+        job.pause?.reason !== "等待人工处理（CODE_BRAIN_COMPLETION_NOT_READY）" ||
+        !samePullRequestExecutionBinding(job.inputBinding, record.inputBinding) ||
+        (record.capabilityRecovery && record.capabilityRecovery.pausedRevision !== job.revision)) return false;
+    const grant = codeItem.display.payload.action.grant;
+    if (job.grantDigest !== grant.grantDigest || grant.executionSource?.kind !== "conflict_preparation" ||
+        !await this.#current(record.inputBinding) || !await this.#grantCurrent(grant)) return false;
+    const proof = await this.taskRuns.get("code-job", record.jobId);
+    const receipt = proof?.receipt;
+    const finished = Date.parse(receipt?.finishedAt);
+    const started = Date.parse(receipt?.modelStartedAt);
+    const paused = Date.parse(job.pause.at);
+    if (proof?.mode !== "active" || proof.active !== false || proof.pendingCommand !== null || proof.stopUnconfirmed === true ||
+        proof.runId !== receipt?.runId || receipt?.session?.transport !== "app-server" ||
+        receipt?.kind !== "code-job" || receipt.taskId !== record.jobId || receipt.roleId !== "developer" ||
+        receipt.phase !== "failed" || receipt.outcomeCode !== "CODE_BRAIN_COMPLETION_NOT_READY" || receipt.stopConfirmed !== true ||
+        typeof receipt.runId !== "string" || !receipt.runId || !Number.isFinite(finished) || !Number.isFinite(started) || !Number.isFinite(paused) ||
+        started < Date.parse(job.createdAt) || started > finished || finished > paused ||
+        (record.capabilityRecovery && record.capabilityRecovery.runId !== receipt.runId)) return false;
+    if (!record.capabilityRecovery) {
+      await this.#save({ ...this.#state, records: this.#state.records.map(row => row.jobId === record.jobId ? {
+        ...row, capabilityRecovery: { capability: "conflict-edit-and-source-v1", pausedRevision: job.revision, runId: receipt.runId },
+      } : row) });
+    }
+    // CAS protects concurrent controls. A durable owner pause in TaskRuns is
+    // still authoritative when the worker next tries to start its model.
+    await this.codeJobControl.resume({ jobId: record.jobId, expectedRevision: job.revision });
+    return true;
   }
 
   async #retirePending(record, item) {

@@ -201,6 +201,7 @@ export async function createCodeJobRuntime({
   brainDirectory,
   taskRuns,
   reviewRepairContextReader,
+  conflictSourceReader,
   actionAdmissionGate,
   dataDirectory,
   operationQueue = new OperationQueue(),
@@ -305,6 +306,7 @@ export async function createCodeJobRuntime({
           brainDirectory,
           taskRuns,
           ...(reviewRepairContextReader === undefined ? {} : { reviewRepairContextReader }),
+          ...(conflictSourceReader == null ? {} : { conflictSourceReader }),
           grantVerifier,
           ...(actionAdmissionGate === undefined
             ? {}

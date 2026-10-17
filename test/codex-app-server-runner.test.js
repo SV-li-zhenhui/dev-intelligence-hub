@@ -49,7 +49,7 @@ function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=fals
     if(request.method.startsWith('thread/') && codeJob)Object.assign(result,{approvalPolicy:'never',sandbox:{type:'readOnly',networkAccess:false}});
     if(request.method==='mcpServerStatus/list') {
       const namespace=Object.keys(calls.find(call=>call.method.startsWith('thread/')).params.config.mcp_servers).find(name=>name.startsWith('dih_code_job_'));
-      result={data:[{name:namespace,tools:Object.fromEntries((toolInventory??['perform_action','read_source','get_state']).map(name=>[name,{}]))}],nextCursor:null};
+        result={data:[{name:namespace,tools:Object.fromEntries((toolInventory??['perform_action','read_source','edit_source','get_state','read_conflict_source']).map(name=>[name,{}]))}],nextCursor:null};
     }
     if(request.method==='turn/start')result={turn:{id:'turn-1'}};
     if(request.method==='turn/steer')result=steerTurnId===false?{}:{turnId:steerTurnId??'turn-1'};

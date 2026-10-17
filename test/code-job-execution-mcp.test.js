@@ -38,7 +38,7 @@ async function tool(endpoint, name, args, id) {
 test("execution MCP exposes exactly scoped semantic tools and marks only reads as read-only", async (t) => {
   const endpoint = await fixture(t);
   assert.match(endpoint.url, /^http:\/\/127\.0\.0\.1:\d+\/code-execution\/[a-f0-9]{64}$/);
-  assert.deepEqual(endpoint.tools, ["perform_action", "read_source", "get_state"]);
+  assert.deepEqual(endpoint.tools, ["perform_action", "read_source", "edit_source", "get_state", "read_conflict_source"]);
   assert.ok((await rpc(endpoint, "initialize")).capabilities.tools);
   assert.deepEqual(await rpc(endpoint, "ping"), {});
   const tools = (await rpc(endpoint, "tools/list")).tools;
@@ -46,7 +46,8 @@ test("execution MCP exposes exactly scoped semantic tools and marks only reads a
   assert.deepEqual(tools[0].inputSchema.properties.decision, CODE_ACTION_DECISION_JSON_SCHEMA);
   assert.equal(tools[0].annotations?.readOnlyHint, false);
   assert.notEqual(tools[0].annotations?.idempotentHint, true);
-  assert.ok(tools.slice(1).every(({ annotations }) => annotations.readOnlyHint));
+  assert.deepEqual(tools.filter(({ annotations }) => annotations.readOnlyHint).map(({ name }) => name),
+    ["read_source", "get_state", "read_conflict_source"]);
   assert.deepEqual(await tool(endpoint, "get_state", {}), { revision: 1 });
   await assert.rejects(tool(endpoint, "shell", {}), { code: "CODE_EXECUTION_TOOL_NOT_ALLOWED" });
   await assert.rejects(tool(endpoint, "perform_action", { decision: decision({ type: "complete", outcome: "done", evidence: [] }) }),
@@ -70,6 +71,23 @@ test('MCP ping, get_state and cached mutation replay cannot renew host inactivit
   assert.equal(writes, 1); assert.equal(codeExecutionWatchdogSignal(watchdog).aborted, false);
   t.mock.timers.tick(60_000);
   assert.equal(codeExecutionWatchdogSignal(watchdog).reason.code, 'STRUCTURED_PROVIDER_IDLE_TIMEOUT');
+});
+
+test("bounded edit RPCs replay once and reject ambiguous authority fields and oversized edits", async t => {
+  let calls = 0;
+  const endpoint = await fixture(t, { editSource: async value => { calls++; return value; } });
+  const args = { path: "src/app.js", sourceVersion: "current", edits: [{ oldText: "before", newText: "after" }] };
+  assert.deepEqual(await tool(endpoint, "edit_source", args, "edit-1"), args);
+  assert.deepEqual(await tool(endpoint, "edit_source", args, "edit-1"), args);
+  assert.equal(calls, 1);
+  await assert.rejects(tool(endpoint, "edit_source", { ...args, edits: [{ oldText: "other", newText: "after" }] }, "edit-1"),
+    { code: "CODE_EXECUTION_REQUEST_ID_CONFLICT" });
+  for (const value of [{ ...args, expectedSha256: "forged" }, { ...args, path: "../outside" },
+    { ...args, edits: [{ oldText: "", newText: "after" }] },
+    { ...args, edits: [{ oldText: "before", newText: "x".repeat(48 * 1024 + 1) }] }]) {
+    await assert.rejects(tool(endpoint, "edit_source", value), { code: "CODE_EDIT_ARGUMENT_INVALID" });
+  }
+  assert.equal(calls, 1);
 });
 
 test("mutating request IDs cache concurrent and reordered canonical replays without repeating actions", async (t) => {

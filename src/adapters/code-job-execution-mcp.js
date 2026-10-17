@@ -5,6 +5,7 @@ import {
 } from "../domain/structured-code-action-contract.js";
 import { beginCodeExecutionSession } from "../lib/code-execution-context.js";
 import { parseJsonWithUniqueKeys } from "../lib/strict-json.js";
+import { normalizeCodeSourceEdits } from "../lib/code-source-edits.js";
 
 const MAXIMUM_REQUEST_BYTES = 1024 * 1024;
 const MAXIMUM_ACTION_REQUESTS = 128;
@@ -19,8 +20,20 @@ const TOOLS = [
         offset: { type: "integer", minimum: 0 }, length: { type: "integer", minimum: 1, maximum: 48_000 },
         sourceVersion: { type: "string", minLength: 1, maxLength: 256 } } },
     annotations: { readOnlyHint: true, destructiveHint: false } },
+  { name: "edit_source", description: "Apply bounded literal edits to a fully read current audited source. Each oldText must match exactly once, in order. Echo sourceVersion. The host preserves all other bytes and uses the existing write_text authority and limits. Read again after a write.",
+    inputSchema: { type: "object", required: ["path", "sourceVersion", "edits"], additionalProperties: false,
+      properties: { path: { type: "string", minLength: 1, maxLength: 1024 }, sourceVersion: { type: "string", minLength: 1, maxLength: 256 },
+        edits: { type: "array", minItems: 1, maxItems: 32, items: { type: "object", required: ["oldText", "newText"], additionalProperties: false,
+          properties: { oldText: { type: "string", minLength: 1, maxLength: 48 * 1024 }, newText: { type: "string", maxLength: 48 * 1024 } } } } } },
+    annotations: { readOnlyHint: false, destructiveHint: true } },
   { name: "get_state", description: "Read current job state, permitted actions, workspace revision and verification evidence.",
     inputSchema: { type: "object", additionalProperties: false, properties: {} },
+    annotations: { readOnlyHint: true, destructiveHint: false } },
+  { name: "read_conflict_source", description: "Read complete ancestor, head or base text from this job's sealed conflict preparation. Only the sealed conflict paths are available. Follow nextOffset until null and echo sourceVersion; these immutable versions cannot authorize writes to the current workspace.",
+    inputSchema: { type: "object", required: ["path", "version", "offset"], additionalProperties: false,
+      properties: { path: { type: "string", minLength: 1, maxLength: 1024 }, version: { type: "string", enum: ["ancestor", "head", "base"] },
+        offset: { type: "integer", minimum: 0 }, length: { type: "integer", minimum: 1, maximum: 48_000 },
+        sourceVersion: { type: "string", minLength: 1, maxLength: 256 } } },
     annotations: { readOnlyHint: true, destructiveHint: false } },
 ];
 
@@ -38,6 +51,13 @@ function exactArguments(value, required, optional = []) {
 }
 
 function normalizeArguments(name, value) {
+  if (name === "read_conflict_source") {
+    const args = exactArguments(value, ["path", "version", "offset"], ["length", "sourceVersion"]);
+    if (!["ancestor", "head", "base"].includes(args.version)) throw failure("CODE_EXECUTION_ARGUMENT_INVALID");
+    const { version, ...page } = args;
+    return { ...normalizeArguments("read_source", page), version };
+  }
+  if (name === "edit_source") return normalizeCodeSourceEdits(value);
   if (name === "perform_action") {
     exactArguments(value, ["decision"]);
     const decision = normalizeStructuredCodeActionDecision(value.decision);
@@ -62,7 +82,7 @@ function normalizeArguments(name, value) {
 
 function toolError(error) {
   const code = typeof error?.code === "string" && error.code.length <= 128 &&
-    /^(?:(?:CODE_EXECUTION|CODE_READ|CODE_JOB|CODE_BRAIN|CODE_ARTIFACT|EXECUTION|STRUCTURED_CODE_ACTION|WORK_LEDGER)_[A-Z0-9_]+|INVALID_CODE_JOB_AUTHORITY)$/u.test(error.code)
+    /^(?:(?:CODE_EXECUTION|CODE_READ|CODE_EDIT|CODE_JOB|CODE_BRAIN|CODE_ARTIFACT|EXECUTION|STRUCTURED_CODE_ACTION|WORK_LEDGER)_[A-Z0-9_]+|INVALID_CODE_JOB_AUTHORITY)$/u.test(error.code)
     ? error.code : "CODE_EXECUTION_FAILED";
   return { isError: true, content: [{ type: "text", text: code }] };
 }
@@ -115,9 +135,9 @@ export async function createCodeJobExecutionMcp(context, { signal = null, watchd
           return { content: [{ type: "text", text: JSON.stringify(value) }] };
         } catch (error) { return toolError(error); }
       };
-      if (params.name !== "perform_action") return await invoke();
+      if (!["perform_action", "edit_source"].includes(params.name)) return await invoke();
       const key = JSON.stringify(message.id);
-      const payload = JSON.stringify(args);
+      const payload = JSON.stringify({ name: params.name, args });
       const previous = mutations.get(key);
       if (previous) {
         if (previous.payload !== payload) throw failure("CODE_EXECUTION_REQUEST_ID_CONFLICT");

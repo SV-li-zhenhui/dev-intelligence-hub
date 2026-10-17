@@ -4,7 +4,9 @@ import { beginCodeExecutionHostOperation, codeExecutionWatchdogSignal } from './
 const contexts = new WeakMap();
 const CALLBACKS = new Map([
   ["perform_action", "performAction"],
+  ["edit_source", "editSource"],
   ["read_source", "readSource"],
+  ["read_conflict_source", "readConflictSource"],
   ["get_state", "getState"],
 ]);
 
@@ -20,8 +22,10 @@ function stateFor(context) {
 
 // A serialized model input cannot recreate this authority. Callbacks retain
 // job ownership, workspace revision, audit and executor validation on the host.
-export function createCodeExecutionContext({ performAction, readSource, getState, close, progressFingerprint, sourceReadIdentity } = {}) {
+export function createCodeExecutionContext({ performAction, editSource, readSource, readConflictSource, getState, close, progressFingerprint, sourceReadIdentity } = {}) {
   if ([performAction, readSource, getState].some((callback) => typeof callback !== "function") ||
+      (editSource !== undefined && typeof editSource !== "function") ||
+      (readConflictSource !== undefined && typeof readConflictSource !== "function") ||
       (close !== undefined && typeof close !== "function") ||
       (progressFingerprint !== undefined && typeof progressFingerprint !== 'function') ||
       (sourceReadIdentity !== undefined && typeof sourceReadIdentity !== 'function')) {
@@ -29,7 +33,7 @@ export function createCodeExecutionContext({ performAction, readSource, getState
   }
   const context = Object.freeze({});
   contexts.set(context, {
-    callbacks: { performAction, readSource, getState, close, progressFingerprint, sourceReadIdentity },
+    callbacks: { performAction, editSource, readSource, readConflictSource, getState, close, progressFingerprint, sourceReadIdentity },
     controller: new AbortController(), started: false, revoked: false,
     queue: new OperationQueue(), closing: null, removeParentAbort: null, pendingCallbacks: new Set(),
   });
@@ -87,13 +91,13 @@ export function beginCodeExecutionSession(context, { signal = null, watchdog = n
       try {
         assertActive(state);
         const callback = CALLBACKS.get(name);
-        if (!callback) throw failure("CODE_EXECUTION_TOOL_NOT_ALLOWED");
+        if (!callback || typeof state.callbacks[callback] !== "function") throw failure("CODE_EXECUTION_TOOL_NOT_ALLOWED");
         return state.queue.enqueue(async () => {
           assertActive(state);
           const finish = watchdog === null ? null : beginCodeExecutionHostOperation(watchdog, name, args);
           let removeAbort;
           const operation = Promise.resolve().then(async () => {
-            const fingerprint = name === 'perform_action' ? state.callbacks.progressFingerprint : null;
+            const fingerprint = ['perform_action', 'edit_source'].includes(name) ? state.callbacks.progressFingerprint : null;
             const before = await fingerprint?.();
             // The trusted read can outlive cancellation or an idle deadline.
             // Re-check admission before starting the side-effecting callback.
@@ -101,7 +105,7 @@ export function beginCodeExecutionSession(context, { signal = null, watchdog = n
             state.controller.signal.throwIfAborted();
             const value = await state.callbacks[callback](args, { signal: state.controller.signal });
             const after = await fingerprint?.();
-            const sourceIdentity = name === 'read_source' ? await state.callbacks.sourceReadIdentity?.() : null;
+            const sourceIdentity = ['read_source', 'read_conflict_source'].includes(name) ? await state.callbacks.sourceReadIdentity?.() : null;
             return { value, before, after, sourceIdentity };
           });
           state.pendingCallbacks.add(operation);
