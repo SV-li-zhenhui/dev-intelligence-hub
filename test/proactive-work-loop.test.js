@@ -466,6 +466,69 @@ function createLoop({ ledger, directory, time, ...options }) {
   });
 }
 
+test("one deferred PR preparation does not abort other eligible work or spend its decision budget", async () => {
+  for (const code of ["OWN_PR_REPAIR_OBJECT_FETCH_FAILED", "WORK_LEDGER_PR_EXECUTION_BINDING_STALE"]) {
+    const time = controlledClock();
+    const first = workItem(1, { type: "role", id: "developer" });
+    const second = workItem(2, { type: "role", id: "developer" });
+    const ledger = new FakeLedger({ source: [first, second], time });
+    const loop = createLoop({ ledger, time,
+      directory: new FakeRoleDirectory({ developer: worker({ roleId: "developer" }) }),
+      automaticOwnPrRepair: { async shouldRun(item) {
+        if (item.itemId === first.itemId) throw Object.assign(new Error("private preparation diagnostic"), { code });
+        return true;
+      } },
+    });
+    const result = await loop.runCycle({ roleId: "developer" });
+    assert.equal(result.claimed, 1);
+    assert.ok(result.outcomes.some(outcome => outcome.itemId === first.itemId && outcome.status === "conflict_material_deferred" && outcome.code === code));
+    assert.equal(ledger.items.find(item => item.itemId === first.itemId).attempt, 0);
+    assert.deepEqual(ledger.calls.claim.map(call => call.itemId), [second.itemId]);
+    assert.equal(JSON.stringify(result).includes("private preparation diagnostic"), false);
+  }
+});
+
+test("PR preparation deferrals respect the scan budget and role scope", async () => {
+  const time = controlledClock();
+  const otherRole = workItem(1, { type: "role", id: "tester" });
+  const developers = Array.from({ length: 8 }, (_, index) => workItem(index + 2, { type: "role", id: "developer" }));
+  const healthy = workItem(10, { type: "role", id: "developer" });
+  const ledger = new FakeLedger({ source: [otherRole, ...developers, healthy], time });
+  const prepared = [];
+  const loop = createLoop({ ledger, time, directory: new FakeRoleDirectory({ developer: worker({ roleId: "developer" }) }),
+    automaticOwnPrRepair: { async shouldRun(item) {
+      prepared.push(item.itemId);
+      if (item.itemId === healthy.itemId) return true;
+      throw Object.assign(new Error("fetch unavailable"), { code: "OWN_PR_REPAIR_OBJECT_FETCH_FAILED" });
+    } },
+  });
+  const result = await loop.runCycle({ roleId: "developer", workLimit: 1 });
+  assert.equal(prepared.length, 4);
+  assert.equal(prepared.includes(otherRole.itemId), false);
+  assert.equal(result.claimed, 0);
+  assert.ok(ledger.items.every(item => item.attempt === 0));
+  assert.equal((await loop.runCycle({ roleId: "developer", workLimit: 1 })).claimed, 0);
+  assert.equal(new Set(prepared).size, 8, "the next cycle visits the next failing candidates");
+  assert.equal((await loop.runCycle({ roleId: "developer", workLimit: 1 })).claimed, 1);
+  assert.deepEqual(ledger.calls.claim.map(call => call.itemId), [healthy.itemId]);
+});
+
+test("PR preparation still propagates unknown failures, runtime fences and cancellation", async () => {
+  for (const code of ["UNEXPECTED_FAILURE", "RUNTIME_RESTART_REQUIRED", "aborted"]) {
+    const time = controlledClock(), controller = new AbortController();
+    const ledger = new FakeLedger({ source: [workItem(1)], time });
+    const failure = Object.assign(new Error("preparation stopped"), { code });
+    const loop = createLoop({ ledger, time, directory: new FakeRoleDirectory(),
+      automaticOwnPrRepair: { async shouldRun() {
+        if (code === "aborted") controller.abort(failure);
+        throw code === "aborted" ? Object.assign(new Error("fetch failed"), { code: "OWN_PR_REPAIR_OBJECT_FETCH_FAILED" }) : failure;
+      } },
+    });
+    await assert.rejects(loop.runCycle({ signal: controller.signal }), error => error === failure);
+    assert.equal(ledger.calls.claim.length, 0);
+  }
+});
+
 test("a conflict decision blocked without materials receives one bounded retry only after exact materials recover", async () => {
   for (const variant of ["current", "trimmed", "already-recovered", "changed-target", "wrong-failure", "preparation-failure"]) {
     const time = controlledClock();

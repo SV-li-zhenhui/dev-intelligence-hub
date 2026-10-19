@@ -60,6 +60,15 @@ function isContextContention(error) {
 const NON_BUDGET_CLAIM_FAILURE_CODES = new Set([
   "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
 ]);
+const PR_PREPARATION_DEFERRED_CODES = new Set([
+  "WORK_LEDGER_PR_EXECUTION_BINDING_STALE",
+  "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+  "OWN_PR_CONFLICT_TARGET_CHANGED",
+  "OWN_PR_REPAIR_OBJECT_FETCH_FAILED",
+  "OWN_PR_REPAIR_OBJECT_TIMEOUT",
+  "OWN_PR_REPAIR_OBJECT_CREDENTIAL_FAILED",
+  "OWN_PR_REPAIR_OBJECT_PREFLIGHT_FAILED",
+]);
 const DECISION_FAILURE_REASONS = Object.freeze({
   retry: "decision_failed",
   exhausted: "decision_attempts_exhausted",
@@ -859,6 +868,7 @@ export class ProactiveWorkLoop {
     this.issueRetirementSweep = null;
     this.fencedClaimDeferrals = new Map();
     this.stalePrFactSweeps = new Map();
+    this.prPreparationSweeps = new Map();
     this.blockedRootSweeps = new Map();
     this.claimCycleSequence = 0;
   }
@@ -911,6 +921,11 @@ export class ProactiveWorkLoop {
     this.stalePrFactSweeps.set(scope, stalePrFactSweep);
     for (const [itemId, revision] of stalePrFactSweep) {
       if (itemRevisions.get(itemId) !== revision) stalePrFactSweep.delete(itemId);
+    }
+    const preparationSweep = this.prPreparationSweeps.get(scope) ?? new Map();
+    this.prPreparationSweeps.set(scope, preparationSweep);
+    for (const [itemId, revision] of preparationSweep) {
+      if (itemRevisions.get(itemId) !== revision) preparationSweep.delete(itemId);
     }
     for (const [itemId, deferral] of this.fencedClaimDeferrals) {
       if (
@@ -981,6 +996,7 @@ export class ProactiveWorkLoop {
         break;
       }
       if (stalePrFactSweep.get(item.itemId) === item.revision) continue;
+      if (preparationSweep.get(item.itemId) === item.revision) continue;
       if (blockedRootSweep.has(item.itemId)) continue;
       const fencedDeferral = this.fencedClaimDeferrals.get(item.itemId);
       if (
@@ -990,7 +1006,24 @@ export class ProactiveWorkLoop {
         continue;
       }
       if (!isAvailable(item, normalizeLoopClock(this.clock))) continue;
-      if (this.automaticOwnPrRepair !== null && !(await this.automaticOwnPrRepair.shouldRun(item))) continue;
+      if (
+        options.roleId !== null &&
+        options.roleId !== ORCHESTRATOR_ROLE_ID &&
+        (item.currentTarget.type !== "role" || item.currentTarget.id !== options.roleId)
+      ) continue;
+      if (this.automaticOwnPrRepair !== null) {
+        try {
+          if (!(await this.automaticOwnPrRepair.shouldRun(item))) continue;
+        } catch (error) {
+          throwIfLoopAborted(options.signal);
+          const code = stableFailureCode(error);
+          if (!PR_PREPARATION_DEFERRED_CODES.has(code)) throw error;
+          availabilityBudgetUsed += 1;
+          preparationSweep.set(item.itemId, item.revision);
+          outcomes.push({ itemId: item.itemId, status: "conflict_material_deferred", code });
+          continue;
+        }
+      }
       if (this.automaticReviewPolicy !== null && item.currentTarget?.id === "pr-engineer") {
         const event = currentWorkItemEvent(item);
         if (event.source?.provider === "github" && event.payload?.relation === "review_requested") {
@@ -1009,14 +1042,6 @@ export class ProactiveWorkLoop {
           normalizeLoopClock(this.clock),
           this.issueActiveWindowDays,
         )
-      ) {
-        continue;
-      }
-      if (
-        options.roleId !== null &&
-        options.roleId !== ORCHESTRATOR_ROLE_ID &&
-        (item.currentTarget.type !== "role" ||
-          item.currentTarget.id !== options.roleId)
       ) {
         continue;
       }
@@ -1213,6 +1238,7 @@ export class ProactiveWorkLoop {
     // Continue a bounded stale-fact sweep across cycles without moving new or
     // urgent candidates behind old work. A changed revision is never skipped.
     if (completedCandidateSweep) this.stalePrFactSweeps.delete(scope);
+    if (completedCandidateSweep) this.prPreparationSweeps.delete(scope);
     if (completedCandidateSweep) this.blockedRootSweeps.delete(scope);
     throwIfLoopAborted(options.signal);
     return {
