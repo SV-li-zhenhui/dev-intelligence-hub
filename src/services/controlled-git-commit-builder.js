@@ -138,10 +138,24 @@ export class ControlledGitCommitBuilder {
       evidenceIds.push(entry.name);
     }
     evidenceIds.sort((left, right) => left.localeCompare(right, "en"));
-    for (const evidenceId of evidenceIds) await this.verify(evidenceId);
+    const stalePreparationEvidenceIds = [];
+    for (const evidenceId of evidenceIds) {
+      try {
+        await this.verify(evidenceId);
+      } catch (error) {
+        // verify loads and validates the sealed local record first. A later
+        // mirror change fences its use, but must not disable unrelated work.
+        // Execution and publication still perform the complete verification.
+        if (error?.code !== "CONTROLLED_GIT_BOUNDARY_CHANGED") throw error;
+        stalePreparationEvidenceIds.push(evidenceId);
+      }
+    }
     return Object.freeze({
       commits: evidenceIds.length,
       removedScratchDirectories,
+      ...(stalePreparationEvidenceIds.length > 0
+        ? { stalePreparationEvidenceIds: Object.freeze(stalePreparationEvidenceIds) }
+        : {}),
     });
   }
 

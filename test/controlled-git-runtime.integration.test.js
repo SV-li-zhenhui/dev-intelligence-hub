@@ -797,7 +797,7 @@ test(
     );
     await mkdir(orphanScratch);
     await writeFile(path.join(orphanScratch, "partial"), "crash residue");
-    const restarted = await createControlledGitRuntimeBundle({
+    const restart = () => createControlledGitRuntimeBundle({
       enabled: true,
       gitCommand,
       preparationRoot: setup.preparationRoot,
@@ -806,6 +806,7 @@ test(
         "contributor/runtime-test": setup.headMirrorRoot,
       },
     });
+    const restarted = await restart();
     await assert.rejects(lstat(orphanScratch), (error) => error?.code === "ENOENT");
     assert.deepEqual(
       await restarted.commitBuilder.verify({ evidenceId: evidence.evidenceId }),
@@ -836,6 +837,15 @@ test(
       evidence,
     );
 
+    const growthFile = path.join(setup.root, "later-mirror-object.txt");
+    await writeFile(growthFile, "a later independent Git fetch adds this object\n");
+    await git(gitCommand, setup.headMirrorRoot, ["hash-object", "-w", growthFile]);
+    const grown = await restart();
+    await assert.rejects(
+      grown.commitBuilder.verify({ evidenceId: evidence.evidenceId }),
+      (error) => error?.code === "CONTROLLED_GIT_BOUNDARY_CHANGED",
+    );
+
     const tamperedObject = await firstLooseObject(commitObjects);
     await rm(tamperedObject, { force: true });
     await writeFile(tamperedObject, "tampered object");
@@ -843,6 +853,7 @@ test(
       restarted.commitBuilder.verify({ evidenceId: evidence.evidenceId }),
       (error) => error?.code === "CONTROLLED_GIT_COMMIT_TAMPERED",
     );
+    await assert.rejects(restart(), (error) => error?.cause?.code === "CONTROLLED_GIT_COMMIT_TAMPERED");
   },
 );
 
