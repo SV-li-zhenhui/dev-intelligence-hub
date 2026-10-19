@@ -384,6 +384,19 @@ function unstartedIntent(item, outboxById) {
   return null;
 }
 
+function retainedWorkflowWaitBinding(item, outbox) {
+  const binding = outbox.sourceBinding;
+  if (outbox.inputDigest !== binding?.inputDigest) return false;
+  if (ledgerDigest(binding) === ledgerDigest(currentWorkItemInputBinding(item))) return true;
+  const source = item.source;
+  if (source?.kind !== "pull_request" || binding.kind !== "pull_request" || binding.rootItemId !== item.itemId ||
+      binding.workKey !== source.workKey || binding.inputRevision >= source.activeRevision) return false;
+  const revision = source.revisions[binding.inputRevision - 1];
+  return revision?.disposition === "accepted" && revision.revision === binding.inputRevision &&
+    ["headRevision", "headRefOid", "eventId", "eventDigest", "inputDigest"].every(key => revision[key] === binding[key]) &&
+    source.bindings.some(entry => entry.inputRevision === binding.inputRevision && entry.eventId === binding.eventId);
+}
+
 function obsoleteHeadCondition(item, outboxById) {
   if (item.status !== "waiting_condition" || item.activeIntentId === null) return null;
   const outbox = outboxById.get(item.activeIntentId);
@@ -391,8 +404,7 @@ function obsoleteHeadCondition(item, outboxById) {
   if (outbox?.status !== "delivered" || outbox.outcome?.status !== "delivered" ||
       outbox.intent.type !== "wait_condition" || condition?.kind !== "workflow_fact" ||
       !["merge-state", "ci-status", "review-decision", "next-action", "action-state", "head-oid", "base-oid", "state"].includes(condition.fact) ||
-      outbox.inputDigest !== item.inputDigest || outbox.sourceBinding == null ||
-      ledgerDigest(outbox.sourceBinding) !== ledgerDigest(currentWorkItemInputBinding(item))) return null;
+      outbox.sourceBinding == null || !retainedWorkflowWaitBinding(item, outbox)) return null;
   return outbox;
 }
 

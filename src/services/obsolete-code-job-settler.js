@@ -23,10 +23,7 @@ export class ObsoleteCodeJobSettler {
   async settle({ grant: value, receipt }, { admitCancellation = admitImmediately } = {}) {
     if (typeof admitCancellation !== "function") throw new TypeError("Cancellation admission is invalid");
     const grant = normalizeCodeJobGrant(value);
-    const read = async () => {
-      const job = await this.#get(receipt.id);
-      return job === null ? null : normalizeCodeJobConfirmationResult(job, grant, receipt);
-    };
+    const read = () => this.read({ grant, receipt });
     const job = await read();
     if (job === null || TERMINAL_STATUSES.has(job.status) || job.status === "cancelling") return job;
     // Cancellation uses the same stop/action reconciliation as owner controls.
@@ -36,5 +33,11 @@ export class ObsoleteCodeJobSettler {
     }));
     await admitted.operation;
     return read();
+  }
+
+  async read({ grant: value, receipt }) {
+    const grant = normalizeCodeJobGrant(value);
+    const job = await this.#get(receipt.id);
+    return job === null ? null : normalizeCodeJobConfirmationResult(job, grant, receipt);
   }
 }

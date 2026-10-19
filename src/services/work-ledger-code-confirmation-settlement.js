@@ -13,17 +13,23 @@ import { codeJobIdForGrant } from "../domain/code-job-contract.js";
 // A public reconciliation command cannot supply a JSON flag as settlement proof.
 const settlements = new WeakMap();
 
-export function isChangedCodeConfirmationDecision(decision) {
+export function codeConfirmationSettlementId(decision) {
   const value = decision?.value;
-  return decision?.source === "proposal" && decision.outcome === "stale" &&
-    typeof decision.referenceId === "string" &&
-    value?.kind === "code_action_proposal" &&
-    typeof value.downstreamRef === "string" &&
-    value.downstreamRef.startsWith("confirmation-code-job-") &&
-    Array.isArray(value.evidence) && value.evidence.length === 3 &&
-    value.evidence[0] === `confirmation:${value.downstreamRef}` &&
-    value.evidence[1] === "authorization_changed" &&
-    ["old_confirmation_status:stale", "old_confirmation_status:completed", "old_confirmation_status:executing", "old_confirmation_status:failed"].includes(value.evidence[2]);
+  if (decision?.source !== "proposal" || decision.outcome !== "stale" ||
+      typeof decision.referenceId !== "string" || value?.kind !== "code_action_proposal" ||
+      !Array.isArray(value.evidence) || value.evidence.length !== 3 ||
+      value.evidence[1] !== "authorization_changed" ||
+      !["old_confirmation_status:stale", "old_confirmation_status:completed", "old_confirmation_status:executing", "old_confirmation_status:failed"].includes(value.evidence[2])) return null;
+  // Older terminal handler results retained the confirmation only in evidence.
+  // This locates its sealed record; it does not itself prove settlement.
+  const reference = value.downstreamRef === null && typeof value.evidence[0] === "string"
+    ? value.evidence[0].slice("confirmation:".length) : value.downstreamRef;
+  return typeof reference === "string" && reference.startsWith("confirmation-code-job-") &&
+    value.evidence[0] === `confirmation:${reference}` ? reference : null;
+}
+
+export function isChangedCodeConfirmationDecision(decision) {
+  return codeConfirmationSettlementId(decision) !== null;
 }
 
 export function isRevokedCodeConfirmationDecision(decision) {
@@ -90,7 +96,7 @@ export function completedCodeConfirmationForSettlement(item, outboxById, snapsho
     const confirmation = normalizeConfirmationState({
       schemaVersion: 1, revision: snapshot.queueRevision, items: [snapshot.item],
     }).items[0];
-    if (confirmation.id !== item.decisionContext.value.downstreamRef ||
+    if (confirmation.id !== codeConfirmationSettlementId(item.decisionContext) ||
       confirmation.kind !== "local.code-job-create" || confirmation.status !== "completed") return null;
     const historical = matchingHistoricalConfirmation(item, outboxById, confirmation);
     if (historical === null || confirmation.receipt.id !== codeJobIdForGrant(historical.grant)) return null;
@@ -121,7 +127,7 @@ export function createRevokedCodeConfirmationSettlement(item, outboxById, snapsh
     const confirmation = normalizeConfirmationState({
       schemaVersion: 1, revision: snapshot.queueRevision, items: [snapshot.item],
     }).items[0];
-    if (confirmation.id !== item.decisionContext.value.downstreamRef ||
+    if (confirmation.id !== codeConfirmationSettlementId(item.decisionContext) ||
       confirmation.kind !== "local.code-job-create" || confirmation.status !== "stale" ||
       confirmation.execution !== null || confirmation.receipt !== null ||
       confirmation.failure !== null || confirmation.rejection !== null ||
@@ -134,6 +140,25 @@ export function createRevokedCodeConfirmationSettlement(item, outboxById, snapsh
     // Missing, malformed, mismatched or executed confirmations never release work.
     return null;
   }
+}
+
+export function unstartedCodeConfirmationForSettlement(item, outboxById, snapshot) {
+  if (item?.status !== "blocked" || item.activeIntentId !== null || item.sourceQuarantine != null ||
+      !isChangedCodeConfirmationDecision(item.decisionContext) || snapshot == null) return null;
+  try {
+    const confirmation = normalizeConfirmationState({ schemaVersion: 1, revision: snapshot.queueRevision, items: [snapshot.item] }).items[0];
+    if (confirmation.id !== codeConfirmationSettlementId(item.decisionContext) || confirmation.kind !== "local.code-job-create" ||
+        confirmation.status !== "stale" || confirmation.execution === null || confirmation.receipt !== null ||
+        confirmation.failure !== null || confirmation.rejection !== null || confirmation.invalidation !== null) return null;
+    const historical = matchingHistoricalConfirmation(item, outboxById, confirmation);
+    return historical === null ? null : { ...historical, receipt: { id: codeJobIdForGrant(historical.grant), createdAt: null } };
+  } catch { return null; }
+}
+
+export function createUnstartedCodeConfirmationSettlement(item, outboxById, snapshot, job) {
+  const unstarted = unstartedCodeConfirmationForSettlement(item, outboxById, snapshot);
+  // Undefined means that the trusted reader is unavailable, not an absent job.
+  return unstarted !== null && job === null ? createSettlement(item, unstarted.outbox) : null;
 }
 
 export function hasCodeConfirmationSettlement(item, outboxById, proof) {

@@ -1593,7 +1593,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     workLedgerRuntimeFactory: async (options) => {
       runtimeOrder.push("ledger");
       calls.ledger = options;
-      assert.equal(await options.confirmationSettlementReader.read({ confirmationId: "before-runtime" }), null);
+      assert.equal(await options.confirmationSettlementReader.read({ confirmationId: "before-runtime" }), undefined);
       assert.equal(await options.obsoleteCodeJobSettler.settle({}), null);
       return ledgerRuntime;
     },

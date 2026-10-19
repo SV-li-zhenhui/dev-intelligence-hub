@@ -1,4 +1,5 @@
 import { normalizeWorkProposalResult } from "../domain/work-proposal-contract.js";
+import { continuesOwnPullRequestRepairInspection } from "./work-ledger-inspection-continuation.js";
 import { normalizeDeliveryEvidenceTarget } from "../domain/delivery-evidence-contract.js";
 import {
   normalizePullRequestExecutionBinding,
@@ -14,7 +15,6 @@ import {
 } from "./work-ledger-state.js";
 import {
   currentWorkItemExecutionBinding,
-  currentWorkItemEvent,
   pullRequestHeadAdmission,
   LEGACY_PR_SOURCE_CUTOVER_REASON,
   LEGACY_PR_SOURCE_QUARANTINE_KIND,
@@ -55,38 +55,6 @@ const PULL_REQUEST_BINDING_FIELDS = Object.freeze([
 function samePullRequestSourceBinding(left, right) {
   return left !== null && right !== null &&
     PULL_REQUEST_BINDING_FIELDS.every((field) => left?.[field] === right?.[field]);
-}
-
-function continuesOwnPullRequestRepairInspection(item, outbox, result) {
-  const boundIntent = outbox.dispatchBinding?.boundIntent;
-  const event = currentWorkItemEvent(item);
-  if (
-    result.kind !== "code_action_proposal" ||
-    result.requestedBy.roleId !== "developer" ||
-    outbox.intent.operation !== "inspect" ||
-    boundIntent?.payload?.operation !== "inspect" ||
-    item.source?.kind !== "pull_request" ||
-    item.source.scope.active !== true ||
-    item.source.scope.kind !== "automatic" ||
-    item.source.pendingRevision !== null ||
-    item.source.identity.targetRoleId !== "developer" ||
-    event.source.provider !== "github" ||
-    event.payload.relation !== "authored" ||
-    event.payload.actionState !== "action_now" ||
-    event.payload.nextAction !== "address_review"
-  ) {
-    return false;
-  }
-  const current = currentWorkItemExecutionBinding(item);
-  if (!samePullRequestSourceBinding(current, outbox.sourceBinding)) return false;
-  try {
-    return samePullRequestExecutionBinding(
-      current,
-      boundIntent.binding.inputBinding,
-    );
-  } catch {
-    return false;
-  }
 }
 
 function contractedPullRequestInspectionStatus(state, item, outbox, result) {

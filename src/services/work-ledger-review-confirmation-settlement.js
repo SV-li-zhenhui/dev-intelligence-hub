@@ -111,7 +111,14 @@ export function createCompletedReviewConfirmationSettlement(item, outboxById, sn
       if (confirmation.status === "completed" && confirmation.receipt?.id) completed.push(confirmation);
       else if (!(confirmation.status === "stale" && confirmation.execution === null && confirmation.failure === null)) return null;
     }
-    if (completed.length !== 1) return null;
+    if (completed.length !== 1) {
+      const ids = [...new Set(plans.map(plan => plan.id))];
+      // A pre-enqueue rejection is settled only after the trusted reader has
+      // checked every historical confirmation identity, including absence.
+      if (completed.length !== 0 || item.decisionContext.value.downstreamRef !== null ||
+          snapshots.length !== ids.length || snapshots.some((snapshot, index) =>
+            snapshot !== null && snapshot?.item?.id !== ids[index])) return null;
+    }
     const proof = Object.freeze({});
     settlements.set(proof, { itemId: item.itemId, itemRevision: item.revision, inputDigest: item.inputDigest,
       decisionDigest: item.decisionContext.contentDigest, intentId: delivered.outbox.intentId,

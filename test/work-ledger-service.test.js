@@ -4995,7 +4995,7 @@ test("same-root cutover releases durably rejected attention", async () => {
   assert.equal(root.source.pendingRevision, null);
 });
 
-async function revokedCodeConfirmationFixture({ executed = false, createdJob = false, observedConfirmationStatus = null } = {}) {
+async function revokedCodeConfirmationFixture({ executed = false, createdJob = false, observedConfirmationStatus = null, legacyNullReference = false } = {}) {
   let overrideSnapshot;
   let confirmationQueue;
   const reads = [];
@@ -5101,7 +5101,7 @@ async function revokedCodeConfirmationFixture({ executed = false, createdJob = f
   }
   const snapshot = await confirmationQueue.readSettlement({ confirmationId: queued.id });
   const result = createWorkProposalResult({
-    proposal, sequence: 1, at: fixture.time.clock(), downstreamRef: plan.id,
+    proposal, sequence: 1, at: fixture.time.clock(), downstreamRef: legacyNullReference ? null : plan.id,
     transition: { status: "stale", summary: "旧确认已安全撤销", evidence: [
       `confirmation:${plan.id}`, "authorization_changed", `old_confirmation_status:${observedConfirmationStatus ?? (createdJob ? "completed" : "stale")}`,
     ] },
@@ -16203,6 +16203,60 @@ test("contracted PR child inspection settles without reviving a pending newer He
   assert.deepEqual(oldChild.graph.deliveries, []);
 });
 
+test("own PR conflict inspection continues and a historical inspect-only completion recovers once", async () => {
+  const fixture = await createFixture({ records: [authoredReviewRepairAssignment(1, { gitFacts: {
+    ...prGitFacts(PR_HEAD_A), relation: "authored", actionState: "action_now", nextAction: "resolve_conflict", isDraft: false,
+  } })] });
+  const result = await prepareProposalResult(fixture, { kind: "code_action_proposal", sealSource: true,
+    intentOverrides: { operation: "inspect" } });
+  await fixture.service.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+  const original = (await fixture.service.listItems()).items[0];
+  assert.equal(original.status, "queued", "inspection is evidence, not completion of conflict repair");
+  const durable = fixture.store.stored();
+  const old = durable.items.find(i => i.itemId === original.itemId);
+  old.status = "completed"; old.statusReason = "proposal_succeeded";
+  fixture.store.replaceStored(durable);
+  const recovered = await createFixture({ store: fixture.store, source: fixture.source, time: fixture.time });
+  const current = (await recovered.service.listItems()).items[0];
+  assert.equal(current.status, "queued");
+  assert.equal(current.attempt, original.attempt, "recovery does not reset the decision budget");
+  const restarted = await createFixture({ store: fixture.store, source: fixture.source, time: fixture.time });
+  assert.equal((await restarted.service.listItems()).items[0].revision, current.revision);
+});
+
+test("conflict continuation never reopens a completed modification, Draft or owner-stopped task", async () => {
+  for (const variant of ["modify", "draft", "paused", "cancelled"]) {
+    const fixture = await createFixture({ records: [authoredReviewRepairAssignment(1, { gitFacts: {
+      ...prGitFacts(PR_HEAD_A), relation: "authored", actionState: "action_now", nextAction: "resolve_conflict", isDraft: variant === "draft",
+    } })] });
+    const result = await prepareProposalResult(fixture, { kind: "code_action_proposal", sealSource: true,
+      intentOverrides: { operation: variant === "modify" ? "modify" : "inspect" } });
+    await fixture.service.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+    if (["paused", "cancelled"].includes(variant)) {
+      const durable = fixture.store.stored();
+      durable.items[0].status = variant; durable.items[0].statusReason = `owner_task_run_${variant}`;
+      fixture.store.replaceStored(durable);
+    }
+    const recovered = await createFixture({ store: fixture.store, source: fixture.source, time: fixture.time });
+    assert.equal((await recovered.service.listItems()).items[0].status, ["paused", "cancelled"].includes(variant) ? variant : "completed", variant);
+  }
+});
+
+test("stale creation settlement does not cancel an existing job or treat an unavailable reader as absence", async () => {
+  const fixture = await revokedCodeConfirmationFixture({ createdJob: true });
+  const snapshot = clone(fixture.snapshot);
+  snapshot.item.status = "stale"; snapshot.item.receipt = null;
+  fixture.replaceSnapshot(snapshot);
+  let cancelled = 0;
+  const readOnly = new ObsoleteCodeJobSettler({ codeJobReader: fixture.jobs,
+    codeJobControl: { cancel: async () => { cancelled += 1; assert.fail("stale admission only permits a read"); } } });
+  fixture.service.obsoleteCodeJobSettler = readOnly;
+  assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, false);
+  assert.equal(cancelled, 0);
+  fixture.service.obsoleteCodeJobSettler = { read: async () => undefined, settle: async () => null };
+  assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, false);
+});
+
 test("own PR review repair continues after successful inspection without a graph evidence target", async () => {
   const fixture = await createFixture({
     records: [authoredReviewRepairAssignment(1)],
@@ -16928,6 +16982,20 @@ test("a changed ledger during executed-confirmation reading cannot cancel the ob
     (error) => error.code === "WORK_LEDGER_STATE_REVISION_CONFLICT");
   assert.equal(cancellations, 0, "a stale asynchronous read must be rejected before requesting cancellation");
   assert.equal((await fixture.jobs.list()).items[0].status, "paused");
+});
+
+test("a legacy null downstream reference still reconciles the exact completed code confirmation", async () => {
+  const fixture = await revokedCodeConfirmationFixture({ createdJob: true, legacyNullReference: true });
+  fixture.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader: fixture.jobs, codeJobControl: fixture.jobs });
+  assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, true);
+  assert.equal((await fixture.service.readItemForReconciliation({ itemId: fixture.item.itemId })).source.current.headRefOid, PR_HEAD_B);
+});
+
+test("an executed stale code confirmation releases cutover only after a read proves no job exists", async () => {
+  const fixture = await revokedCodeConfirmationFixture({ executed: true });
+  fixture.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader: fixture.jobs, codeJobControl: fixture.jobs });
+  assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, true);
+  assert.equal((await fixture.jobs.list()).items.length, 0);
 });
 
 test("restart during old-job cancellation preserves the fence until a trusted receipt makes the new Head claimable", async () => {

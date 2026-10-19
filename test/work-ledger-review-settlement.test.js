@@ -48,7 +48,7 @@ function scopeLifecycleAssignment(sequence, event) {
 
 async function fixture({ outcome = "applied", transformPlan = (plan) => plan, downstream = false,
   followupScope = "followup", followupHead = HEAD, leaveScope = false, leaveScopeAfterResult = false,
-  ignoredReentry = false, ownerFollowup = false } = {}) {
+  ignoredReentry = false, ownerFollowup = false, neverEnqueued = false } = {}) {
   const store = new MemoryStore();
   const records = [assignment(1)];
   const source = { async readAssignmentBatch({ afterSequence, limit }) {
@@ -91,10 +91,12 @@ async function fixture({ outcome = "applied", transformPlan = (plan) => plan, do
   assert.equal((await dispatcher.dispatchPending()).delivered, 1);
   queue = makeQueue(); await queue.recover();
   const plan = createGitHubReviewProposalConfirmationPlan(proposal, { actorAccountId: "review-account" });
-  const queued = await queue.enqueue(transformPlan(clone(plan)));
-  await queue.approve(queued.id, { requestId: "approve-review-42", expectedQueueRevision: queued.queueRevision,
-    expectedItemRevision: queued.itemRevision, displayedPayloadDigest: queued.displayedPayloadDigest,
-    approvalBindingDigest: queued.approvalBindingDigest });
+  if (!neverEnqueued) {
+    const queued = await queue.enqueue(transformPlan(clone(plan)));
+    await queue.approve(queued.id, { requestId: "approve-review-42", expectedQueueRevision: queued.queueRevision,
+      expectedItemRevision: queued.itemRevision, displayedPayloadDigest: queued.displayedPayloadDigest,
+      approvalBindingDigest: queued.approvalBindingDigest });
+  }
   const leaveAutomaticScope = async () => {
     const sequence = records.length + 1;
     const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.left_scope",
@@ -172,6 +174,27 @@ test("Review settlement proof cannot be forged, serialized, or reused at another
   assert.equal(createCompletedReviewConfirmationSettlement(old, attestationMismatch, snapshots), null);
   const ambiguous = new Map(byId); ambiguous.set("duplicate-delivered-proposal", clone([...byId.values()][0]));
   assert.equal(createCompletedReviewConfirmationSettlement(old, ambiguous, snapshots), null);
+});
+
+test("a sealed Review rejected before enqueue releases its replacement only after all historical IDs are read", async () => {
+  const f = await fixture({ neverEnqueued: true });
+  const old = await f.service.readItemForReconciliation({ itemId: f.proposal.requestedBy.workItemId });
+  const byId = new Map((await f.service.listOutbox()).items.map(row => [row.intentId, row]));
+  const snapshots = await Promise.all(reviewConfirmationSettlementIds(old, byId).map(id => f.queue.readSettlement({ confirmationId: id })));
+  assert.equal(createCompletedReviewConfirmationSettlement(old, byId, snapshots.slice(1)), null);
+  assert.ok(createCompletedReviewConfirmationSettlement(old, byId, snapshots));
+  await f.restart();
+  assert.equal((await f.service.reconcilePullRequestSource(await f.command())).applied, true);
+  assert.equal(f.executions, 0);
+});
+
+test("an unavailable confirmation reader cannot prove an unqueued Review absent", async () => {
+  const f = await fixture({ neverEnqueued: true });
+  f.overrideRead(async () => undefined);
+  assert.equal((await f.service.reconcilePullRequestSource(await f.command())).applied, false);
+  f.overrideRead(null);
+  assert.equal((await f.service.reconcilePullRequestSource(await f.command())).applied, true);
+  assert.equal(f.executions, 0);
 });
 
 test("a changed ledger while reading a completed Review cannot use its captured settlement", async () => {

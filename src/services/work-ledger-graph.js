@@ -13,6 +13,7 @@ import {
   workLedgerError,
 } from "./work-ledger-values.js";
 import { currentWorkItemInputBinding } from "./work-ledger-pr-source.js";
+import { isRecoveredConflictInspection } from "./work-ledger-inspection-continuation.js";
 
 export const WORK_LEDGER_GRAPH_ID = "work-ledger";
 
@@ -603,6 +604,7 @@ export function validateWorkLedgerGraphTransition(previousState, nextState) {
         (
           (nextItem.status === "queued" &&
             nextItem.source.activeRevision > item.source.activeRevision) ||
+          isRecoveredConflictInspection(previousState, item, nextItem) ||
           isCompletedPullRequestRootScopeExit(item, nextItem) ||
           isCompletedPullRequestRootRetiredAfterAdvance(item, nextItem, nextItemsById) ||
           isCompletedPullRequestRootPendingCutover(

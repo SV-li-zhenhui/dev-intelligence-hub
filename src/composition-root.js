@@ -1378,9 +1378,10 @@ export async function createApplication({
           assignmentSource: workflowRouting,
           operationQueue: new OperationQueue(),
           confirmationSettlementReader: Object.freeze({
-            read: (input) => confirmationRuntime?.confirmationSettlementReader?.read(input) ?? null,
+            read: (input) => confirmationRuntime?.confirmationSettlementReader?.read(input),
           }),
           obsoleteCodeJobSettler: Object.freeze({
+            read: (input) => obsoleteCodeJobSettler?.read(input),
             settle: (input, options) => obsoleteCodeJobSettler?.settle(input, options) ?? null,
           }),
           ...(ordinaryActionAdmissionGate === null

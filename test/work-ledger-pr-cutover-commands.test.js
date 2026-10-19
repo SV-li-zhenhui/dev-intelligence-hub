@@ -419,3 +419,24 @@ test("cutover keeps unknown waiting states blocked and accepts retry settlement"
     [],
   );
 });
+
+test("a delivered workflow wait from a retained earlier source revision cannot strand the new Head", () => {
+  const revision = (n) => ({ revision: n, disposition: "accepted", headRevision: n, headRefOid: String(n).repeat(40),
+    eventId: `event-${n}`, eventDigest: String(n).repeat(64), inputDigest: String(n).repeat(64) });
+  const old = revision(1), current = revision(2);
+  const item = root({ status: "waiting_condition", activeIntentId: "old-wait", inputDigest: current.inputDigest,
+    source: { kind: "pull_request", workKey: "same-work", activeRevision: 2, pendingRevision: null,
+      current, revisions: [old, current], bindings: [{ inputRevision: 1, eventId: old.eventId }] } });
+  const sourceBinding = { kind: "pull_request", rootItemId: item.itemId, workKey: "same-work", inputRevision: 1,
+    headRevision: 1, headRefOid: old.headRefOid, eventId: old.eventId, eventDigest: old.eventDigest, inputDigest: old.inputDigest };
+  const wait = { intentId: "old-wait", status: "delivered", outcome: { status: "delivered" },
+    inputDigest: old.inputDigest, sourceBinding, intent: { type: "wait_condition", condition: { kind: "workflow_fact", fact: "merge-state" } } };
+  assert.deepEqual(blockersFor(item, [wait], { forceHeadChanged: true }), []);
+  for (const changed of [
+    { ...wait, sourceBinding: { ...sourceBinding, workKey: "foreign" } },
+    { ...wait, sourceBinding: { ...sourceBinding, headRefOid: "f".repeat(40) } },
+    { ...wait, inputDigest: "f".repeat(64) },
+    { ...wait, intent: { type: "wait_condition", condition: { kind: "external", fact: "merge-state" } } },
+  ]) assert.equal(blockersFor(item, [changed], { forceHeadChanged: true }).length, 1);
+  assert.equal(blockersFor(item, [wait]).length, 1, "an ordinary unchanged source cannot release the wait");
+});

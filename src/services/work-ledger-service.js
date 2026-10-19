@@ -1,4 +1,5 @@
 import { scheduler } from "node:timers/promises";
+import { completedConflictInspectionRecoveryProof } from "./work-ledger-inspection-continuation.js";
 import { automaticReviewWorkAdmission } from "../domain/automatic-review-policy.js";
 import { inactivePullRequestTakeoverRecoveryProof } from "./work-ledger-pr-retirement-recovery.js";
 import { createWorkIntentDispatchBinding } from "../domain/work-intent-dispatch-binding.js";
@@ -8,6 +9,9 @@ import {
   completedCodeConfirmationForSettlement,
   createCompletedCodeConfirmationSettlement,
   isChangedCodeConfirmationDecision,
+  codeConfirmationSettlementId,
+  unstartedCodeConfirmationForSettlement,
+  createUnstartedCodeConfirmationSettlement,
 } from "./work-ledger-code-confirmation-settlement.js";
 import { isChangedReviewConfirmationDecision, reviewConfirmationSettlementIds,
   createCompletedReviewConfirmationSettlement } from "./work-ledger-review-confirmation-settlement.js";
@@ -667,6 +671,7 @@ export class WorkLedgerService {
           this.state = await this.#readDurableState();
           await this.#reconcileRecoveredPullRequestScopes();
           await this.#recoverInactivePullRequestTakeovers();
+          await this.#recoverCompletedConflictInspections();
           await this.#reconcileRecoveredPullRequestAuthorityFences();
           await this.#reconcileRecoveredIssueScopes();
           this.ready = true;
@@ -1485,9 +1490,16 @@ export class WorkLedgerService {
         continue;
       }
       const confirmation = await this.confirmationSettlementReader.read({
-        confirmationId: item.decisionContext.value.downstreamRef,
+        confirmationId: codeConfirmationSettlementId(item.decisionContext),
       });
       let proof = createRevokedCodeConfirmationSettlement(item, outboxById, confirmation);
+      if (proof === null && typeof this.obsoleteCodeJobSettler?.read === "function") {
+        const unstarted = unstartedCodeConfirmationForSettlement(item, outboxById, confirmation);
+        if (unstarted !== null) {
+          const job = await this.obsoleteCodeJobSettler.read(unstarted);
+          proof = createUnstartedCodeConfirmationSettlement(item, outboxById, confirmation, job);
+        }
+      }
       if (proof === null && this.obsoleteCodeJobSettler !== null) {
         const completed = completedCodeConfirmationForSettlement(item, outboxById, confirmation);
         if (completed !== null) {
@@ -2886,6 +2898,21 @@ export class WorkLedgerService {
     }
     if (timelineEvents.length === 0) return;
     await this.#commitMutation({ patch: { items }, timelineEvents, result: null });
+  }
+
+  async #recoverCompletedConflictInspections() {
+    const now = this.#now();
+    const timelineEvents = [];
+    const items = this.state.items.map(item => {
+      const proof = completedConflictInspectionRecoveryProof(this.state, item);
+      if (proof === null) return item;
+      timelineEvents.push({ itemId: item.itemId, type: "transitioned", at: now, actorId: "work-ledger-system",
+        details: { fromStatus: "completed", toStatus: "queued", reason: "pr_conflict_inspection_continued",
+          context: { evidenceRefs: [proof.intentId, proof.resultId] } } });
+      return { ...item, status: "queued", statusReason: "pr_conflict_inspection_continued",
+        revision: item.revision + 1, updatedAt: now };
+    });
+    if (timelineEvents.length > 0) await this.#commitMutation({ patch: { items }, timelineEvents, result: null });
   }
 
   async #reconcileRecoveredPullRequestAuthorityFences() {
