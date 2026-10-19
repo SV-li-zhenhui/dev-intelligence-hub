@@ -1011,6 +1011,15 @@ test(
         args.some((argument) => ["fetch", "push", "update-ref"].includes(argument))),
       false,
     );
+    const growthFile = path.join(setup.root, "later-delivery-mirror-object.txt");
+    await writeFile(growthFile, "independent mirror object growth\n");
+    await git(gitCommand, setup.headMirrorRoot, ["hash-object", "-w", growthFile]);
+    const stale = new ChangePackageControlledCommitService(serviceOptions);
+    assert.deepEqual(await stale.recover(), {
+      deliveries: 1, committed: 0, pending: 1, stalePreparationDeliveryIds: [receipt.deliveryId],
+    });
+    await assert.rejects(stale.delivery().deliver(request), { code: "CONTROLLED_GIT_BOUNDARY_CHANGED" });
+    assert.equal(calls.create, 1);
   },
 );
 

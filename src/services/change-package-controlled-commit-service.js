@@ -287,17 +287,24 @@ export class ChangePackageControlledCommitService {
           this.#ready = true;
           let committed = 0;
           let pending = 0;
+          const stalePreparationDeliveryIds = [];
           for (const original of [...this.#state.deliveries]) {
             const request = normalizeChangePackageControlledCommitRequest(
               original.request,
             );
             const manifest = await this.#loadManifest(request);
             const record = findRecord(this.#state, request.deliveryId);
-            const recovered = await this.#recoverRecord(
-              record,
-              request,
-              manifest,
-            );
+            let recovered;
+            try {
+              recovered = await this.#recoverRecord(record, request, manifest);
+            } catch (error) {
+              // Historical preparation drift is not current delivery authority.
+              // deliver() still verifies the record before returning a receipt.
+              if (error?.code !== "CONTROLLED_GIT_BOUNDARY_CHANGED") throw error;
+              stalePreparationDeliveryIds.push(request.deliveryId);
+              pending += 1;
+              continue;
+            }
             if (recovered.status === "committed") committed += 1;
             else pending += 1;
           }
@@ -305,6 +312,9 @@ export class ChangePackageControlledCommitService {
             deliveries: this.#state.deliveries.length,
             committed,
             pending,
+            ...(stalePreparationDeliveryIds.length > 0
+              ? { stalePreparationDeliveryIds: Object.freeze(stalePreparationDeliveryIds) }
+              : {}),
           });
         } catch (error) {
           this.#ready = false;
