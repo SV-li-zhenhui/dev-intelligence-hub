@@ -576,7 +576,8 @@ export class WorkCoordinationService {
       "dispatch",
       () => this.#dispatch({
         limit: this.#defaults.dispatchLimit,
-        ...(options.roleId === "pr-engineer" ? { roleId: options.roleId } : {}),
+        ...(["pr-engineer", "orchestrator"].includes(options.roleId)
+          ? { roleId: options.roleId } : {}),
       }),
     ]);
     if (options.roleId === "pr-engineer" && this.#runReviewProposals !== null) {

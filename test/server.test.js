@@ -3945,110 +3945,114 @@ test("Review waits for a newer refresh queued behind a developer", async () => {
 });
 
 for (const blocker of ["memory projection", "legacy patrol"]) {
-  test(`automatic own-PR developer bypasses stalled ${blocker}, coalesces manual ticks and drains`, async () => {
-    const blocked = deferred();
-    const releaseBlocked = deferred();
-    const releaseDeveloper = deferred();
-    const timers = [];
-    let developerRuns = 0;
-    let handoffs = 0;
-    const background = startApplicationBackgroundWork({
-      config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
-      employeeRegistry: {
-        schedules: () => [{ id: "developer", intervalMinutes: 10 }],
-        async runSelected(ids) {
-          if (ids[0] === "pr-reviewer" && blocker === "legacy patrol") {
-            blocked.resolve(); await releaseBlocked.promise;
-          }
-          if (ids[0] !== "developer") return;
-          developerRuns += 1;
-          await releaseDeveloper.promise;
+  for (const roleId of ["developer", "orchestrator"]) {
+    test(`automatic ${roleId} bypasses stalled ${blocker}, coalesces manual ticks and drains`, async () => {
+      const blocked = deferred();
+      const releaseBlocked = deferred();
+      const releaseRole = deferred();
+      const timers = [];
+      let roleRuns = 0;
+      let handoffs = 0;
+      const background = startApplicationBackgroundWork({
+        config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+        employeeRegistry: {
+          schedules: () => [{ id: roleId, intervalMinutes: 10 }],
+          async runSelected(ids) {
+            if (ids[0] === "pr-reviewer" && blocker === "legacy patrol") {
+              blocked.resolve(); await releaseBlocked.promise;
+            }
+            if (ids[0] !== roleId) return;
+            roleRuns += 1;
+            await releaseRole.promise;
+          },
         },
-      },
-      refreshService: { async refresh() {} },
-      ...(blocker === "memory projection" ? {
-        memoryProjector: { async runCycle() { blocked.resolve(); await releaseBlocked.promise; } },
-      } : {}),
-      reviewHandoffReconciler: { async runCycle() { handoffs += 1; } },
-    }, {
-      setIntervalFn(callback) { const timer = { callback, unref() {} }; timers.push(timer); return timer; },
-      clearIntervalFn() {},
+        refreshService: { async refresh() {} },
+        ...(blocker === "memory projection" ? {
+          memoryProjector: { async runCycle() { blocked.resolve(); await releaseBlocked.promise; } },
+        } : {}),
+        reviewHandoffReconciler: { async runCycle() { handoffs += 1; } },
+      }, {
+        setIntervalFn(callback) { const timer = { callback, unref() {} }; timers.push(timer); return timer; },
+        clearIntervalFn() {},
+      });
+      try {
+        await blocked.promise;
+        const handoffsBeforeRole = handoffs;
+        const scheduled = timers[1].callback();
+        const manual = background.runEmployee(roleId);
+        manual.catch(() => {});
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(roleRuns, 1, "fresh role handoffs must not wait for optional memory or legacy work");
+        assert.equal(handoffs, handoffsBeforeRole, "other roles must not run Review-only handoff recovery");
+        assert.ok(background.drainStatus().activeParticipants.some(
+          ({ id }) => id === DRAIN_PARTICIPANTS.employeeExecution.id,
+        ));
+        const refreshed = assert.rejects(background.initialRefresh, { code: "LIFECYCLE_SHUTDOWN_ABORTED" });
+        const manualStopped = assert.rejects(manual, { code: "LIFECYCLE_SHUTDOWN_ABORTED" });
+        let stopped = false;
+        const stopping = background.stop().then(() => { stopped = true; });
+        releaseBlocked.resolve();
+        await refreshed;
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(stopped, false, "shutdown must drain the independent role");
+        assert.equal(background.drainStatus().backgroundOperationActive, true);
+        releaseRole.resolve();
+        await Promise.all([scheduled, manualStopped, stopping]);
+        assert.equal(roleRuns, 1, "manual and scheduled requests must share one role cycle");
+      } finally {
+        releaseBlocked.resolve(); releaseRole.resolve(); await background.stop();
+      }
     });
-    try {
-      await blocked.promise;
-      const handoffsBeforeDeveloper = handoffs;
-      const scheduled = timers[1].callback();
-      const manual = background.runEmployee("developer");
-      manual.catch(() => {});
-      await new Promise((resolve) => setImmediate(resolve));
-      assert.equal(developerRuns, 1, "fresh own-PR repair must not wait for optional memory or legacy work");
-      assert.equal(handoffs, handoffsBeforeDeveloper, "developer must not run Review-only handoff recovery");
-      assert.ok(background.drainStatus().activeParticipants.some(
-        ({ id }) => id === DRAIN_PARTICIPANTS.employeeExecution.id,
-      ));
-      const refreshed = assert.rejects(background.initialRefresh, { code: "LIFECYCLE_SHUTDOWN_ABORTED" });
-      const manualStopped = assert.rejects(manual, { code: "LIFECYCLE_SHUTDOWN_ABORTED" });
-      let stopped = false;
-      const stopping = background.stop().then(() => { stopped = true; });
-      releaseBlocked.resolve();
-      await refreshed;
-      await new Promise((resolve) => setImmediate(resolve));
-      assert.equal(stopped, false, "shutdown must drain the independent developer");
-      assert.equal(background.drainStatus().backgroundOperationActive, true);
-      releaseDeveloper.resolve();
-      await Promise.all([scheduled, manualStopped, stopping]);
-      assert.equal(developerRuns, 1, "manual and scheduled requests must share one role cycle");
-    } finally {
-      releaseBlocked.resolve(); releaseDeveloper.resolve(); await background.stop();
-    }
-  });
+ }
 }
 
-test("automatic own-PR developer uses scoped coordination while general code jobs are busy", async () => {
-  const codeJobsStarted = deferred();
-  const releaseCodeJobs = deferred();
-  const workScopes = [];
-  const noOpCycle = { async runCycle() {} };
-  const coordination = new WorkCoordinationService({
-    ledger: { async intake() {} },
-    proposalResultReconciler: noOpCycle,
-    attentionResultReconciler: noOpCycle,
-    conditionWaker: noOpCycle,
-    codeJobRunner: { async runCycle() { codeJobsStarted.resolve(); await releaseCodeJobs.promise; } },
-    workLoop: { async runCycle(options) { workScopes.push(options); } },
-    dispatcher: { async dispatchPending() {} },
+for (const roleId of ["developer", "orchestrator"]) {
+  test(`automatic ${roleId} uses scoped coordination while general code jobs are busy`, async () => {
+    const codeJobsStarted = deferred();
+    const releaseCodeJobs = deferred();
+    const workScopes = [];
+    const noOpCycle = { async runCycle() {} };
+    const coordination = new WorkCoordinationService({
+      ledger: { async intake() {} },
+      proposalResultReconciler: noOpCycle,
+      attentionResultReconciler: noOpCycle,
+      conditionWaker: noOpCycle,
+      codeJobRunner: { async runCycle() { codeJobsStarted.resolve(); await releaseCodeJobs.promise; } },
+      workLoop: { async runCycle(options) { workScopes.push(options); } },
+      dispatcher: { async dispatchPending() {} },
+    });
+    const registry = new EmployeeRegistry(["pr-reviewer", roleId].map((id) => ({
+      id,
+      async view() {},
+      async roleView() {},
+      async control() {},
+      run(options) {
+        return id === roleId ? coordination.runCycle({
+          trigger: `employee:${roleId}`, includeWork: true, roleId: id, signal: options.signal,
+        }) : Promise.resolve();
+      },
+    })));
+    const background = startApplicationBackgroundWork({
+      config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: roleId === "developer", automaticReview: roleId === "orchestrator" } },
+      employeeRegistry: registry,
+      workCoordination: coordination,
+      refreshService: { async refresh() {} },
+    }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
+    try {
+      await codeJobsStarted.promise;
+      const roleRun = background.runEmployee(roleId);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(workScopes.length, 1, "scoped role decisions must not wait for general code jobs");
+      assert.equal(workScopes[0].roleId, roleId);
+      assert.equal(workScopes[0].trigger, `employee:${roleId}`);
+      assert.equal(workScopes[0].signal instanceof AbortSignal, true);
+      assert.equal(workScopes[0].signal.aborted, false);
+      await roleRun;
+      releaseCodeJobs.resolve();
+      await background.initialRefresh;
+    } finally { releaseCodeJobs.resolve(); await background.stop(); }
   });
-  const registry = new EmployeeRegistry(["pr-reviewer", "developer"].map((id) => ({
-    id,
-    async view() {},
-    async roleView() {},
-    async control() {},
-    run(options) {
-      return id === "developer" ? coordination.runCycle({
-        trigger: "employee:developer", includeWork: true, roleId: id, signal: options.signal,
-      }) : Promise.resolve();
-    },
-  })));
-  const background = startApplicationBackgroundWork({
-    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
-    employeeRegistry: registry,
-    workCoordination: coordination,
-    refreshService: { async refresh() {} },
-  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
-  try {
-    await codeJobsStarted.promise;
-    const developer = background.runEmployee("developer");
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(workScopes.length, 1, "scoped developer decisions must not wait for general code jobs");
-    assert.equal(workScopes[0].roleId, "developer");
-    assert.equal(workScopes[0].trigger, "employee:developer");
-    assert.equal(workScopes[0].signal instanceof AbortSignal, true);
-    assert.equal(workScopes[0].signal.aborted, false);
-    await developer;
-    releaseCodeJobs.resolve();
-    await background.initialRefresh;
-  } finally { releaseCodeJobs.resolve(); await background.stop(); }
-});
+}
 
 test("automatic own-PR developer waits for the latest queued refresh behind general work", async () => {
   const timers = [];

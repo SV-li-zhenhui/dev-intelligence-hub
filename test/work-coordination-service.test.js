@@ -177,6 +177,22 @@ test("the PR engineer publishes its Review without waiting for general code jobs
   assert.deepEqual(calls, ["attention_results", "dispatch", "publish_review", "review_results"]);
 });
 
+test("orchestrator handoffs dispatch only their role while general code jobs are busy", async () => {
+  const started = deferred(), release = deferred();
+  const { service, calls } = fixture({
+    codeJobRunner: { async runCycle() { started.resolve(); await release.promise; } },
+  });
+  const general = service.runCycle({ includeWork: false });
+  try {
+    await started.promise;
+    await service.runCycle({ roleId: "orchestrator" });
+    assert.deepEqual(calls, [
+      ["work", { trigger: "scheduled", intakeLimit: 100, workLimit: 20, roleId: "orchestrator" }],
+      ["dispatch", { limit: 50, roleId: "orchestrator" }],
+    ]);
+  } finally { release.resolve(); await general; }
+});
+
 test("proposal execution is a safe no-op when no runner is configured", async () => {
   const calls = [];
   const service = new WorkCoordinationService({

@@ -4203,6 +4203,11 @@ export function startApplicationBackgroundWork(
   function isIndependentEmployeeCycle(options) {
     if (options.includeLegacyEmployees || options.employeeIds?.length !== 1) return false;
     const employeeId = options.employeeIds[0];
+    if (employeeId === "orchestrator") {
+      return application.config.githubActions?.enabled === true &&
+        (application.config.githubActions.automaticReview === true ||
+          application.config.githubActions.automaticOwnPrRepair === true);
+    }
     return employeeId === "pr-engineer" || (employeeId === "developer" &&
       application.config.githubActions?.enabled === true &&
       application.config.githubActions.automaticOwnPrRepair === true);
@@ -4217,7 +4222,7 @@ export function startApplicationBackgroundWork(
     activeIndependentEmployeeCycles += 1;
     try {
       // Each role keeps its scoped coordination and execution checks. General
-      // code jobs and memory projection must not delay Reviews or own-PR repair.
+      // code jobs and memory projection must not delay role handoffs or Reviews.
       await runDrainParticipant(DRAIN_PARTICIPANTS.employeeExecution, () => {
         const runOptions = backgroundOperationOptions({ trigger: options.trigger }, options.signal);
         return typeof employeeRegistry.runSelected === "function"
