@@ -725,6 +725,33 @@ test("a lifecycle cutover after binding prevents downstream attention creation",
 
 const WORK_INTENT_REF = /^work-intent-[a-f0-9]{64}$/;
 
+for (const sealed of [false, true]) {
+  test(`incomplete local completion returns for delivery and cannot poison later intents (sealed ${sealed})`, async () => {
+    const pair = workPair(2, completeIntent());
+    const other = workPair(3, askUserIntent());
+    const { dispatcher, ledger, time } = fixture([pair, other]);
+    if (sealed) {
+      ledger.failAckBeforeOnce = true;
+      assert.equal((await dispatcher.dispatchPending({ limit: 1 })).uncertain, 1);
+      assert.notEqual(ledger.outbox[0].dispatchBinding, null);
+      time.advance(1_001);
+    }
+    const ack = ledger.ackIntent.bind(ledger);
+    ledger.ackIntent = (input) => {
+      if (input.nextStatus === "completed") throw Object.assign(new Error("Missing required report"), { code: "WORK_LEDGER_GRAPH_BLOCKED" });
+      return ack(input);
+    };
+    const recovered = fixture([], { ledger, time }).dispatcher;
+    const result = await recovered.dispatchPending();
+    assert.equal(result.retryWait, 1);
+    assert.equal(result.uncertain, 0);
+    assert.equal(result.delivered, 1);
+    assert.equal(ledger.outbox[0].status, "failed");
+    assert.equal(ledger.items[0].status, "retry_wait");
+    assert.equal(ledger.ackCalls.find(call => call.nextStatus === "retry_wait").details.code, "completion-delivery-required");
+  });
+}
+
 test("internal outcomes and durable proposals map to explicit ledger states", async (t) => {
   const cases = [
     { name: "wait", intent: waitIntent(), role: "pr-reviewer", next: "waiting_condition" },

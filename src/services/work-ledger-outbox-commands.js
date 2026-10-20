@@ -39,6 +39,7 @@ import {
 import {
   registeredCrossRootPullRequestCutover,
 } from "./work-ledger-pr-cutover-commands.js";
+import { assertWorkLedgerGraphCompletable } from "./work-ledger-graph.js";
 
 const PROPOSAL_INTENT_TYPES = new Set([
   "propose_github_review",
@@ -239,6 +240,7 @@ export function planIntentStage({ state, input, clock }) {
     );
   }
   const requestedBy = normalizeRequestedBy(input, item, suppliedIntent);
+  if (suppliedIntent.type === "complete") assertWorkLedgerGraphCompletable(state, itemId);
   const intent = bindProposalDispatchIntent(
     state,
     item,
@@ -675,6 +677,7 @@ export function planIntentAcknowledgement({ state, input, clock }) {
     : null;
   const legacyCutover = isWorkItemInLegacyPullRequestCutover(item);
   const nextStatus = legacyCutover ? "blocked" : input.nextStatus;
+  if (nextStatus === "completed") assertWorkLedgerGraphCompletable(state, item.itemId);
   const activeIntentId = !legacyCutover &&
       INTENT_WAITING_STATUSES.has(input.nextStatus)
     ? outbox.intentId

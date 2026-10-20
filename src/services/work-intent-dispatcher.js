@@ -1642,6 +1642,7 @@ export class WorkIntentDispatcher {
       const outcome = dataMap(bound.payload)?.get("outcome");
       return this.#ackDelivered(claimed, item, {
         nextStatus: "completed",
+        localCompletion: true,
         details: {
           resultRef: bound.intentId,
           ...(typeof outcome === "string" ? { outcome } : {}),
@@ -1670,7 +1671,7 @@ export class WorkIntentDispatcher {
     });
   }
 
-  async #ackDelivered(claimed, item, { nextStatus, details, target }) {
+  async #ackDelivered(claimed, item, { nextStatus, details, target, localCompletion = false }) {
     try {
       await this.#ledger.ackIntent({
         intentId: claimed.intentId,
@@ -1693,7 +1694,12 @@ export class WorkIntentDispatcher {
           downstreamRef: details.downstreamRef ?? details.resultRef,
         },
       };
-    } catch {
+    } catch (error) {
+      if (localCompletion && error?.code === "WORK_LEDGER_GRAPH_BLOCKED") {
+        return this.#ackFailure(claimed, item, {
+          nextStatus: "retry_wait", code: "completion-delivery-required",
+        });
+      }
       return {
         claimed: true,
         counter: "uncertain",
