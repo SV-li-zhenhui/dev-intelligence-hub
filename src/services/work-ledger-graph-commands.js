@@ -17,6 +17,7 @@ import {
 } from "./work-ledger-transitions.js";
 import {
   boundedLedgerString,
+  boundedLedgerText,
   canonicalLedgerValue,
   hasExactLedgerKeys,
   normalizeLedgerTarget,
@@ -125,13 +126,12 @@ function normalizeChildWork(value) {
   if (!hasExactLedgerKeys(value, ["title", "description"])) {
     throw graphCommandError("子任务工作说明无效");
   }
+  let description;
+  try { description = boundedLedgerText(value.description, "work.description", 16 * 1024); }
+  catch { throw graphCommandError("work.description 无效"); }
   return {
     title: graphCommandString(value.title, "work.title", 256),
-    description: graphCommandString(
-      value.description,
-      "work.description",
-      16 * 1024,
-    ),
+    description,
   };
 }
 

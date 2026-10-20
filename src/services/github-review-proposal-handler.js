@@ -530,9 +530,11 @@ export class GitHubReviewProposalHandler {
       typeof context !== "object" ||
       Array.isArray(context) ||
       Object.getPrototypeOf(context) !== Object.prototype ||
-      Reflect.ownKeys(context).length !== 2 ||
+      Reflect.ownKeys(context).some(key => !["inputBinding", "author", "reviewFeedbackDigest"].includes(key)) ||
       !Object.hasOwn(context, "inputBinding") ||
       !Object.hasOwn(context, "author") ||
+      (Object.hasOwn(context, "reviewFeedbackDigest") &&
+        (typeof context.reviewFeedbackDigest !== "string" || !/^[a-f0-9]{64}$/.test(context.reviewFeedbackDigest))) ||
       !sameValue(context.inputBinding, inputBinding) ||
       (context.author !== null &&
         (typeof context.author !== "string" || !GITHUB_LOGIN.test(context.author)))

@@ -13,6 +13,7 @@ import {
   "../domain/pull-request-execution-binding.js";
 import {
   boundedLedgerString,
+  boundedLedgerText,
   canonicalLedgerValue,
   cloneLedgerValue,
   hasExactLedgerKeys,
@@ -607,11 +608,9 @@ function assertGraphTaskProvenance(
     128,
   );
   const title = safeString(assignment.work.title, "graphTask.work.title", 256);
-  const description = safeString(
-    assignment.work.description,
-    "graphTask.work.description",
-    16 * 1024,
-  );
+  let description;
+  try { description = boundedLedgerText(assignment.work.description, "graphTask.work.description", 16 * 1024); }
+  catch { throw corrupted("graphTask.work.description 损坏"); }
   let sourceBinding = null;
   if (assignment.graphTask.sourceBinding !== null) {
     try {

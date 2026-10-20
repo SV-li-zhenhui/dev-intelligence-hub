@@ -302,6 +302,22 @@ test("a self-authored blocking proposal is queued as a COMMENT review", async ()
   );
 });
 
+test("review authority accepts the ledger's optional feedback digest and keeps rejecting invalid contexts", async () => {
+  for (const extra of [{}, { reviewFeedbackDigest: "a".repeat(64) },
+    { reviewFeedbackDigest: null }, { reviewFeedbackDigest: "invalid" },
+    { reviewFeedbackDigest: "a".repeat(64), unexpected: true }]) {
+    const producer = new FakeConfirmationProducer();
+    const valid = Object.keys(extra).length === 0 ||
+      (Object.keys(extra).length === 1 && extra.reviewFeedbackDigest === "a".repeat(64));
+    const result = await handler(producer, { pullRequestContextReader: { async readCurrent(inputBinding) {
+      return { inputBinding, author: "review-account", ...extra };
+    } } }).handle(handlerInput());
+    assert.equal(producer.enqueueCalls.length, valid ? 1 : 0, JSON.stringify(extra));
+    if (valid) assert.equal(producer.enqueueCalls[0].action.reviewEvent, "COMMENT");
+    else assert.equal(result.status, "stale");
+  }
+});
+
 test("missing author context preserves the proposed verdict", async () => {
   const producer = new FakeConfirmationProducer();
   await handler(producer, {
