@@ -113,9 +113,11 @@ export function createCompletedReviewConfirmationSettlement(item, outboxById, sn
     }
     if (completed.length !== 1) {
       const ids = [...new Set(plans.map(plan => plan.id))];
-      // A pre-enqueue rejection is settled only after the trusted reader has
-      // checked every historical confirmation identity, including absence.
-      if (completed.length !== 0 || item.decisionContext.value.downstreamRef !== null ||
+      const reference = item.decisionContext.value.downstreamRef;
+      // Both pre-enqueue rejection and unexecuted revocation require every
+      // historical identity. A retained reference must identify an actual row.
+      if (completed.length !== 0 || (reference !== null &&
+          !snapshots.some(snapshot => snapshot?.item?.id === reference)) ||
           snapshots.length !== ids.length || snapshots.some((snapshot, index) =>
             snapshot !== null && snapshot?.item?.id !== ids[index])) return null;
     }

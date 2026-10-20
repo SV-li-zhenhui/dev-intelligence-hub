@@ -1235,7 +1235,7 @@ import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
 import { CodeJobStore } from "../src/services/code-job-store.js";
 import { CodeJobApprovalExecutor } from "../src/services/code-job-approval-executor.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
-import { ObsoleteCodeJobSettler } from "../src/services/obsolete-code-job-settler.js";
+import { ObsoleteCodeJobSettler, hasUnstartedCodeJobAuthorityFence } from "../src/services/obsolete-code-job-settler.js";
 import {
   createLocalWorkLedgerCandidateProcessor,
   createWorkerWorkLedgerCandidateProcessor,
@@ -5190,6 +5190,50 @@ for (const status of ["failed", "cancelled", "fenced"]) {
     assert.deepEqual(await fixture.jobs.get(job.jobId), before);
   });
 }
+
+test("an unstarted authority-fenced old-Head job releases only with its exact terminal detail", async () => {
+  const fixture = await revokedCodeConfirmationFixture({ createdJob: true });
+  const job = (await fixture.jobs.list()).items[0];
+  await fixture.jobs.fence({ jobId: job.jobId, expectedRevision: job.revision,
+    result: { code: "INVALID_CODE_JOB_AUTHORITY", message: "Old PR Head is no longer current" } });
+  const before = await fixture.jobs.get(job.jobId);
+  const settleWith = reader => new ObsoleteCodeJobSettler({ codeJobReader: reader,
+    codeJobControl: { cancel: async () => assert.fail("a terminal fence must remain intact") } });
+  fixture.service.obsoleteCodeJobSettler = settleWith({ get: id => fixture.jobs.get(id) });
+  assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, false);
+  for (const variant of ["wrong-code", "missing-detail", "archived", "incomplete", "changed-revision", "observed-action"]) {
+    const projection = structuredClone(before);
+    if (variant === "observed-action") {
+      projection.turn = 1;
+      projection.observationCount = 1;
+      projection.latestObservation = { actionType: "read_text", status: "succeeded", recordedAt: projection.updatedAt };
+    }
+    fixture.service.obsoleteCodeJobSettler = settleWith({ get: async () => structuredClone(projection),
+      getDetail: async request => {
+        const detail = await fixture.jobs.getDetail(request);
+        detail.job = structuredClone(projection);
+        if (variant === "wrong-code") detail.terminalDetail.code = "OWNER_STOPPED";
+        if (variant === "missing-detail") return null;
+        if (variant === "archived") detail.archived = true;
+        if (variant === "incomplete") detail.nextCursor = "unread-history";
+        if (variant === "changed-revision") detail.job.revision += 1;
+        return detail;
+      } });
+    assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, false, variant);
+  }
+  fixture.service.obsoleteCodeJobSettler = settleWith(fixture.jobs);
+  const storedJob = await fixture.jobs.getForWorker(job.jobId);
+  const marked = await fixture.service.obsoleteCodeJobSettler.read({ grant: storedJob.grant, receipt: fixture.snapshot.item.receipt });
+  assert.equal(hasUnstartedCodeJobAuthorityFence(marked), true);
+  assert.equal(hasUnstartedCodeJobAuthorityFence(structuredClone(marked)), false);
+  marked.turn = 1;
+  assert.equal(hasUnstartedCodeJobAuthorityFence(marked), false);
+  assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, true);
+  assert.deepEqual(await fixture.jobs.get(job.jobId), before);
+  const next = await fixture.service.readItemForReconciliation({ itemId: fixture.item.itemId });
+  assert.equal(next.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(next.source.pendingRevision, null);
+});
 
 test("an admitted old-Head job keeps the next Head fenced until cancellation is settled", async () => {
   const fixture = await revokedCodeConfirmationFixture({ createdJob: true });

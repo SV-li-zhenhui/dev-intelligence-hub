@@ -12,6 +12,7 @@ import { ConfirmationQueue, ConfirmationExecutionError } from "../src/services/c
 import { ledgerDigest } from "../src/services/work-ledger-values.js";
 import { createCompletedReviewConfirmationSettlement, hasReviewConfirmationSettlement,
   reviewConfirmationSettlementIds } from "../src/services/work-ledger-review-confirmation-settlement.js";
+import { planPullRequestSourceReconciliation } from "../src/services/work-ledger-pr-cutover-commands.js";
 
 const HEAD = "a".repeat(40);
 const NOW = "2026-10-15T02:00:00.000Z";
@@ -48,7 +49,8 @@ function scopeLifecycleAssignment(sequence, event) {
 
 async function fixture({ outcome = "applied", transformPlan = (plan) => plan, downstream = false,
   followupScope = "followup", followupHead = HEAD, leaveScope = false, leaveScopeAfterResult = false,
-  ignoredReentry = false, ownerFollowup = false, neverEnqueued = false } = {}) {
+  ignoredReentry = false, ownerFollowup = false, neverEnqueued = false, revokedUnexecuted = false,
+  leaveScopeAfterFollowup = false } = {}) {
   const store = new MemoryStore();
   const records = [assignment(1)];
   const source = { async readAssignmentBatch({ afterSequence, limit }) {
@@ -93,7 +95,9 @@ async function fixture({ outcome = "applied", transformPlan = (plan) => plan, do
   const plan = createGitHubReviewProposalConfirmationPlan(proposal, { actorAccountId: "review-account" });
   if (!neverEnqueued) {
     const queued = await queue.enqueue(transformPlan(clone(plan)));
-    await queue.approve(queued.id, { requestId: "approve-review-42", expectedQueueRevision: queued.queueRevision,
+    if (revokedUnexecuted) await queue.invalidate(queued.id, { requestedBy: queued.requestedBy,
+      approvalBindingDigest: queued.approvalBindingDigest, reason: "authorization_changed" });
+    else await queue.approve(queued.id, { requestId: "approve-review-42", expectedQueueRevision: queued.queueRevision,
       expectedItemRevision: queued.itemRevision, displayedPayloadDigest: queued.displayedPayloadDigest,
       approvalBindingDigest: queued.approvalBindingDigest });
   }
@@ -108,7 +112,7 @@ async function fixture({ outcome = "applied", transformPlan = (plan) => plan, do
   if (leaveScope) await leaveAutomaticScope();
   const result = createWorkProposalResult({ proposal, sequence: 1, at: NOW, downstreamRef: downstream ? plan.id : null,
     transition: { status: "stale", summary: "Authority left scope before receipt recovery", evidence: downstream
-      ? [`confirmation:${plan.id}`, "authorization_changed", "old_confirmation_status:completed"]
+      ? [`confirmation:${plan.id}`, "authorization_changed", `old_confirmation_status:${revokedUnexecuted ? "stale" : "completed"}`]
       : ["authorization_changed", `proposal:${proposal.proposalId}`] } });
   await service.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
   const staleHistory = (await service.listOutbox()).items[0];
@@ -141,6 +145,7 @@ async function fixture({ outcome = "applied", transformPlan = (plan) => plan, do
   }
   records.push(assignment(records.length + 1, followupScope, followupHead, ownerFollowup
     ? { eventType: "pull_request.owner_requested", provider: "local-owner" } : {})); await service.intake();
+  if (leaveScopeAfterFollowup) await leaveAutomaticScope();
   return { store, records, plan, proposal, reads, staleHistory,
     get service() { return service; }, get queue() { return queue; }, get executions() { return executions; },
     overrideRead(value) { overrideRead = value; },
@@ -195,6 +200,70 @@ test("an unavailable confirmation reader cannot prove an unqueued Review absent"
   f.overrideRead(null);
   assert.equal((await f.service.reconcilePullRequestSource(await f.command())).applied, true);
   assert.equal(f.executions, 0);
+});
+
+test("an enqueued Review revoked before execution releases its followup only with every historical identity checked", async () => {
+  const f = await fixture({ downstream: true, revokedUnexecuted: true });
+  const old = await f.service.readItemForReconciliation({ itemId: f.proposal.requestedBy.workItemId });
+  const outbox = new Map((await f.service.listOutbox()).items.map(row => [row.intentId, row]));
+  const snapshots = await Promise.all(reviewConfirmationSettlementIds(old, outbox).map(id => f.queue.readSettlement({ confirmationId: id })));
+  assert.ok(createCompletedReviewConfirmationSettlement(old, outbox, snapshots));
+  assert.equal(createCompletedReviewConfirmationSettlement(old, outbox, snapshots.slice(1)), null);
+  assert.equal(createCompletedReviewConfirmationSettlement(old, outbox, snapshots.map(() => null)), null);
+  assert.equal(createCompletedReviewConfirmationSettlement(old, outbox, snapshots.map(x => x ?? undefined)), null);
+  await f.restart();
+  assert.equal((await f.service.reconcilePullRequestSource(await f.command())).applied, true);
+  assert.deepEqual((await f.service.listOutbox()).items[0], f.staleHistory);
+  assert.equal((await f.queue.get(f.plan.id)).status, "stale");
+  assert.equal(f.executions, 0);
+});
+
+test("a later same-Head scope departure preserves the registered predecessor chain after restart", async () => {
+  const f = await fixture({ neverEnqueued: true, ownerFollowup: true, leaveScopeAfterFollowup: true,
+    followupScope: "owner-request:123e4567-e89b-42d3-a456-426614174002" });
+  await f.restart();
+  const result = await f.service.reconcilePullRequestSource(await f.command());
+  assert.equal(result.applied, true);
+  const next = await f.service.readItemForReconciliation({ itemId: result.itemId });
+  assert.equal(next.source.current.headRefOid, HEAD);
+  assert.equal(next.source.pendingRevision, null);
+  assert.equal((await f.service.claim({ itemId: next.itemId, expectedRevision: next.revision,
+    workerId: "employee-pr-engineer", leaseDurationMs: 30_000 })).status, "working");
+  assert.equal(f.executions, 0);
+});
+
+test("same-Head departure recovery rejects an unproven or newer predecessor observation", async () => {
+  const f = await fixture({ neverEnqueued: true, ownerFollowup: true, leaveScopeAfterFollowup: true,
+    followupScope: "owner-request:123e4567-e89b-42d3-a456-426614174002" });
+  const command = await f.command();
+  const stored = await f.store.read("work-ledger-state", null);
+  const oldId = f.proposal.requestedBy.workItemId;
+  const old = stored.items.find(item => item.itemId === oldId);
+  const outbox = new Map(stored.outbox.map(row => [row.intentId, row]));
+  const snapshots = await Promise.all(reviewConfirmationSettlementIds(old, outbox).map(id => f.queue.readSettlement({ confirmationId: id })));
+  const proof = createCompletedReviewConfirmationSettlement(old, outbox, snapshots);
+  assert.ok(proof);
+  const confirmationSettlements = new Map([[oldId, proof]]);
+  assert.equal(planPullRequestSourceReconciliation({ state: stored, input: command,
+    clock: () => NOW, timelineLimit: 20_000, confirmationSettlements }).result.applied, true);
+  for (const variant of ["active", "wrong-lifecycle", "non-lifecycle", "different-head", "unaccepted-anchor", "missing-anchor", "late-anchor"]) {
+    const state = clone(stored);
+    const source = state.items.find(item => item.itemId === oldId).source;
+    if (variant === "active") source.scope.active = true;
+    if (variant === "wrong-lifecycle") source.scope.lastLifecycleEventId = "unrelated-lifecycle";
+    if (variant === "non-lifecycle") source.current.event.eventType = "pull_request.updated";
+    if (variant === "different-head") source.revisions[source.activeRevision - 2].headRefOid = "c".repeat(40);
+    if (variant === "unaccepted-anchor") source.revisions[source.activeRevision - 2].disposition = "ignored_unproven_head";
+    if (variant === "missing-anchor") source.bindings = source.bindings.filter(binding => binding.inputRevision !== source.activeRevision - 1);
+    if (variant === "late-anchor") source.bindings.find(binding => binding.inputRevision === source.activeRevision - 1).sourceSequence = 2;
+    assert.throws(() => planPullRequestSourceReconciliation({ state, input: command,
+      clock: () => NOW, timelineLimit: 20_000, confirmationSettlements }), error =>
+      error.code === "WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT" &&
+      /跨来源 PR cutover (绑定链无效|候选绑定无效)/u.test(error.message), variant);
+  }
+  assert.throws(() => planPullRequestSourceReconciliation({ state: stored, input: command,
+    clock: () => NOW, timelineLimit: 20_000 }), { code: "WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT" },
+  "settlement is still mandatory");
 });
 
 test("a changed ledger while reading a completed Review cannot use its captured settlement", async () => {

@@ -738,11 +738,24 @@ function operationalPullRequestSourceObservation(root) {
 }
 
 function assertCrossRootCutoverChain(root, predecessor) {
-  const pendingSequence = crossRootPullRequestCutoverCandidate(root)
-    ?.sourceSequence;
-  const predecessorSequence = operationalPullRequestSourceObservation(
+  const candidate = crossRootPullRequestCutoverCandidate(root);
+  const pendingSequence = candidate?.sourceSequence;
+  let predecessorSequence = operationalPullRequestSourceObservation(
     predecessor,
   ).sourceSequence;
+  const source = predecessor.source;
+  const previous = source.revisions[source.activeRevision - 2];
+  // A later scope departure cannot invalidate an already registered same-Head
+  // chain. Only the immediately preceding accepted observation may anchor it;
+  // normal authority, settlement and CAS checks still govern activation.
+  if (predecessorSequence >= pendingSequence && source.pendingRevision === null &&
+      source.scope.kind === "automatic" && source.scope.active === false &&
+      source.current.event.eventType === "pull_request.left_scope" &&
+      source.scope.lastLifecycleEventId === source.current.eventId &&
+      previous?.disposition === "accepted" && previous.headRefOid === source.current.headRefOid &&
+      source.current.headRefOid === root.source.revisions[candidate.inputRevision - 1].headRefOid) {
+    predecessorSequence = sourceObservationForRevision(source, previous.revision).sourceSequence;
+  }
   if (
     predecessor.kind !== "source_root" ||
     predecessor.source?.kind !== "pull_request" ||
