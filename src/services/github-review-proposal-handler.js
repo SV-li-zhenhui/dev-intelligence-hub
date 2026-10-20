@@ -512,7 +512,8 @@ export class GitHubReviewProposalHandler {
         verified = await this.#verifyInputAuthority(
           cloneWorkProposalValue(inputBinding),
         );
-      } catch {
+      } catch (error) {
+        if (error?.code === "OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE") throw error;
         return null;
       }
       return sameValue(verified, inputBinding) ? { author: null } : null;
@@ -522,7 +523,8 @@ export class GitHubReviewProposalHandler {
       context = await this.#readPullRequestContext(
         cloneWorkProposalValue(inputBinding),
       );
-    } catch {
+    } catch (error) {
+      if (error?.code === "OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE") throw error;
       return null;
     }
     if (

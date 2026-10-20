@@ -17,6 +17,7 @@ export async function createOwnerWorkRequestRuntime({
   roleReadiness,
   capabilityReadiness,
   pullRequestResolver,
+  incomingReviewReader,
   actionAdmissionGate,
   operationQueue,
   clock,
@@ -67,6 +68,7 @@ export async function createOwnerWorkRequestRuntime({
       roleReadiness,
       ...(capabilityReadiness === undefined ? {} : { capabilityReadiness }),
       ...(pullRequestResolver === undefined ? {} : { pullRequestResolver }),
+      ...(incomingReviewReader === undefined ? {} : { incomingReviewReader }),
       exclusiveLease: guard,
       ...(actionAdmissionGate === undefined ? {} : { actionAdmissionGate }),
       ...(operationQueue === undefined ? {} : { operationQueue }),
@@ -80,6 +82,7 @@ export async function createOwnerWorkRequestRuntime({
       list: (options) => admit(() => service.list(options)),
       resumePending: () => admit(() => service.resumePending()),
       refreshBlockedPullRequestSources: options => admit(() => service.refreshBlockedPullRequestSources(options)),
+      verifyAutomaticReviewContinuation: binding => admit(() => service.verifyAutomaticReviewContinuation(binding)),
       close,
     });
   } catch (error) {
@@ -127,6 +130,8 @@ export function createLazyOwnerWorkRequestRuntime(factory) {
       (await resolve()).resumePending(...arguments_),
     refreshBlockedPullRequestSources: async (...arguments_) =>
       (await resolve()).refreshBlockedPullRequestSources(...arguments_),
+    verifyAutomaticReviewContinuation: async (...arguments_) =>
+      (await resolve()).verifyAutomaticReviewContinuation(...arguments_),
     async close() {
       closed = true;
       if (runtimePromise === null) return;

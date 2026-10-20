@@ -26,7 +26,10 @@ import { createWorkLedgerRuntime } from "../src/work-ledger-runtime.js";
 import { createWorkflowRoutingRuntime } from "../src/workflow-routing-runtime.js";
 import { OrchestratorService } from "../src/services/orchestrator-service.js";
 import { RoleContextAssembler } from "../src/services/role-context-assembler.js";
-import { currentWorkItemExecutionBinding } from "../src/services/work-ledger-pr-source.js";
+import { createPullRequestWorkSource, currentWorkItemExecutionBinding, normalizePullRequestWorkSource } from "../src/services/work-ledger-pr-source.js";
+import { AutomaticReviewScopeExitReader } from "../src/services/automatic-review-scope-exit-reader.js";
+import { emptyWorkGraphMemoryProjection, reconcileMigratedWorkGraphMemoryAuthority } from "../src/services/work-ledger-graph-memory.js";
+import { normalizeWorkLedgerLimits } from "../src/services/work-ledger-state.js";
 import { ownerWorkRequestForItem } from "../public/manual-work-assignment.js";
 
 const REQUEST_ID = "123e4567-e89b-42d3-a456-426614174000";
@@ -102,13 +105,16 @@ function clockFixture() {
   };
 }
 
-function routingConfig({ enabled = true } = {}) {
+function routingConfig({ enabled = true, legacyExitRoute = false } = {}) {
   return {
     workflowRouting: {
       schemaVersion: 1,
       enabled,
       maxHops: 8,
       rules: [
+        ...(legacyExitRoute ? [{ id: "legacy-exit-route", source: "root", enabled: true, priority: 1000, fallback: false,
+          condition: { op: "globAny", path: "eventType", patterns: ["pull_request.created", "pull_request.left_scope"] },
+          targets: [{ type: "role", id: "pr-engineer" }], onMatch: "stop" }] : []),
         {
           id: "generic-owner-fallback",
           source: "root",
@@ -154,7 +160,8 @@ function capabilityReadiness(overrides = {}) {
 async function createRoutingAndLedger(store, clock, options = {}) {
   const routing = await createWorkflowRoutingRuntime(
     routingConfig(options),
-    { store, clock, createGuard: guardFactory },
+    { store, clock, createGuard: guardFactory,
+      ...(options.scopeExitRecoveryReader ? { scopeExitRecoveryReader: options.scopeExitRecoveryReader } : {}) },
   );
   const ledger = await createWorkLedgerRuntime({
     store,
@@ -816,13 +823,92 @@ test("owner request cancellation reaches the PR resolver and does not stage canc
   assert.equal(calls, 1);
 });
 
-for (const variant of ["changed-head", "same-target", "paused", "unavailable", "concurrent-pause"]) {
+for (const variant of ["closed", "unassigned", "assigned", "unavailable", "concurrent-pause", "incomplete-snapshot"]) {
+  test(`fresh scope reconciliation retires a legacy exit without inventing authority (${variant})`, async t => {
+    const root = await mkdtemp(path.join(tmpdir(), "legacy-review-exit-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const store = new StateStore(path.join(root, "state")), clock = clockFixture();
+    let reader;
+    const runtime = await createRoutingAndLedger(store, clock, { legacyExitRoute: true,
+      scopeExitRecoveryReader: { read: options => reader.read(options) } });
+    const routing = runtime.routing;
+    let ledger = runtime.ledger;
+    t.after(() => Promise.all([ledger.close(), routing.close()]));
+    const event = { schemaVersion: 1, eventType: "pull_request.left_scope", occurredAt: "2026-08-01T01:00:00.000Z",
+      source: { provider: "github", scopeId: "github-dashboard" },
+      subject: { id: "github:pr:acme/repo#42", repository: "acme/repo", number: 42 },
+      payload: { title: "Old exited PR", state: "open", relation: "review_requested", headRefOid: "a".repeat(40),
+        gitTargetAvailable: true, gitTarget: { schemaVersion: 1, provider: "github", sourceAccountId: "runtime-user",
+          baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "d".repeat(40),
+          headRepository: "acme/repo", headRefName: "old-pr", headRefOid: "a".repeat(40) } } };
+    await routing.ingest({ event: { ...event, eventType: "pull_request.created", occurredAt: "2026-08-01T00:00:00.000Z" } });
+    await ledger.intake();
+    await routing.ingest({ event });
+    await ledger.intake();
+    // Restore the schema-valid historical state left by the old cutover:
+    // an ordinary exit pointer was activated without lifecycle authority.
+    const legacy = await store.read("work-ledger-state");
+    const envelope = (await routing.readAssignmentBatch({ afterSequence: 1, limit: 100 })).items[0];
+    const historical = legacy.items.find(item => item.source?.kind === "pull_request");
+    historical.source = normalizePullRequestWorkSource(createPullRequestWorkSource(envelope).source);
+    historical.event = envelope.event;
+    historical.inputDigest = historical.source.current.inputDigest;
+    legacy.graphMemoryProjection = reconcileMigratedWorkGraphMemoryAuthority(
+      emptyWorkGraphMemoryProjection(), legacy, normalizeWorkLedgerLimits());
+    await ledger.close();
+    await store.write("work-ledger-state", legacy);
+    ledger = await createWorkLedgerRuntime({ store, assignmentSource: routing, clock,
+      idFactory: () => "owner-work-lease", createGuard: guardFactory });
+    const before = (await ledger.listItems()).items.find(item => item.source?.kind === "pull_request");
+    assert.equal(before.status, "queued");
+    assert.equal(before.source.current.event.eventType, "pull_request.left_scope");
+    assert.equal(before.source.scope.active, true, "a raw exit event cannot mint lifecycle proof");
+    const pause = async () => {
+      const current = await ledger.readItemForReconciliation({ itemId: before.itemId });
+      await ledger.scopedGraphPlannerFactory.forRoot({ scopeRootTaskId: before.itemId }).pauseTask({
+        taskId: current.itemId, expectedTaskRevision: current.revision,
+        expectedGraphRevision: (await ledger.getSummary()).revision, reason: "owner_paused" });
+    };
+    let reads = 0;
+    reader = new AutomaticReviewScopeExitReader({ ledger, account: "runtime-user", clock, github: {
+      async readIncomingReviewRequest() {
+        reads++;
+        if (variant === "unavailable") throw new Error("GitHub unavailable");
+        if (variant === "concurrent-pause") await pause();
+        return { kind: "pull_request", state: variant === "closed" ? "closed" : "open", isDraft: false,
+          incomingReviewFactsAvailable: true, headRefOid: "b".repeat(40),
+          reviewRecipient: variant === "assigned" ? "runtime-user" : null,
+          reviewReceivedVia: variant === "assigned" ? "assignee" : null };
+      },
+    } });
+    const snapshot = { refreshedAt: clock().toISOString(), items: [], sourceStatus: {
+      githubPullRequests: { ok: true, stale: false, complete: variant !== "incomplete-snapshot" },
+      githubIssues: { ok: true, stale: false } } };
+    const recovered = await routing.ingestSnapshot({ snapshot });
+    await ledger.intake();
+    const after = await ledger.readItemForReconciliation({ itemId: before.itemId });
+    const exited = ["closed", "unassigned"].includes(variant);
+    assert.equal(after.source.scope.active, !exited);
+    assert.equal(after.status, exited ? "blocked" : variant === "concurrent-pause" ? "paused" : "queued");
+    assert.deepEqual(after.graph, before.graph);
+    assert.equal(recovered.events.length, exited ? 1 : 0);
+    if (exited) {
+      assert.ok(after.source.bindings.some(item => item.scopeLifecycle === true));
+      await assert.rejects(ledger.claim({ itemId: after.itemId, expectedRevision: after.revision,
+        workerId: "employee-pr-engineer", leaseDurationMs: 30_000 }));
+    }
+    if (variant === "incomplete-snapshot") assert.equal(reads, 0);
+    assert.equal((await routing.ingestSnapshot({ snapshot })).events.length, 0);
+  });
+}
+
+for (const variant of ["changed-head", "same-target", "paused", "unavailable", "concurrent-pause", "unassigned", "assignment-unavailable", "concurrent-unassignment"]) {
   test(`automatic owner PR refresh uses ordinary source intake after unstarted fact failures (${variant})`, async t => {
     const root = await mkdtemp(path.join(tmpdir(), "owner-pr-refresh-"));
     t.after(() => rm(root, { recursive: true, force: true }));
     const store = new StateStore(path.join(root, "state")), clock = clockFixture();
     const { routing, ledger } = await createRoutingAndLedger(store, clock);
-    let head = "a".repeat(40), unavailable = false, duringResolve = async () => {};
+    let head = "a".repeat(40), unavailable = false, assigned = true, assignmentUnavailable = false, duringResolve = async () => {};
     const ownerLedger = { ...ledger, async listItems(options) {
       // A large unrelated blocked history must not delay the owner's current PR.
       if (options?.status === "blocked") return { items: Array.from({ length: 10 }, (_, index) => ({ itemId: `historical-${index}` })),
@@ -830,6 +916,12 @@ for (const variant of ["changed-head", "same-target", "paused", "unavailable", "
       return ledger.listItems(options);
     } };
     const options = { store, workflowRouting: routing, ledger: ownerLedger, roleReadiness: roleReadiness(), clock, createGuard: guardFactory,
+      incomingReviewReader: { async read() {
+        if (assignmentUnavailable) throw new Error("Assignment facts unavailable");
+        return { kind: "pull_request", state: "open", isDraft: false, incomingReviewFactsAvailable: true,
+          headRefOid: head, reviewRecipient: assigned ? "runtime-user" : null,
+          reviewReceivedVia: assigned ? "assignee" : null, reviewRequestEventId: assigned ? "assignment-1" : null };
+      } },
       pullRequestResolver: { async resolvePullRequestTarget(target) {
         if (unavailable) throw new Error("GitHub unavailable");
         await duringResolve();
@@ -840,6 +932,10 @@ for (const variant of ["changed-head", "same-target", "paused", "unavailable", "
     let owner = await createOwnerWorkRequestRuntime(options);
     t.after(async () => { await owner.close(); await ledger.close(); await routing.close(); });
     const original = await owner.submit(pullRequest());
+    assigned = false;
+    const originalItem = await ledger.readItemForReconciliation({ itemId: original.workItemId });
+    await owner.verifyAutomaticReviewContinuation(currentWorkItemExecutionBinding(originalItem));
+    assigned = true;
     let item;
     for (let attempt = 1; attempt <= 3; attempt++) {
       item = await ledger.readItemForReconciliation({ itemId: original.workItemId });
@@ -861,6 +957,9 @@ for (const variant of ["changed-head", "same-target", "paused", "unavailable", "
     if (variant === "paused") await pause();
     if (variant === "unavailable") unavailable = true;
     if (variant === "concurrent-pause") duringResolve = pause;
+    if (variant === "unassigned") assigned = false;
+    if (variant === "assignment-unavailable") assignmentUnavailable = true;
+    if (variant === "concurrent-unassignment") duringResolve = async () => { assigned = false; };
     assert.equal((await owner.refreshBlockedPullRequestSources()).refreshed, variant === "changed-head" ? 1 : 0);
     if (variant === "changed-head") {
       const pending = (await ledger.listPendingPullRequestSources()).items.find(candidate => candidate.itemId === item.itemId);
@@ -870,6 +969,14 @@ for (const variant of ["changed-head", "same-target", "paused", "unavailable", "
     const current = await ledger.readItemForReconciliation({ itemId: item.itemId });
     assert.equal(current.source.current.headRefOid, variant === "changed-head" ? head : "a".repeat(40));
     assert.equal((await owner.get(original.requestId)).eventId, original.eventId);
+    if (variant === "changed-head") {
+      const binding = currentWorkItemExecutionBinding(current);
+      await owner.verifyAutomaticReviewContinuation(binding);
+      assigned = false;
+      await assert.rejects(owner.verifyAutomaticReviewContinuation(binding), { code: "OWNER_REVIEW_ASSIGNMENT_REVOKED" });
+      assignmentUnavailable = true;
+      await assert.rejects(owner.verifyAutomaticReviewContinuation(binding), { code: "OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE" });
+    }
     await owner.close(); owner = await createOwnerWorkRequestRuntime(options);
     assert.equal((await owner.refreshBlockedPullRequestSources()).refreshed, 0);
     assert.equal((await ledger.listOutbox()).items.length, 0);

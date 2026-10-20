@@ -220,6 +220,7 @@ export class OwnerWorkRequestService {
     roleReadiness,
     capabilityReadiness,
     pullRequestResolver,
+    incomingReviewReader,
     exclusiveLease,
     actionAdmissionGate,
     operationQueue,
@@ -247,6 +248,8 @@ export class OwnerWorkRequestService {
           ["resolvePullRequestTarget"],
           "pullRequestResolver",
         );
+    this.incomingReviewReader = incomingReviewReader === undefined ? null
+      : requirePort(incomingReviewReader, ["read"], "incomingReviewReader");
     this.exclusiveLease = requirePort(exclusiveLease, ["run"], "exclusiveLease");
     const gate = actionAdmissionGate ?? DIRECT_ADMISSION;
     this.runNewWorkAdmission = requirePort(
@@ -300,7 +303,7 @@ export class OwnerWorkRequestService {
     limit = listOptions({ limit }).limit;
     normalizeAbortSignal(signal);
     this.#assertReady();
-    if (typeof this.ledger.readItemForReconciliation !== "function" ||
+    if (this.incomingReviewReader === null || typeof this.ledger.readItemForReconciliation !== "function" ||
         typeof this.ledger.listOutbox !== "function" ||
         typeof this.ledger.verifyPullRequestExecutionBinding !== "function") return { refreshed: 0 };
     const admitted = await this.runNewWorkAdmission(() => ({ operation: this.operationQueue.enqueue(() =>
@@ -328,6 +331,7 @@ export class OwnerWorkRequestService {
             await this.ledger.verifyPullRequestExecutionBinding(binding);
             if ((await this.ledger.listOutbox({ itemId: item.itemId, limit: 1 })).items.length !== 0) continue;
             remoteAttempts++;
+            if (!await this.#hasCurrentReviewAssignment(binding, null)) continue;
             let event = await this.#createPullRequestEvent(record.request, this.#now(), signal);
             const previous = item.source.current.event.payload;
             if (event.payload.headRefOid === previous.headRefOid &&
@@ -339,6 +343,7 @@ export class OwnerWorkRequestService {
             const latest = await this.ledger.readItemForReconciliation({ itemId: item.itemId });
             if (!isDeepStrictEqual(latest, item)) continue;
             await this.ledger.verifyPullRequestExecutionBinding(binding);
+            if (!await this.#hasCurrentReviewAssignment(binding, event.payload.headRefOid)) continue;
             throwIfCancelled(signal);
             const assignment = oneRoleAssignment(await this.workflowRouting.ingest({ event: workflowEventInput(event) }), "persisted");
             await this.#intakeAssignment(assignment.assignmentId, signal);
@@ -347,13 +352,62 @@ export class OwnerWorkRequestService {
             throwIfCancelled(signal);
             // One unavailable PR must not suppress other ordinary source refreshes.
             if (!["OWNER_PULL_REQUEST_RESOLUTION_FAILED", "OWNER_WORK_REQUEST_INVALID", "OWNER_WORK_REQUEST_ROUTING_NOT_READY",
-              "OWNER_WORK_REQUEST_ROLE_NOT_READY", "WORK_LEDGER_PR_EXECUTION_BINDING_STALE"].includes(error?.code)) throw error;
+              "OWNER_WORK_REQUEST_ROLE_NOT_READY", "WORK_LEDGER_PR_EXECUTION_BINDING_STALE", "OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE"].includes(error?.code)) throw error;
             deferred++;
           }
         }
         return { refreshed, deferred };
       })) }));
     return admitted.operation;
+  }
+
+  async #hasCurrentReviewAssignment(binding, expectedHead) {
+    let facts;
+    try {
+      if (this.incomingReviewReader === null) throw new Error("Incoming assignment reader unavailable");
+      facts = await this.incomingReviewReader.read({ repository: binding.repository,
+        number: binding.pullRequestNumber, account: binding.gitTarget.sourceAccountId });
+      if (facts?.incomingReviewFactsAvailable !== true || facts.kind !== "pull_request" ||
+          !["open", "closed", "merged"].includes(facts.state?.toLowerCase()) || typeof facts.isDraft !== "boolean" ||
+          !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(facts.headRefOid || "")) {
+        throw new Error("Incoming assignment facts incomplete");
+      }
+    } catch (cause) {
+      throw ownerRequestError("OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE", "无法核验 PR 的当前分配关系", 503, { cause });
+    }
+    return facts.kind === "pull_request" && facts.state?.toLowerCase() === "open" && facts.isDraft === false &&
+      (expectedHead === null || facts.headRefOid === expectedHead) &&
+      typeof facts.reviewRecipient === "string" &&
+      facts.reviewRecipient.toLowerCase() === binding.gitTarget.sourceAccountId.toLowerCase() &&
+      facts.reviewReceivedVia === "assignee" && typeof facts.reviewRequestEventId === "string" &&
+      facts.reviewRequestEventId.length > 0;
+  }
+
+  async verifyAutomaticReviewContinuation(binding) {
+    this.#assertReady();
+    const state = await this.#readState();
+    const record = state.records.find(record => record.phase === "intaken" && record.workItemId === binding.rootItemId &&
+      [2, 3, 4].includes(record.request.schemaVersion) && record.request.workType === "pull_request");
+    if (!record) return binding;
+    const root = await this.ledger.readItemForReconciliation({ itemId: record.workItemId });
+    const source = root?.source;
+    // New explicit requests have a new immutable record and scope. Only a
+    // later accepted event continuing the original host-owned scope is gated.
+    if (source?.kind !== "pull_request" || source.current.eventId === record.event.eventId) return binding;
+    const original = source.bindings.find(entry => entry.assignmentId === record.assignment.assignmentId &&
+      entry.eventId === record.event.eventId);
+    if (!original || source.scope.kind !== "owner_requested" ||
+        source.identity.scopeId !== record.event.source.scopeId ||
+        !isDeepStrictEqual(source.current.event.source, record.event.source) ||
+        !isDeepStrictEqual(source.current.event.subject, record.event.subject) ||
+        source.current.sourceSequence <= original.sourceSequence ||
+        source.revisions[source.activeRevision - 1]?.disposition !== "accepted") return binding;
+    await this.ledger.verifyPullRequestExecutionBinding(binding);
+    if (!await this.#hasCurrentReviewAssignment(binding, binding.headRefOid)) {
+      throw ownerRequestError("OWNER_REVIEW_ASSIGNMENT_REVOKED", "历史 Review 续接已不再分配给当前账号", 409);
+    }
+    await this.ledger.verifyPullRequestExecutionBinding(binding);
+    return binding;
   }
 
   async submit(value, { signal = null } = {}) {

@@ -911,6 +911,7 @@ class GitHubActionAdapter {
       return samePullRequestExecutionBinding(verified, binding);
     } catch (error) {
       if (error instanceof GitHubActionError) throw error;
+      if (error?.code === "OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE") throw actionError("GITHUB_UNAVAILABLE");
       return false;
     }
   }

@@ -624,6 +624,18 @@ test("revoked work proposal authority prevents every GitHub call", async () => {
   assert.equal(runner.calls.length, 0);
 });
 
+test("unavailable historical assignment facts remain retryable at execution and unknown at reconciliation", async () => {
+  for (const method of ["execute", "reconcile"]) {
+    const runner = new FakeRunner(method === "reconcile" ? [actor(), pages([])] : []);
+    const adapter = createAdapter(runner, { inputAuthorityVerifier: { async verify() {
+      throw Object.assign(new Error("Assignment lookup unavailable"), { code: "OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE" });
+    } } });
+    assert.deepEqual(await adapter[method](workProposalEnvelope()), { status: "error",
+      error: { trust: method === "execute" ? "absent" : "unknown", code: "GITHUB_UNAVAILABLE" } });
+    assert.equal(runner.calls.some(call => call.args.includes("POST")), false);
+  }
+});
+
 test("legacy work-proposal actions are reconcile-only and cannot be retried", async () => {
   const legacy = reviewEnvelope({ kind: "github.work-proposal-review" });
   const executeRunner = new FakeRunner();

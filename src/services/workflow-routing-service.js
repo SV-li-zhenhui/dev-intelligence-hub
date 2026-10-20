@@ -1,4 +1,4 @@
-import { normalizeWorkflowEvent } from "../domain/workflow-events.js";
+import { normalizeStoredWorkflowEvent, normalizeWorkflowEvent } from "../domain/workflow-events.js";
 import { DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS } from "../domain/prioritizer.js";
 import { normalizeWorkflowRoutingConfig } from "../domain/workflow-router.js";
 import {
@@ -106,6 +106,7 @@ export class WorkflowRoutingService {
     auditByteBudget = MAX_WORKFLOW_AUDIT_BYTES,
     bundleByteBudget = MAX_WORKFLOW_BUNDLE_BYTES,
     issueActiveWindowDays = DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS,
+    scopeExitRecoveryReader = null,
   } = {}) {
     if (
       !store ||
@@ -128,6 +129,10 @@ export class WorkflowRoutingService {
     this.router = router;
     this.clock = clock;
     this.issueActiveWindowDays = issueActiveWindowDays;
+    if (scopeExitRecoveryReader !== null && typeof scopeExitRecoveryReader?.read !== "function") {
+      throw new TypeError("scopeExitRecoveryReader is invalid");
+    }
+    this.scopeExitRecoveryReader = scopeExitRecoveryReader;
     this.operationQueue = operationQueue || new OperationQueue();
     this.exclusiveLease = exclusiveLease;
     this.runNewWorkAdmission = newWorkAdmissionRun(actionAdmissionGate);
@@ -318,18 +323,34 @@ export class WorkflowRoutingService {
       snapshot,
       projectionOptions,
     );
+    // Read ledger/GitHub before the routing lease: intake reads routing while
+    // holding the ledger lease, so the reverse order would deadlock.
+    const recoveredExits = this.scopeExitRecoveryReader !== null &&
+      snapshot.sourceStatus?.githubPullRequests?.ok === true && snapshot.sourceStatus.githubPullRequests.complete === true
+      ? await this.scopeExitRecoveryReader.read({ sourceScopeId }) : [];
     return this.#admitNewWork(() => this.#writeTransaction(async () => {
       const replay = this.#snapshotReplay(currentCheckpoint);
-      if (replay) return replay;
-      const config = this.#requireConfig();
       const existingEventIds = new Set(
         this.state.events.map(({ eventId }) => eventId),
       );
-      const events = workflowEventsFromSnapshots(
+      const extraEvents = recoveredExits.map(normalizeStoredWorkflowEvent).filter(event => {
+        if (event.eventType !== "pull_request.left_scope" || event.source.provider !== "github" || event.source.scopeId !== sourceScopeId) {
+          throw new TypeError("scope recovery may only revoke its GitHub scope");
+        }
+        return !existingEventIds.has(event.eventId);
+      });
+      if (replay && extraEvents.length === 0) return replay;
+      const config = this.#requireConfig();
+      const emittedEventIds = new Set(existingEventIds);
+      const events = [...(replay ? [] : workflowEventsFromSnapshots(
         this.state.checkpoint,
         currentCheckpoint,
         { sourceScopeId, ...projectionOptions },
-      ).filter((event) => !existingEventIds.has(event.eventId));
+      )), ...extraEvents].filter(event => {
+        if (emittedEventIds.has(event.eventId)) return false;
+        emittedEventIds.add(event.eventId);
+        return true;
+      });
       const assignments = [];
       const audit = [];
       for (const event of events) {

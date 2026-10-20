@@ -103,7 +103,8 @@ import { createWorkProposalRuntime } from "./work-proposal-runtime.js";
 import { createWorkflowRoutingRuntime } from "./workflow-routing-runtime.js";
 import { createPrTriageWorkRequest } from "./domain/owner-work-request.js";
 import { DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS } from "./domain/prioritizer.js";
-import { samePullRequestExecutionBinding } from "./domain/pull-request-execution-binding.js";
+import { createPullRequestExecutionBinding, samePullRequestExecutionBinding } from "./domain/pull-request-execution-binding.js";
+import { AutomaticReviewScopeExitReader } from "./services/automatic-review-scope-exit-reader.js";
 
 const GITHUB_REVIEW_PROPOSAL_RUNNER_ID = "github-review-runner";
 const GITHUB_PULL_REQUEST_ACTION_RUNNER_ID = "github-pr-action-runner";
@@ -1059,6 +1060,7 @@ export async function createApplication({
   let codeExecutorRuntime = null;
   let changePackageRuntime = null;
   let automaticOwnPrRepair = null;
+  let automaticReviewScopeExitReader = null;
   let workflowRouting = null;
   let workLedgerRuntime = null;
   const originalRepairFeedbackReader = new OriginalRepairFeedbackReader({
@@ -1276,6 +1278,15 @@ export async function createApplication({
       await workflowRoutingRuntimeFactory(config, {
         ...runtimeDependencies(workflowRoutingDependencies),
         store,
+        ...(config.githubActions?.enabled === true && config.githubActions.automaticReview === true ? {
+          scopeExitRecoveryReader: Object.freeze({ async read(options) {
+            if (!workLedgerRuntime) return [];
+            automaticReviewScopeExitReader ??= new AutomaticReviewScopeExitReader({ ledger: workLedgerRuntime, github,
+              account: config.githubActions.actorAccountId,
+              ...(workCoordinationDependencies.clock ? { clock: workCoordinationDependencies.clock } : {}) });
+            return automaticReviewScopeExitReader.read(options);
+          } }),
+        } : {}),
         ...(ordinaryActionAdmissionGate === null
           ? {}
           : { actionAdmissionGate: ordinaryActionAdmissionGate }),
@@ -1583,8 +1594,14 @@ export async function createApplication({
     inputAuthorityVerifier = workLedgerRuntime === null
       ? null
       : Object.freeze({
-          verify: (binding) =>
-            workLedgerRuntime.verifyPullRequestExecutionBinding(binding),
+          async verify(binding) {
+            const verified = await workLedgerRuntime.verifyPullRequestExecutionBinding(binding);
+            const root = await workLedgerRuntime.readItemForReconciliation?.({ itemId: verified.rootItemId });
+            if (root?.source?.scope?.kind === "owner_requested" && root.source.identity.targetRoleId === "pr-engineer") {
+              await ownerWorkRequests?.verifyAutomaticReviewContinuation?.(verified);
+            }
+            return verified;
+          },
         });
     let activeCodeJobOptions = null;
     if (localCodeExecutionEnabled) {
@@ -2161,8 +2178,11 @@ export async function createApplication({
           }),
           inputAuthorityVerifier,
           pullRequestContextReader: Object.freeze({
-            readCurrent: (binding) =>
-              workLedgerRuntime.readPullRequestExecutionContext(binding),
+            async readCurrent(binding) {
+              const context = await workLedgerRuntime.readPullRequestExecutionContext(binding);
+              await inputAuthorityVerifier.verify(binding);
+              return context;
+            },
           }),
           actorAccountId: config.githubActions.actorAccountId,
           leaseDurationMs: coordinationConfig.leaseDurationMs,
@@ -2410,6 +2430,7 @@ export async function createApplication({
               ["resolvePullRequestTarget"],
               "owner pull request resolver",
             ),
+            incomingReviewReader: Object.freeze({ read: input => github.readIncomingReviewRequest(input) }),
             ...(ordinaryActionAdmissionGate === null
               ? {}
               : { actionAdmissionGate: ordinaryActionAdmissionGate }),
@@ -2484,7 +2505,7 @@ export async function createApplication({
         ["read"],
         "workflow fact source",
       );
-      const pullRequestContextReader = frozenPort(
+      const rawPullRequestContextReader = frozenPort(
         frozenPort(
           factSourceService,
           ["pullRequestTaskContextReader"],
@@ -2493,6 +2514,11 @@ export async function createApplication({
         ["read"],
         "workflow PR task context reader",
       );
+      const pullRequestContextReader = Object.freeze({ async read(input, options) {
+        const binding = createPullRequestExecutionBinding(input);
+        await inputAuthorityVerifier.verify(binding);
+        return rawPullRequestContextReader.read(input, options);
+      } });
       const proposalResultReader = workProposalRuntime.evidenceReader
         ? frozenPort(
             workProposalRuntime.evidenceReader,
@@ -2591,7 +2617,7 @@ export async function createApplication({
       });
       const workLoop = proactiveWorkLoopFactory({
         taskRuns,
-        ledger: workLedgerRuntime,
+        ledger: Object.freeze({ ...workLedgerRuntime, verifyPullRequestExecutionBinding: inputAuthorityVerifier.verify }),
         roleDirectory,
         roleContextAssembler,
         orchestratorService,

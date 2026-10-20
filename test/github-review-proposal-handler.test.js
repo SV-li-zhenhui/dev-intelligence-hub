@@ -516,6 +516,34 @@ test("revoked target authority prevents enqueue and invalidates an existing conf
   );
 });
 
+test("a revoked historical Review assignment withdraws its pending confirmation", async () => {
+  const producer = new FakeConfirmationProducer();
+  const waiting = await handler(producer).handle(handlerInput());
+  const reader = { async readCurrent() { throw Object.assign(new Error("Assign changed"), {
+    code: "OWNER_REVIEW_ASSIGNMENT_REVOKED" }); } };
+  const result = await handler(producer, { pullRequestContextReader: reader }).handle(handlerInput({
+    status: "waiting_confirmation", downstreamRef: waiting.downstreamRef }));
+  assert.equal(result.status, "stale");
+  assert.equal(producer.invalidateCalls.length, 1);
+  assert.equal(producer.status, "stale");
+});
+
+test("unavailable assignment facts defer a Review without withdrawing or reenqueuing it", async () => {
+  const producer = new FakeConfirmationProducer();
+  const waiting = await handler(producer).handle(handlerInput());
+  const unavailable = Object.assign(new Error("GitHub unavailable"), { code: "OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE" });
+  for (const override of [
+    { pullRequestContextReader: { async readCurrent() { throw unavailable; } } },
+    { pullRequestContextReader: undefined, inputAuthorityVerifier: { async verify() { throw unavailable; } } },
+  ]) {
+    await assert.rejects(handler(producer, override).handle(handlerInput({
+      status: "waiting_confirmation", downstreamRef: waiting.downstreamRef })), { code: unavailable.code });
+  }
+  assert.equal(producer.status, "pending");
+  assert.equal(producer.invalidateCalls.length, 0);
+  assert.equal(producer.enqueueCalls.length, 1);
+});
+
 test("a completed self-authored Review settles after its source authority becomes stale", async () => {
   const producer = new FakeConfirmationProducer();
   const selfAuthoredHandler = handler(producer, {
