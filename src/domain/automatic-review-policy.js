@@ -30,8 +30,13 @@ export function automaticReviewWorkAdmission(root, inputRevision = root?.source?
   if (source?.kind !== "pull_request" || root.sourceQuarantine !== null || source.scope?.active !== true) return null;
   const event = source.current?.event;
   if (!event?.source || source.identity?.provider !== event.source.provider || source.identity?.scopeId !== event.source.scopeId) return null;
+  const orchestratedRereview = event.payload?.workType === "general" &&
+    source.identity.targetRoleId === "orchestrator" && event.payload.nextAction === "rereview" &&
+    event.payload.suggestedCapability === "pr-review" &&
+    /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(source.current.headRefOid || "") &&
+    event.payload.expectedHeadRefOid === source.current.headRefOid && event.payload.headRefOid === source.current.headRefOid;
   if (event.source.provider === "local-owner" && source.scope.kind === "owner_requested" &&
-      event.eventType === "pull_request.owner_requested" && event.payload?.workType === "pull_request") {
+      event.eventType === "pull_request.owner_requested" && (event.payload?.workType === "pull_request" || orchestratedRereview)) {
     return { kind: "owner_requested", admittedAt: root.createdAt };
   }
   const facts = event?.payload;

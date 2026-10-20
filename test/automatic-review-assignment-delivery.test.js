@@ -46,9 +46,11 @@ async function fixture({ reviewEvent = "REQUEST_CHANGES", automatic = true, lega
       source: continuation === "assigned" ? { provider: "github", scopeId: "github-dashboard" }
         : { provider: "local-owner", scopeId: "owner-request:123e4567-e89b-42d3-a456-426614174000" },
       subject: { id: "github:pr:acme/repo#42", repository: "acme/repo", number: 42 },
-      payload: { ...eventFacts, relation: "review_requested", workType: "pull_request", gitTargetAvailable: true, gitTarget } });
+      payload: { ...eventFacts, relation: "review_requested", workType: continuation === "orchestrated_rereview" ? "general" : "pull_request",
+        ...(continuation === "orchestrated_rereview" ? { nextAction: "rereview", suggestedCapability: "pr-review", expectedHeadRefOid: HEAD } : {}),
+        gitTargetAvailable: true, gitTarget } });
     const record = { sequence: 1, event, assignment: { assignmentId: "assignment-work-42", eventId: event.eventId,
-      target: { type: "role", id: "pr-engineer" }, reason: "Review", createdAt: event.occurredAt } };
+      target: { type: "role", id: continuation === "orchestrated_rereview" ? "orchestrator" : "pr-engineer" }, reason: "Review", createdAt: event.occurredAt } };
     let sequence = 0;
     const makeLedger = () => new WorkLedgerService({ store, exclusiveLease: { run: operation => operation() },
       clock: () => event.occurredAt, idFactory: () => `review-fixture-${++sequence}`,
@@ -122,7 +124,7 @@ async function fixture({ reviewEvent = "REQUEST_CHANGES", automatic = true, lega
     async restart() { queue = makeQueue(); await queue.recover(); } };
 }
 
-for (const continuation of ["assigned", "owner_requested"]) {
+for (const continuation of ["assigned", "owner_requested", "orchestrated_rereview"]) {
   test(`system ${continuation} continuation publishes failed-CI Review and hands off automatically after restart`, async () => {
     const f = await fixture({ continuation, reviewEvent: "COMMENT" });
     assert.equal(f.publications, 1);

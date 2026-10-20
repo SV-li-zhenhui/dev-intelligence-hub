@@ -85,6 +85,25 @@ test("only a current explicit Review root grants owner continuation, not general
   assert.equal(automaticReviewWorkAdmission(root), null);
 });
 
+test("a Head-bound orchestrated rereview grants continuation while other general triage stays excluded", () => {
+  const root = admittedRoot({ provider: "local-owner", workType: "general", facts: {
+    nextAction: "rereview", suggestedCapability: "pr-review", expectedHeadRefOid: item.headRefOid,
+  } });
+  root.source.identity.targetRoleId = "orchestrator";
+  root.source.current.headRefOid = item.headRefOid;
+  assert.deepEqual(automaticReviewWorkAdmission(root), { kind: "owner_requested", admittedAt: root.createdAt });
+  for (const patch of [
+    { nextAction: "confirm" }, { suggestedCapability: "development" },
+    { expectedHeadRefOid: "b".repeat(40) }, { headRefOid: "b".repeat(40) },
+  ]) {
+    const changed = structuredClone(root);
+    Object.assign(changed.source.current.event.payload, patch);
+    assert.equal(automaticReviewWorkAdmission(changed), null);
+  }
+  root.source.identity.targetRoleId = "developer";
+  assert.equal(automaticReviewWorkAdmission(root), null);
+});
+
 test("replacement Assign retains its own timely intake across later snapshots", () => {
   const root = admittedRoot();
   const incomingReview = { eventId: "event-2", receivedAt: "2026-10-10T09:00:00Z" };
