@@ -533,6 +533,26 @@ function isCompletedPullRequestRootRetiredAfterAdvance(previous, next, nextItems
   return false;
 }
 
+function isCompletedInactivePullRequestRootAdvanced(previous, next) {
+  // Fresh facts can advance an inactive source after its sealed action settles.
+  // Retire the old completion without reopening work or changing its deliveries.
+  return previous.kind === "source_root" && previous.source?.kind === "pull_request" &&
+    previous.status === "completed" && previous.source.scope.kind === "automatic" &&
+    previous.source.scope.active === false && next?.kind === "source_root" &&
+    next.source?.kind === "pull_request" &&
+    next.status === "blocked" && next.statusReason === "pr_source_left_scope" &&
+    next.revision === previous.revision + 1 && next.ownerId === null &&
+    next.leaseId === null && next.leaseUntil === null && next.activeIntentId === null &&
+    next.decisionContext === null && next.availableAt === null &&
+    next.source.pendingRevision === null &&
+    next.source.activeRevision > previous.source.activeRevision &&
+    next.source.authorityEpoch >= previous.source.authorityEpoch &&
+    next.source.current.sourceSequence > previous.source.current.sourceSequence &&
+    ledgerDigest(next.source.scope) === ledgerDigest(previous.source.scope) &&
+    ledgerDigest(next.source.identity) === ledgerDigest(previous.source.identity) &&
+    ledgerDigest(next.graph) === ledgerDigest(previous.graph);
+}
+
 function isCompletedPullRequestRootPendingCutover(previous, next, previousItems, nextItems) {
   const prefix = "pr_source_cross_root_cutover_pending:";
   if (
@@ -616,6 +636,7 @@ export function validateWorkLedgerGraphTransition(previousState, nextState) {
             nextItem.source.activeRevision > item.source.activeRevision) ||
           isRecoveredConflictInspection(previousState, item, nextItem) ||
           isCompletedPullRequestRootScopeExit(item, nextItem) ||
+          isCompletedInactivePullRequestRootAdvanced(item, nextItem) ||
           isCompletedPullRequestRootRetiredAfterAdvance(item, nextItem, nextItemsById) ||
           isCompletedPullRequestRootPendingCutover(
             item, nextItem, previousItemsById, nextItemsById,

@@ -918,6 +918,61 @@ for (const limit of [1, 2, 100]) {
   });
 }
 
+for (const limit of [1, 100]) {
+  test(`a proven Head advance retires completed inactive work without blocking later intake (limit ${limit})`, async () => {
+    const fixture = await completedInactivePrFixture();
+    const before = (await fixture.service.listItems()).items.find(item => item.source.identity.pullRequestNumber === 42);
+    const outboxes = (await fixture.service.listOutbox()).items;
+    const previousState = fixture.store.stored();
+    fixture.source.records.push(prAssignment(4, { headRefOid: PR_HEAD_B, previousHeadRefOid: PR_HEAD_A,
+      changedFields: ['headRefOid'], occurredAt: '2026-08-02T01:10:00.000Z', gitFacts: prGitFacts(PR_HEAD_B) }),
+    prAssignment(5, { headRefOid: PR_HEAD_B, changedFields: ['gitTarget'],
+      occurredAt: '2026-08-02T01:11:00.000Z', gitFacts: prGitFacts(PR_HEAD_B, { baseRefOid: 'e'.repeat(40) }) }),
+    prAssignment(6, { pullRequestNumber: 43, headRefOid: PR_HEAD_C, changedFields: ['gitTarget'],
+      occurredAt: '2026-08-02T01:12:00.000Z', gitFacts: prGitFacts(PR_HEAD_C, { baseRefOid: 'e'.repeat(40) }) }));
+    fixture.source.highWatermark = 6;
+    for (let step = 0; step < 3; step++) {
+      const result = await fixture.service.intake({ limit });
+      assert.equal(result.error, undefined, JSON.stringify(result));
+      if (result.cursor === 6) break;
+    }
+    assert.equal((await fixture.service.getSummary()).intakeCursor, 6);
+    const items = (await fixture.service.listItems()).items;
+    const retired = items.find(item => item.itemId === before.itemId);
+    assert.equal(retired.status, 'blocked');
+    assert.equal(retired.statusReason, 'pr_source_left_scope');
+    assert.equal(retired.source.scope.active, false);
+    assert.equal(retired.source.current.headRefOid, PR_HEAD_B);
+    assert.equal(retired.decisionContext, null);
+    assert.deepEqual(retired.graph, before.graph);
+    assert.deepEqual((await fixture.service.listOutbox()).items, outboxes);
+    await assert.rejects(fixture.service.claim({ itemId: retired.itemId, expectedRevision: retired.revision,
+      workerId: 'employee-pr-engineer', leaseDurationMs: 30_000 }));
+    if (limit === 100) {
+      const after = fixture.store.stored();
+      validateWorkLedgerGraphTransition(previousState, after);
+      for (const mutate of [
+        item => { item.status = 'completed'; },
+        item => { item.source.scope.revision++; },
+        item => { item.source.identity.scopeId = 'another-scope'; },
+        item => { item.graph.acceptanceContracts[0].acceptanceCriteria.push('Changed historical contract'); },
+        item => { item.activeIntentId = 'unsettled-intent'; },
+        item => { item.source.current.sourceSequence = before.source.current.sourceSequence; },
+        item => { item.source.activeRevision = before.source.activeRevision; },
+      ]) {
+        const forged = clone(after);
+        mutate(forged.items.find(item => item.itemId === retired.itemId));
+        assert.throws(() => validateWorkLedgerGraphTransition(previousState, forged));
+      }
+    }
+    assert.equal(items.find(item => item.source.identity.pullRequestNumber === 43).source.current.event.payload.gitTarget.baseRefOid,
+      'e'.repeat(40));
+    const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+    assert.equal((await restarted.service.intake({ limit })).received, 0);
+    assert.deepEqual((await restarted.service.listItems()).items, items);
+  });
+}
+
 test('accepted scope reentry and a later proven Head update retain normal authority rules', async () => {
   const fixture = await completedInactivePrFixture();
   const before = (await fixture.service.listItems()).items.find(item => item.source.identity.pullRequestNumber === 42);

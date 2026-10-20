@@ -2627,6 +2627,9 @@ export class WorkLedgerService {
           root.statusReason === "pr_source_reentered_scope_without_route";
         const firstRevisionInBatch =
           initialItemIds.has(root.itemId) && !revisedItemIds.has(root.itemId);
+        const retireInactiveCompleted = root.status === "completed" &&
+          root.source.scope.kind === "automatic" && root.source.scope.active === false &&
+          appended.source.scope.active === false && appended.activeAdvanced;
         root = {
           ...root,
           source: appended.source,
@@ -2649,6 +2652,11 @@ export class WorkLedgerService {
               }
             : {}),
           ...fencedPullRequestRootPatch(root, appended.disposition),
+          ...(retireInactiveCompleted ? {
+            status: "blocked", statusReason: "pr_source_left_scope",
+            ownerId: null, leaseId: null, leaseUntil: null, activeIntentId: null,
+            availableAt: null, decisionContext: null,
+          } : {}),
           updatedAt: now,
         };
         revisedItemIds.add(root.itemId);
