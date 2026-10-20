@@ -2,7 +2,12 @@ import {
   normalizeConfirmationPlan,
   normalizeConfirmationState,
 } from "../domain/confirmation-contract.js";
-import { createCodeActionProposalConfirmationPlan } from "../domain/code-action-proposal-confirmation.js";
+import { createCodeActionProposalConfirmationPlan, codeJobConfirmationIdForProposal } from "../domain/code-action-proposal-confirmation.js";
+import { createWorkIntentDispatchBinding } from "../domain/work-intent-dispatch-binding.js";
+import { normalizeWorkResultAttestation } from "./work-ledger-result-attestation.js";
+import { createWorkDecisionContext } from "./work-ledger-state.js";
+import { currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
+import { samePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
 import { currentWorkItemInputBinding } from "./work-ledger-pr-source.js";
 import { ledgerDigest } from "./work-ledger-values.js";
@@ -74,6 +79,32 @@ function createSettlement(item, outbox) {
     intentId: outbox.intentId, outboxDigest: digest(outbox),
   });
   return proof;
+}
+
+export function unstartedConflictProposalForRecovery(item, outboxById) {
+  try {
+    const decision = item?.decisionContext, value = decision?.value;
+    if (item?.status !== "blocked" || item.activeIntentId !== null || item.sourceQuarantine != null ||
+        decision?.source !== "proposal" || decision.outcome !== "stale" || value?.kind !== "code_action_proposal" ||
+        value.downstreamRef !== null || digest(value.evidence) !== digest(["authorization_changed", `proposal:${decision.referenceId}`])) return null;
+    const delivered = matchingDeliveredProposal(item, outboxById);
+    if (delivered === null) return null;
+    const { proposal, outbox } = delivered;
+    if (outbox.updatedAt !== item.updatedAt || proposal.payload.operation !== "modify" ||
+        proposal.source.assignmentId !== item.assignmentId || proposal.source.eventId !== proposal.binding.inputBinding.eventId ||
+        proposal.binding.executionSource?.kind !== "conflict_preparation" ||
+        !samePullRequestExecutionBinding(proposal.binding.inputBinding, currentWorkItemExecutionBinding(item)) ||
+        digest(createWorkIntentDispatchBinding(outbox.dispatchBinding.boundIntent)) !== digest(outbox.dispatchBinding)) return null;
+    const attestation = normalizeWorkResultAttestation(outbox.outcome.details.resultAttestation);
+    const result = attestation.payload;
+    if (attestation.kind !== "proposal_result" || attestation.intentId !== outbox.intentId ||
+        result.proposalId !== proposal.proposalId || result.proposalContentDigest !== proposal.contentDigest ||
+        result.kind !== proposal.kind || digest(result.requestedBy) !== digest(proposal.requestedBy)) return null;
+    const expected = createWorkDecisionContext({ source: "proposal", referenceId: result.proposalId, outcome: result.outcome,
+      value: { kind: result.kind, resultId: result.resultId, resultDigest: result.contentDigest, summary: result.summary,
+        downstreamRef: result.downstreamRef, evidence: result.evidence }, observedAt: result.at });
+    return digest(expected) === digest(decision) ? { ...delivered, confirmationId: codeJobConfirmationIdForProposal(proposal) } : null;
+  } catch { return null; }
 }
 
 function matchingHistoricalConfirmation(item, outboxById, confirmation) {

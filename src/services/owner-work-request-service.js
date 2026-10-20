@@ -297,6 +297,8 @@ export class OwnerWorkRequestService {
   // Continue the original owner authorization on a new remote Head through
   // ordinary source intake. The original request and frozen event stay intact.
   async refreshBlockedPullRequestSources({ limit = 10, signal = null } = {}) {
+    limit = listOptions({ limit }).limit;
+    normalizeAbortSignal(signal);
     this.#assertReady();
     if (typeof this.ledger.readItemForReconciliation !== "function" ||
         typeof this.ledger.listOutbox !== "function" ||
@@ -304,21 +306,18 @@ export class OwnerWorkRequestService {
     const admitted = await this.runNewWorkAdmission(() => ({ operation: this.operationQueue.enqueue(() =>
       this.exclusiveLease.run(async () => {
         this.state = await this.#readState();
-        const readPage = () => this.ledger.listItems({ status: "blocked", roleId: "pr-engineer", limit,
-          ...(this.refreshCursor === null ? {} : { cursor: this.refreshCursor }) });
-        let page;
-        try { page = await readPage(); }
-        catch (error) {
-          if (this.refreshCursor === null || error?.code !== "WORK_LEDGER_CURSOR_INVALID") throw error;
-          this.refreshCursor = null; page = await readPage();
-        }
-        this.refreshCursor = page.nextCursor ?? null;
-        let refreshed = 0, deferred = 0;
-        for (const item of page.items) {
+        const records = this.state.records.filter(record => record.phase === "intaken" &&
+          [2, 3, 4].includes(record.request.schemaVersion) && record.request.workType === "pull_request")
+          .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || left.requestId.localeCompare(right.requestId));
+        const start = records.findIndex(record => record.requestId === this.refreshCursor) + 1;
+        let refreshed = 0, deferred = 0, remoteAttempts = 0;
+        for (let offset = 0; offset < Math.min(records.length, Math.max(50, limit * 5)) && remoteAttempts < limit; offset++) {
           throwIfCancelled(signal);
-          const record = this.state.records.find(record => record.workItemId === item.itemId && record.phase === "intaken" &&
-            [2, 3, 4].includes(record.request.schemaVersion) && record.request.workType === "pull_request");
-          if (!record || item.kind !== "source_root" || item.statusReason !== "decision_attempts_exhausted" ||
+          const record = records[(start + offset) % records.length];
+          this.refreshCursor = record.requestId;
+          const item = await this.ledger.readItemForReconciliation({ itemId: record.workItemId });
+          if (item?.kind !== "source_root" || item.status !== "blocked" || item.currentTarget?.id !== "pr-engineer" ||
+              item.statusReason !== "decision_attempts_exhausted" ||
               item.decisionContext !== null || item.activeIntentId !== null || item.leaseId !== null || item.ownerId !== null ||
               item.sourceQuarantine !== null || item.graph.deliveries.length !== 0 || item.source?.pendingRevision !== null ||
               item.source.current.event.source.provider !== "local-owner" ||
@@ -328,6 +327,7 @@ export class OwnerWorkRequestService {
             if (binding?.schemaVersion !== 2) continue;
             await this.ledger.verifyPullRequestExecutionBinding(binding);
             if ((await this.ledger.listOutbox({ itemId: item.itemId, limit: 1 })).items.length !== 0) continue;
+            remoteAttempts++;
             let event = await this.#createPullRequestEvent(record.request, this.#now(), signal);
             const previous = item.source.current.event.payload;
             if (event.payload.headRefOid === previous.headRefOid &&

@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 import { normalizePullRequestExecutionBinding, samePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
 import { unstartedConflictDispatchFailure } from "./work-ledger-conflict-failure.js";
-import { codeConfirmationSettlementId, completedCodeConfirmationForSettlement } from "./work-ledger-code-confirmation-settlement.js";
+import { codeConfirmationSettlementId, completedCodeConfirmationForSettlement, unstartedConflictProposalForRecovery } from "./work-ledger-code-confirmation-settlement.js";
 import { ObsoleteCodeJobSettler, hasUnstartedCodeJobAuthorityFence } from "./obsolete-code-job-settler.js";
 
 const STATE_KEY = "automatic-own-pr-conflict-recovery-state";
@@ -90,6 +90,11 @@ export class AutomaticOwnPrConflictRecovery {
       return unstartedConflictDispatchFailure(item, outboxes.values())?.intentId ?? null;
     }
     if (item.statusReason !== "proposal_stale") return null;
+    const unstarted = unstartedConflictProposalForRecovery(item, outboxes);
+    if (unstarted !== null && typeof this.confirmationSettlementReader?.read === "function") {
+      return await this.confirmationSettlementReader.read({ confirmationId: unstarted.confirmationId }) === null
+        ? unstarted.proposal.proposalId : null;
+    }
     const confirmationId = codeConfirmationSettlementId(item.decisionContext);
     if (confirmationId === null || typeof this.confirmationSettlementReader?.read !== "function") return null;
     const snapshot = await this.confirmationSettlementReader.read({ confirmationId });

@@ -174,6 +174,9 @@ async function fixture(t, {
       if (request.args.includes("merge-base")) {
         return processResult(mergeBaseOutput, { exitCode: mergeBaseExitCode });
       }
+      if (request.args.includes("rev-list")) return processResult(`${TREE}\n${README}\n`);
+      if (request.args.includes("pack-objects")) return processResult(Buffer.from("test seed pack"));
+      if (request.args.includes("index-pack")) return processResult(`pack\t${TREE}\n`);
       if (request.args.includes("diff-tree")) {
         return processResult(request.args.includes(HEAD) ? headRaw : baseRaw);
       }
@@ -267,8 +270,14 @@ test("seals a both-modified conflict behind fixed Git commands and a content man
     assert.equal(call.env.GIT_TERMINAL_PROMPT, "0");
     assert.equal(call.env.GIT_NO_LAZY_FETCH, "1");
     assert.ok(call.env.GIT_OBJECT_DIRECTORY.startsWith(setup.preparationRoot));
-    assert.ok(call.env.GIT_ALTERNATE_OBJECT_DIRECTORIES.includes(path.join(setup.baseMirrorRoot, "objects")));
-    assert.ok(call.env.GIT_ALTERNATE_OBJECT_DIRECTORIES.includes(path.join(setup.headMirrorRoot, "objects")));
+    if (call.args.includes("merge-tree")) {
+      assert.equal(call.env.GIT_ALTERNATE_OBJECT_DIRECTORIES, path.join(call.cwd, "merge-seed-objects"));
+    } else if (call.args.includes("index-pack")) {
+      assert.equal(call.env.GIT_ALTERNATE_OBJECT_DIRECTORIES, "");
+    } else {
+      assert.ok(call.env.GIT_ALTERNATE_OBJECT_DIRECTORIES.includes(path.join(setup.baseMirrorRoot, "objects")));
+      assert.ok(call.env.GIT_ALTERNATE_OBJECT_DIRECTORIES.includes(path.join(setup.headMirrorRoot, "objects")));
+    }
     assert.equal(call.cwd.startsWith(setup.preparationRoot), true);
   }
   assert.equal(setup.mirrorInspector.calls.length, 8);

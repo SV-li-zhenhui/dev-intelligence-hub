@@ -11,7 +11,10 @@ import { createReviewRepairCodeExecutionSource } from "../src/domain/code-execut
 import { createControlledCommitEvidence, createControlledCommitMessage } from "../src/domain/controlled-commit-evidence.js";
 import { createChangePackageControlledCommitReceipt } from "../src/domain/change-package-controlled-commit.js";
 import { createPullRequestExternalActionConfirmationPlan } from "../src/domain/pull-request-external-action.js";
-import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
+import { normalizeBoundWorkProposal, createWorkProposalResult } from "../src/domain/work-proposal-contract.js";
+import { createWorkDecisionContext } from "../src/services/work-ledger-state.js";
+import { createProposalResultAttestation } from "../src/services/work-ledger-result-attestation.js";
+import { createWorkIntentDispatchBinding } from "../src/domain/work-intent-dispatch-binding.js";
 import { AutomaticOwnPrRepair } from "../src/services/automatic-own-pr-repair.js";
 import { AutomaticOwnPrConflict } from "../src/services/automatic-own-pr-conflict.js";
 import { HistoricalControlledCommitReader } from "../src/services/historical-controlled-commit-reader.js";
@@ -293,9 +296,10 @@ async function fixture({ enabled = true, conflict = false, operation = "modify",
   };
 }
 
-for (const kind of ["dispatch-stale", "authority-fenced"]) {
+for (const kind of ["dispatch-stale", "authority-fenced", "proposal-before-confirmation"]) {
   for (const variant of ["recover", "disabled", "head-drift", "paused", "source-mismatch", "preparation-failed", "concurrent-change", "later-ledger-change", "budget-exhausted",
-    ...(kind === "dispatch-stale" ? ["bound-dispatch", "unknown-failure"] : ["observed-action", "archived", "unknown-terminal", "changed-detail"])]) {
+    ...(kind === "dispatch-stale" ? ["bound-dispatch", "unknown-failure"] : kind === "authority-fenced"
+      ? ["observed-action", "archived", "unknown-terminal", "changed-detail"] : ["confirmation-exists", "forged-result"])]) {
   test(`automatic conflict recovery rebuilds materials only after a proven unstarted failure (${kind}, ${variant})`, async () => {
     let f, reads = 0;
     const outboxes = [], transitions = [];
@@ -321,7 +325,7 @@ for (const kind of ["dispatch-stale", "authority-fenced"]) {
       statusReason: kind === "dispatch-stale" ? "intent_failed" : "proposal_stale", updatedAt: CREATED_AT,
       currentTarget: { type: "role", id: "developer" }, activeIntentId: null, leaseId: null,
       graph: { deliveries: [] }, decisionContext: null,
-      assignment: { graphTask: { sourceBinding: Object.fromEntries(
+      assignmentId: f.proposal.source.assignmentId, assignment: { graphTask: { sourceBinding: Object.fromEntries(
         ["kind", "rootItemId", "workKey", "inputRevision", "headRevision", "headRefOid", "eventId", "eventDigest", "inputDigest"].map(key => [key, b[key]])) } },
     });
     f.item.event = { schemaVersion: 1, eventId: b.eventId, contentDigest: b.eventDigest,
@@ -343,9 +347,23 @@ for (const kind of ["dispatch-stale", "authority-fenced"]) {
         contentDigest: "8".repeat(64), observedAt: "2026-10-10T02:59:59.800Z", value: { kind: "code_action_proposal",
           downstreamRef: confirmation.id, evidence: [`confirmation:${confirmation.id}`, "authorization_changed", "old_confirmation_status:completed"] } };
       const { proposalId, contentDigest, ...content } = f.proposal;
-      Object.assign(outbox, { status: "delivered", dispatchBinding: { boundIntent: { intentId: proposalId, ...content } },
+      Object.assign(outbox, { status: "delivered", dispatchBinding: createWorkIntentDispatchBinding({ intentId: proposalId, ...content }),
         outcome: { status: "delivered", details: { downstreamRef: proposalId, proposalDigest: f.proposal.contentDigest,
           resultAttestation: { decisionContentDigest: f.item.decisionContext.contentDigest } } } });
+    }
+    if (kind === "proposal-before-confirmation") {
+      if (variant === "confirmation-exists") await f.deliver();
+      const result = createWorkProposalResult({ proposal: f.proposal, sequence: 1, at: "2026-10-10T02:59:59.800Z", downstreamRef: null,
+        transition: { status: "stale", summary: "Source invalid before enqueue", evidence: ["authorization_changed", `proposal:${f.proposal.proposalId}`] } });
+      f.item.decisionContext = createWorkDecisionContext({ source: "proposal", referenceId: result.proposalId, outcome: result.outcome,
+        observedAt: result.at, value: { kind: result.kind, resultId: result.resultId, resultDigest: result.contentDigest,
+          summary: result.summary, downstreamRef: result.downstreamRef, evidence: result.evidence } });
+      const { proposalId, contentDigest, ...content } = f.proposal;
+      Object.assign(outbox, { status: "delivered", dispatchBinding: createWorkIntentDispatchBinding({ intentId: proposalId, ...content }),
+        outcome: { status: "delivered", details: { downstreamRef: proposalId, proposalDigest: contentDigest,
+          resultAttestation: createProposalResultAttestation({ intentId: outbox.intentId, result,
+            decisionContentDigest: f.item.decisionContext.contentDigest }) } } });
+      if (variant === "forged-result") outbox.outcome.details.resultAttestation.payload.summary = "forged";
     }
     outboxes.push(outbox);
     // Existing cached material must not be reused to recover an expired source.

@@ -823,7 +823,13 @@ for (const variant of ["changed-head", "same-target", "paused", "unavailable", "
     const store = new StateStore(path.join(root, "state")), clock = clockFixture();
     const { routing, ledger } = await createRoutingAndLedger(store, clock);
     let head = "a".repeat(40), unavailable = false, duringResolve = async () => {};
-    const options = { store, workflowRouting: routing, ledger, roleReadiness: roleReadiness(), clock, createGuard: guardFactory,
+    const ownerLedger = { ...ledger, async listItems(options) {
+      // A large unrelated blocked history must not delay the owner's current PR.
+      if (options?.status === "blocked") return { items: Array.from({ length: 10 }, (_, index) => ({ itemId: `historical-${index}` })),
+        nextCursor: "historical-page" };
+      return ledger.listItems(options);
+    } };
+    const options = { store, workflowRouting: routing, ledger: ownerLedger, roleReadiness: roleReadiness(), clock, createGuard: guardFactory,
       pullRequestResolver: { async resolvePullRequestTarget(target) {
         if (unavailable) throw new Error("GitHub unavailable");
         await duringResolve();

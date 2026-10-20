@@ -2402,6 +2402,35 @@ export class ControlledGitService {
       resultTreeOid, treeEntries, gitExecutable });
   }
 
+  async #mergeInIsolatedObjects({ scratchRoot, gitDirectory, prefix, environment, commits, oidLength }) {
+    // merge-tree can freshen a packed alternate when its result reuses an
+    // existing subtree. Seed only these commits and their trees, without
+    // history, so every Git write is confined to disposable object stores.
+    const output = checkedProcessOutput(await this.#runGit({ args: [...prefix, "rev-list", "--objects", "--no-object-names",
+      ...commits.map(oid => `${oid}^{tree}`)], cwd: scratchRoot, env: environment,
+      maxOutputBytes: this.#limits.maxProtocolBytes }), [0], this.#limits.maxProtocolBytes).stdout;
+    const records = decodeUtf8(output, "CONTROLLED_GIT_PROTOCOL_ERROR", "Merge seed object list 不是 UTF-8").trim().split("\n");
+    if (records.some(oid => !oidPattern(oidLength).test(oid))) {
+      throw controlledGitError("CONTROLLED_GIT_PROTOCOL_ERROR", "Merge seed object list 无效");
+    }
+    const seedRoot = path.join(scratchRoot, "merge-seed-objects");
+    await mkdir(seedRoot);
+    await mkdir(path.join(seedRoot, "info"));
+    await mkdir(path.join(seedRoot, "pack"));
+    const context = { gitDirectory, cwd: scratchRoot, environment };
+    const pack = await this.#runControlledCommitGit("pack-objects", { ...context,
+      records: Buffer.from([...new Set([...commits, ...records])].join("\n") + "\n") });
+    await this.#runControlledCommitGit("index-pack", { ...context, content: pack,
+      environment: { ...environment, GIT_OBJECT_DIRECTORY: seedRoot, GIT_ALTERNATE_OBJECT_DIRECTORIES: "" } });
+    try {
+      return await this.#runGit({ args: [...prefix, "merge-tree", "--write-tree", `--merge-base=${commits[2]}`,
+        "--no-messages", "-z", commits[0], commits[1]], cwd: scratchRoot,
+        env: { ...environment, GIT_ALTERNATE_OBJECT_DIRECTORIES: seedRoot }, maxOutputBytes: this.#limits.maxProtocolBytes });
+    } finally {
+      await rm(seedRoot, { recursive: true, force: true });
+    }
+  }
+
   async #inspectInScratch({
     gitTarget,
     baseBoundary,
@@ -2470,21 +2499,8 @@ export class ControlledGitService {
       baseBoundary.oidLength,
     );
     const mergeTreeOutput = checkedProcessOutput(
-      await this.#runGit({
-        args: [
-          ...prefix,
-          "merge-tree",
-          "--write-tree",
-          `--merge-base=${mergeBaseOid}`,
-          "--no-messages",
-          "-z",
-          gitTarget.headRefOid,
-          gitTarget.baseRefOid,
-        ],
-        cwd: scratchRoot,
-        env: environment,
-        maxOutputBytes: this.#limits.maxProtocolBytes,
-      }),
+      await this.#mergeInIsolatedObjects({ scratchRoot, gitDirectory: scratchGitDirectory,
+        prefix, environment, commits: [gitTarget.headRefOid, gitTarget.baseRefOid, mergeBaseOid], oidLength: baseBoundary.oidLength }),
       [0, 1],
       this.#limits.maxProtocolBytes,
     );
@@ -3295,21 +3311,9 @@ export class ControlledGitService {
         );
       }
       const mergeOutput = checkedProcessOutput(
-        await this.#runGit({
-          args: [
-            ...prefix,
-            "merge-tree",
-            "--write-tree",
-            `--merge-base=${mergeBaseOid}`,
-            "--no-messages",
-            "-z",
-            manifest.gitTarget.headRefOid,
-            manifest.gitTarget.baseRefOid,
-          ],
-          cwd: scratchRoot,
-          env: environment,
-          maxOutputBytes: this.#limits.maxProtocolBytes,
-        }),
+        await this.#mergeInIsolatedObjects({ scratchRoot, gitDirectory: scratchGitDirectory,
+          prefix, environment, commits: [manifest.gitTarget.headRefOid, manifest.gitTarget.baseRefOid, mergeBaseOid],
+          oidLength: baseBoundary.oidLength }),
         [0, 1],
         this.#limits.maxProtocolBytes,
       );

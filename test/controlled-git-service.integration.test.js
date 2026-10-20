@@ -10,6 +10,7 @@ import {
   readdir,
   rm,
   unlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -202,7 +203,7 @@ async function workspaceFiles(root) {
   return files.sort((left, right) => left.localeCompare(right, "en"));
 }
 
-async function createRepositoryFixture(t, gitCommand, { binaryConflict = false } = {}) {
+async function createRepositoryFixture(t, gitCommand, { binaryConflict = false, oneSidedDirectories = false } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "controlled-git-integration-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const repositoryRoot = path.join(root, "source");
@@ -248,6 +249,10 @@ async function createRepositoryFixture(t, gitCommand, { binaryConflict = false }
   ).stdout.trim();
 
   await git(gitCommand, repositoryRoot, ["switch", "--create", "feature"]);
+  if (oneSidedDirectories) {
+    await mkdir(path.join(repositoryRoot, "base-only"));
+    await writeFile(path.join(repositoryRoot, "base-only", "common.txt"), "shared addition\n");
+  }
   await Promise.all([
     writeFile(
       path.join(repositoryRoot, "src", "conflict.txt"),
@@ -265,6 +270,11 @@ async function createRepositoryFixture(t, gitCommand, { binaryConflict = false }
   ).stdout.trim();
 
   await git(gitCommand, repositoryRoot, ["switch", "main"]);
+  if (oneSidedDirectories) {
+    await mkdir(path.join(repositoryRoot, "base-only"));
+    await writeFile(path.join(repositoryRoot, "base-only", "common.txt"), "shared addition\n");
+    await writeFile(path.join(repositoryRoot, "base-only", "nested.txt"), "base-only tree\n");
+  }
   await Promise.all([
     writeFile(
       path.join(repositoryRoot, "src", "conflict.txt"),
@@ -336,6 +346,30 @@ function serviceFor(gitCommand, setup) {
 }
 
 const gitCommand = locateGit();
+
+test("merge preparation and repeated verification preserve donor object metadata", { skip: gitCommand === null }, async t => {
+  const setup = await createRepositoryFixture(t, gitCommand, { oneSidedDirectories: true });
+  for (const root of [setup.baseMirrorRoot, setup.headMirrorRoot]) {
+    for (const entry of await readdir(path.join(root, "objects", "pack"))) {
+      const file = path.join(root, "objects", "pack", entry);
+      await utimes(file, new Date("2020-01-01T00:00:00Z"), new Date("2020-01-01T00:00:00Z"));
+    }
+  }
+  const inspector = new GitBareMirrorInspector({ gitCommand });
+  const boundaries = () => Promise.all([
+    inspector.preflight({ repository: setup.request.gitTarget.baseRepository, mirrorRoot: setup.baseMirrorRoot,
+      expectedCommitOid: setup.request.gitTarget.baseRefOid }),
+    inspector.preflight({ repository: setup.request.gitTarget.headRepository, mirrorRoot: setup.headMirrorRoot,
+      expectedCommitOid: setup.request.gitTarget.headRefOid }),
+  ]);
+  const before = await boundaries();
+  const prepared = await serviceFor(gitCommand, setup).inspectConflict(setup.request);
+  const binding = createConflictPreparationBinding({ preparation: prepared, gitTarget: setup.request.gitTarget });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await serviceFor(gitCommand, setup).verifyConflictPreparation({ binding });
+    assert.deepEqual(await boundaries(), before);
+  }
+});
 
 test(
   "real isolated mirrors produce a durable full conflict workspace without source writes",
