@@ -37,6 +37,7 @@ const RUNTIME_METHODS = Object.freeze([
   "reconcilePullRequestSourceBatch",
   "claim",
   "transition",
+  "recoverUnstartedReviewProposal",
   "controlModelRun",
   "scheduleRetry",
   "handoff",

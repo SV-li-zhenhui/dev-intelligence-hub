@@ -50,6 +50,21 @@ test("fact intake stays a separate fast operation", async () => {
   assert.deepEqual(calls, [["intake", { limit: 73 }]]);
 });
 
+test("automatic owner source refresh precedes global and PR engineer work without entering other roles", async () => {
+  const refreshed = [];
+  const { service, calls } = fixture({ ownerPullRequestSourceRefresher: { async runCycle(options) {
+    refreshed.push(options); calls.push(["owner_refresh", options]); return { refreshed: 1 };
+  } } });
+  for (const roleId of [null, "pr-engineer", "developer", "tester"]) {
+    calls.length = 0;
+    const result = await service.runCycle({ ...(roleId === null ? {} : { roleId }) });
+    assert.equal(result.stages.owner_pull_request_source_refresh?.ok === true,
+      roleId === null || roleId === "pr-engineer");
+    if (roleId === null || roleId === "pr-engineer") assert.equal(calls[0][0], "owner_refresh");
+  }
+  assert.equal(refreshed.length, 2);
+});
+
 test("agency executes proposals before reconciling their durable results", async () => {
   const { service, calls } = fixture({
     intakeLimit: 61,

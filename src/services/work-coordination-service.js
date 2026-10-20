@@ -361,6 +361,7 @@ export class WorkCoordinationService {
   #runProposals;
   #runReviewProposals;
   #runOwnPrRepairs;
+  #refreshOwnerPullRequestSources;
   #reconcileProposals;
   #reconcileAttention;
   #wakeConditions;
@@ -380,6 +381,7 @@ export class WorkCoordinationService {
     proposalRunner,
     reviewProposalRunner = null,
     automaticOwnPrRepair = null,
+    ownerPullRequestSourceRefresher = null,
     proposalResultReconciler,
     attentionResultReconciler,
     conditionWaker,
@@ -396,6 +398,8 @@ export class WorkCoordinationService {
   } = {}) {
     this.#intake = requirePort(ledger, "intake", "ledger");
     this.#runOwnPrRepairs = automaticOwnPrRepair === null ? null : requirePort(automaticOwnPrRepair, "runCycle", "automaticOwnPrRepair");
+    this.#refreshOwnerPullRequestSources = ownerPullRequestSourceRefresher === null ? null :
+      requirePort(ownerPullRequestSourceRefresher, "runCycle", "ownerPullRequestSourceRefresher");
     this.#runCodeJobs = codeJobRunner == null
       ? skipCodeJobs
       : requirePort(codeJobRunner, "runCycle", "codeJobRunner");
@@ -543,6 +547,10 @@ export class WorkCoordinationService {
         ? [["attention_results", () =>
             this.#reconcileAttention({ limit: this.#defaults.attentionLimit })]]
         : [];
+    if (this.#refreshOwnerPullRequestSources !== null && (options.roleId === null || options.roleId === "pr-engineer")) {
+      stages.unshift(["owner_pull_request_source_refresh", () => this.#refreshOwnerPullRequestSources({
+        limit: this.#defaults.codeJobLimit, signal: options.signal })]);
+    }
     if (options.includeWork) {
       stages.push([
         "work",

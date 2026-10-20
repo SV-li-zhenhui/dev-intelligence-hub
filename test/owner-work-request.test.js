@@ -816,6 +816,60 @@ test("owner request cancellation reaches the PR resolver and does not stage canc
   assert.equal(calls, 1);
 });
 
+for (const variant of ["changed-head", "same-target", "paused", "unavailable", "concurrent-pause"]) {
+  test(`automatic owner PR refresh uses ordinary source intake after unstarted fact failures (${variant})`, async t => {
+    const root = await mkdtemp(path.join(tmpdir(), "owner-pr-refresh-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const store = new StateStore(path.join(root, "state")), clock = clockFixture();
+    const { routing, ledger } = await createRoutingAndLedger(store, clock);
+    let head = "a".repeat(40), unavailable = false, duringResolve = async () => {};
+    const options = { store, workflowRouting: routing, ledger, roleReadiness: roleReadiness(), clock, createGuard: guardFactory,
+      pullRequestResolver: { async resolvePullRequestTarget(target) {
+        if (unavailable) throw new Error("GitHub unavailable");
+        await duringResolve();
+        return { ...target, title: "PR 42", state: "open", gitTarget: { schemaVersion: 1, provider: "github",
+          sourceAccountId: "runtime-user", baseRepository: target.repository, baseRefName: "main", baseRefOid: "d".repeat(40),
+          headRepository: "contributor/repo", headRefName: "fix/owner-request", headRefOid: head } };
+      } } };
+    let owner = await createOwnerWorkRequestRuntime(options);
+    t.after(async () => { await owner.close(); await ledger.close(); await routing.close(); });
+    const original = await owner.submit(pullRequest());
+    let item;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      item = await ledger.readItemForReconciliation({ itemId: original.workItemId });
+      item = await ledger.claim({ itemId: item.itemId, expectedRevision: item.revision,
+        workerId: "employee-pr-engineer", leaseDurationMs: 30_000 });
+      if (attempt < 3) await ledger.scheduleRetry({ itemId: item.itemId, expectedRevision: item.revision, leaseId: item.leaseId,
+        actorId: "employee-pr-engineer", reason: "decision_failed", details: { code: "ROLE_CONTEXT_PR_FACT_UNAVAILABLE" },
+        availableAt: new Date(clock().getTime() + 2_000).toISOString() });
+      else await ledger.transition({ itemId: item.itemId, expectedRevision: item.revision, leaseId: item.leaseId,
+        actorId: "employee-pr-engineer", toStatus: "blocked", reason: "decision_attempts_exhausted", details: { code: "ROLE_CONTEXT_PR_FACT_UNAVAILABLE" } });
+    }
+    const pause = async () => {
+      const current = await ledger.readItemForReconciliation({ itemId: item.itemId });
+      await ledger.scopedGraphPlannerFactory.forRoot({ scopeRootTaskId: item.itemId }).pauseTask({
+        taskId: current.itemId, expectedTaskRevision: current.revision,
+        expectedGraphRevision: (await ledger.getSummary()).revision, reason: "owner_paused" });
+    };
+    if (variant !== "same-target") head = "b".repeat(40);
+    if (variant === "paused") await pause();
+    if (variant === "unavailable") unavailable = true;
+    if (variant === "concurrent-pause") duringResolve = pause;
+    assert.equal((await owner.refreshBlockedPullRequestSources()).refreshed, variant === "changed-head" ? 1 : 0);
+    if (variant === "changed-head") {
+      const pending = (await ledger.listPendingPullRequestSources()).items.find(candidate => candidate.itemId === item.itemId);
+      if (pending) await ledger.reconcilePullRequestSource({ itemId: pending.itemId, expectedRevision: pending.revision,
+        expectedPendingRevision: pending.source.pendingRevision, expectedGraphRevision: (await ledger.getSummary()).revision });
+    }
+    const current = await ledger.readItemForReconciliation({ itemId: item.itemId });
+    assert.equal(current.source.current.headRefOid, variant === "changed-head" ? head : "a".repeat(40));
+    assert.equal((await owner.get(original.requestId)).eventId, original.eventId);
+    await owner.close(); owner = await createOwnerWorkRequestRuntime(options);
+    assert.equal((await owner.refreshBlockedPullRequestSources()).refreshed, 0);
+    assert.equal((await ledger.listOutbox()).items.length, 0);
+  });
+}
+
 test("an explicit PR request resolves one immutable target before staging a PR engineer root", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "owner-pr-request-"));
   t.after(() => rm(root, { recursive: true, force: true }));

@@ -79,6 +79,7 @@ export async function createOwnerWorkRequestRuntime({
       get: (requestId) => admit(() => service.get(requestId)),
       list: (options) => admit(() => service.list(options)),
       resumePending: () => admit(() => service.resumePending()),
+      refreshBlockedPullRequestSources: options => admit(() => service.refreshBlockedPullRequestSources(options)),
       close,
     });
   } catch (error) {
@@ -124,6 +125,8 @@ export function createLazyOwnerWorkRequestRuntime(factory) {
     list: async (...arguments_) => (await resolve()).list(...arguments_),
     resumePending: async (...arguments_) =>
       (await resolve()).resumePending(...arguments_),
+    refreshBlockedPullRequestSources: async (...arguments_) =>
+      (await resolve()).refreshBlockedPullRequestSources(...arguments_),
     async close() {
       closed = true;
       if (runtimePromise === null) return;

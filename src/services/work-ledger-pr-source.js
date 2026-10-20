@@ -619,7 +619,9 @@ function acceptedHeadChange(source, input, causalHeadRefOid) {
   const predecessor = causalHeadRefOid ?? observed.headRefOid;
   if (input.headRefOid === predecessor) return true;
   return (
-    input.event.eventType === "pull_request.updated" &&
+    (input.event.eventType === "pull_request.updated" ||
+      (input.event.eventType === "pull_request.owner_requested" && source.scope.kind === "owner_requested" &&
+        input.event.source.provider === "local-owner" && input.event.source.scopeId === source.current.event.source.scopeId)) &&
     Array.isArray(input.event.payload.changedFields) &&
     input.event.payload.changedFields.includes("headRefOid") &&
     input.previousHeadRefOid === predecessor

@@ -13,6 +13,7 @@ import { ledgerDigest } from "../src/services/work-ledger-values.js";
 import { createCompletedReviewConfirmationSettlement, hasReviewConfirmationSettlement,
   reviewConfirmationSettlementIds } from "../src/services/work-ledger-review-confirmation-settlement.js";
 import { planPullRequestSourceReconciliation } from "../src/services/work-ledger-pr-cutover-commands.js";
+import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
 
 const HEAD = "a".repeat(40);
 const NOW = "2026-10-15T02:00:00.000Z";
@@ -52,6 +53,7 @@ async function fixture({ outcome = "applied", transformPlan = (plan) => plan, do
   ignoredReentry = false, ownerFollowup = false, neverEnqueued = false, revokedUnexecuted = false,
   leaveScopeAfterFollowup = false } = {}) {
   const store = new MemoryStore();
+  let currentTime = NOW;
   const records = [assignment(1)];
   const source = { async readAssignmentBatch({ afterSequence, limit }) {
     const items = records.filter((row) => row.sequence > afterSequence).slice(0, limit);
@@ -68,7 +70,7 @@ async function fixture({ outcome = "applied", transformPlan = (plan) => plan, do
     return overrideRead ? overrideRead(input) : queue.readSettlement(input);
   } };
   const makeService = () => new WorkLedgerService({ store, assignmentSource: source, exclusiveLease: lease(),
-    clock: () => NOW, idFactory: () => "review-lease", confirmationSettlementReader: reader });
+    clock: () => currentTime, idFactory: () => "review-lease", confirmationSettlementReader: reader });
   const makeQueue = () => new ConfirmationQueue({ store, exclusiveLease: lease(), clock: () => new Date(NOW),
     executor: { async execute() { executions++;
       if (outcome === "absent") throw new ConfirmationExecutionError("TEST_REVIEW_ABSENT", "absent");
@@ -143,10 +145,13 @@ async function fixture({ outcome = "applied", transformPlan = (plan) => plan, do
     await store.write("work-ledger-state", stored);
     service = makeService(); await service.recover();
   }
-  records.push(assignment(records.length + 1, followupScope, followupHead, ownerFollowup
-    ? { eventType: "pull_request.owner_requested", provider: "local-owner" } : {})); await service.intake();
+  if (followupScope !== null) {
+    records.push(assignment(records.length + 1, followupScope, followupHead, ownerFollowup
+      ? { eventType: "pull_request.owner_requested", provider: "local-owner" } : {})); await service.intake();
+  }
   if (leaveScopeAfterFollowup) await leaveAutomaticScope();
   return { store, records, plan, proposal, reads, staleHistory,
+    setTime(value) { currentTime = value; },
     get service() { return service; }, get queue() { return queue; }, get executions() { return executions; },
     overrideRead(value) { overrideRead = value; },
     async restart() { queue = makeQueue(); await queue.recover(); service = makeService(); await service.recover(); },
@@ -160,6 +165,87 @@ async function fixture({ outcome = "applied", transformPlan = (plan) => plan, do
     },
   };
 }
+
+for (const variant of ["recover", "confirmation-exists", "reader-unavailable", "paused", "concurrent-change", "later-ledger-change"]) {
+  test(`a same-Head pre-enqueue stale Review recovers once without replaying publication (${variant})`, async () => {
+    const f = await fixture({ neverEnqueued: true, followupScope: null });
+    let item = await f.service.readItemForReconciliation({ itemId: f.proposal.requestedBy.workItemId });
+    if (variant === "confirmation-exists") await f.queue.enqueue(f.plan);
+    if (variant === "reader-unavailable") f.overrideRead(() => { throw new Error("Unavailable"); });
+    if (variant === "later-ledger-change") {
+      let changed = await f.service.transition({ itemId: item.itemId, expectedRevision: item.revision, leaseId: null,
+        actorId: "owner", toStatus: "queued", reason: "owner_resumed" });
+      f.setTime("2026-10-15T02:00:01.000Z");
+      changed = await f.service.transition({ itemId: changed.itemId, expectedRevision: changed.revision, leaseId: null,
+        actorId: "owner", toStatus: "blocked", reason: "proposal_stale" });
+      item = changed;
+    }
+    const pause = async current => f.service.pauseGraphTask({ authority: { actorId: "owner", scopeRootTaskId: current.itemId },
+      command: { taskId: current.itemId, expectedTaskRevision: current.revision,
+        expectedGraphRevision: (await f.service.getSummary()).revision, reason: "owner_paused" } });
+    if (variant === "paused") { await pause(item); item = await f.service.readItemForReconciliation({ itemId: item.itemId }); }
+    if (variant === "concurrent-change") f.overrideRead(async input => {
+      const current = await f.service.readItemForReconciliation({ itemId: item.itemId });
+      if (current.status !== "paused") await pause(current);
+      return f.queue.readSettlement(input);
+    });
+    const call = () => f.service.recoverUnstartedReviewProposal({ itemId: item.itemId, expectedRevision: item.revision });
+    if (variant === "reader-unavailable") await assert.rejects(call());
+    else assert.equal(await call(), variant === "recover");
+    assert.equal(f.executions, 0);
+    assert.deepEqual((await f.service.listOutbox()).items[0], f.staleHistory);
+    if (variant === "recover") {
+      const queued = await f.service.readItemForReconciliation({ itemId: item.itemId });
+      assert.equal(queued.status, "queued");
+      await f.service.transition({ itemId: queued.itemId, expectedRevision: queued.revision, actorId: "work-ledger-system",
+        leaseId: null, toStatus: "blocked", reason: "proposal_stale" });
+      await f.restart();
+      const blocked = await f.service.readItemForReconciliation({ itemId: item.itemId });
+      assert.equal(await f.service.recoverUnstartedReviewProposal({ itemId: blocked.itemId, expectedRevision: blocked.revision }), false);
+    }
+  });
+}
+
+for (const enabled of [true, false]) {
+  test(`normal automatic work cycles recover proven pre-enqueue Review failures only when enabled (${enabled})`, async () => {
+    const f = await fixture({ neverEnqueued: true, followupScope: null });
+    const loop = new ProactiveWorkLoop({ ledger: f.service, clock: () => new Date(NOW),
+      automaticReviewPolicy: { enabled, account: "review-account" },
+      roleDirectory: { async resolve() { return { roleId: "pr-engineer", workerId: "review-worker", enabled: false, paused: false }; } },
+      roleContextAssembler: { async assemble() { return { context: { code: { pullRequest: { reviewMaterial: {} } } } }; } },
+      orchestratorService: { async execute() { assert.fail("unexpected orchestration"); } } });
+    await loop.runCycle({ roleId: "pr-engineer" });
+    assert.equal((await f.service.readItemForReconciliation({ itemId: f.proposal.requestedBy.workItemId })).status,
+      enabled ? "queued" : "blocked");
+    assert.equal(f.executions, 0);
+  });
+}
+
+test("automatic Review recovery bounds material preparation and restarts a retired scan cursor", async () => {
+  const f = await fixture({ neverEnqueued: true, followupScope: null });
+  const pages = [];
+  const ledger = Object.fromEntries(["intake", "claim", "stageIntent", "scheduleRetry", "transition", "listTimeline",
+    "verifyPullRequestExecutionBinding", "recoverUnstartedReviewProposal", "readItemForReconciliation", "listClaimCandidates"]
+    .map(name => [name, f.service[name].bind(f.service)]));
+  ledger.listItems = async options => {
+    if (options.status === "blocked" && options.roleId === "pr-engineer") {
+      pages.push(options);
+      if (options.cursor === "retired") throw Object.assign(new Error("Retired cursor"), { code: "WORK_LEDGER_CURSOR_INVALID" });
+      const result = await f.service.listItems(options);
+      return { ...result, nextCursor: pages.length === 1 ? "retired" : null };
+    }
+    return f.service.listItems(options);
+  };
+  const loop = new ProactiveWorkLoop({ ledger, clock: () => new Date(NOW),
+    automaticReviewPolicy: { enabled: true, account: "review-account" },
+    roleDirectory: { async resolve() { return { roleId: "pr-engineer", workerId: "review-worker", enabled: false, paused: false }; } },
+    roleContextAssembler: { async assemble() { return { context: { code: { pullRequest: { reviewMaterial: {} } } } }; } },
+    orchestratorService: { async execute() { assert.fail("unexpected orchestration"); } } });
+  await loop.runCycle({ roleId: "pr-engineer" });
+  await loop.runCycle({ roleId: "pr-engineer" });
+  assert.deepEqual(pages.map(({ cursor, limit }) => ({ cursor: cursor ?? null, limit })),
+    [{ cursor: null, limit: 2 }, { cursor: "retired", limit: 2 }, { cursor: null, limit: 2 }]);
+});
 
 test("Review settlement proof cannot be forged, serialized, or reused at another item/outbox revision", async () => {
   const f = await fixture();

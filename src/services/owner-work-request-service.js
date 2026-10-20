@@ -1,5 +1,8 @@
 import { OperationQueue } from "../lib/operation-queue.js";
+import { isDeepStrictEqual } from "node:util";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
+import { normalizeWorkflowEvent } from "../domain/workflow-events.js";
+import { currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
 
 import {
   createOwnerIssueEvent,
@@ -255,6 +258,7 @@ export class OwnerWorkRequestService {
     this.clock = clock;
     this.operationQueue = operationQueue || new OperationQueue();
     this.state = emptyOwnerWorkRequestState();
+    this.refreshCursor = null;
     this.ready = false;
   }
 
@@ -288,6 +292,68 @@ export class OwnerWorkRequestService {
       );
     }
     return { resumed, ...this.#recoveryStatus() };
+  }
+
+  // Continue the original owner authorization on a new remote Head through
+  // ordinary source intake. The original request and frozen event stay intact.
+  async refreshBlockedPullRequestSources({ limit = 10, signal = null } = {}) {
+    this.#assertReady();
+    if (typeof this.ledger.readItemForReconciliation !== "function" ||
+        typeof this.ledger.listOutbox !== "function" ||
+        typeof this.ledger.verifyPullRequestExecutionBinding !== "function") return { refreshed: 0 };
+    const admitted = await this.runNewWorkAdmission(() => ({ operation: this.operationQueue.enqueue(() =>
+      this.exclusiveLease.run(async () => {
+        this.state = await this.#readState();
+        const readPage = () => this.ledger.listItems({ status: "blocked", roleId: "pr-engineer", limit,
+          ...(this.refreshCursor === null ? {} : { cursor: this.refreshCursor }) });
+        let page;
+        try { page = await readPage(); }
+        catch (error) {
+          if (this.refreshCursor === null || error?.code !== "WORK_LEDGER_CURSOR_INVALID") throw error;
+          this.refreshCursor = null; page = await readPage();
+        }
+        this.refreshCursor = page.nextCursor ?? null;
+        let refreshed = 0, deferred = 0;
+        for (const item of page.items) {
+          throwIfCancelled(signal);
+          const record = this.state.records.find(record => record.workItemId === item.itemId && record.phase === "intaken" &&
+            [2, 3, 4].includes(record.request.schemaVersion) && record.request.workType === "pull_request");
+          if (!record || item.kind !== "source_root" || item.statusReason !== "decision_attempts_exhausted" ||
+              item.decisionContext !== null || item.activeIntentId !== null || item.leaseId !== null || item.ownerId !== null ||
+              item.sourceQuarantine !== null || item.graph.deliveries.length !== 0 || item.source?.pendingRevision !== null ||
+              item.source.current.event.source.provider !== "local-owner" ||
+              item.source.current.event.source.scopeId !== record.event.source.scopeId) continue;
+          try {
+            const binding = currentWorkItemExecutionBinding(item);
+            if (binding?.schemaVersion !== 2) continue;
+            await this.ledger.verifyPullRequestExecutionBinding(binding);
+            if ((await this.ledger.listOutbox({ itemId: item.itemId, limit: 1 })).items.length !== 0) continue;
+            let event = await this.#createPullRequestEvent(record.request, this.#now(), signal);
+            const previous = item.source.current.event.payload;
+            if (event.payload.headRefOid === previous.headRefOid &&
+                isDeepStrictEqual(event.payload.gitTarget, previous.gitTarget)) continue;
+            if (event.payload.headRefOid !== previous.headRefOid) event = normalizeWorkflowEvent({
+              ...workflowEventInput(event), payload: { ...event.payload,
+                previousHeadRefOid: previous.headRefOid, changedFields: ["headRefOid"] } });
+            await this.#preflight(event);
+            const latest = await this.ledger.readItemForReconciliation({ itemId: item.itemId });
+            if (!isDeepStrictEqual(latest, item)) continue;
+            await this.ledger.verifyPullRequestExecutionBinding(binding);
+            throwIfCancelled(signal);
+            const assignment = oneRoleAssignment(await this.workflowRouting.ingest({ event: workflowEventInput(event) }), "persisted");
+            await this.#intakeAssignment(assignment.assignmentId, signal);
+            refreshed++;
+          } catch (error) {
+            throwIfCancelled(signal);
+            // One unavailable PR must not suppress other ordinary source refreshes.
+            if (!["OWNER_PULL_REQUEST_RESOLUTION_FAILED", "OWNER_WORK_REQUEST_INVALID", "OWNER_WORK_REQUEST_ROUTING_NOT_READY",
+              "OWNER_WORK_REQUEST_ROLE_NOT_READY", "WORK_LEDGER_PR_EXECUTION_BINDING_STALE"].includes(error?.code)) throw error;
+            deferred++;
+          }
+        }
+        return { refreshed, deferred };
+      })) }));
+    return admitted.operation;
   }
 
   async submit(value, { signal = null } = {}) {

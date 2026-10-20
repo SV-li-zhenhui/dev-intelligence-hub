@@ -14,7 +14,7 @@ import {
   createUnstartedCodeConfirmationSettlement,
 } from "./work-ledger-code-confirmation-settlement.js";
 import { isChangedReviewConfirmationDecision, reviewConfirmationSettlementIds,
-  createCompletedReviewConfirmationSettlement } from "./work-ledger-review-confirmation-settlement.js";
+  createCompletedReviewConfirmationSettlement, hasReviewConfirmationSettlement } from "./work-ledger-review-confirmation-settlement.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 import {
   isTrustedPullRequestScopeLifecycleAssignment,
@@ -1538,6 +1538,43 @@ export class WorkLedgerService {
 
   async transition(input = {}) {
     return this.#executeCommand(planWorkItemTransition, input);
+  }
+
+  async recoverUnstartedReviewProposal({ itemId, expectedRevision }) {
+    if (!this.confirmationSettlementReader) return false;
+    const item = await this.readItemForReconciliation({ itemId });
+    const eligible = candidate => candidate?.revision === expectedRevision && candidate.kind === "source_root" &&
+      candidate.status === "blocked" && candidate.statusReason === "proposal_stale" &&
+      candidate.currentTarget?.id === "pr-engineer" && candidate.ownerId === null && candidate.leaseId === null &&
+      candidate.activeIntentId === null && candidate.sourceQuarantine === null &&
+      candidate.decisionContext?.value?.downstreamRef === null && candidate.graph.deliveries.length === 0;
+    if (!eligible(item)) return false;
+    const outboxes = new Map(this.state.outbox.filter(entry => entry.itemId === itemId).map(entry => [entry.intentId, cloneLedgerValue(entry)]));
+    if (![...outboxes.values()].some(entry => entry.outcome?.details?.downstreamRef === item.decisionContext.referenceId &&
+        entry.updatedAt === item.updatedAt)) return false;
+    const ids = reviewConfirmationSettlementIds(item, outboxes);
+    if (ids.length === 0) return false;
+    const confirmations = [];
+    for (const confirmationId of ids) confirmations.push(await this.confirmationSettlementReader.read({ confirmationId }));
+    if (confirmations.some(value => value !== null)) return false;
+    const proof = createCompletedReviewConfirmationSettlement(item, outboxes, confirmations);
+    if (proof === null) return false;
+    return this.#admitNewWork(() => this.#writeTransaction(async () => {
+      const current = this.state.items.find(candidate => candidate.itemId === itemId);
+      const currentOutboxes = new Map(this.state.outbox.filter(entry => entry.itemId === itemId).map(entry => [entry.intentId, entry]));
+      const timeline = this.state.timeline.filter(entry => entry.itemId === itemId);
+      if (!eligible(current) || ledgerDigest(current) !== ledgerDigest(item) ||
+          !hasReviewConfirmationSettlement(current, currentOutboxes, proof) ||
+          timeline[0]?.type !== "pr_source_created" || timeline[0].at !== current.createdAt ||
+          timeline.some(entry => entry.details.reason === "review_authority_context_recovered") ||
+          this.state.items.some(candidate => candidate.graph?.parentItemId === itemId)) return false;
+      verifyPullRequestExecutionAuthority(this.state, currentWorkItemExecutionBinding(current));
+      const mutation = planWorkItemTransition({ state: this.state, input: { itemId, expectedRevision, leaseId: null,
+        actorId: "work-ledger-system", toStatus: "queued", reason: "review_authority_context_recovered",
+        details: { evidenceRefs: [`proposal:${current.decisionContext.referenceId}`] } }, clock: () => this.#now() });
+      await this.#commitMutation(mutation);
+      return true;
+    }));
   }
 
   async controlModelRun(input = {}) {

@@ -2364,7 +2364,7 @@ export async function createApplication({
             ),
             ledger: frozenPort(
               workLedgerRuntime,
-              ["intake", "listItems", "readItemProgress"],
+              ["intake", "listItems", "readItemProgress", "readItemForReconciliation", "listOutbox", "verifyPullRequestExecutionBinding"],
               "owner work request ledger",
             ),
             roleReadiness: Object.freeze({
@@ -2658,6 +2658,9 @@ export async function createApplication({
         proposalRunner,
         reviewProposalRunner,
         ...(automaticOwnPrRepair === null ? {} : { automaticOwnPrRepair }),
+        ...(config.githubActions?.automaticReview === true ? { ownerPullRequestSourceRefresher: Object.freeze({
+          runCycle: options => ownerWorkRequests.refreshBlockedPullRequestSources(options),
+        }) } : {}),
         proposalResultReconciler,
         attentionResultReconciler,
         conditionWaker,

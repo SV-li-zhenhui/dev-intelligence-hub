@@ -749,6 +749,7 @@ export class ProactiveWorkLoop {
   } = {}) {
     this.taskRuns = taskRuns;
     this.automaticReviewPolicy = automaticReviewPolicy;
+    this.reviewRecoveryCursor = null;
     this.automaticOwnPrRepair = automaticOwnPrRepair;
     this.readReviewRepairContext = optionalPortMethod(reviewRepairContextReader,
       "readBinding", "reviewRepairContextReader.readBinding");
@@ -770,6 +771,8 @@ export class ProactiveWorkLoop {
       "ledger.readItemForReconciliation",
     );
     this.listTimeline = optionalPortMethod(ledger, "listTimeline", "ledger.listTimeline");
+    this.recoverUnstartedReviewProposal = optionalPortMethod(ledger,
+      "recoverUnstartedReviewProposal", "ledger.recoverUnstartedReviewProposal");
     this.verifyPullRequestExecutionBinding = optionalPortMethod(
       ledger, "verifyPullRequestExecutionBinding", "ledger.verifyPullRequestExecutionBinding",
     );
@@ -906,6 +909,7 @@ export class ProactiveWorkLoop {
     );
     throwIfLoopAborted(options.signal);
     const recoveryOutcomes = await this.#recoverOldHeadDecisionExhaustion(options) ?? [];
+    await this.#recoverUnstartedReviewProposals(options);
     const candidateAt = normalizeLoopClock(this.clock);
     const candidateWindow = await this.#listCandidateWindow(
       options,
@@ -1981,6 +1985,40 @@ export class ProactiveWorkLoop {
       throwIfLoopAborted(signal);
     }
     return null;
+  }
+
+  async #recoverUnstartedReviewProposals(options) {
+    if (this.automaticReviewPolicy?.enabled !== true || this.roleContextAssembler === null ||
+        this.recoverUnstartedReviewProposal === null ||
+        (options.roleId !== null && options.roleId !== "pr-engineer")) return;
+    // Recovery preparation shares the role's runtime budget with healthy work.
+    // Scan one small page per cycle, retaining progress across blocked tasks.
+    const readPage = () => this.ledger.listItems({ status: "blocked", roleId: "pr-engineer", limit: Math.min(2, options.workLimit),
+      ...(this.reviewRecoveryCursor === null ? {} : { cursor: this.reviewRecoveryCursor }) });
+    let result;
+    try { result = await readPage(); }
+    catch (error) {
+      if (this.reviewRecoveryCursor === null || error?.code !== "WORK_LEDGER_CURSOR_INVALID") throw error;
+      this.reviewRecoveryCursor = null; result = await readPage();
+    }
+    this.reviewRecoveryCursor = result.nextCursor ?? null;
+    throwIfLoopAborted(options.signal);
+    for (const item of result.items.filter(item => item.statusReason === "proposal_stale" &&
+        item.decisionContext?.value?.kind === "github_review_proposal" && item.decisionContext.value.downstreamRef === null)) {
+      try {
+        const binding = currentWorkItemExecutionBinding(item);
+        if (binding?.schemaVersion !== 2) continue;
+        await this.verifyPullRequestExecutionBinding(binding);
+        const packet = await this.#assembleContext(item, { roleId: "pr-engineer" }, options);
+        if (!packet?.context?.code?.pullRequest?.reviewMaterial) continue;
+        throwIfLoopAborted(options.signal);
+        await this.verifyPullRequestExecutionBinding(binding);
+        await this.recoverUnstartedReviewProposal({ itemId: item.itemId, expectedRevision: item.revision });
+      } catch (error) {
+        throwIfLoopAborted(options.signal);
+        if (RUNTIME_ADMISSION_ERROR_CODES.has(stableFailureCode(error))) throw error;
+      }
+    }
   }
 
   async #recoverOldHeadDecisionExhaustion(options) {
