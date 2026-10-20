@@ -129,6 +129,34 @@ test("automatic developer cycles advance admitted jobs and proposals without gen
     "proposal_execution", "proposals", "own_pr_repairs", "work", "dispatch"]);
 });
 
+for (const roleId of [null, "developer"]) {
+  test(`material recovery precedes a long code job without publishing early (role ${roleId})`, async () => {
+    const blocked = deferred(), started = deferred(), recovered = [];
+    const { service, calls } = fixture({
+      codeJobRunner: { async runCycle() { calls.push(["code_jobs"]); started.resolve(); await blocked.promise; return {}; } },
+      automaticOwnPrRepair: {
+        async runRecoveryCycle(options) { recovered.push(options); calls.push(["recovery"]); return {}; },
+        async runCycle(options) { calls.push(["own_pr_repairs", options]); return {}; },
+      },
+    });
+    const options = { includeWork: roleId !== null, ...(roleId === null ? {} : { roleId }) };
+    const running = service.runCycle(options);
+    await started.promise;
+    assert.deepEqual(calls.map(([name]) => name), ["recovery", "code_jobs"]);
+    const coalesced = service.runCycle(options);
+    assert.equal(recovered.length, 1);
+    blocked.resolve();
+    await Promise.all([running, coalesced]);
+    assert.equal(calls.filter(([name]) => name === "own_pr_repairs").length, 1);
+    assert.ok(calls.findIndex(([name]) => name === "code_job_change_packages") <
+      calls.findIndex(([name]) => name === "own_pr_repairs"));
+    assert.equal(calls.find(([name]) => name === "own_pr_repairs")[1].includeRecovery, false);
+    calls.length = 0;
+    await service.runCycle({ roleId: "pr-engineer" });
+    assert.equal(calls.some(([name]) => name === "recovery"), false);
+  });
+}
+
 test("the PR engineer publishes its Review without waiting for general code jobs", async () => {
   const calls = [];
   let reviewReady = false;

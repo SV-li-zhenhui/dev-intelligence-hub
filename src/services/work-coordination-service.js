@@ -361,6 +361,7 @@ export class WorkCoordinationService {
   #runProposals;
   #runReviewProposals;
   #runOwnPrRepairs;
+  #runOwnPrRecoveries;
   #refreshOwnerPullRequestSources;
   #reconcileProposals;
   #reconcileAttention;
@@ -398,6 +399,8 @@ export class WorkCoordinationService {
   } = {}) {
     this.#intake = requirePort(ledger, "intake", "ledger");
     this.#runOwnPrRepairs = automaticOwnPrRepair === null ? null : requirePort(automaticOwnPrRepair, "runCycle", "automaticOwnPrRepair");
+    this.#runOwnPrRecoveries = typeof automaticOwnPrRepair?.runRecoveryCycle === "function"
+      ? requirePort(automaticOwnPrRepair, "runRecoveryCycle", "automaticOwnPrRepair") : null;
     this.#refreshOwnerPullRequestSources = ownerPullRequestSourceRefresher === null ? null :
       requirePort(ownerPullRequestSourceRefresher, "runCycle", "ownerPullRequestSourceRefresher");
     this.#runCodeJobs = codeJobRunner == null
@@ -508,7 +511,8 @@ export class WorkCoordinationService {
               limit: this.#defaults.codeJobLimit,
             })],
           ...(this.#runOwnPrRepairs === null ? [] : [["own_pr_repairs", () =>
-            this.#runOwnPrRepairs({ limit: this.#defaults.codeJobLimit })]]),
+            this.#runOwnPrRepairs({ limit: this.#defaults.codeJobLimit,
+              ...(this.#runOwnPrRecoveries === null ? {} : { includeRecovery: false }) })]]),
           ["change_package_application_results", () =>
             this.#reconcileChangePackageApplicationResults()],
           ["code_job_memory", () =>
@@ -541,12 +545,16 @@ export class WorkCoordinationService {
             ["proposal_execution", () => this.#runProposals({ limit: this.#defaults.proposalLimit,
               ...(options.signal === null ? {} : { signal: options.signal }) })],
             ["proposal_results", () => this.#reconcileProposals({ limit: this.#defaults.proposalLimit })],
-            ["own_pr_repairs", () => this.#runOwnPrRepairs({ limit: this.#defaults.codeJobLimit })],
+            ["own_pr_repairs", () => this.#runOwnPrRepairs({ limit: this.#defaults.codeJobLimit,
+              ...(this.#runOwnPrRecoveries === null ? {} : { includeRecovery: false }) })],
           ]
       : options.roleId === "pr-engineer"
         ? [["attention_results", () =>
             this.#reconcileAttention({ limit: this.#defaults.attentionLimit })]]
         : [];
+    if (this.#runOwnPrRecoveries !== null && (options.roleId === null || options.roleId === "developer")) {
+      stages.unshift(["own_pr_material_recovery", () => this.#runOwnPrRecoveries({ limit: this.#defaults.codeJobLimit })]);
+    }
     if (this.#refreshOwnerPullRequestSources !== null && (options.roleId === null || options.roleId === "pr-engineer")) {
       stages.unshift(["owner_pull_request_source_refresh", () => this.#refreshOwnerPullRequestSources({
         limit: this.#defaults.codeJobLimit, signal: options.signal })]);

@@ -218,16 +218,25 @@ export class AutomaticOwnPrConflict {
     return await this.#grantCurrent(codeItem.display.payload.action.grant) && await this.#current(record.inputBinding) !== null;
   }
 
-  runCycle({ limit = 10 } = {}) {
+  runRecoveryCycle({ limit = 10 } = {}) {
+    return this.#queue.enqueue(() => this.#recoverMaterials(limit));
+  }
+
+  async #recoverMaterials(limit) {
+    const inspectionRecovery = await this.inspectionRecovery?.runCycle({ limit });
+    const conflictRecovery = await this.conflictRecovery?.runCycle({ limit });
+    return { ...(inspectionRecovery ? { inspectionRecovery } : {}), ...(conflictRecovery ? { conflictRecovery } : {}) };
+  }
+
+  runCycle({ limit = 10, includeRecovery = true } = {}) {
     return this.#queue.enqueue(async () => {
-      const inspectionRecovery = await this.inspectionRecovery?.runCycle({ limit });
-      const conflictRecovery = await this.conflictRecovery?.runCycle({ limit });
+      const recovery = includeRecovery ? await this.#recoverMaterials(limit) : {};
       const pending = this.#state.records.filter(active);
       const start = pending.findIndex(record => record.jobId === this.#lastJobId) + 1;
       const candidates = [...pending.slice(start), ...pending.slice(0, start)].slice(0, limit);
       this.#lastJobId = candidates.at(-1)?.jobId ?? null;
       const result = { scanned: candidates.length, published: 0, failed: 0, stale: 0,
-        ...(inspectionRecovery ? { inspectionRecovery } : {}), ...(conflictRecovery ? { conflictRecovery } : {}) };
+        ...recovery };
       for (const record of candidates) {
         try { const status = await this.#advance(record); if (Object.hasOwn(result, status)) result[status] += 1; }
         catch (error) { result.failed += 1; result.lastFailure = error?.code ?? "OWN_PR_CONFLICT_PROGRESS_UNAVAILABLE"; }

@@ -308,7 +308,11 @@ export class AutomaticOwnPrRepair {
     });
   }
 
-  runCycle({ limit = 10 } = {}) {
+  runRecoveryCycle({ limit = 10 } = {}) {
+    return this.conflictRepair?.runRecoveryCycle({ limit }) ?? Promise.resolve({});
+  }
+
+  runCycle({ limit = 10, includeRecovery = true } = {}) {
     return this.#queue.enqueue(async () => {
       const pending = !this.codeJobReader || !this.controlledCommitReader ? [] :
         this.#state.repairs.filter((row) => ["working", "pushing"].includes(row.status));
@@ -329,7 +333,7 @@ export class AutomaticOwnPrRepair {
       }
       await this.#reconcileReviews(limit, result);
       if (this.conflictRepair) {
-        const conflicts = await this.conflictRepair.runCycle({ limit });
+        const conflicts = await this.conflictRepair.runCycle({ limit, includeRecovery });
         for (const key of ["scanned", "published", "failed", "stale"]) result[key] += conflicts[key];
         if (conflicts.lastFailure) result.lastFailure = conflicts.lastFailure;
       }
