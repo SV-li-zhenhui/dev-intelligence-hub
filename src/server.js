@@ -4138,6 +4138,7 @@ export function startApplicationBackgroundWork(
     setIntervalFn = setInterval,
     clearIntervalFn = clearInterval,
     reportError = console.error,
+    log = console.log,
     drainTimeoutMs = defaultShutdownDrainTimeoutMs,
     observeDrainParticipant = () => {},
   } = {},
@@ -4390,10 +4391,13 @@ export function startApplicationBackgroundWork(
       return;
     }
     try {
-      await runDrainParticipant(
+      const result = await runDrainParticipant(
         DRAIN_PARTICIPANTS.memoryProjection,
         () => application.memoryProjector.runCycle({ signal }),
       );
+      if (result?.authorityBound?.status === "deferred") {
+        log(`memory_projection_deferred stage=${stage} code=${result.authorityBound.code} attempts=${result.authorityBound.attempts}`);
+      }
     } catch (error) {
       failures.push(agencyCycleFailure(stage, error));
     }
@@ -4783,6 +4787,7 @@ function createDeferredBackgroundWork(
   startBackgroundWorkFn,
   reportError,
   drainTimeoutMs,
+  log,
 ) {
   let delegate = null;
   let startPromise = null;
@@ -4802,6 +4807,7 @@ function createDeferredBackgroundWork(
       const started = startBackgroundWorkFn(application, {
         reportError,
         drainTimeoutMs,
+        log,
       });
       if (!started || typeof started !== "object") {
         throw new TypeError("startBackgroundWorkFn must return background work");
@@ -4880,11 +4886,13 @@ export async function startDashboardServer(
         startBackgroundWorkFn,
         reportError,
         shutdownDrainTimeoutMs,
+        log,
       );
     } else {
       backgroundWork = startBackgroundWorkFn(application, {
         reportError,
         drainTimeoutMs: shutdownDrainTimeoutMs,
+        log,
       });
     }
     server = createDashboardServer(application, {

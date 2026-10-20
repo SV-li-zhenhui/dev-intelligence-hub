@@ -1020,6 +1020,83 @@ test("memory projector captures confirmation authority after earlier projection 
   );
 });
 
+test("projection without an authority verifier still advances an empty authority checkpoint", async () => {
+  const { journal, store } = await localMemoryFixture();
+  const graphSource = graphProjectionSource();
+  const projector = new MemoryProjector({
+    memoryLifecycleProducer: journal,
+    memoryAuthorityReader: journal,
+    memoryAuthoritySource: memoryAuthoritySource([], [], graphSource, 7),
+    graphProjectionSource: graphSource,
+    store,
+  });
+  await projector.runCycle();
+  assert.equal(journal.getAuthorityProjectionState().workLedgerRevision, 7);
+  assert.deepEqual(journal.getAuthorityProjectionState().entries, []);
+});
+
+for (const mode of ["once", "persistent", "unknown", "aborted"]) {
+  test(`authority snapshot contention is bounded without replaying historical projection (${mode})`, async () => {
+    const binding = pullRequestExternalActionBinding();
+    const item = pullRequestWorkItem(binding);
+    const graphSource = graphProjectionSource();
+    const { journal, store, values } = await localMemoryFixture();
+    let revision = 1, historyWrites = 0, workWrites = 0, authorityWrites = 0;
+    const verified = [];
+    const controller = new AbortController();
+    const failure = Object.assign(new Error("snapshot changed"), {
+      code: mode === "unknown" ? "MEMORY_STORAGE_FAILED" : "WORK_LEDGER_MEMORY_AUTHORITY_SNAPSHOT_STALE",
+    });
+    const projector = new MemoryProjector({
+      memoryLifecycleProducer: {
+        appendGraphEvents: input => journal.appendGraphEvents(input),
+        adoptGraphCheckpoint: input => journal.adoptGraphCheckpoint(input),
+        appendProjectionRecords: input => { historyWrites++; return journal.appendProjectionRecords(input); },
+        appendWorkItems: input => { workWrites++; return journal.appendWorkItems(input); },
+        appendAuthorityProjection: input => { authorityWrites++; return journal.appendAuthorityProjection(input); },
+      },
+      memoryAuthorityReader: journal,
+      memoryAuthoritySource: { async readSnapshot({ limit }) {
+        return { ledgerRevision: revision, items: [item], timeline: [proposalDecisionTimeline(item, "contention")],
+          graph: await graphSource.readBatch({ limit }) };
+      } },
+      graphProjectionSource: graphSource,
+      inputAuthorityVerifier: { async verify() { assert.fail("batch verification is required"); } },
+      inputAuthorityBatchVerifier: { async verify({ ledgerRevision, bindings }) {
+        verified.push(ledgerRevision);
+        if (mode !== "once" || verified.length === 1) {
+          revision++;
+          if (mode === "aborted") controller.abort(failure);
+          throw failure;
+        }
+        assert.equal(ledgerRevision, revision, "retry must capture a new ledger snapshot");
+        return { ledgerRevision, current: bindings.map(() => false) };
+      } }, store,
+    });
+    const cycle = projector.runCycle({ signal: controller.signal });
+    if (["unknown", "aborted"].includes(mode)) {
+      await assert.rejects(cycle, error => error === failure);
+      assert.equal(verified.length, 1);
+    } else {
+      const result = await cycle;
+      assert.deepEqual(verified, [1, 2]);
+      if (mode === "persistent") {
+        assert.equal(result.authorityBound.status, "deferred");
+        assert.equal(result.authorityBound.code, failure.code);
+        assert.equal(result.authorityBound.attempts, 2);
+      } else {
+        assert.equal(journal.getAuthorityProjectionState().workLedgerRevision, 2);
+        const records = values.get("unified-memory-records").records.filter(record => record.source.kind === "work-decision");
+        assert.ok(records.length > 0);
+        assert.ok(records.every(record => JSON.parse(record.content).authority.current === false));
+      }
+    }
+    assert.equal(historyWrites, 1);
+    assert.equal(workWrites, 1);
+    assert.equal(authorityWrites, mode === "once" ? 1 : 0);
+  });
+}
+
 test("authority verification runs once per distinct binding for a large projection cycle", async () => {
   const bindingFor = (number, marker) => pullRequestExternalActionBinding({
     repository: `acme/repo-${number}`,

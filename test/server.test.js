@@ -4091,6 +4091,28 @@ test("automatic own-PR developer waits for the latest queued refresh behind gene
   }
 });
 
+test("memory authority deferrals remain visible while automatic employee work continues", async () => {
+  const logs = [], errors = [];
+  let employees = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7 },
+    employeeRegistry: { schedules: () => [], async runSelected() { employees++; } },
+    refreshService: { async refresh() {} },
+    memoryProjector: { async runCycle() { return { authorityBound: {
+      status: "deferred", code: "WORK_LEDGER_MEMORY_AUTHORITY_SNAPSHOT_STALE", attempts: 2,
+    } }; } },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {},
+    log: value => logs.push(value), reportError: value => errors.push(value) });
+  try {
+    await background.initialRefresh;
+    await background.runEmployee("tester", { trigger: "scheduled" });
+    assert.ok(employees > 0);
+    assert.equal(errors.length, 0);
+    assert.ok(logs.some(value => /memory_before_employee.*WORK_LEDGER_MEMORY_AUTHORITY_SNAPSHOT_STALE/u.test(value)));
+    assert.ok(logs.some(value => /memory_after_employee.*WORK_LEDGER_MEMORY_AUTHORITY_SNAPSHOT_STALE/u.test(value)));
+  } finally { await background.stop(); }
+});
+
 test("automatic own-PR developer cancels a startup fact wait on stop", async () => {
   const releaseRefresh = deferred();
   let developers = 0;

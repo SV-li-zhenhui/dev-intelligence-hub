@@ -26,6 +26,7 @@ const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
 const INVALID_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
 const GRAPH_BATCH_LIMIT = 100;
+const AUTHORITY_SNAPSHOT_ATTEMPTS = 2;
 const CONFIRMATION_PAGE_LIMIT = 100;
 const CONFIRMATION_MAXIMUM_ITEMS = 1_000;
 const AUTHORITY_VERIFICATION_MAXIMUM_BINDINGS = 100_000;
@@ -2195,14 +2196,30 @@ export class MemoryProjector {
           })
         );
     added += Number(workResult?.added) || 0;
-    const confirmationSnapshot = confirmationPreflight === null
-      ? null
-      : await readConfirmationMemorySnapshot(this.#readConfirmationPage, signal);
-    const authorityBound = await this.#projectAuthorityBoundRecords(
-      finalSnapshot,
-      confirmationSnapshot,
-      signal,
-    );
+    let authorityBound = null;
+    if (this.#verifyInputAuthority === null) {
+      authorityBound = await this.#projectAuthorityBoundRecords(finalSnapshot, null, signal);
+    } else {
+      for (let attempt = 1; attempt <= AUTHORITY_SNAPSHOT_ATTEMPTS; attempt++) {
+        const confirmationSnapshot = confirmationPreflight === null ? null
+          : await readConfirmationMemorySnapshot(this.#readConfirmationPage, signal);
+        // History/work projection may be long. Capture authority immediately
+        // before verification; a retry must rebuild bindings from a new read.
+        const authoritySnapshot = normalizeMemoryAuthoritySnapshot(
+          await runProjectionPort(signal, () => this.#readSnapshot({ limit: GRAPH_BATCH_LIMIT })),
+        );
+        try {
+          authorityBound = await this.#projectAuthorityBoundRecords(authoritySnapshot, confirmationSnapshot, signal);
+          break;
+        } catch (error) {
+          throwIfProjectionAborted(signal);
+          if (error?.code !== "WORK_LEDGER_MEMORY_AUTHORITY_SNAPSHOT_STALE") throw error;
+          if (attempt === AUTHORITY_SNAPSHOT_ATTEMPTS) authorityBound = {
+            status: "deferred", code: error.code, attempts: attempt, observed: 0, added: 0,
+          };
+        }
+      }
+    }
     throwIfProjectionAborted(signal);
     added += authorityBound?.added ?? 0;
     return {
