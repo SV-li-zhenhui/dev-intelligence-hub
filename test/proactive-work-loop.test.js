@@ -467,7 +467,7 @@ function createLoop({ ledger, directory, time, ...options }) {
 }
 
 test("one deferred PR preparation does not abort other eligible work or spend its decision budget", async () => {
-  for (const code of ["OWN_PR_REPAIR_OBJECT_FETCH_FAILED", "WORK_LEDGER_PR_EXECUTION_BINDING_STALE"]) {
+  for (const code of ["OWN_PR_REPAIR_OBJECT_FETCH_FAILED", "WORK_LEDGER_PR_EXECUTION_BINDING_STALE", "CONTROLLED_GIT_UNSUPPORTED_TREE"]) {
     const time = controlledClock();
     const first = workItem(1, { type: "role", id: "developer" });
     const second = workItem(2, { type: "role", id: "developer" });
