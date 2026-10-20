@@ -46,8 +46,16 @@ export class AutomaticOwnPrInspectionRecovery {
 
   runCycle({ limit = 10 } = {}) {
     return this.#queue.enqueue(async () => {
-      const page = await this.ledger.listItems({ status: "blocked", roleId: "developer", order: "newest", limit,
+      const readPage = () => this.ledger.listItems({ status: "blocked", roleId: "developer", order: "newest", limit,
         ...(this.#cursor === null ? {} : { cursor: this.#cursor }) });
+      let page;
+      try { page = await readPage(); }
+      catch (error) {
+        if (this.#cursor === null || error?.code !== "WORK_LEDGER_CURSOR_INVALID") throw error;
+        // The cursor task can leave the blocked set between recovery cycles.
+        this.#cursor = null;
+        page = await readPage();
+      }
       this.#cursor = page.nextCursor ?? null;
       const result = { scanned: 0, requeued: 0, failed: 0 };
       for (const item of page.items) {

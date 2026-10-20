@@ -138,6 +138,31 @@ test("automatic inspection recovery prepares objects then requeues the same fail
   assert.equal(f.calls.length, 2);
 });
 
+for (const code of ["WORK_LEDGER_CURSOR_INVALID", "MEMORY_STORAGE_FAILED"]) {
+  test(`automatic inspection recovery handles a retired page cursor only (${code})`, async () => {
+    const f = await recoveryFixture();
+    const requests = [];
+    const failure = Object.assign(new Error("cursor task left blocked work"), { code });
+    f.dependencies.ledger.listItems = async request => {
+      requests.push(request);
+      if (requests.length === 1) return { items: [], nextCursor: "retired-task" };
+      if (request.cursor) throw failure;
+      return { items: [structuredClone(f.item)], nextCursor: null };
+    };
+    await f.service.runCycle();
+    if (code === "WORK_LEDGER_CURSOR_INVALID") {
+      assert.equal((await f.service.runCycle()).requeued, 1);
+      assert.equal(requests.length, 3);
+      assert.equal(requests[1].cursor, "retired-task");
+      assert.equal(Object.hasOwn(requests[2], "cursor"), false);
+    } else {
+      await assert.rejects(f.service.runCycle(), error => error === failure);
+      assert.equal(requests.length, 2);
+      assert.deepEqual(f.calls, []);
+    }
+  });
+}
+
 test("zero-action snapshot timeouts share the existing automatic inspection recovery budget", async () => {
   const f = await recoveryFixture({ failureCode: "GIT_SNAPSHOT_TIMEOUT" });
   assert.equal((await f.service.runCycle()).requeued, 1);
