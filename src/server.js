@@ -4193,9 +4193,18 @@ export function startApplicationBackgroundWork(
     independentEmployeeFactWaiters.clear();
   }
 
+  function independentEmployeeFactsReady() {
+    const actions = application.config.githubActions;
+    const automatic = actions?.enabled === true &&
+      (actions.automaticReview === true || actions.automaticOwnPrRepair === true);
+    // Queuing a future refresh does not change the last fully admitted facts.
+    // Starting that refresh closes factsReady until routing and intake finish.
+    return factsReady && (automatic || readyFactCycleSequence === factCycleSequence);
+  }
+
   function waitForIndependentEmployeeFacts() {
     if (stopped) return Promise.resolve(false);
-    if (factsReady && readyFactCycleSequence === factCycleSequence) return Promise.resolve(true);
+    if (independentEmployeeFactsReady()) return Promise.resolve(true);
     if (pendingFactCycles === 0) return Promise.resolve(false);
     return new Promise((resolve) => independentEmployeeFactWaiters.add(resolve));
   }
@@ -4215,7 +4224,7 @@ export function startApplicationBackgroundWork(
 
   async function runIndependentEmployee(options) {
     options.signal.throwIfAborted();
-    if (stopped || !factsReady || readyFactCycleSequence !== factCycleSequence) {
+    if (stopped || !independentEmployeeFactsReady()) {
       return { skipped: "facts_not_ready" };
     }
     const employeeId = options.employeeIds[0];
@@ -4598,7 +4607,7 @@ export function startApplicationBackgroundWork(
         if (stopped) return result;
         factsReady = true;
         readyFactCycleSequence = sequence;
-        if (readyFactCycleSequence === factCycleSequence) releaseIndependentEmployeeFactWaiters(true);
+        if (independentEmployeeFactsReady()) releaseIndependentEmployeeFactWaiters(true);
         if (pendingFactCycles === 1) {
           confirmationAccess.open();
           try {

@@ -4054,45 +4054,82 @@ for (const roleId of ["developer", "orchestrator"]) {
   });
 }
 
-test("automatic own-PR developer waits for the latest queued refresh behind general work", async () => {
-  const timers = [];
-  const generalStarted = deferred();
-  const releaseGeneral = deferred();
-  const releaseRefresh = deferred();
-  let refreshes = 0;
-  let developers = 0;
+for (const roleId of ["developer", "orchestrator", "pr-engineer"]) {
+  test(`automatic ${roleId} continues on admitted facts until a queued refresh starts`, async () => {
+    const timers = [];
+    const generalStarted = deferred();
+    const releaseGeneral = deferred();
+    const releaseRefresh = deferred();
+    let refreshes = 0;
+    let roleRuns = 0;
+    const background = startApplicationBackgroundWork({
+      config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true, automaticReview: true } },
+      employeeRegistry: {
+        schedules: () => [{ id: "requirements-analyst", intervalMinutes: 10 }, { id: roleId, intervalMinutes: 11 }],
+        async runSelected(ids) {
+          if (ids[0] === "requirements-analyst") { generalStarted.resolve(); await releaseGeneral.promise; }
+          if (ids[0] === roleId) roleRuns += 1;
+        },
+      },
+      refreshService: { async refresh() { if (++refreshes > 1) await releaseRefresh.promise; } },
+    }, {
+      setIntervalFn(callback) { const timer = { callback, unref() {} }; timers.push(timer); return timer; },
+      clearIntervalFn() {},
+    });
+    try {
+      await background.initialRefresh;
+      const general = timers[1].callback();
+      await generalStarted.promise;
+      const refresh = timers[0].callback();
+      const role = timers[2].callback();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(roleRuns, 1, "a refresh queued behind general work must not stall automatic roles");
+      await role;
+      releaseGeneral.resolve();
+      await general;
+      await new Promise((resolve) => setImmediate(resolve));
+      const duringRefresh = background.runEmployee(roleId);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(roleRuns, 1, "an actively refreshing snapshot must finish admission before new role work");
+      releaseRefresh.resolve();
+      await Promise.all([refresh, duringRefresh]);
+      assert.equal(roleRuns, 2);
+    } finally {
+      releaseGeneral.resolve(); releaseRefresh.resolve(); await background.stop();
+    }
+  });
+}
+
+test("automatic role waiters resume after admitted facts even when another refresh is queued", async () => {
+  const refreshing = deferred(), releaseRefresh = deferred();
+  const general = deferred(), releaseGeneral = deferred();
+  let refreshes = 0, roleRuns = 0;
   const background = startApplicationBackgroundWork({
-    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticReview: true } },
     employeeRegistry: {
-      schedules: () => [{ id: "requirements-analyst", intervalMinutes: 10 }, { id: "developer", intervalMinutes: 11 }],
+      schedules: () => [],
       async runSelected(ids) {
-        if (ids[0] === "requirements-analyst") { generalStarted.resolve(); await releaseGeneral.promise; }
-        if (ids[0] === "developer") developers += 1;
+        if (ids[0] === "requirements-analyst") { general.resolve(); await releaseGeneral.promise; }
+        if (ids[0] === "orchestrator") roleRuns += 1;
       },
     },
-    refreshService: { async refresh() { if (++refreshes > 1) await releaseRefresh.promise; } },
-  }, {
-    setIntervalFn(callback) { const timer = { callback, unref() {} }; timers.push(timer); return timer; },
-    clearIntervalFn() {},
-  });
+    refreshService: { async refresh() {
+      if (++refreshes === 1) { refreshing.resolve(); await releaseRefresh.promise; }
+    } },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
   try {
-    await background.initialRefresh;
-    const general = timers[1].callback();
-    await generalStarted.promise;
-    const refresh = timers[0].callback();
-    const developer = timers[2].callback();
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(developers, 0, "a queued refresh must invalidate the previous facts");
-    releaseGeneral.resolve();
-    await general;
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(developers, 0, "the developer must wait until refreshed facts are admitted");
+    await refreshing.promise;
+    const role = background.runEmployee("orchestrator");
+    const generalRun = background.runEmployee("requirements-analyst");
+    const nextRefresh = background.refresh({ notify: true });
     releaseRefresh.resolve();
-    await Promise.all([refresh, developer]);
-    assert.equal(developers, 1);
-  } finally {
-    releaseGeneral.resolve(); releaseRefresh.resolve(); await background.stop();
-  }
+    await general.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(refreshes, 1, "the second refresh must still be queued behind general work");
+    assert.equal(roleRuns, 1, "existing role waiters must use the now fully admitted facts");
+    releaseGeneral.resolve();
+    await Promise.all([role, generalRun, nextRefresh, background.initialRefresh]);
+  } finally { releaseRefresh.resolve(); releaseGeneral.resolve(); await background.stop(); }
 });
 
 test("memory authority deferrals remain visible while automatic employee work continues", async () => {
