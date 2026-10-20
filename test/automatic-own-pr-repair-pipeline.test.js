@@ -294,7 +294,7 @@ async function fixture({ enabled = true, conflict = false, operation = "modify",
 }
 
 for (const kind of ["dispatch-stale", "authority-fenced"]) {
-  for (const variant of ["recover", "disabled", "head-drift", "paused", "source-mismatch", "preparation-failed", "concurrent-change", "budget-exhausted",
+  for (const variant of ["recover", "disabled", "head-drift", "paused", "source-mismatch", "preparation-failed", "concurrent-change", "later-ledger-change", "budget-exhausted",
     ...(kind === "dispatch-stale" ? ["bound-dispatch", "unknown-failure"] : ["observed-action", "archived", "unknown-terminal", "changed-detail"])]) {
   test(`automatic conflict recovery rebuilds materials only after a proven unstarted failure (${kind}, ${variant})`, async () => {
     let f, reads = 0;
@@ -340,7 +340,7 @@ for (const kind of ["dispatch-stale", "authority-fenced"]) {
       f.details.set(job.jobId, { job: clone(job), archived: false, historyAvailable: true, observations: [], nextCursor: null,
         terminalDetail: { code: "INVALID_CODE_JOB_AUTHORITY" } });
       f.item.decisionContext = { source: "proposal", outcome: "stale", referenceId: f.proposal.proposalId,
-        contentDigest: "8".repeat(64), observedAt: CREATED_AT, value: { kind: "code_action_proposal",
+        contentDigest: "8".repeat(64), observedAt: "2026-10-10T02:59:59.800Z", value: { kind: "code_action_proposal",
           downstreamRef: confirmation.id, evidence: [`confirmation:${confirmation.id}`, "authorization_changed", "old_confirmation_status:completed"] } };
       const { proposalId, contentDigest, ...content } = f.proposal;
       Object.assign(outbox, { status: "delivered", dispatchBinding: { boundIntent: { intentId: proposalId, ...content } },
@@ -354,6 +354,7 @@ for (const kind of ["dispatch-stale", "authority-fenced"]) {
     if (variant === "disabled") f.config.githubActions.automaticOwnPrRepair = false;
     if (variant === "head-drift") f.facts.headRefOid = "9".repeat(40);
     if (variant === "paused") f.item.status = "paused";
+    if (variant === "later-ledger-change") f.item.updatedAt = "2026-10-10T03:00:01.000Z";
     if (variant === "source-mismatch") outbox.inputDigest = "9".repeat(64);
     if (variant === "bound-dispatch") outbox.dispatchBinding = {};
     if (variant === "unknown-failure") outbox.outcome.details.code = "conflict-source-invalid";

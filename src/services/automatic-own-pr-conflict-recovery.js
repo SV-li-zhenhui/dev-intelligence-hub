@@ -89,12 +89,14 @@ export class AutomaticOwnPrConflictRecovery {
     if (item.statusReason === "intent_failed" && item.decisionContext === null) {
       return unstartedConflictDispatchFailure(item, outboxes.values())?.intentId ?? null;
     }
-    if (item.statusReason !== "proposal_stale" || item.updatedAt !== item.decisionContext?.observedAt) return null;
+    if (item.statusReason !== "proposal_stale") return null;
     const confirmationId = codeConfirmationSettlementId(item.decisionContext);
     if (confirmationId === null || typeof this.confirmationSettlementReader?.read !== "function") return null;
     const snapshot = await this.confirmationSettlementReader.read({ confirmationId });
     const completed = completedCodeConfirmationForSettlement(item, outboxes, snapshot);
-    if (completed === null || completed.grant.operation !== "modify" ||
+    // observedAt precedes the atomic application. The delivered outbox and
+    // blocked item share the actual ledger commit time, including on replay.
+    if (completed === null || completed.outbox.updatedAt !== item.updatedAt || completed.grant.operation !== "modify" ||
         completed.grant.executionSource?.kind !== "conflict_preparation" ||
         !samePullRequestExecutionBinding(completed.grant.inputBinding, currentWorkItemExecutionBinding(item))) return null;
     const job = await this.#settler.read(completed);
