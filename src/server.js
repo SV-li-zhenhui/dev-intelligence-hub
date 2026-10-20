@@ -4212,7 +4212,7 @@ export function startApplicationBackgroundWork(
   function isIndependentEmployeeCycle(options) {
     if (options.includeLegacyEmployees || options.employeeIds?.length !== 1) return false;
     const employeeId = options.employeeIds[0];
-    if (employeeId === "orchestrator") {
+    if (["orchestrator", "tester"].includes(employeeId)) {
       return application.config.githubActions?.enabled === true &&
         (application.config.githubActions.automaticReview === true ||
           application.config.githubActions.automaticOwnPrRepair === true);

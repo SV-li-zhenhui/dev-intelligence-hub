@@ -3945,7 +3945,7 @@ test("Review waits for a newer refresh queued behind a developer", async () => {
 });
 
 for (const blocker of ["memory projection", "legacy patrol"]) {
-  for (const roleId of ["developer", "orchestrator"]) {
+  for (const roleId of ["developer", "orchestrator", "tester"]) {
     test(`automatic ${roleId} bypasses stalled ${blocker}, coalesces manual ticks and drains`, async () => {
       const blocked = deferred();
       const releaseBlocked = deferred();
@@ -4006,7 +4006,7 @@ for (const blocker of ["memory projection", "legacy patrol"]) {
  }
 }
 
-for (const roleId of ["developer", "orchestrator"]) {
+for (const roleId of ["developer", "orchestrator", "tester"]) {
   test(`automatic ${roleId} uses scoped coordination while general code jobs are busy`, async () => {
     const codeJobsStarted = deferred();
     const releaseCodeJobs = deferred();
@@ -4033,7 +4033,7 @@ for (const roleId of ["developer", "orchestrator"]) {
       },
     })));
     const background = startApplicationBackgroundWork({
-      config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: roleId === "developer", automaticReview: roleId === "orchestrator" } },
+      config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: roleId === "developer", automaticReview: roleId !== "developer" } },
       employeeRegistry: registry,
       workCoordination: coordination,
       refreshService: { async refresh() {} },
@@ -4054,7 +4054,7 @@ for (const roleId of ["developer", "orchestrator"]) {
   });
 }
 
-for (const roleId of ["developer", "orchestrator", "pr-engineer"]) {
+for (const roleId of ["developer", "orchestrator", "pr-engineer", "tester"]) {
   test(`automatic ${roleId} continues on admitted facts until a queued refresh starts`, async () => {
     const timers = [];
     const generalStarted = deferred();
