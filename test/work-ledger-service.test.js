@@ -4262,6 +4262,10 @@ test("leaving PR scope atomically fails an unsealed pending action", async () =>
   root = (await fixture.service.listItems()).items[0];
   const outbox = (await fixture.service.listOutbox()).items[0];
   assert.equal(root.source.scope.active, false);
+  assert.deepEqual((await fixture.service.listOutbox({ itemId: root.itemId, limit: 1 })).items, [outbox]);
+  assert.deepEqual((await fixture.service.listOutbox({ itemId: "unrelated-work-item" })).items, []);
+  await assert.rejects(fixture.service.listOutbox({ itemId: "" }));
+  await assert.rejects(fixture.service.listOutbox({ itemId: root.itemId, unsupported: true }));
   assert.equal(root.status, "blocked");
   assert.equal(root.activeIntentId, null);
   assert.equal(outbox.status, "failed");

@@ -822,6 +822,11 @@ export class WorkLedgerService {
 
   async listOutbox(options = {}) {
     this.#assertReady();
+    if (isPlainLedgerObject(options) && Object.hasOwn(options, "itemId")) {
+      const { itemId: suppliedItemId, ...pageOptions } = options;
+      const itemId = boundedLedgerString(suppliedItemId, "itemId", 192);
+      return queryPage(this.state.outbox.filter(entry => entry.itemId === itemId), "intentId", pageOptions, WORK_LEDGER_OUTBOX_STATUSES);
+    }
     return queryPage(
       this.state.outbox,
       "intentId",

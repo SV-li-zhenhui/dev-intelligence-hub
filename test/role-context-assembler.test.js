@@ -1957,6 +1957,20 @@ test("a configured root orchestrator receives exact direct-child coordination by
   assert.equal(Object.isFrozen(packet.context.code.childDeliveries[0]), true);
 });
 
+test("root coordination exposes a proven pre-dispatch conflict failure without raw host diagnostics", async () => {
+  const fixture = rootOrchestratorFixture();
+  const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === "task-current");
+  state.ledgerStatus = "blocked";
+  state.statusReason = "intent_failed";
+  state.dispatchFailure = { intentId: "work-intent-conflict", code: "conflict-source-stale", downstreamCreated: false };
+  state.rawError = "PRIVATE-HOST-TRACE";
+  const packet = await assemble(fixture, { roleId: "orchestrator" });
+  const visible = packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === state.taskId);
+  assert.equal(visible.blockingCondition, "conflict-source-stale");
+  assert.deepEqual(visible.dispatchFailure, state.dispatchFailure);
+  assert.equal(JSON.stringify(packet).includes("PRIVATE-HOST-TRACE"), false);
+});
+
 test("root coordination distinguishes settled ledger work from coarse graph progress", async (t) => {
   for (const ledgerStatus of ["queued", "retry_wait", "blocked", "working", "waiting_external"]) {
     await t.test(ledgerStatus, async () => {

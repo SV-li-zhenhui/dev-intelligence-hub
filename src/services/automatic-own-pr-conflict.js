@@ -8,6 +8,7 @@ import { createPullRequestExternalActionConfirmationPlan } from "../domain/pull-
 import { currentWorkItemEvent, currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
 import { approveOwnPrAction, repairCommitMatchesJob, planOwnPrPushRetry, retryOwnPrPush, validateOwnPrPushRetry } from "./automatic-own-pr-repair-authorization.js";
 import { AutomaticOwnPrInspectionRecovery } from "./automatic-own-pr-inspection-recovery.js";
+import { AutomaticOwnPrConflictRecovery } from "./automatic-own-pr-conflict-recovery.js";
 
 const STATE_KEY = "automatic-own-pr-conflict-state";
 const STATUSES = new Set(["working", "pushing", "published", "failed", "stale"]);
@@ -54,17 +55,23 @@ export class AutomaticOwnPrConflict {
   #inspections = new Map();
 
   constructor({ configurationReader, store, ledger, github, confirmations, codeJobReader,
-    controlledCommitReader, objectSync, grantVerifier, conflictInspectionReader, codeJobControl, taskRuns }) {
+    controlledCommitReader, objectSync, grantVerifier, conflictInspectionReader, codeJobControl, taskRuns, confirmationSettlementReader }) {
     Object.assign(this, { configurationReader, store, ledger, github, confirmations, codeJobReader,
       controlledCommitReader, objectSync, grantVerifier, conflictInspectionReader, codeJobControl, taskRuns });
     this.inspectionRecovery = objectSync && typeof ledger.listItems === "function" && typeof ledger.transition === "function" &&
       typeof codeJobReader?.getDetail === "function" && typeof ledger.listTimeline === "function"
       ? new AutomaticOwnPrInspectionRecovery({ store, ledger, codeJobReader, objectSync, current: binding => this.#current(binding) }) : null;
+    this.conflictRecovery = objectSync && conflictInspectionReader && typeof ledger.listOutbox === "function" &&
+      typeof ledger.listItems === "function" && typeof ledger.transition === "function" &&
+      typeof codeJobReader?.get === "function" && typeof codeJobReader.getDetail === "function"
+      ? new AutomaticOwnPrConflictRecovery({ store, ledger, codeJobReader, confirmationSettlementReader,
+        prepareInspection: request => this.prepareInspection(request), current: binding => this.#current(binding) }) : null;
   }
 
   async recover() {
     this.#state = normalizeState(await this.store.read(STATE_KEY, { schemaVersion: 1, records: [] }));
     await this.inspectionRecovery?.recover();
+    await this.conflictRecovery?.recover();
     for (const record of this.#state.records) {
       if (record.status !== "failed" || !record.pushConfirmationId || !this.confirmations.retry) continue;
       let item;
@@ -109,7 +116,7 @@ export class AutomaticOwnPrConflict {
     return structuredClone(cached);
   }
 
-  async prepareInspection({ itemId, itemRevision, inputDigest }) {
+  async prepareInspection({ itemId, itemRevision, inputDigest, force = false }) {
     if (!this.conflictInspectionReader) return null;
     const item = await this.ledger.readItemForReconciliation({ itemId });
     if (item.revision !== itemRevision || item.inputDigest !== inputDigest ||
@@ -119,7 +126,8 @@ export class AutomaticOwnPrConflict {
     const configuration = await this.#current(binding);
     if (!configuration) return null;
     const cached = this.#inspections.get(itemId);
-    if (cached && samePullRequestExecutionBinding(cached.inputBinding, binding)) return structuredClone(cached);
+    if (!force && cached && samePullRequestExecutionBinding(cached.inputBinding, binding)) return structuredClone(cached);
+    this.#inspections.delete(itemId);
     await this.objectSync.prepare({ configuration, inputBinding: binding });
     const inspection = await this.conflictInspectionReader.read(binding);
     const latest = await this.ledger.readItemForReconciliation({ itemId });
@@ -213,12 +221,13 @@ export class AutomaticOwnPrConflict {
   runCycle({ limit = 10 } = {}) {
     return this.#queue.enqueue(async () => {
       const inspectionRecovery = await this.inspectionRecovery?.runCycle({ limit });
+      const conflictRecovery = await this.conflictRecovery?.runCycle({ limit });
       const pending = this.#state.records.filter(active);
       const start = pending.findIndex(record => record.jobId === this.#lastJobId) + 1;
       const candidates = [...pending.slice(start), ...pending.slice(0, start)].slice(0, limit);
       this.#lastJobId = candidates.at(-1)?.jobId ?? null;
       const result = { scanned: candidates.length, published: 0, failed: 0, stale: 0,
-        ...(inspectionRecovery ? { inspectionRecovery } : {}) };
+        ...(inspectionRecovery ? { inspectionRecovery } : {}), ...(conflictRecovery ? { conflictRecovery } : {}) };
       for (const record of candidates) {
         try { const status = await this.#advance(record); if (Object.hasOwn(result, status)) result[status] += 1; }
         catch (error) { result.failed += 1; result.lastFailure = error?.code ?? "OWN_PR_CONFLICT_PROGRESS_UNAVAILABLE"; }

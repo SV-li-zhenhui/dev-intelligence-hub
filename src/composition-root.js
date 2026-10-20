@@ -1994,6 +1994,7 @@ export async function createApplication({
       }
       const ownPrRepairDependencies = {
         configurationReader: configurationRuntime.reader, store, ledger: workLedgerRuntime,
+        confirmationSettlementReader: confirmationRuntime.confirmationSettlementReader,
         github, confirmations: Object.freeze({ ...confirmationRuntime.producerQueue, ...confirmationRuntime.queue }), codeJobReader,
         controlledCommitReader: codeExecutorRuntime.controlledCommitBuilder,
         historicalControlledCommitReader: new HistoricalControlledCommitReader({

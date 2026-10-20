@@ -30,7 +30,7 @@ import { ownReviewFeedbackDigest } from "../src/adapters/github-own-review-feedb
 import { OriginalRepairFeedbackReader } from "../src/services/original-repair-feedback-reader.js";
 import { createOriginalRepairFeedbackSnapshot, createOriginalRepairFeedbackArchiveRecord,
   originalRepairFeedbackArchiveKey, originalRepairFeedbackArchiveReference } from "../src/domain/original-repair-feedback.js";
-import { currentWorkItemExecutionBinding } from "../src/services/work-ledger-pr-source.js";
+import { currentWorkItemExecutionBinding, currentWorkItemInputBinding } from "../src/services/work-ledger-pr-source.js";
 import { pullRequestExternalActionBinding, externalActionControlledCommit } from "./support/pull-request-external-action-fixture.js";
 
 const CREATED_AT = "2026-10-10T03:00:00.000Z";
@@ -127,7 +127,7 @@ function controlledCommit(grant, overrides = {}) {
   });
 }
 
-async function fixture({ enabled = true, conflict = false, operation = "modify", objectSync = null, pushOutcome = "applied", store = new MemoryStore(), clock = () => new Date(CREATED_AT), codeJobControl, taskRuns } = {}) {
+async function fixture({ enabled = true, conflict = false, operation = "modify", objectSync = null, pushOutcome = "applied", store = new MemoryStore(), clock = () => new Date(CREATED_AT), codeJobControl, taskRuns, recoveryLedger = {}, conflictInspectionReader } = {}) {
   const binding = pullRequestExternalActionBinding({
     gitTarget: { headRepository: "acme/repo", headRefName: "fix/review-feedback" },
   });
@@ -235,9 +235,11 @@ async function fixture({ enabled = true, conflict = false, operation = "modify",
     const dependencies = {
       objectSync,
       configurationReader: { async readActive() { return { configuration: config }; } }, store,
-      ledger: { async readPullRequestExecutionContext() { return clone(context); }, async readItemForReconciliation() { return clone(item); } },
+      ledger: { async readPullRequestExecutionContext() { return clone(context); }, async readItemForReconciliation() { return clone(item); }, ...recoveryLedger },
       github: { async readOwnPullRequestFeedback() { return clone(facts); }, async readOwnPullRequestConflict() { return clone(facts); } }, confirmations: confirmationPort,
-      codeJobReader: { async getDetail({ jobId }) { return clone(details.get(jobId) ?? null); } },
+      codeJobReader: { async get(jobId) { return clone(jobs.get(jobId) ?? null); }, async getDetail({ jobId }) { return clone(details.get(jobId) ?? null); } },
+      conflictInspectionReader,
+      confirmationSettlementReader: { read: request => queue.readSettlement(request) },
       controlledCommitReader: { async verify({ evidenceId }) { return clone(verified.get(evidenceId)); } },
       historicalControlledCommitReader: new HistoricalControlledCommitReader({ store,
         controlledCommitReader: { async verify({ evidenceId }) { return clone(verified.get(evidenceId)); } } }),
@@ -289,6 +291,105 @@ async function fixture({ enabled = true, conflict = false, operation = "modify",
       service = makeService(); await service.recover();
     },
   };
+}
+
+for (const kind of ["dispatch-stale", "authority-fenced"]) {
+  for (const variant of ["recover", "disabled", "head-drift", "paused", "source-mismatch", "preparation-failed", "concurrent-change", "budget-exhausted",
+    ...(kind === "dispatch-stale" ? ["bound-dispatch", "unknown-failure"] : ["observed-action", "archived", "unknown-terminal", "changed-detail"])]) {
+  test(`automatic conflict recovery rebuilds materials only after a proven unstarted failure (${kind}, ${variant})`, async () => {
+    let f, reads = 0;
+    const outboxes = [], transitions = [];
+    f = await fixture({ conflict: true, objectSync: { async prepare() {} },
+      recoveryLedger: {
+        async listItems() { return { items: [clone(f.item)], nextCursor: null }; },
+        async listOutbox() { return { items: clone(outboxes), nextCursor: null }; },
+        async transition(request) {
+          assert.equal(request.expectedRevision, f.item.revision);
+          transitions.push(request); f.item.status = "queued"; f.item.revision++;
+        },
+      },
+      conflictInspectionReader: { async read(inputBinding) {
+        reads++;
+        if (reads > 1 && variant === "preparation-failed") throw Object.assign(new Error("material is still invalid"), { code: "CONTROLLED_GIT_PREPARATION_TAMPERED" });
+        if (reads > 1 && variant === "concurrent-change") f.item.revision++;
+        return { inputBinding, preparationBinding: externalActionControlledCommit(inputBinding).executionSource.preparationBinding,
+          conflicts: [{ path: "src/conflict.txt" }] };
+      } },
+    });
+    const b = f.binding;
+    Object.assign(f.item, { kind: "graph_task", revision: 4, inputDigest: "e".repeat(64), status: "blocked",
+      statusReason: kind === "dispatch-stale" ? "intent_failed" : "proposal_stale", updatedAt: CREATED_AT,
+      currentTarget: { type: "role", id: "developer" }, activeIntentId: null, leaseId: null,
+      graph: { deliveries: [] }, decisionContext: null,
+      assignment: { graphTask: { sourceBinding: Object.fromEntries(
+        ["kind", "rootItemId", "workKey", "inputRevision", "headRevision", "headRefOid", "eventId", "eventDigest", "inputDigest"].map(key => [key, b[key]])) } },
+    });
+    f.item.event = { schemaVersion: 1, eventId: b.eventId, contentDigest: b.eventDigest,
+      occurredAt: CREATED_AT, eventType: "pull_request.updated", source: { provider: "github", scopeId: "test" },
+      subject: { id: `github:pr:${b.repository}#${b.pullRequestNumber}`, repository: b.repository, number: b.pullRequestNumber },
+      payload: { nextAction: "resolve_conflict", relation: "authored", headRefOid: b.headRefOid, gitTargetAvailable: true, gitTarget: b.gitTarget } };
+    const outbox = { intentId: "host-conflict-intent", itemId: f.item.itemId, inputDigest: f.item.inputDigest,
+      sourceBinding: currentWorkItemInputBinding(f.item), requestedBy: { roleId: "developer" },
+      intent: { type: "propose_code_action", operation: "modify" }, updatedAt: CREATED_AT,
+      status: "failed", dispatchBinding: null, outcome: { status: "failed", details: { code: "conflict-source-stale" } } };
+    if (kind === "authority-fenced") {
+      const result = await f.deliver();
+      const confirmation = await f.queue.get(result.downstreamRef);
+      const job = f.jobs.get(codeJobIdForGrant(f.grant));
+      Object.assign(job, { status: "fenced", terminalResult: { kind: "fenced", recordedAt: CREATED_AT } });
+      f.details.set(job.jobId, { job: clone(job), archived: false, historyAvailable: true, observations: [], nextCursor: null,
+        terminalDetail: { code: "INVALID_CODE_JOB_AUTHORITY" } });
+      f.item.decisionContext = { source: "proposal", outcome: "stale", referenceId: f.proposal.proposalId,
+        contentDigest: "8".repeat(64), observedAt: CREATED_AT, value: { kind: "code_action_proposal",
+          downstreamRef: confirmation.id, evidence: [`confirmation:${confirmation.id}`, "authorization_changed", "old_confirmation_status:completed"] } };
+      const { proposalId, contentDigest, ...content } = f.proposal;
+      Object.assign(outbox, { status: "delivered", dispatchBinding: { boundIntent: { intentId: proposalId, ...content } },
+        outcome: { status: "delivered", details: { downstreamRef: proposalId, proposalDigest: f.proposal.contentDigest,
+          resultAttestation: { decisionContentDigest: f.item.decisionContext.contentDigest } } } });
+    }
+    outboxes.push(outbox);
+    // Existing cached material must not be reused to recover an expired source.
+    await f.service.conflictRepair.prepareInspection({ itemId: f.item.itemId, itemRevision: 4, inputDigest: f.item.inputDigest });
+    assert.equal(reads, 1);
+    if (variant === "disabled") f.config.githubActions.automaticOwnPrRepair = false;
+    if (variant === "head-drift") f.facts.headRefOid = "9".repeat(40);
+    if (variant === "paused") f.item.status = "paused";
+    if (variant === "source-mismatch") outbox.inputDigest = "9".repeat(64);
+    if (variant === "bound-dispatch") outbox.dispatchBinding = {};
+    if (variant === "unknown-failure") outbox.outcome.details.code = "conflict-source-invalid";
+    if (variant === "budget-exhausted") {
+      await f.store.write("automatic-own-pr-conflict-recovery-state", { schemaVersion: 1,
+        records: [1, 2, 3].map(attempt => ({ itemId: f.item.itemId, inputBinding: b, failureRef: `old-${attempt}`, attempt, status: "requeued" })) });
+      await f.service.conflictRepair.conflictRecovery.recover();
+    }
+    if (kind === "authority-fenced") {
+      const job = f.jobs.get(codeJobIdForGrant(f.grant)), detail = f.details.get(job.jobId);
+      if (variant === "observed-action") {
+        Object.assign(job, { turn: 1, observationCount: 1, latestObservation: { actionType: "read_text", status: "succeeded", recordedAt: CREATED_AT } });
+        detail.job = clone(job);
+      }
+      if (variant === "archived") detail.archived = true;
+      if (variant === "unknown-terminal") detail.terminalDetail.code = "OWNER_STOPPED";
+      if (variant === "changed-detail") detail.job.revision++;
+    }
+    const result = await f.service.conflictRepair.runCycle();
+    if (variant !== "recover") {
+      assert.equal(result.conflictRecovery?.requeued, 0);
+      assert.equal(transitions.length, 0);
+      assert.equal(f.pushes.length, 0);
+      return;
+    }
+    assert.equal(result.conflictRecovery?.requeued, 1);
+    assert.equal(reads, 2);
+    assert.equal(transitions.length, 1);
+    assert.equal(f.item.status, "queued");
+    assert.equal(f.pushes.length, 0);
+    await f.restart();
+    f.item.status = "blocked";
+    await f.service.conflictRepair.runCycle();
+    assert.equal(transitions.length, 1, "a restarted host must not replay a settled recovery");
+  });
+  }
 }
 
 test("automatic conflict materials are synchronized and read only for a current owned task", async () => {

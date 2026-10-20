@@ -14,6 +14,7 @@ import {
 } from "./work-ledger-values.js";
 import { currentWorkItemInputBinding } from "./work-ledger-pr-source.js";
 import { isRecoveredConflictInspection } from "./work-ledger-inspection-continuation.js";
+import { unstartedConflictDispatchFailure } from "./work-ledger-conflict-failure.js";
 
 export const WORK_LEDGER_GRAPH_ID = "work-ledger";
 
@@ -379,6 +380,12 @@ export function projectWorkLedgerGraphView(state, options) {
   const graph = projectWorkLedgerGraphSnapshot(state, options);
   const stateEntries = ledgerDataEntries(state);
   const fields = new Map(stateEntries);
+  const outboxesByItemId = new Map();
+  for (const outbox of fields.get("outbox") ?? []) {
+    const siblings = outboxesByItemId.get(outbox.itemId) ?? [];
+    siblings.push(outbox);
+    outboxesByItemId.set(outbox.itemId, siblings);
+  }
   const itemsById = new Map(
     denseProjectionArray(fields.get("items")).map((item) => {
       const entries = ledgerDataEntries(item);
@@ -401,6 +408,8 @@ export function projectWorkLedgerGraphView(state, options) {
       );
     }
     workLedgerStatusToGraphStatus(item.get("status"));
+    const dispatchFailure = item.get("statusReason") === "intent_failed"
+      ? unstartedConflictDispatchFailure(Object.fromEntries(item), outboxesByItemId.get(task.taskId) ?? []) : null;
     return {
       taskId: task.taskId,
       taskRevision: task.revision,
@@ -409,6 +418,7 @@ export function projectWorkLedgerGraphView(state, options) {
       leaseUntil: item.get("leaseUntil"),
       availableAt: item.get("availableAt"),
       statusReason: item.get("statusReason"),
+      ...(dispatchFailure === null ? {} : { dispatchFailure }),
       updatedAt: item.get("updatedAt"),
       work: projectedItemWork(item),
     };

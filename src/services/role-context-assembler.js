@@ -508,6 +508,13 @@ function normalizeSnapshot(value) {
       throw invalid("taskState.ledgerStatus is invalid");
     }
     const work = exactData(fields.get("work"), ["title", "description"], "task work");
+    let dispatchFailure = null;
+    if (ledgerStatus === "blocked" && fields.get("statusReason") === "intent_failed" && fields.get("dispatchFailure") != null) {
+      const failure = exactData(fields.get("dispatchFailure"), ["intentId", "code", "downstreamCreated"], "dispatch failure");
+      if (failure.get("code") !== "conflict-source-stale" || failure.get("downstreamCreated") !== false) throw invalid("dispatch failure is invalid");
+      dispatchFailure = { intentId: identifier(failure.get("intentId"), "dispatchFailure.intentId"),
+        code: "conflict-source-stale", downstreamCreated: false };
+    }
     if (statesById.has(taskId)) throw invalid("task state IDs are duplicated");
     statesById.set(taskId, {
       taskId,
@@ -517,7 +524,8 @@ function normalizeSnapshot(value) {
       ),
       ledgerStatus,
       blockingCondition: ledgerStatus === "blocked" && fields.get("statusReason") === "proposal_stale"
-        ? "proposal-stale" : null,
+        ? "proposal-stale" : dispatchFailure?.code ?? null,
+      dispatchFailure,
       work: {
         title: nullableText(work.get("title"), "work.title", 256),
         description: nullableText(
@@ -894,6 +902,7 @@ function projectRootCoordination(roleId, currentTask, snapshot) {
       status: child.status,
       ledgerStatus: taskState.ledgerStatus,
       blockingCondition: taskState.blockingCondition,
+      ...(taskState.dispatchFailure === null ? {} : { dispatchFailure: { ...taskState.dispatchFailure } }),
       responsibility: { ...child.responsibility },
       work: {
         title: taskState.work.title,
