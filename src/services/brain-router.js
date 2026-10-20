@@ -346,13 +346,15 @@ export class BrainRouter {
     });
   }
 
-  async withAdmission(brainValue, {entityKey, signal = null} = {}, operation) {
+  async withAdmission(brainValue, {entityKey, signal = null, waitForCapacity = false} = {}, operation) {
     const brain = normalizeBrainConfig(brainValue);
     const provider = this.#provider(brain.provider);
     const requestSignal = normalizeAbortSignal(signal);
     requestSignal?.throwIfAborted();
     if (typeof operation !== 'function') throw new TypeError('admission operation is invalid');
-    return provider.withAdmission ? provider.withAdmission({entityKey:normalizeAdmissionEntityKey(entityKey),signal:requestSignal},operation) : operation();
+    if (typeof waitForCapacity !== 'boolean') throw new TypeError('admission wait option is invalid');
+    return provider.withAdmission ? provider.withAdmission({entityKey:normalizeAdmissionEntityKey(entityKey),signal:requestSignal,
+      ...(waitForCapacity ? {waitForCapacity:true} : {})},operation) : operation();
   }
 
   describe(brainValue) {

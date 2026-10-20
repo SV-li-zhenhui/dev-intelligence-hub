@@ -103,6 +103,26 @@ function assignedTask(eventType, suffix = "1") {
   };
 }
 
+test("workforce enables fair model waiting only when the host opts into automatic work", async () => {
+  for (const waitForModelCapacity of [false, true]) {
+    const calls = [];
+    const selected = role("test-model"); selected.brain.provider = "cli";
+    const workforce = createOwnedTestConfiguredWorkforce({
+      waitForModelCapacity, brainProviders: { cli: { kind: "codex-cli", credentialMode: "codex-native-login" } },
+      roles: { analyst: selected }, store: new MemoryStore(),
+    }, { supervisedCliProviderFactory(options) { return {
+      id: options.id, remote: true, singleAttempt: true,
+      async generate() { assert.fail("admission alone must not launch a model"); },
+      withAdmission(request, operation) { calls.push(request); return operation(); },
+    }; } });
+    let entered = 0;
+    await workforce.workers[0].withDecisionAdmission({ item: { itemId: "work-42" } }, async () => { entered += 1; });
+    assert.equal(entered, 1);
+    assert.equal(calls[0].waitForCapacity === true, waitForModelCapacity);
+    await workforce.close();
+  }
+});
+
 test("workforce builds independently controlled roles over one local provider", async () => {
   const calls = [];
   const workforce = createConfiguredWorkforce({

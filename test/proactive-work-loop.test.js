@@ -19,6 +19,22 @@ test('busy model admission leaves work unclaimed without consuming decision atte
   assert.equal(cycle.outcomes[0].status,'waiting_model');
 });
 
+test('a model queue timeout leaves its task unclaimed and permits another candidate', async () => {
+  const time = controlledClock(), first = workItem(1), second = workItem(2);
+  const ledger = new FakeLedger({source:[first,second],time});
+  const candidate = worker();
+  candidate.withDecisionAdmission = async ({item}, operation) => {
+    if (item.itemId === first.itemId) throw Object.assign(new Error('queue deadline reached'), {code:'STRUCTURED_PROVIDER_QUEUE_TIMEOUT'});
+    return operation();
+  };
+  const cycle = await createLoop({ledger,directory:new FakeRoleDirectory({'pr-reviewer':candidate}),time}).runCycle();
+  assert.equal(cycle.outcomes[0].status,'waiting_model');
+  assert.equal(cycle.outcomes[0].code,'STRUCTURED_PROVIDER_QUEUE_TIMEOUT');
+  assert.deepEqual(ledger.calls.claim.map(call=>call.itemId),[second.itemId]);
+  assert.equal(ledger.items.find(item=>item.itemId===first.itemId).attempt,0);
+  assert.equal(cycle.workAttempts,1);
+});
+
 for (const command of ['pause', 'cancel']) {
   test(`accepted ${command} survives a decision deadline until process stop is confirmed`, { timeout: 10_000 }, async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
@@ -3602,6 +3618,48 @@ test("a child-blocked root generic decision stays unclaimed", async () => {
   assert.equal(ledger.calls.claim.length, 0);
   assert.equal(ledger.calls.stageIntent.length, 0);
   assert.equal(serviceCalls, 0);
+});
+
+test("healthy pending external Review children leave root model capacity for the next PR", async (t) => {
+  for (const variant of ["healthy", "blocked", "paused", "waiting_condition", "submitted", "accepted", "truncated", "wrong-role", "head-changed", "other-dependency"]) {
+    await t.test(variant, async () => {
+      const time = controlledClock();
+      const root = workItem(42, { type: "role", id: "orchestrator" });
+      root.event = { ...root.event, eventType: "pull_request.owner_requested", source: { provider: "local-owner" }, payload: {
+        workType: "general", priority: "urgent", nextAction: "rereview", suggestedCapability: "pr-review",
+        expectedHeadRefOid: "a".repeat(40), headRefOid: variant === "head-changed" ? "b".repeat(40) : "a".repeat(40),
+      } };
+      const child = workItem(43, { type: "role", id: "pr-engineer" });
+      child.graph.parentItemId = root.itemId;
+      const tail = workItem(44, { type: "role", id: "orchestrator" });
+      const ledger = new FakeLedger({ source: [root, child, tail], time });
+      const decisions = [];
+      const loop = createLoop({ ledger, time, workLimit: 1,
+        directory: new FakeRoleDirectory({ orchestrator: worker({ roleId: "orchestrator", workerId: "employee-orchestrator",
+          decide: async ({ item }) => { decisions.push(item.itemId); return completeDecision(); } }),
+          "pr-engineer": worker({ roleId: "pr-engineer" }) }),
+        roleContextAssembler: { async assemble({ roleId, item }) {
+          const packet = contextPacket(item, roleId);
+          if (item.itemId === root.itemId) packet.context.requirements.coordination = {
+            deliveryWindow: { pendingCount: 0, hasMore: false },
+            directChildren: [{ responsibility: { type: "role", id: variant === "wrong-role" ? "developer" : "pr-engineer" },
+              ledgerStatus: ["blocked", "paused", "waiting_condition"].includes(variant) ? variant : "queued",
+              hasMoreDeliverables: variant === "truncated", deliverableCount: 1, hasAcceptedRequiredReview: false,
+              hasOtherDependencies: variant === "other-dependency", directDependencyTaskIds: [],
+              deliverables: [{ kind: "github-review", required: true, state: ["submitted", "accepted"].includes(variant) ? variant : "none" }],
+            }],
+          };
+          return packet;
+        } }, orchestratorService: { async execute() { assert.fail("No orchestration command is needed"); } },
+      });
+      const result = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+      if (variant === "healthy") {
+        assert.deepEqual(decisions, [tail.itemId], JSON.stringify(result));
+        assert.equal(result.outcomes[0].status, "graph_blocked");
+        assert.equal(ledger.calls.claim.some(call => call.itemId === root.itemId), false);
+      } else assert.equal(decisions.includes(root.itemId), true, "actionable or incomplete child facts must still reach the model");
+    });
+  }
 });
 
 async function blockedRootSweepLoop({ listReadinessItems, rootPriority = null, includeTail = false } = {}) {

@@ -571,12 +571,14 @@ function configuredWorkforce({
   roles = {},
   store,
   onRun = async () => {},
+  waitForModelCapacity = false,
   clock,
   actionAdmissionGate,
   dependencies = {},
   constructionCleanupOwner: rawConstructionCleanupOwner,
 } = {}, brainRouterFactory) {
   if (typeof onRun !== "function") throw new TypeError("onRun is invalid");
+  if (typeof waitForModelCapacity !== "boolean") throw new TypeError("waitForModelCapacity is invalid");
   const constructionCleanupOwner = configuredConstructionCleanupOwner(
     rawConstructionCleanupOwner,
   );
@@ -594,6 +596,7 @@ function configuredWorkforce({
     for (const [id, rawConfig] of dataEntries(roles, "employees.roles")) {
       const config = roleOptions(id, rawConfig);
       const employee = new ConfiguredRoleEmployee({
+        waitForModelCapacity,
         definition: {
           id,
           name: config.name,

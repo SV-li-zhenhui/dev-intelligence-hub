@@ -88,6 +88,52 @@ test("native resource admission is nonblocking, held through callback, and relea
   await provider.close();
 });
 
+test("queued automatic admission gets the next slot before a later orchestrator", async (t) => {
+  const f = await fixture(t), releaseCode = gate(), releaseOther = gate(), releaseReview = gate(), enteredReview = gate();
+  const provider = f.create(undefined, {}, { maxConcurrentTurns: 2, allowConcurrentNativeHome: true });
+  const order = [], errors = [];
+  const code = provider.withAdmission({ entityKey: "pr:code" }, () => releaseCode.promise);
+  const other = provider.withAdmission({ entityKey: "pr:other" }, () => releaseOther.promise);
+  const review = provider.withAdmission({ entityKey: "pr:review", waitForCapacity: true }, async () => {
+    order.push("review"); enteredReview.resolve(); await releaseReview.promise;
+    return provider.generate(request());
+  }).catch(error => errors.push(error.code));
+  const orchestrator = provider.withAdmission({ entityKey: "pr:orchestrator", waitForCapacity: true }, () => {
+    order.push("orchestrator");
+  }).catch(error => errors.push(error.code));
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(errors, [], "automatic roles must queue without repeatedly losing their place");
+    assert.deepEqual(order, []);
+    releaseOther.resolve(); await enteredReview.promise;
+    assert.deepEqual(order, ["review"]);
+    releaseReview.resolve();
+    await Promise.all([review, orchestrator]);
+    assert.deepEqual(order, ["review", "orchestrator"]);
+    assert.deepEqual(errors, [], "nested generation must borrow its reservation");
+  } finally {
+    releaseCode.resolve(); releaseOther.resolve(); releaseReview.resolve();
+    await Promise.all([code, other, review, orchestrator]); await provider.close();
+  }
+});
+
+for (const ending of ["cancel", "timeout", "close"]) {
+  test(`queued automatic admission ${ending} never claims capacity or invokes work`, async (t) => {
+    const f = await fixture(t), release = gate(), controller = new AbortController();
+    const provider = f.create(undefined, { queueTimeoutMs: 20 });
+    const active = provider.withAdmission({ entityKey: "pr:active" }, () => release.promise);
+    const expected = { cancel: "STRUCTURED_PROVIDER_CANCELLED", timeout: "STRUCTURED_PROVIDER_QUEUE_TIMEOUT", close: "STRUCTURED_PROVIDER_CANCELLED" }[ending];
+    const queued = assert.rejects(provider.withAdmission({ entityKey: "pr:queued", waitForCapacity: true, signal: controller.signal },
+      () => assert.fail("cancelled or expired work must remain unclaimed")), { code: expected });
+    if (ending === "cancel") controller.abort();
+    const closing = ending === "close" ? provider.close() : null;
+    try { await queued; }
+    finally { release.resolve(); await active; await closing; }
+    if (ending !== "close") await provider.withAdmission({ entityKey: "pr:next", waitForCapacity: true }, async () => {});
+    await provider.close();
+  });
+}
+
 test('a rejected overlapping use cannot unlock a still-running reservation',async(t)=>{
   const f=await fixture(t),entered=gate(),finish=gate();
   const provider=f.create(async call=>{entered.resolve();await finish.promise;return result(call);});

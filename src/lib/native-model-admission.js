@@ -52,11 +52,11 @@ export function currentNativeAdmission(state) {
   return token?.state === state && !token.released ? token : null;
 }
 
-export function withNativeAdmission(state, entity, signal, operation) {
+export async function withNativeAdmission(state, entity, signal, operation, {waitForCapacity = false} = {}) {
   signal?.throwIfAborted();
   if (state.blocked) throw problem('STRUCTURED_PROVIDER_REAP_FAILED');
-  if (state.queue.length || !fits(state, entity, false)) throw problem('STRUCTURED_PROVIDER_BUSY');
-  const token = reserve(state, entity, false);
+  if (!waitForCapacity && (state.queue.length || !fits(state, entity, false))) throw problem('STRUCTURED_PROVIDER_BUSY');
+  const token = waitForCapacity ? await acquireNativeAdmission(state, entity, signal) : reserve(state, entity, false);
   return reservations.run(token, async () => {
     try { signal?.throwIfAborted(); return await operation(); }
     finally { token.release(); }

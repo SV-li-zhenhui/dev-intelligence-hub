@@ -2327,6 +2327,9 @@ export async function createApplication({
     let workCoordination = null;
     const configuredWorkforce = coordinationEnabled
       ? trackRuntime(configuredWorkforceFactory({
+          ...(config.githubActions?.enabled === true &&
+            (config.githubActions.automaticReview === true || config.githubActions.automaticOwnPrRepair === true)
+            ? { waitForModelCapacity: true } : {}),
           constructionCleanupOwner: configuredConstructionCleanupOwner,
           brainProviders: config.brainProviders || {},
           roles: config.employees?.roles || {},

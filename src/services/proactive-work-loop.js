@@ -555,9 +555,29 @@ function isUnclaimedStalePrFact(result) {
 
 function configuredResultConsumesWorkBudget(result) {
   if (isUnclaimedStalePrFact(result)) return false;
+  if (result.decisionSkipped === true && result.outcome.status === "graph_blocked") return false;
   return result.claimed ||
     !result.claimAttempted ||
     claimFailureConsumesWorkBudget(result.outcome);
+}
+
+function hasHealthyPendingRereviewChildren(item, context) {
+  const event = currentWorkItemEvent(item);
+  const payload = event?.payload;
+  if (event?.eventType !== "pull_request.owner_requested" || event.source?.provider !== "local-owner" ||
+      payload?.workType !== "general" || payload.nextAction !== "rereview" || payload.suggestedCapability !== "pr-review" ||
+      typeof payload.expectedHeadRefOid !== "string" || payload.expectedHeadRefOid !== payload.headRefOid) return false;
+  const coordination = context?.requirements?.coordination;
+  const children = coordination?.directChildren;
+  if (!Array.isArray(children) || children.length === 0 || coordination.deliveryWindow?.pendingCount !== 0 ||
+      coordination.deliveryWindow.hasMore !== false) return false;
+  return children.every(child => child.responsibility?.type === "role" && child.responsibility.id === "pr-engineer" &&
+    ["queued", "working", "dispatch_pending", "waiting_external"].includes(child.ledgerStatus) &&
+    child.hasMoreDeliverables === false && child.hasAcceptedRequiredReview === false && child.hasOtherDependencies === false &&
+    Array.isArray(child.directDependencyTaskIds) && child.directDependencyTaskIds.length === 0 &&
+    Array.isArray(child.deliverables) && child.deliverableCount === child.deliverables.length &&
+    child.deliverables.some(slot => slot.required === true && ["review-report", "github-review"].includes(slot.kind)) &&
+    child.deliverables.every(slot => slot.state === "none"));
 }
 
 function ownErrorData(error, name) {
@@ -1230,9 +1250,10 @@ export class ProactiveWorkLoop {
           } else await processAdmitted();
         } catch (error) {
           throwIfLoopAborted(options.signal);
-          if (stableFailureCode(error) !== 'STRUCTURED_PROVIDER_BUSY') throw error;
+          const code = stableFailureCode(error);
+          if (!['STRUCTURED_PROVIDER_BUSY', 'STRUCTURED_PROVIDER_QUEUE_TIMEOUT'].includes(code)) throw error;
           availabilityBudgetUsed -= 1;
-          outcomes.push({itemId:item.itemId,status:'waiting_model',code:'STRUCTURED_PROVIDER_BUSY'});
+          outcomes.push({itemId:item.itemId,status:'waiting_model',code});
         }
       } finally {
         this.inFlightItemIds.delete(item.itemId);
@@ -1620,6 +1641,10 @@ export class ProactiveWorkLoop {
     let decision;
     try {
       packet = await this.#assembleContext(item, worker, options);
+      if (graphBlocked && hasHealthyPendingRereviewChildren(item, packet.context)) {
+        return { claimAttempted: false, claimed: false, decisionSkipped: true,
+          outcome: { status: "graph_blocked", workerId: worker.workerId } };
+      }
       ({ decision, packet } = await this.#decideWithMemory(
         item,
         worker,

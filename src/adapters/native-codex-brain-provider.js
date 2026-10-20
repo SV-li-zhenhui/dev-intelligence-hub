@@ -96,6 +96,7 @@ function operationSignal(caller) {
   return { signal: controller.signal, abort,
     follow(signal) { clearTimeout(timer); const forward = () => controller.abort(signal.reason); signal.addEventListener('abort', forward, { once: true }); if (signal.aborted) forward(); return () => signal.removeEventListener('abort', forward); },
     deadline(timeoutMs, code) { clearTimeout(timer); timer = setTimeout(() => controller.abort(failure(code)),timeoutMs); },
+    clearDeadline() { clearTimeout(timer); },
     close() { clearTimeout(timer); caller?.removeEventListener("abort", abort); } };
 }
 
@@ -390,10 +391,24 @@ export class NativeCodexBrainProvider {
     return attempt;
   }
 
-  async withAdmission({entityKey, signal = null} = {}, operation) {
+  async withAdmission({entityKey, signal = null, waitForCapacity = false} = {}, operation) {
     if (this.#closed) throw failure();
     if (typeof entityKey !== 'string' || !entityKey || Buffer.byteLength(entityKey) > 1024 || /[\u0000-\u001f]/u.test(entityKey) || typeof operation !== 'function') throw new TypeError('Native admission request is invalid');
-    return withNativeAdmission(this.#state, nativeCodexDigest(entityKey), normalizeAbortSignal(signal), operation);
+    if (typeof waitForCapacity !== 'boolean') throw new TypeError('Native admission wait option is invalid');
+    const caller = normalizeAbortSignal(signal);
+    if (!waitForCapacity) return withNativeAdmission(this.#state, nativeCodexDigest(entityKey), caller, operation);
+    const waiting = operationSignal(caller);
+    waiting.deadline(this.#options.queueTimeoutMs, 'STRUCTURED_PROVIDER_QUEUE_TIMEOUT');
+    this.#controllers.add(waiting);
+    const queued = withNativeAdmission(this.#state, nativeCodexDigest(entityKey), waiting.signal, () => {
+      waiting.clearDeadline();
+      waiting.signal.throwIfAborted();
+      if (this.#closed) throw failure('STRUCTURED_PROVIDER_CANCELLED');
+      return operation();
+    }, {waitForCapacity: true});
+    this.#operations.add(queued);
+    try { return await queued; }
+    finally { waiting.close(); this.#controllers.delete(waiting); this.#operations.delete(queued); }
   }
 
   async generate(rawRequest) {

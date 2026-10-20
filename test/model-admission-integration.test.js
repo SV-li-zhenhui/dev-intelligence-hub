@@ -13,6 +13,38 @@ import {githubEntitySessionKey} from '../src/lib/session-key.js';
 
 const deferred=()=>{let resolve;const promise=new Promise(r=>{resolve=r;});return {resolve,promise};};
 
+test('automatic employee queues without claiming and rechecks role pause after admission', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'dih-automatic-admission-'));
+  t.after(() => rm(root, {recursive:true,force:true}));
+  const home = path.join(root, 'home'); await mkdir(home);
+  const provider = new NativeCodexBrainProvider({id:'native', cliKind:'codex-cli', credentialMode:'codex-native-login', queueTimeoutMs:1000}, {
+    environment:{CODEX_HOME:home}, temporaryRoot:path.join(root,'runtime'),
+    rootDirectoryManager:{async prepare(){assert.fail('waiting must not prepare a model');}},
+    processRunner:{async run(){assert.fail('waiting must not launch a model');}},
+  });
+  const router = createTestConfiguredBrainRouter({brainProviders:{native:{kind:'codex-cli',credentialMode:'codex-native-login'}}},
+    {supervisedCliProviderFactory:()=>provider});
+  const employee = new ConfiguredRoleEmployee({definition:{id:'analyst',name:'Analyst',mission:'Inspect work',enabled:true,scheduleMinutes:5},
+    permissions:{allowedIntents:['complete']}, brain:{provider:'native',model:'test-model',remoteData:{requirements:true,code:false,memory:false}},
+    waitForModelCapacity:true, brainRouter:router, store:new StateStore(path.join(root,'state'))});
+  const directory = new RoleWorkerDirectory({workers:[employee.asRoleWorker()],legacyOwnedRoleIds:[]});
+  const worker = await directory.resolve({type:'role',id:'analyst'});
+  const release = deferred();
+  const occupied = provider.withAdmission({entityKey:'occupied'}, () => release.promise);
+  let claims = 0, outcome = null;
+  const input = {item:{itemId:'work-43',event:{eventType:'issue.updated',subject:{repository:'owner/repo',number:43}}}};
+  const queued = worker.withDecisionAdmission(input, () => { claims += 1; }).then(value => outcome={value}, error => outcome={error});
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(outcome, null, 'automatic admission must keep its queue position');
+    assert.equal(claims, 0);
+    await employee.control('pause', 0);
+    release.resolve(); await occupied; await queued;
+    assert.equal(outcome.error.code, 'ROLE_PAUSED');
+    assert.equal(claims, 0, 'a queued role must be rechecked before claiming');
+  } finally { release.resolve(); await occupied; await queued; await provider.close(); }
+});
+
 test('configured employee, directory, engine, router and native home share admission through receipt settlement',async t=>{
   const root=await mkdtemp(path.join(tmpdir(),'dih-model-admission-'));
   t.after(()=>rm(root,{recursive:true,force:true}));

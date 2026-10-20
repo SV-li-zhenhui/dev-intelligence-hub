@@ -371,6 +371,7 @@ export class ConfiguredRoleEmployee {
   #taskDecisionEngine;
   #canProposeCodeAction;
   #workerPort;
+  #waitForModelCapacity;
 
   constructor({
     definition: definitionValue,
@@ -388,6 +389,7 @@ export class ConfiguredRoleEmployee {
     workerId,
     stateKey,
     initialPaused = false,
+    waitForModelCapacity = false,
     operationQueue = new OperationQueue(),
   } = {}) {
     if (typeof onRun !== "function") throw new TypeError("onRun is invalid");
@@ -395,6 +397,8 @@ export class ConfiguredRoleEmployee {
     if (typeof initialPaused !== "boolean") {
       throw new TypeError("initialPaused is invalid");
     }
+    if (typeof waitForModelCapacity !== "boolean") throw new TypeError("waitForModelCapacity is invalid");
+    this.#waitForModelCapacity = waitForModelCapacity;
     const definition = normalizeRoleDefinition(definitionValue);
     const permissions = normalizeRolePermissions(permissionsValue);
     const brain = normalizeBrainConfig(brainValue);
@@ -642,7 +646,8 @@ export class ConfiguredRoleEmployee {
     const entityKey = kind && typeof event.subject?.repository === 'string' && Number.isSafeInteger(event.subject?.number) && event.subject.number > 0
       ? githubEntitySessionKey({kind,repository:event.subject.repository,number:event.subject.number})
       : `work-item:${item?.itemId ?? this.workerId}`;
-    return engine.withAdmission({entityKey,signal}, async () => {
+    return engine.withAdmission({entityKey,signal,
+      ...(this.#waitForModelCapacity ? {waitForCapacity:true} : {})}, async () => {
       throwIfDecisionAborted(signal);
       await this.#assertRoleUnchanged(before,signal);
       return operation();
