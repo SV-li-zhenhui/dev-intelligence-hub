@@ -8,6 +8,8 @@ import { GitHubAdapter } from "./adapters/github-adapter.js";
 import { createProductionSupervisedCliBrainProvider } from "./adapters/supervised-cli-brain-provider.js";
 import { AutomaticReviewPublisher } from "./services/automatic-review-publisher.js";
 import { AutomaticOwnPrRepair } from "./services/automatic-own-pr-repair.js";
+import { AutomaticLocalCodeAuthorization } from "./services/automatic-local-code-authorization.js";
+import { AutomaticOwnPrHandoff } from "./services/automatic-own-pr-handoff.js";
 import { HistoricalControlledCommitReader } from "./services/historical-controlled-commit-reader.js";
 import { ReviewRepairContextReader, normalizeReviewRepairFeedbackContext } from "./services/review-repair-context-reader.js";
 import { OriginalRepairFeedbackReader } from "./services/original-repair-feedback-reader.js";
@@ -1060,6 +1062,8 @@ export async function createApplication({
   let codeExecutorRuntime = null;
   let changePackageRuntime = null;
   let automaticOwnPrRepair = null;
+  let automaticLocalCodeAuthorization = null;
+  let codeAuthorizationRoleRegistry = null;
   let automaticReviewScopeExitReader = null;
   let workflowRouting = null;
   let workLedgerRuntime = null;
@@ -2055,6 +2059,13 @@ export async function createApplication({
           conflictInspectionReader: codeExecutorRuntime?.conflictInspectionReader,
           ...(codeExecutorRuntime?.conflictSourceReader ? { codeJobControl, taskRuns } : {}) }) });
       await automaticOwnPrRepair.recover();
+      automaticLocalCodeAuthorization = new AutomaticLocalCodeAuthorization({
+        ...ownPrRepairDependencies,
+        specialized: automaticOwnPrRepair,
+        roleStateReader: { async read(roleId) {
+          return codeAuthorizationRoleRegistry?.get(roleId)?.roleView() ?? null;
+        } },
+      });
     }
     if (localCodeExecutionEnabled && !confirmationRuntime) {
       throw new Error("本地代码工作提案需要可用的确认运行时");
@@ -2226,7 +2237,7 @@ export async function createApplication({
           codeJobReader,
           grantFactory,
           ...(automaticOwnPrRepair === null ? {} : {
-            automaticOwnPrRepair,
+            automaticOwnPrRepair: automaticLocalCodeAuthorization,
             // Two current-fact checks bracket globally bounded Git preparation.
             // Leave a margin for persisting the result before the lease expires.
             handlerTimeoutMs: Math.min(
@@ -2363,6 +2374,7 @@ export async function createApplication({
       prEmployee,
       ...configuredWorkforce.employees,
     ]);
+    codeAuthorizationRoleRegistry = employeeRegistry;
     let workLedgerView = null;
     let dailyWorkLedgerView = null;
     let workGraphView = null;
@@ -2903,6 +2915,33 @@ export async function createApplication({
       },
       operationsRuntimeDependencies,
     );
+    const standardReviewHandoff = ownerWorkRequests && confirmationRuntime?.reviewHandoffs
+      ? new ReviewHandoffReconciler({
+          confirmations: confirmationRuntime.reviewHandoffs,
+          ownerWorkRequests,
+          githubAssignee: confirmationRuntime.reviewHandoffAssignee,
+          testingOwnersByProduct: config.workCoordination?.policy?.testingOwnersByProduct || {},
+          automaticAssignmentsEnabled: config.githubActions?.automaticReview === true && config.githubActions?.assignAfterAutomaticReview !== false,
+          timeoutMs: 2 * (config.githubActions?.timeoutMs ?? 60_000) +
+            (coordinationTiming?.resolveTimeoutMs ?? 30_000),
+        }) : null;
+    const ownPrHandoff = ownPrRepairEnabled && workLedgerRuntime && codeJobReader && confirmationRuntime?.reviewHandoffAssignee
+      ? new AutomaticOwnPrHandoff({ store, configurationReader: configurationRuntime.reader,
+          ledger: workLedgerRuntime, github, codeJobReader, assignee: confirmationRuntime.reviewHandoffAssignee,
+          roleStateReader: { async read(roleId) { return employeeRegistry.get(roleId)?.roleView() ?? null; } },
+        }) : null;
+    const reviewHandoffReconciler = ownPrHandoff === null ? standardReviewHandoff : Object.freeze({
+      async runCycle(options = {}) {
+        const runOperation = options.runOperation ?? (operation => operation());
+        const results = await Promise.allSettled([
+          standardReviewHandoff?.runCycle(options),
+          runOperation(() => ownPrHandoff.runCycle({ signal: options.signal ?? null })),
+        ]);
+        const errors = results.filter(result => result.status === 'rejected').map(result => result.reason);
+        if (errors.length) throw new AggregateError(errors, 'Review handoff recovery failed');
+        return results.flatMap(result => result.value === undefined ? [] : Array.isArray(result.value) ? result.value : [result.value]);
+      },
+    });
     const close = () => runtimeLifecycle.close();
     return {
       config,
@@ -2944,18 +2983,7 @@ export async function createApplication({
       workCoordination,
       ownerWorkRetry,
       ownerWorkRequests,
-      reviewHandoffReconciler: ownerWorkRequests && confirmationRuntime?.reviewHandoffs
-        ? new ReviewHandoffReconciler({
-            confirmations: confirmationRuntime.reviewHandoffs,
-            ownerWorkRequests,
-            githubAssignee: confirmationRuntime.reviewHandoffAssignee,
-            testingOwnersByProduct: config.workCoordination?.policy?.testingOwnersByProduct || {},
-            automaticAssignmentsEnabled: config.githubActions?.automaticReview === true && config.githubActions?.assignAfterAutomaticReview !== false,
-            // Local intake, target verification, then assignment each need their budget.
-            timeoutMs: 2 * (config.githubActions?.timeoutMs ?? 60_000) +
-              (coordinationTiming?.resolveTimeoutMs ?? 30_000),
-          })
-        : null,
+      reviewHandoffReconciler,
       deliveryEvidence,
       memorySearch,
       memoryAnswer,

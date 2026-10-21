@@ -4381,6 +4381,7 @@ test("automatic own PR repair composes internal push with ownership guards and c
           calls.confirmation = dependencies;
           assert.throws(() => calls.externalExecutor.pushAuthorization.verifyPush(repairEnvelope), { code: "GITHUB_AUTHORIZATION_UNAVAILABLE" });
           return {
+            reviewHandoffAssignee: { async assignAssignee() { throw new Error("No live assignment in composition test"); } },
             queue: confirmationQueuePort(), producerQueue: confirmationProducerPort(),
             memoryProjectionSource: confirmationMemoryProjectionSourcePort(),
             applicationResultSource: { async readSnapshot() {} },
@@ -4495,6 +4496,9 @@ test("automatic own PR repair composes internal push with ownership guards and c
             t.mock.restoreAll();
           }
         }
+        const { AutomaticLocalCodeAuthorization } = await import('../src/services/automatic-local-code-authorization.js');
+        assert.ok(calls.codeRunner.automaticOwnPrRepair instanceof AutomaticLocalCodeAuthorization);
+        assert.deepEqual(await application.reviewHandoffReconciler.runCycle(), [{ assigned: 0, already: 0, pending: 0 }]);
         assert.equal(application.prEmployee.config.automaticOwnPrRepair, true);
         assert.deepEqual(calls.externalExecutor.enabledActions, ["push"]);
         assert.deepEqual(config.githubActions.enabledActions, explicitPush ? ["push"] : []);

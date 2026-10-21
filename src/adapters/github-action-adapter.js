@@ -145,6 +145,7 @@ function normalizeAssigneeRequest(value) {
     "pullRequestNumber",
     "assigneeLogin",
     ...(Object.hasOwn(value, "expectedHeadOid") ? ["expectedHeadOid"] : []),
+    ...(Object.hasOwn(value, "expectedAssigneeLogin") ? ["expectedAssigneeLogin"] : []),
   ]);
   const actorAccountId = exactString(value.actorAccountId, GITHUB_LOGIN, 39);
   const assigneeLogin = exactString(value.assigneeLogin, GITHUB_LOGIN, 39);
@@ -166,6 +167,7 @@ function normalizeAssigneeRequest(value) {
     pullRequestNumber: value.pullRequestNumber,
     assigneeLogin,
     ...(Object.hasOwn(value, "expectedHeadOid") ? { expectedHeadOid: exactString(value.expectedHeadOid, SHA, 64) } : {}),
+    ...(Object.hasOwn(value, "expectedAssigneeLogin") ? { expectedAssigneeLogin: exactString(value.expectedAssigneeLogin, GITHUB_LOGIN, 39) } : {}),
   });
 }
 
@@ -738,6 +740,7 @@ class GitHubActionAdapter {
             { childEnvironment, operation: credentialOperation },
           );
           this.#assertAssignablePullRequest(current, request);
+          this.#assertHandoffOwner(current, request);
           let observed = current;
           let changed = false;
           if (!this.#hasAssignee(observed, request.assigneeLogin)) {
@@ -761,10 +764,11 @@ class GitHubActionAdapter {
             }
             changed = true;
           }
+          const previousOwner = request.expectedAssigneeLogin || request.actor.accountId;
           if (
-            request.actor.accountId.toLowerCase() !==
+            previousOwner.toLowerCase() !==
               request.assigneeLogin.toLowerCase() &&
-            this.#hasAssignee(observed, request.actor.accountId)
+            this.#hasAssignee(observed, previousOwner)
           ) {
             await this.#assertHandoffHead(request, childEnvironment, credentialOperation);
             await this.#assertActor(
@@ -776,7 +780,7 @@ class GitHubActionAdapter {
               ["api", "--method", "DELETE", `${route}/assignees`, "--input", "-"],
               {
                 input: JSON.stringify({
-                  assignees: [request.actor.accountId],
+                  assignees: [previousOwner],
                 }),
                 childEnvironment,
                 operation: credentialOperation,
@@ -785,7 +789,7 @@ class GitHubActionAdapter {
             this.#assertAssignablePullRequest(observed, request);
             if (
               !this.#hasAssignee(observed, request.assigneeLogin) ||
-              this.#hasAssignee(observed, request.actor.accountId)
+              this.#hasAssignee(observed, previousOwner)
             ) {
               throw actionError("GITHUB_PROTOCOL");
             }
@@ -807,6 +811,16 @@ class GitHubActionAdapter {
     if (!request.expectedHeadOid) return;
     const pr = await this.#runJson(["api", "--method", "GET", `repos/${request.repository}/pulls/${request.pullRequestNumber}`], { childEnvironment, operation });
     if (pr?.state !== "open" || pr?.head?.sha !== request.expectedHeadOid) throw actionError("GITHUB_HANDOFF_HEAD_CHANGED", "absent");
+    this.#assertHandoffOwner(pr, request);
+  }
+
+  #assertHandoffOwner(pr, request) {
+    if (!request.expectedAssigneeLogin) return;
+    const allowed = [request.expectedAssigneeLogin, request.assigneeLogin].map(login => login.toLowerCase());
+    if (!Array.isArray(pr.assignees) || pr.assignees.length === 0 ||
+        pr.assignees.some(person => typeof person?.login !== 'string' || !allowed.includes(person.login.toLowerCase()))) {
+      throw actionError('GITHUB_HANDOFF_OWNER_CHANGED', 'absent');
+    }
   }
 
   async assignReviewOutcome(input, { signal = null } = {}) {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { GitHubAdapter } from "../src/adapters/github-adapter.js";
-import { readOwnReviewFeedback, summarizeOwnReviewFeedback } from "../src/adapters/github-own-review-feedback.js";
+import { readOwnReviewFeedback, readOwnPullRequestHandoff, summarizeOwnReviewFeedback } from "../src/adapters/github-own-review-feedback.js";
 
 const ACCOUNT = "local-owner";
 const HEAD = "a".repeat(40);
@@ -67,6 +67,56 @@ function page(nodes, hasNextPage = false, endCursor = null) {
 function pullRequest(overrides = {}) {
   return { number: 42, url: "https://github.com/acme/repo/pull/42", author: { login: ACCOUNT }, state: "OPEN", headRefOid: HEAD, reviewDecision: "CHANGES_REQUESTED", ...overrides };
 }
+
+test("handoff reads only paged review metadata and dismissal supersedes approval while comments do not", async () => {
+  const queries = [];
+  const base = pullRequest({ isDraft: false, updatedAt: AT, assignees: page([{ login: ACCOUNT }]) });
+  const approvals = [review({ id: "approved", state: "APPROVED" }),
+    review({ id: "other-approved", author: { login: "other" }, state: "APPROVED" })];
+  const later = [review({ id: "dismissed", state: "DISMISSED", submittedAt: "2026-10-10T02:00:00Z" }),
+    review({ id: "commented", author: { login: "other" }, state: "COMMENTED", submittedAt: "2026-10-10T03:00:00Z" })];
+  const adapter = new GitHubAdapter({ run: async (_command, args) => {
+    if (args.at(-1) === "user") return { login: ACCOUNT };
+    const query = args.find(value => value.startsWith("query=")); queries.push(query);
+    return { data: { repository: { pullRequest: { ...base,
+      ...(query.includes("after: $cursor") ? { reviews: page(later) } :
+        query.includes("reviews(first:") ? { reviews: page(approvals, true, "next") } : {}) } } } };
+  } });
+  const result = await adapter.readOwnPullRequestHandoff({ repository: "acme/repo", number: 42, account: ACCOUNT });
+  assert.equal(queries.length, 3);
+  assert.ok(queries.every(query => !query.includes("reviewThreads") && !query.includes("body")));
+  assert.deepEqual(result.reviewDecisions.map(({ author, state }) => ({ author, state })), [
+    { author: "reviewer", state: "DISMISSED" }, { author: "other", state: "APPROVED" },
+  ]);
+});
+
+for (const variant of ["head", "lifecycle", "updatedAt", "assignees", "incomplete-assignees", "duplicate-review"]) {
+  test(`handoff rejects inconsistent metadata (${variant})`, async () => {
+    let call = 0;
+    const base = pullRequest({ isDraft: false, updatedAt: AT, assignees: page([{ login: ACCOUNT }]) });
+    await assert.rejects(readOwnPullRequestHandoff(async () => {
+      call++;
+      const pr = { ...base };
+      if (call === 1) pr.reviews = page([review()], variant === "duplicate-review", "next");
+      else if (variant === "head") pr.headRefOid = "b".repeat(40);
+      else if (variant === "lifecycle") pr.state = "CLOSED";
+      else if (variant === "updatedAt") pr.updatedAt = "2026-10-10T02:00:00Z";
+      else if (variant === "assignees") pr.assignees = page([{ login: "other" }]);
+      else if (variant === "duplicate-review") pr.reviews = page([review()]);
+      if (variant === "incomplete-assignees") pr.assignees = page([{ login: ACCOUNT }], true, "next");
+      return { data: { repository: { pullRequest: pr } } };
+    }, { repository: "acme/repo", number: 42, account: ACCOUNT }));
+  });
+}
+
+test("full feedback shares the dismissal-aware handoff decision projection", async () => {
+  const result = await readOwnReviewFeedback(async () => ({ data: { repository: { pullRequest: pullRequest({
+    reviews: page([review({ id: "old", state: "APPROVED" }),
+      review({ id: "dismissed", state: "DISMISSED", submittedAt: "2026-10-10T02:00:00Z" })]),
+    reviewThreads: page([]),
+  }) } } }), { repository: "acme/repo", number: 42, account: ACCOUNT });
+  assert.equal(result.reviewDecisions[0].state, "DISMISSED");
+});
 
 test("live own feedback queries and returns the current Draft fact", async () => {
   const queries = [];

@@ -1,10 +1,21 @@
 import { createHash } from "node:crypto";
 import { GITHUB_CURRENT_PULL_REQUEST_FIELDS, githubCurrentPullRequestGitTarget } from "./github-current-pull-request-target.js";
 
-const PR_IDENTITY = "number url author { login } state isDraft headRefOid reviewDecision updatedAt";
+const PR_IDENTITY = "number url author { login } state isDraft headRefOid reviewDecision updatedAt assignees(first: 100) { nodes { login } pageInfo { hasNextPage } }";
 const REVIEW_FIELDS = "id author { login } state submittedAt commit { oid } body url";
+const HANDOFF_REVIEW_FIELDS = "id author { login } state submittedAt commit { oid }";
 const COMMENT_FIELDS = "id author { login } body createdAt updatedAt url pullRequestReview { id state submittedAt commit { oid } }";
 const PAGE_INFO = "pageInfo { hasNextPage endCursor }";
+const HANDOFF_QUERY = `query OwnPullRequestHandoff($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    ${PR_IDENTITY} reviews(first: 100) { nodes { ${HANDOFF_REVIEW_FIELDS} } ${PAGE_INFO} }
+  } }
+}`;
+const HANDOFF_REVIEWS_QUERY = `query OwnPullRequestHandoffReviews($owner: String!, $name: String!, $number: Int!, $cursor: String!) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    ${PR_IDENTITY} reviews(first: 100, after: $cursor) { nodes { ${HANDOFF_REVIEW_FIELDS} } ${PAGE_INFO} }
+  } }
+}`;
 const THREAD_FIELDS = `id path line originalLine isResolved isOutdated comments(first: 100) { nodes { ${COMMENT_FIELDS} } ${PAGE_INFO} }`;
 const INITIAL_QUERY = `query OwnReviewFeedback($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
@@ -78,13 +89,7 @@ export function ownReviewFeedbackDigest(feedback) {
 
 export function summarizeOwnReviewFeedback({ reviews, threads }, account) {
   const normalizedAccount = account.toLowerCase();
-  const latestDecisions = new Map();
-  for (const review of reviews) {
-    const reviewer = login(review);
-    if (!reviewer || reviewer === normalizedAccount || !["APPROVED", "CHANGES_REQUESTED"].includes(review.state)) continue;
-    const previous = latestDecisions.get(reviewer);
-    if (!previous || Date.parse(review.submittedAt) >= Date.parse(previous.submittedAt)) latestDecisions.set(reviewer, review);
-  }
+  const latestDecisions = latestReviewDecisions(reviews, account);
   const changeRequests = sortById([...latestDecisions.values()]
     .filter(({ state }) => state === "CHANGES_REQUESTED")
     .map((review) => ({
@@ -130,6 +135,32 @@ export function summarizeOwnReviewFeedback({ reviews, threads }, account) {
     reviewFeedbackFingerprints,
     feedback,
   };
+}
+
+function latestReviewDecisions(reviews, account, includeDismissed = false) {
+  const normalizedAccount = account.toLowerCase();
+  const latestDecisions = new Map();
+  for (const review of reviews) {
+    const reviewer = login(review);
+    if (!reviewer || reviewer === normalizedAccount ||
+        !["APPROVED", "CHANGES_REQUESTED", ...(includeDismissed ? ["DISMISSED"] : [])].includes(review.state)) continue;
+    const previous = latestDecisions.get(reviewer);
+    if (!previous || Date.parse(review.submittedAt) >= Date.parse(previous.submittedAt)) latestDecisions.set(reviewer, review);
+  }
+  return latestDecisions;
+}
+
+function handoffReviewDecisions(reviews, account) {
+  return [...latestReviewDecisions(reviews, account, true).values()].map(review => ({
+    author: review.author.login, state: review.state,
+    reviewedHeadRefOid: review.commit?.oid || "", submittedAt: review.submittedAt,
+  }));
+}
+
+function handoffAssignees(pr) {
+  if (!Array.isArray(pr.assignees?.nodes) || pr.assignees.pageInfo?.hasNextPage !== false ||
+      pr.assignees.nodes.some(node => typeof node?.login !== "string")) throw invalid("assignees are incomplete");
+  return pr.assignees.nodes.map(node => node.login);
 }
 
 function assertPullRequest(pr, identity, expectedHead = null) {
@@ -230,8 +261,35 @@ export async function readOwnReviewFeedback(run, identity, options = {}) {
     number: identity.number,
     headRefOid: pr.headRefOid,
     reviewDecision: pr.reviewDecision || "",
+    ...(pr.assignees === undefined ? {} : { assignees: handoffAssignees(pr) }),
+    reviewDecisions: handoffReviewDecisions(reviews, identity.account),
     ...summarizeOwnReviewFeedback({ reviews, threads }, identity.account),
   };
+}
+
+export async function readOwnPullRequestHandoff(run, identity, options = {}) {
+  const [owner, name] = identity.repository.split("/");
+  const parameters = { owner, name, number: identity.number };
+  const initial = await graphql(run, HANDOFF_QUERY, parameters, options);
+  const pr = assertPullRequest(initial.repository?.pullRequest, identity);
+  const assignees = handoffAssignees(pr);
+  const reviews = await readPages(pr.reviews, async cursor => {
+    const result = await graphql(run, HANDOFF_REVIEWS_QUERY, { ...parameters, cursor }, options);
+    const current = assertPullRequest(result.repository?.pullRequest, identity, pr.headRefOid);
+    assertSameLifecycle(current, pr);
+    return current.reviews;
+  });
+  assertNodes(reviews, "review");
+  const final = await graphql(run, IDENTITY_QUERY, parameters, options);
+  const current = assertPullRequest(final.repository?.pullRequest, identity, pr.headRefOid);
+  assertSameLifecycle(current, pr);
+  if (typeof pr.isDraft !== "boolean" || typeof pr.updatedAt !== "string" || !Number.isFinite(Date.parse(pr.updatedAt)) ||
+      current.reviewDecision !== pr.reviewDecision || current.updatedAt !== pr.updatedAt ||
+      JSON.stringify(handoffAssignees(current)) !== JSON.stringify(assignees)) throw invalid("changed during read");
+  return { state: pr.state.toLowerCase(), isDraft: pr.isDraft, author: pr.author.login,
+    currentUser: identity.account, repo: identity.repository, number: identity.number,
+    headRefOid: pr.headRefOid, reviewDecision: pr.reviewDecision || "", assignees,
+    reviewDecisions: handoffReviewDecisions(reviews, identity.account) };
 }
 
 export async function readOwnPullRequestConflict(run, identity, options = {}) {

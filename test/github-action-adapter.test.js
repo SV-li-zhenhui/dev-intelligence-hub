@@ -1486,3 +1486,58 @@ test("pending and rejected confirmations never acquire a Review credential", asy
 
   assert.equal(acquisitions, 0);
 });
+
+
+test("named reviewer handoff adds QA before removing the reviewer", async () => {
+  const request = { actorAccountId: "local-owner", repository: "acme/command-center",
+    pullRequestNumber: 42, expectedHeadOid: HEAD, expectedAssigneeLogin: "human-reviewer", assigneeLogin: "qt-tester" };
+  const live = assignees => ({ ...pullRequestIssue(assignees), head: { sha: HEAD } });
+  const runner = new FakeRunner([
+    actor(), pullRequestIssue(["human-reviewer"]), live(["human-reviewer"]), actor(),
+    pullRequestIssue(["human-reviewer", "qt-tester"]), live(["human-reviewer", "qt-tester"]), actor(),
+    pullRequestIssue(["qt-tester"]),
+  ]);
+  assert.deepEqual(await createAdapter(runner).assignAssignee(request), { status: "applied", assigneeLogin: "qt-tester" });
+  const writes = runner.calls.filter(call => call.args.includes("POST") || call.args.includes("DELETE"));
+  assert.equal(writes.length, 2);
+  assert.ok(writes[0].args.includes("POST"));
+  assert.deepEqual(JSON.parse(writes[0].input), { assignees: ["qt-tester"] });
+  assert.ok(writes[1].args.includes("DELETE"));
+  assert.deepEqual(JSON.parse(writes[1].input), { assignees: ["human-reviewer"] });
+  assert.equal(runner.responses.length, 0);
+});
+
+test("named reviewer handoff refuses owner or Head drift before writing", async t => {
+  const request = { actorAccountId: "local-owner", repository: "acme/command-center",
+    pullRequestNumber: 42, expectedHeadOid: HEAD, expectedAssigneeLogin: "human-reviewer", assigneeLogin: "qt-tester" };
+  for (const [name, responses, code] of [
+    ["initial owner", [actor(), pullRequestIssue(["other-owner"])], "GITHUB_HANDOFF_OWNER_CHANGED"],
+    ["live owner", [actor(), pullRequestIssue(["human-reviewer"]), { ...pullRequestIssue(["other-owner"]), head: { sha: HEAD } }], "GITHUB_HANDOFF_OWNER_CHANGED"],
+    ["live Head", [actor(), pullRequestIssue(["human-reviewer"]), { ...pullRequestIssue(["human-reviewer"]), head: { sha: OTHER_HEAD } }], "GITHUB_HANDOFF_HEAD_CHANGED"],
+  ]) await t.test(name, async () => {
+    const runner = new FakeRunner(responses);
+    await assert.rejects(createAdapter(runner).assignAssignee(request), { code });
+    assert.equal(runner.calls.some(call => call.args.includes("POST") || call.args.includes("DELETE")), false);
+    assert.equal(runner.responses.length, 0);
+  });
+});
+
+test("named reviewer handoff converges after an add succeeds but its acknowledgement is lost", async () => {
+  const request = { actorAccountId: "local-owner", repository: "acme/command-center",
+    pullRequestNumber: 42, expectedHeadOid: HEAD, expectedAssigneeLogin: "human-reviewer", assigneeLogin: "qt-tester" };
+  const live = assignees => ({ ...pullRequestIssue(assignees), head: { sha: HEAD } });
+  let owners = ["human-reviewer"];
+  const first = new FakeRunner([actor(), pullRequestIssue(owners), live(owners), actor(), () => {
+    owners = ["human-reviewer", "qt-tester"];
+    throw new Error("assignment acknowledgement lost");
+  }]);
+  await assert.rejects(createAdapter(first).assignAssignee(request));
+  assert.equal(first.calls.some(call => call.args.includes("DELETE")), false);
+  assert.deepEqual(owners, ["human-reviewer", "qt-tester"]);
+  const retry = new FakeRunner([actor(), pullRequestIssue(owners), live(owners), actor(), pullRequestIssue(["qt-tester"])]);
+  assert.deepEqual(await createAdapter(retry).assignAssignee(request), { status: "applied", assigneeLogin: "qt-tester" });
+  assert.equal(retry.calls.some(call => call.args.includes("POST")), false);
+  const removal = retry.calls.find(call => call.args.includes("DELETE"));
+  assert.deepEqual(JSON.parse(removal.input), { assignees: ["human-reviewer"] });
+  assert.equal(retry.responses.length, 0);
+});
