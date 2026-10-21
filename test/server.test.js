@@ -8,6 +8,55 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
+import { WorkContinuationScheduler } from '../src/services/work-continuation-scheduler.js';
+
+test('durable continuations start automatically after fresh intake and hand off without a role timer', { timeout: 5_000 }, async () => {
+  const refresh = deferred();
+  const developerStarted = deferred();
+  const releaseDeveloper = deferred();
+  const testerStarted = deferred();
+  const releaseTester = deferred();
+  const item = { itemId: 'work-continuation', revision: 1, status: 'queued', currentTarget: { type: 'role', id: 'developer' } };
+  let persisted;
+  let factRead = false;
+  const roles = [];
+  const config = { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } };
+  const scheduler = new WorkContinuationScheduler({
+    store: { async read(_key, fallback) { return structuredClone(persisted ?? fallback); }, async write(_key, state) { persisted = structuredClone(state); } },
+    ledger: {
+      async listClaimCandidates() { assert.equal(factRead, true); return { items: [structuredClone(item)], facts: [{ itemId: item.itemId, graphBlocked: false }], nextCursor: null }; },
+      async readItemForReconciliation() { return structuredClone(item); },
+      async readItemProgress() { return [structuredClone(item)]; },
+    },
+    configurationReader: { async readActive() { return { configuration: config }; } },
+    roleStateReader: { async read() { return { enabled: true, paused: false }; } },
+  });
+  const timers = [];
+  const background = startApplicationBackgroundWork({ config, workContinuationScheduler: scheduler,
+    refreshService: { async refresh() { await refresh.promise; factRead = true; } },
+    employeeRegistry: { schedules: () => [], async runSelected(ids) {
+      const role = ids[0]; if (!['developer', 'tester'].includes(role)) return;
+      roles.push(role);
+      if (role === 'developer') { developerStarted.resolve(); await releaseDeveloper.promise; item.currentTarget.id = 'tester'; item.revision += 1; }
+      if (role === 'tester') { testerStarted.resolve(); await releaseTester.promise; item.revision += 1; }
+    } },
+  }, { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {} });
+  try {
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(persisted, undefined);
+    refresh.resolve(); await developerStarted.promise;
+    assert.equal(persisted.records[0].status, 'running');
+    const tick = timers.find(timer => timer.delay === 10_000);
+    await tick.callback(); assert.deepEqual(roles, ['developer']);
+    releaseDeveloper.resolve(); await testerStarted.promise;
+    assert.deepEqual(roles, ['developer', 'tester']);
+    assert.ok(background.drainStatus().activeParticipants.some(({ id }) => id === DRAIN_PARTICIPANTS.workContinuation.id));
+    let stopped = false;
+    const stopping = background.stop().then(() => { stopped = true; });
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(stopped, false);
+    releaseTester.resolve(); await stopping; await background.initialRefresh;
+    assert.notEqual(persisted.records[0].status, 'running', 'the durable acknowledgement must be included in shutdown drain');
+  } finally { refresh.resolve(); releaseDeveloper.resolve(); releaseTester.resolve(); await background.stop(); }
+});
 import { createApplication } from "../src/composition-root.js";
 import {
   createDashboardServer,
@@ -2138,7 +2187,7 @@ test("production drain participants reject every public trigger before execution
   const reportedErrors = [];
   const executed = [];
   const participantIds = Object.values(DRAIN_PARTICIPANTS).filter(
-    (participant) => participant !== DRAIN_PARTICIPANTS.reviewHandoffRecovery,
+    (participant) => participant !== DRAIN_PARTICIPANTS.reviewHandoffRecovery && participant !== DRAIN_PARTICIPANTS.workContinuation,
   ).map(
     (participant) => participant.id,
   );

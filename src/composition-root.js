@@ -10,6 +10,7 @@ import { AutomaticReviewPublisher } from "./services/automatic-review-publisher.
 import { AutomaticOwnPrRepair } from "./services/automatic-own-pr-repair.js";
 import { AutomaticLocalCodeAuthorization } from "./services/automatic-local-code-authorization.js";
 import { AutomaticOwnPrHandoff } from "./services/automatic-own-pr-handoff.js";
+import { WorkContinuationScheduler } from "./services/work-continuation-scheduler.js";
 import { HistoricalControlledCommitReader } from "./services/historical-controlled-commit-reader.js";
 import { ReviewRepairContextReader, normalizeReviewRepairFeedbackContext } from "./services/review-repair-context-reader.js";
 import { OriginalRepairFeedbackReader } from "./services/original-repair-feedback-reader.js";
@@ -1067,6 +1068,7 @@ export async function createApplication({
   let automaticReviewScopeExitReader = null;
   let workflowRouting = null;
   let workLedgerRuntime = null;
+  let workContinuationScheduler = null;
   const originalRepairFeedbackReader = new OriginalRepairFeedbackReader({
     store,
     executionContextReader: Object.freeze({
@@ -2630,6 +2632,18 @@ export async function createApplication({
           ? {}
           : { actionAdmissionGate: ordinaryActionAdmissionGate }),
       });
+      if (configurationRuntime && typeof workLedgerRuntime?.listClaimCandidates === "function" &&
+          typeof workLedgerRuntime?.readItemForReconciliation === "function" && typeof workLedgerRuntime?.readItemProgress === "function") {
+        workContinuationScheduler = new WorkContinuationScheduler({
+          store, ledger: workLedgerRuntime, configurationReader: configurationRuntime.reader, taskRuns,
+          roleStateReader: { async read(roleId) { return employeeRegistry.get(roleId)?.roleView() ?? null; } },
+          preparations: [
+            () => proposalResultReconciler.runCycle({ limit: 10 }),
+            () => conditionWaker.runCycle({ limit: 10 }),
+          ],
+          ...clockOptions,
+        });
+      }
       const workLoop = proactiveWorkLoopFactory({
         taskRuns,
         ledger: Object.freeze({ ...workLedgerRuntime, verifyPullRequestExecutionBinding: inputAuthorityVerifier.verify }),
@@ -2981,6 +2995,7 @@ export async function createApplication({
       attentionBrowser,
       attentionCoordinator,
       workCoordination,
+      workContinuationScheduler,
       ownerWorkRetry,
       ownerWorkRequests,
       reviewHandoffReconciler,

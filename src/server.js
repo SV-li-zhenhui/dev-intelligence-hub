@@ -62,6 +62,7 @@ export const DRAIN_PARTICIPANTS = Object.freeze({
     "prReviewer.recoverConfirmations",
   ),
   workCoordinationCycle: drainParticipant("workCoordination.runCycle"),
+  workContinuation: drainParticipant("workContinuationScheduler.runCycle"),
   reviewHandoffRecovery: drainParticipant("reviewHandoffReconciler.runCycle"),
   employeeExecution: drainParticipant(
     "employeeRegistry.runSelected/runAll/run",
@@ -2764,6 +2765,7 @@ export function createDashboardServer(
           refreshing: Boolean(application.refreshService.running),
           employee,
           employees,
+          ...(application.workContinuationScheduler ? { continuations: application.workContinuationScheduler.readStatus() } : {}),
           ...(runtimeSource ? { runtimeSource } : {}),
           ...(memory ? { memory } : {}),
         });
@@ -4240,6 +4242,7 @@ export function startApplicationBackgroundWork(
       });
       options.signal.throwIfAborted();
       if (employeeId === "pr-engineer") await recoverReviewHandoffs(options.signal);
+      signalWorkContinuations();
       return { skipped: null };
     } finally {
       activeIndependentEmployeeCycles -= 1;
@@ -4495,6 +4498,7 @@ export function startApplicationBackgroundWork(
     if (signal.aborted) throwAgencyCycleFailures(failures, signal);
     await projectMemory(failures, signal, "memory_after_employee");
     throwAgencyCycleFailures(failures, signal);
+    signalWorkContinuations();
     return { skipped: null };
   }
 
@@ -4582,6 +4586,21 @@ export function startApplicationBackgroundWork(
     );
   }
 
+  function signalWorkContinuations() {
+    if (stopped || !independentEmployeeFactsReady() || !application.workContinuationScheduler) return Promise.resolve();
+    return runCoalescedTracked(coalescedAgencyCycles, "work-continuations", (signal) =>
+      runDrainParticipant(DRAIN_PARTICIPANTS.workContinuation, () => application.workContinuationScheduler.runCycle({
+        signal,
+        dispatch: ({ roleId }) => runCoalescedAgencyCycle(`employee:${roleId}`, {
+          trigger: "scheduled", employeeIds: [roleId], discardWhenFactsPending: true,
+        }, backgroundPriority.scheduled, { rethrow: true, admitOnDequeue: true }),
+        runOperation: operation => runTracked(
+          () => runDrainParticipant(DRAIN_PARTICIPANTS.workContinuation, operation), { rethrow: true },
+        ),
+      })),
+    );
+  }
+
   function enqueueFactCycle(factOperation, signal = workController.signal) {
     const sequence = ++factCycleSequence;
     pendingFactCycles += 1;
@@ -4608,6 +4627,7 @@ export function startApplicationBackgroundWork(
         factsReady = true;
         readyFactCycleSequence = sequence;
         if (independentEmployeeFactsReady()) releaseIndependentEmployeeFactWaiters(true);
+        signalWorkContinuations();
         if (pendingFactCycles === 1) {
           confirmationAccess.open();
           try {
@@ -4658,6 +4678,10 @@ export function startApplicationBackgroundWork(
     { notify: false },
     { rethrow: true },
   );
+
+  if (application.workContinuationScheduler) {
+    timers.push(setIntervalFn(signalWorkContinuations, 10_000));
+  }
 
   timers.push(
     setIntervalFn(

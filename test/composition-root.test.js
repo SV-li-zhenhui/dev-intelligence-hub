@@ -593,6 +593,33 @@ function memoryStore() {
   };
 }
 
+test("versioned automatic composition wires durable continuations to the shared ledger and reconcilers", async () => {
+  const config = structuredClone(defaultCodeJobConfiguration());
+  config.codeExecutor = { enabled: false };
+  config.workCoordination.policy.workspaceByRepository = {};
+  config.githubActions = { ...workCoordinationConfig().githubActions, enabledActions: [], automaticReview: true };
+  const closeCalls = [], calls = {};
+  const stubs = localCoordinationStubs({ calls, closeCalls, runners: {} });
+  const ledger = await stubs.workLedgerRuntimeFactory({});
+  let scans = 0, reconciled = 0, conditions = 0;
+  Object.assign(ledger, {
+    async listClaimCandidates() { scans += 1; return { items: [], facts: [], nextCursor: null }; },
+    async readItemProgress() { return []; },
+  });
+  const application = await createApplication({
+    ...stubs, config, store: memoryStore(), versionedConfiguration: true,
+    configurationRuntimeFactory: configurationRuntimeFactory(config, closeCalls),
+    workLedgerRuntimeFactory: async () => ledger,
+    workProposalResultReconcilerFactory: () => ({ async runCycle() { reconciled += 1; } }),
+    workConditionWakerFactory: () => ({ async runCycle() { conditions += 1; } }),
+  });
+  try {
+    assert.ok(application.workContinuationScheduler);
+    assert.deepEqual(await application.workContinuationScheduler.runCycle({ dispatch: async () => { assert.fail('no ready work'); } }), { started: 0, skipped: null });
+    assert.deepEqual([scans, reconciled, conditions], [1, 1, 1]);
+  } finally { await application.close(); }
+});
+
 test("review handoff admits the configured GitHub and local resolution budgets", async () => {
   const config = workCoordinationConfig();
   config.githubActions.timeoutMs = 60_000;

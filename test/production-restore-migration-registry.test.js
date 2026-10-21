@@ -106,6 +106,7 @@ const EXPECTED_OWNER_IDS = Object.freeze([
   "confirmation-queue",
   "task-run-execution-receipts",
   "automatic-own-pr-repair-state",
+  "work-continuations",
   "original-repair-feedback-archive",
   "work-proposal-state",
   "attention-inbox",
@@ -315,6 +316,20 @@ test("a future ledger schema blocks the production restore before any writes", a
   });
   await assert.rejects(createProductionRestoreMigrationRegistry().migrate(fixture));
   assert.equal(writes, 0);
+});
+
+test("durable continuations are validated during restore without losing pending wakes", async (t) => {
+  const owner = allPersistedSchemaOwners().find(({ ownerId }) => ownerId === "work-continuations");
+  assert.equal(owner.mode, "validate");
+  const state = { schemaVersion: 1, records: [{ itemId: "work-one", roleId: "developer", fingerprint: "a".repeat(64),
+    status: "running", attempt: 2, reason: "work_ready", nextAttemptAt: null, updatedAt: "2026-10-21T00:00:00.000Z" }] };
+  const fixture = await candidateDirectory(t, { "work-continuations.json": state });
+  const file = path.join(fixture.directory, "work-continuations.json");
+  const before = await readFile(file);
+  await createProductionRestoreMigrationRegistry().migrate(fixture);
+  assert.deepEqual(await readFile(file), before);
+  const future = await candidateDirectory(t, { "work-continuations.json": { schemaVersion: 2, records: [] } });
+  await assert.rejects(createProductionRestoreMigrationRegistry().migrate(future));
 });
 
 test("execution receipts are a validated backup owner and remain byte-for-byte unchanged", async (t) => {

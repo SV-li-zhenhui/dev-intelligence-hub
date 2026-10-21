@@ -385,6 +385,7 @@ async function migrateCandidate({ root, catalog, jsonByKey }) {
   for (const ownerId of [
     "task-run-execution-receipts",
     "automatic-own-pr-repair-state",
+    "work-continuations",
     "work-proposal-state",
     "attention-inbox",
     "owner-work-requests",

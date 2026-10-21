@@ -899,6 +899,24 @@ must complete before employees are resumed. Privileged settings remain disabled
 in `config.example.json`; review every enabled role, brain data class, workspace,
 GitHub action, and routing rule in the active version after an upgrade.
 
+## Automatic work continuations
+
+In automatic mode, `work-continuations.json` records the next role to wake,
+the work-item revision, retry time, and wake receipt. Fresh intake and completed
+role runs signal the scheduler; a 10-second scan recovers missed signals. Each
+role still uses its normal claim, permission, current-input, and pause checks.
+
+Wake intent is saved before dispatch. Interrupted wakes are recovered after a
+restart; repeated signals for an active role share its existing execution.
+The ledger remains authoritative, so a crash before the wake record is saved
+is recovered from claimable work. This is recoverable delivery, not an atomic
+transaction between the ledger and wake store.
+
+Three attempts without progress produce a stalled diagnostic and a five-minute
+retry interval. They do not block the ledger or disable the existing role timers.
+`GET /api/health` includes continuation counts and bounded stalled-work details.
+Backup and restore validate the continuation store alongside other state owners.
+
 ## Live GitHub smoke-test cleanup
 
 Any test that creates a real GitHub pull request must register cleanup as soon

@@ -46,6 +46,7 @@ import {
 } from "./controlled-code-executor.js";
 import { TASK_RUN_RECEIPT_STATE_KEY, normalizeTaskRunExecutionReceiptPersistedState } from "./task-run-execution-receipts.js";
 import { AUTOMATIC_OWN_PR_REPAIR_STATE_KEY, normalizeAutomaticOwnPrRepairState } from "./automatic-own-pr-repair.js";
+import { WORK_CONTINUATION_STATE_KEY, normalizeWorkContinuationState } from "./work-continuation-scheduler.js";
 import { ORIGINAL_REPAIR_FEEDBACK_ARCHIVE_PREFIX, normalizeOriginalRepairFeedbackArchiveRecord } from "../domain/original-repair-feedback.js";
 import {
   planLegacyAuthorityProjectionAdoption,
@@ -183,6 +184,10 @@ const OWNER_BASELINES = Object.freeze([
     currentVersion: 2,
     supportedVersions: frozenVersions(1, 2),
     optional: true,
+  }),
+  Object.freeze({
+    ownerId: "work-continuations", key: WORK_CONTINUATION_STATE_KEY, mode: "validate",
+    currentVersion: 1, supportedVersions: frozenVersions(1), optional: true,
   }),
   Object.freeze({
     ownerId: "original-repair-feedback-archive",
@@ -574,6 +579,9 @@ const PRODUCTION_OWNER_CATALOG = Object.freeze([
     normalize: normalizeAutomaticOwnPrRepairState,
   }),
   definePersistedSchemaOwner({
+    ownerId: "work-continuations", normalize: normalizeWorkContinuationState,
+  }),
+  definePersistedSchemaOwner({
     ownerId: "original-repair-feedback-archive",
     normalize: normalizeOriginalRepairFeedbackArchiveRecord,
     verifyImmutable: normalizeOriginalRepairFeedbackArchiveRecord,
@@ -641,6 +649,7 @@ const FIXED_OWNER_KEYS = Object.freeze({
   "confirmation-queue": CONFIRMATION_QUEUE_STATE_KEY,
   "task-run-execution-receipts": TASK_RUN_RECEIPT_STATE_KEY,
   "automatic-own-pr-repair-state": AUTOMATIC_OWN_PR_REPAIR_STATE_KEY,
+  "work-continuations": WORK_CONTINUATION_STATE_KEY,
   "work-proposal-state": WORK_PROPOSAL_STATE_KEY,
   "attention-inbox": ATTENTION_INBOX_STATE_KEY,
   "owner-work-requests": OWNER_WORK_REQUEST_STATE_KEY,
