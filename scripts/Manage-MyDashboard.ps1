@@ -121,6 +121,8 @@ $shutdownFailureRecoveryReason = "managed_shutdown_lifecycle_failure"
 $unexpectedExitRecoveryReason = "managed_process_exit_without_receipt"
 $shutdownFailureEvidenceKind = "shutdown_failure"
 $unexpectedExitEvidenceKind = "unexpected_exit"
+$interruptedShutdownRecoveryReason = "managed_shutdown_exit_without_terminal"
+$interruptedShutdownEvidenceKind = "interrupted_shutdown"
 $unexpectedExitAuthorityInvalidatedMessage = (
     "Unexpected-exit recovery authority was permanently invalidated " +
     "by a late shutdown receipt."
@@ -1416,7 +1418,8 @@ function Get-ValidatedRecoverySnapshot {
         $manifest.reason -isnot [string] -or
         $manifest.reason -notin @(
             $shutdownFailureRecoveryReason,
-            $unexpectedExitRecoveryReason
+            $unexpectedExitRecoveryReason,
+            $interruptedShutdownRecoveryReason
         ) -or
         $manifest.sourceDirectory -isnot [string] -or
         -not $pathComparer.Equals(
@@ -1531,12 +1534,31 @@ function Get-UnexpectedExitRecoveryEvidence {
     }
 }
 
+function Get-InterruptedShutdownRecoveryEvidence {
+    param([Parameter(Mandatory = $true)]$State)
+    $requested = Read-ShutdownReceipt -State $State -Phase "requested"
+    if ($null -eq $requested) { throw "Interrupted shutdown requires an authenticated request receipt." }
+    Assert-RecoveryPathAbsent -Path (Get-ReceiptPath -State $State -Phase "terminal") -Description "Interrupted shutdown terminal receipt"
+    return [pscustomobject]@{
+        Kind = $interruptedShutdownEvidenceKind
+        State = $State
+        Requested = $requested
+        Terminal = $null
+        ControlSha256 = Get-BoundedSha256 -Path $controlFile -Description "Process control state"
+        RequestedSha256 = Get-BoundedSha256 -Path (Get-ReceiptPath -State $State -Phase "requested") -Description "Shutdown request receipt"
+        TerminalSha256 = Get-AbsentRecoveryReceiptSha256 -State $State -Phase "terminal"
+    }
+}
+
 function Get-DeadProcessRecoveryEvidence {
     param([Parameter(Mandatory = $true)]$State)
     $requested = Read-ShutdownReceipt -State $State -Phase "requested"
     $terminal = Read-ShutdownReceipt -State $State -Phase "terminal"
     if ($null -eq $requested -and $null -eq $terminal) {
         return Get-UnexpectedExitRecoveryEvidence -State $State
+    }
+    if ($null -ne $requested -and $null -eq $terminal) {
+        return Get-InterruptedShutdownRecoveryEvidence -State $State
     }
     if ($null -eq $requested -or $null -eq $terminal) {
         throw "Dead-process recovery has incomplete shutdown receipt evidence."
@@ -1554,7 +1576,9 @@ function Assert-SameRecoveryEvidence {
     }
     $current = if ($Evidence.Kind -eq $shutdownFailureEvidenceKind) {
         Get-AuthenticatedRecoveryEvidence -State $currentState
-    } elseif ($Evidence.Kind -eq $unexpectedExitEvidenceKind) {
+    } elseif ($Evidence.Kind -eq $interruptedShutdownEvidenceKind) {
+        Get-InterruptedShutdownRecoveryEvidence -State $currentState
+    } elseif ($Evidence.Kind -in @($unexpectedExitEvidenceKind, $interruptedShutdownEvidenceKind)) {
         Get-UnexpectedExitRecoveryEvidence -State $currentState
     } else {
         throw "Recovery evidence kind is invalid."
@@ -1668,7 +1692,8 @@ function Write-RecoverySnapshotManifest {
         [Parameter(Mandatory = $true)]
         [ValidateSet(
             "managed_shutdown_lifecycle_failure",
-            "managed_process_exit_without_receipt"
+            "managed_process_exit_without_receipt",
+            "managed_shutdown_exit_without_terminal"
         )]
         [string]$Reason
     )
@@ -1719,6 +1744,8 @@ function Prepare-FailedShutdownRecovery {
     }
     $snapshotReason = if ($evidence.Kind -eq $shutdownFailureEvidenceKind) {
         $shutdownFailureRecoveryReason
+    } elseif ($evidence.Kind -eq $interruptedShutdownEvidenceKind) {
+        $interruptedShutdownRecoveryReason
     } else {
         $unexpectedExitRecoveryReason
     }
@@ -2173,7 +2200,7 @@ function Invalidate-UnexpectedExitRecoveryAuthority {
         [Parameter(Mandatory = $true)]$State,
         [Parameter(Mandatory = $true)]$Snapshot
     )
-    if ($Snapshot.Reason -ne $unexpectedExitRecoveryReason) {
+    if ($Snapshot.Reason -notin @($unexpectedExitRecoveryReason, $interruptedShutdownRecoveryReason)) {
         throw "Only unexpected-exit recovery authority can be invalidated by receipt presence."
     }
     if ($Authority.Record.state -ne "invalidated") {
@@ -2240,6 +2267,9 @@ function Assert-OrInvalidateUnexpectedExitRecoveryAuthority {
             Description = "Unexpected-exit shutdown terminal receipt tombstone"
         }
     )
+    if ($Snapshot.Reason -eq $interruptedShutdownRecoveryReason) {
+        $paths = @($paths | Where-Object { $_.Description -notmatch "requested" })
+    }
     foreach ($candidate in $paths) {
         try {
             Assert-RecoveryPathAbsent `
@@ -2297,6 +2327,13 @@ function Get-ArchivedRecoveryEvidence {
         $terminalHash = Get-BoundedSha256 `
             -Path $terminalPath `
             -Description "Archived shutdown terminal receipt"
+    } elseif ($Snapshot.Reason -eq $interruptedShutdownRecoveryReason) {
+        $kind = $interruptedShutdownEvidenceKind
+        $requested = Read-ShutdownReceiptFromPath -State $archivedState -Phase "requested" -Path $requestedPath
+        $terminal = $null
+        Assert-OrInvalidateUnexpectedExitRecoveryAuthority -Authority ([pscustomobject]@{ Id = $Location.Id; Directory = $Location.Directory; RecordPath = $Location.RecordPath; Record = $Record }) -State $archivedState -Snapshot $Snapshot
+        $requestedHash = Get-BoundedSha256 -Path $requestedPath -Description "Archived shutdown request receipt"
+        $terminalHash = Get-AbsentRecoveryReceiptSha256 -State $archivedState -Phase "terminal"
     } elseif ($Snapshot.Reason -eq $unexpectedExitRecoveryReason) {
         $kind = $unexpectedExitEvidenceKind
         $requested = $null
@@ -2381,7 +2418,9 @@ function Publish-RecoveryIncident {
             $Evidence.Kind -eq $unexpectedExitEvidenceKind -and
             $Snapshot.Reason -ne $unexpectedExitRecoveryReason
         ) -or
+        ($Evidence.Kind -eq $interruptedShutdownEvidenceKind -and $Snapshot.Reason -ne $interruptedShutdownRecoveryReason) -or
         $Evidence.Kind -notin @(
+            $interruptedShutdownEvidenceKind,
             $shutdownFailureEvidenceKind,
             $unexpectedExitEvidenceKind
         )
@@ -2435,6 +2474,10 @@ function Publish-RecoveryIncident {
             -Destination $archivedTerminalPath `
             -ExpectedSha256 $Evidence.TerminalSha256 `
             -Description "Shutdown terminal receipt"
+    } elseif ($Evidence.Kind -eq $interruptedShutdownEvidenceKind) {
+        Publish-ExactRecoveryEvidenceCopy -Source (Get-ReceiptPath -State $Evidence.State -Phase "requested") -Destination $archivedRequestedPath -ExpectedSha256 $Evidence.RequestedSha256 -Description "Shutdown request receipt"
+        Assert-RecoveryPathAbsent -Path (Get-ReceiptPath -State $Evidence.State -Phase "terminal") -Description "Interrupted shutdown terminal receipt"
+        Assert-RecoveryPathAbsent -Path $archivedTerminalPath -Description "Archived interrupted shutdown terminal receipt"
     } else {
         foreach ($phase in @("requested", "terminal")) {
             Assert-RecoveryPathAbsent `
@@ -2622,7 +2665,7 @@ function Remove-ExactShutdownReceipts {
         [Parameter(Mandatory = $true)]$Incident,
         [Parameter(Mandatory = $true)]$Snapshot
     )
-    if ($Evidence.Kind -eq $unexpectedExitEvidenceKind) {
+    if ($Evidence.Kind -in @($unexpectedExitEvidenceKind, $interruptedShutdownEvidenceKind)) {
         Assert-OrInvalidateUnexpectedExitRecoveryAuthority `
             -Authority $Incident `
             -State $Evidence.State `
@@ -2638,7 +2681,8 @@ function Remove-ExactShutdownReceipts {
         $tombstone = Assert-DirectChildPath `
             -Parent $Incident.Directory `
             -Child (Join-Path $Incident.Directory "$phase-receipt-removal.tmp")
-        if ($Evidence.Kind -eq $unexpectedExitEvidenceKind) {
+        if ($Evidence.Kind -eq $unexpectedExitEvidenceKind -or
+            ($Evidence.Kind -eq $interruptedShutdownEvidenceKind -and $phase -eq "terminal")) {
             Assert-OrInvalidateUnexpectedExitRecoveryAuthority `
                 -Authority $Incident `
                 -State $Evidence.State `
@@ -2651,7 +2695,7 @@ function Remove-ExactShutdownReceipts {
             }
             continue
         }
-        if ($Evidence.Kind -ne $shutdownFailureEvidenceKind) {
+        if ($Evidence.Kind -notin @($shutdownFailureEvidenceKind, $interruptedShutdownEvidenceKind)) {
             throw "Recovery evidence kind is invalid during receipt cleanup."
         }
         $pathExists = Test-Path -LiteralPath $path
@@ -2840,7 +2884,7 @@ function Recover-FailedShutdown {
             -State $incident.Evidence.State `
             -Snapshot $snapshot
         $evidence = $incident.Evidence
-        if ($evidence.Kind -eq $unexpectedExitEvidenceKind) {
+        if ($evidence.Kind -in @($unexpectedExitEvidenceKind, $interruptedShutdownEvidenceKind)) {
             $receiptBarriers = @(
                 Open-UnexpectedExitReceiptBarriers `
                     -Incident $incident `

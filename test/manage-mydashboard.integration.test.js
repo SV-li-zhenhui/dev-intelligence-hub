@@ -4003,3 +4003,41 @@ for (const invalidKind of ["wrong case", "file", "junction", "snapshot directory
     },
   );
 }
+
+for (const variant of ["recover", "late-terminal", "changed-request"]) {
+  test(`interrupted shutdown with authenticated request and missing terminal: ${variant}`,
+    { skip: WINDOWS_MANAGER_SKIP }, async t => {
+      const fixture = await createUnexpectedExitRecoveryFixture(t, {prepare:false});
+      const receipt = {schemaVersion:1, phase:"requested", status:"unknown", processId:fixture.state.processId,
+        instanceId:fixture.state.instanceId, startIdentity:fixture.state.startIdentity,
+        atUnixMilliseconds:String(Date.now()), errorCode:null, hmac:""};
+      receipt.hmac = signFixtureDocument(fixture.state.controlToken, receiptPayload(receipt));
+      const original = JSON.stringify(receipt) + "\n";
+      await writeFile(fixture.requestedPath, original);
+      const prepared = invokeManager(fixture.root, "PrepareFailedShutdownRecovery", 10);
+      assert.equal(prepared.status, 0, prepared.stderr + prepared.stdout);
+      fixture.snapshotId = prepared.stdout.match(/shutdown-failure-[0-9]{8}-[0-9]{6}-[a-f0-9]{32}/u)?.[0];
+      assert.equal(typeof fixture.snapshotId, "string");
+      fixture.snapshotDirectory = path.join(fixture.runtime.runtimeDirectory, "recovery-snapshots", fixture.snapshotId);
+      const manifest = JSON.parse(await readFile(path.join(fixture.snapshotDirectory,"manifest.json"),"utf8"));
+      assert.equal(manifest.reason, "managed_shutdown_exit_without_terminal");
+      assert.equal(await readFile(fixture.requestedPath,"utf8"),original);
+      assert.equal(await fileExists(fixture.terminalPath),false);
+      if (variant === "late-terminal") await writeFile(fixture.terminalPath, '{"late":true}\n');
+      if (variant === "changed-request") await writeSignedReceipt(fixture,"requested",r=>({...r,atUnixMilliseconds:String(Date.now()+1)}));
+      const result = invokeRecovery(fixture);
+      if (variant !== "recover") {
+        assert.notEqual(result.status,0,result.stdout);
+        assert.equal(await fileExists(fixture.controlPath),true);
+        assert.equal(await fileExists(fixture.requestedPath),true);
+        return;
+      }
+      await assertRecoveryCompleted(fixture,result);
+      const incident = await onlyRecoveryIncident(fixture);
+      assert.equal(await readFile(path.join(incident.directory,"requested-receipt.json"),"utf8"),original);
+      assert.equal(await fileExists(path.join(incident.directory,"terminal-receipt.json")),false);
+      const record = JSON.parse(await readFile(incident.recordPath,"utf8"));
+      assert.equal(record.sourceHashes.requestedReceipt,createHash("sha256").update(original).digest("hex"));
+      assert.equal(record.state,"recovered");
+    });
+}
