@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { WorkContinuationScheduler, WORK_CONTINUATION_STATE_KEY, normalizeWorkContinuationState } from '../src/services/work-continuation-scheduler.js';
+import { WorkContinuationScheduler } from '../src/services/work-continuation-scheduler.js';
+import { WORK_CONTINUATION_STATE_KEY, normalizeWorkContinuationState, migrateWorkContinuationState } from '../src/services/work-continuation-state.js';
 
 const clone = value => structuredClone(value);
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
@@ -17,6 +18,7 @@ function fixture() {
     async write(key, state) { assert.equal(key, WORK_CONTINUATION_STATE_KEY); persisted = normalizeWorkContinuationState(state); },
   };
   const ledger = {
+    async listItems() { return { items: clone(items.filter(item => ['waiting_external', 'waiting_condition', 'retry_wait', 'paused', 'dispatch_pending'].includes(item.status))), nextCursor: null }; },
     async listClaimCandidates() { return { items: clone(items), nextCursor: null, facts: items.map(item => ({ itemId: item.itemId, graphBlocked: false })) }; },
     async readItemForReconciliation({ itemId }) { return clone(items.find(item => item.itemId === itemId) ?? null); },
     async readItemProgress(ids) { return clone(items.filter(item => ids.includes(item.itemId))); },
@@ -96,6 +98,7 @@ test('slow roles coalesce while other roles advance and old acknowledgements can
   blocked.resolve(); await f.drain();
   assert.equal(f.state().records.find(record => record.itemId === 'work-one').fingerprint, pending.fingerprint);
   assert.equal(f.state().records.find(record => record.itemId === 'work-one').status, 'pending');
+  assert.notEqual(f.state().records.find(record => record.itemId === 'work-one').receipts[0].finishedAt, null);
 });
 
 test('repeated unchanged inputs back off and remain recoverable after stalled diagnostics', async () => {
@@ -171,7 +174,7 @@ test('obsolete and terminal pending intents are retired without dispatch', async
 });
 
 test('persisted continuation timestamps and unknown schema versions fail validation', () => {
-  assert.throws(() => normalizeWorkContinuationState({ schemaVersion: 2, records: [] }));
+  assert.throws(() => normalizeWorkContinuationState({ schemaVersion: 3, records: [] }));
   assert.throws(() => normalizeWorkContinuationState({ schemaVersion: 1, records: [{
     itemId: 'work-one', roleId: 'developer', fingerprint: 'a'.repeat(64), attempt: 1,
     status: 'running', reason: 'work_ready', updatedAt: 123, nextAttemptAt: null,
@@ -191,4 +194,125 @@ test('adjacent completion signals share preparations and cleanup reads one bound
   await scheduler.runCycle(input); await f.drain();
   assert.equal(prepared, 1); assert.equal(batches, 1); assert.equal(durableReads, before);
   f.advance(5_000); await scheduler.runCycle(input); await f.drain(); assert.equal(prepared, 2);
+});
+
+test('handoff records preserve source, condition and execution receipts across the next input', async () => {
+  const f = fixture(); f.items[0].graph = { parentItemId: 'work-parent' };
+  const scheduler = new WorkContinuationScheduler(f.options);
+  await scheduler.runCycle(f); await f.drain();
+  let record = f.state().records[0];
+  assert.equal(record.source.parentItemId, 'work-parent');
+  assert.equal(record.source.itemRevision, 1);
+  assert.deepEqual(record.condition, { type: 'claimable', reference: null });
+  assert.equal(record.receipts.length, 1);
+  assert.equal(record.receipts[0].outcome, 'progressed');
+  assert.equal(record.receipts[0].observedRevision, 2);
+  assert.ok(record.receipts[0].finishedAt);
+  const wakeId = record.receipts[0].wakeId;
+  await scheduler.runCycle(f); await f.drain();
+  record = f.state().records[0];
+  assert.equal(record.receipts.length, 2);
+  assert.equal(record.receipts[0].wakeId, wakeId);
+  for (let wake = 2; wake < 6; wake += 1) { await scheduler.runCycle(f); await f.drain(); }
+  record = f.state().records[0];
+  assert.equal(record.receipts.length, 5);
+  assert.equal(record.receipts.some(receipt => receipt.wakeId === wakeId), false);
+  assert.deepEqual(record.receipts.map(receipt => receipt.observedRevision), [3, 4, 5, 6, 7]);
+});
+
+test('waiting external handoffs persist their trigger without executing until the ledger wakes them', async () => {
+  const f = fixture(); const item = f.items[0];
+  item.status = 'waiting_external'; item.activeIntentId = 'work-intent-one';
+  const list = f.ledger.listClaimCandidates;
+  f.ledger.listClaimCandidates = async () => item.status === 'queued' ? list() : { items: [], facts: [], nextCursor: null };
+  const scheduler = new WorkContinuationScheduler(f.options);
+  await scheduler.runCycle(f); await f.drain();
+  assert.equal(f.dispatched.length, 0);
+  assert.equal(f.state().records[0].status, 'waiting');
+  assert.deepEqual(f.state().records[0].condition, { type: 'intent_result', reference: 'work-intent-one' });
+  item.status = 'queued'; item.revision += 1;
+  await scheduler.runCycle(f); await f.drain();
+  assert.deepEqual(f.dispatched, ['developer']);
+});
+
+test('overdue execution requests stop and retains ownership until its actual operation settles', async () => {
+  const f = fixture(); const release = deferred(); const began = deferred();
+  f.config.workCoordination = { leaseDurationMs: 1_000 };
+  const scheduler = new WorkContinuationScheduler(f.options); let calls = 0; let executionSignal;
+  const input = { ...f, dispatch: async ({ signal }) => { calls += 1; executionSignal = signal; began.resolve(); await release.promise; signal.throwIfAborted(); } };
+  await scheduler.runCycle(input); await began.promise;
+  f.advance(1_001); await scheduler.runCycle(input);
+  assert.equal(executionSignal.aborted, true);
+  assert.equal(f.state().records[0].recovery.action, 'wait_for_stop');
+  assert.equal(f.state().records[0].status, 'running');
+  assert.equal(scheduler.readStatus().overdueCount, 1);
+  await scheduler.runCycle(input); assert.equal(calls, 1);
+  release.resolve(); await f.drain();
+  const record = f.state().records[0];
+  assert.equal(record.receipts[0].outcome, 'timed_out');
+  assert.equal(record.receipts[0].errorCode, 'WORK_CONTINUATION_TIMEOUT');
+  assert.equal(record.recovery.action, 'retry');
+  f.advance(30_001); await scheduler.runCycle(f); await f.drain();
+  assert.equal(f.state().records[0].status, 'delivered');
+});
+
+test('timeout recovery is persisted before cancellation and never loses the old receipt after a revision changes', async () => {
+  const f = fixture(); const began = deferred(), release = deferred(); let executionSignal;
+  f.config.workCoordination = { leaseDurationMs: 1_000 };
+  const scheduler = new WorkContinuationScheduler(f.options);
+  const input = { ...f, dispatch: async ({ signal }) => { executionSignal = signal; began.resolve(); await release.promise; signal.throwIfAborted(); } };
+  await scheduler.runCycle(input); await began.promise;
+  f.items[0].revision += 1; await scheduler.runCycle(input);
+  f.advance(1_001);
+  const write = f.store.write; f.store.write = async () => { throw new Error('storage unavailable'); };
+  // No new ledger change may mask a missing durable timeout request.
+  await assert.rejects(scheduler.runCycle(input), /storage unavailable/);
+  assert.equal(executionSignal.aborted, false);
+  f.store.write = write;
+  await scheduler.runCycle(input); assert.equal(executionSignal.aborted, true);
+  assert.equal(scheduler.readStatus().overdueCount, 1);
+  assert.equal(f.state().records[0].receipts[0].errorCode, 'WORK_CONTINUATION_TIMEOUT');
+  release.resolve(); await f.drain();
+  const record = f.state().records[0];
+  assert.equal(record.status, 'pending');
+  assert.equal(record.receipts[0].outcome, 'timed_out');
+});
+
+test('ready work can displace waiting diagnostics at capacity', async () => {
+  const f = fixture();
+  f.items[0].status = 'waiting_external';
+  f.ledger.listClaimCandidates = async () => ({ items: [], facts: [], nextCursor: null });
+  await new WorkContinuationScheduler(f.options).runCycle(f);
+  const template = f.state().records[0];
+  const scheduler = new WorkContinuationScheduler(f.options);
+  const began = deferred(), release = deferred();
+  f.items[0].status = 'queued'; f.items[0].revision += 1;
+  f.ledger.listClaimCandidates = async () => ({ items: [clone(f.items[0])], facts: [{ itemId: f.items[0].itemId, graphBlocked: false }], nextCursor: null });
+  await scheduler.runCycle({ ...f, dispatch: async () => { began.resolve(); await release.promise; } });
+  await began.promise;
+  const running = f.state().records[0];
+  f.items.push(...Array.from({ length: 999 }, (_, index) => ({
+    itemId: `waiting-${index}`, revision: 1, status: 'waiting_external', currentTarget: { type: 'role', id: 'developer' },
+  })));
+  f.seed({ schemaVersion: 2, records: [running, ...f.items.slice(1).map(item => ({ ...clone(template), itemId: item.itemId }))] });
+  const ready = { itemId: 'ready-new', revision: 1, status: 'queued', currentTarget: { type: 'role', id: 'tester' } };
+  f.items.push(ready);
+  f.ledger.listItems = async () => ({ items: clone(f.items.slice(1, 101)), nextCursor: null });
+  f.ledger.listClaimCandidates = async () => ({ items: [clone(ready)], facts: [{ itemId: ready.itemId, graphBlocked: false }], nextCursor: null });
+  try {
+    await scheduler.runCycle(f);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(f.dispatched, ['tester']);
+    assert.equal(f.state().records.length, 1000);
+    assert.equal(f.state().records.find(record => record.itemId === running.itemId).receipts[0].outcome, 'running');
+  } finally { release.resolve(); await f.drain(); }
+});
+
+test('legacy wake migration is detached and does not fabricate a past execution', () => {
+  const old = { schemaVersion: 1, records: [{ itemId: 'work-one', roleId: 'developer', fingerprint: 'a'.repeat(64),
+    status: 'running', attempt: 3, reason: 'work_ready', nextAttemptAt: null, updatedAt: '2026-10-21T00:00:00.000Z' }] };
+  const before = clone(old), state = migrateWorkContinuationState(old);
+  assert.deepEqual(old, before); assert.equal(state.schemaVersion, 2);
+  assert.deepEqual(state.records[0].receipts, []); assert.equal(state.records[0].source.itemRevision, null);
+  assert.deepEqual(migrateWorkContinuationState(state), state);
 });

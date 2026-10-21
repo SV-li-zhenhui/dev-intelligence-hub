@@ -4573,26 +4573,31 @@ export function startApplicationBackgroundWork(
     return runCoalescedTracked(
       coalescedAgencyCycles,
       key,
-      (signal) => enqueueAgencyCycle(
-        {
-          ...options,
-          factCycleSequenceAtRequest: factCycleSequence,
-          signal,
-        },
-        priority,
-        runOptions,
-      ),
+      async (signal) => {
+        const executionSignal = options.signal ? AbortSignal.any([signal, options.signal]) : signal;
+        try {
+          return await enqueueAgencyCycle({ ...options, factCycleSequenceAtRequest: factCycleSequence, signal: executionSignal }, priority, runOptions);
+        } catch (error) {
+          // The continuation owns this cancellation. Its durable receipt is
+          // tracked separately; cooperative cancellation is not a drain failure.
+          if (executionSignal.aborted && error === executionSignal.reason && error?.code === "WORK_CONTINUATION_TIMEOUT") {
+            return { skipped: "continuation_timeout" };
+          }
+          throw error;
+        }
+      },
       runOptions,
     );
   }
 
   function signalWorkContinuations() {
-    if (stopped || !independentEmployeeFactsReady() || !application.workContinuationScheduler) return Promise.resolve();
+    if (stopped || !application.workContinuationScheduler) return Promise.resolve();
     return runCoalescedTracked(coalescedAgencyCycles, "work-continuations", (signal) =>
       runDrainParticipant(DRAIN_PARTICIPANTS.workContinuation, () => application.workContinuationScheduler.runCycle({
         signal,
-        dispatch: ({ roleId }) => runCoalescedAgencyCycle(`employee:${roleId}`, {
-          trigger: "scheduled", employeeIds: [roleId], discardWhenFactsPending: true,
+        allowDispatch: independentEmployeeFactsReady(),
+        dispatch: ({ roleId, signal: executionSignal }) => runCoalescedAgencyCycle(`employee:${roleId}`, {
+          trigger: "scheduled", employeeIds: [roleId], discardWhenFactsPending: true, signal: executionSignal,
         }, backgroundPriority.scheduled, { rethrow: true, admitOnDequeue: true }),
         runOperation: operation => runTracked(
           () => runDrainParticipant(DRAIN_PARTICIPANTS.workContinuation, operation), { rethrow: true },

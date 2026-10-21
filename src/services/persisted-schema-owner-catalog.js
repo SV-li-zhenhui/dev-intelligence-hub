@@ -46,7 +46,7 @@ import {
 } from "./controlled-code-executor.js";
 import { TASK_RUN_RECEIPT_STATE_KEY, normalizeTaskRunExecutionReceiptPersistedState } from "./task-run-execution-receipts.js";
 import { AUTOMATIC_OWN_PR_REPAIR_STATE_KEY, normalizeAutomaticOwnPrRepairState } from "./automatic-own-pr-repair.js";
-import { WORK_CONTINUATION_STATE_KEY, normalizeWorkContinuationState } from "./work-continuation-scheduler.js";
+import { WORK_CONTINUATION_STATE_KEY, normalizeWorkContinuationState, migrateWorkContinuationState } from "./work-continuation-state.js";
 import { ORIGINAL_REPAIR_FEEDBACK_ARCHIVE_PREFIX, normalizeOriginalRepairFeedbackArchiveRecord } from "../domain/original-repair-feedback.js";
 import {
   planLegacyAuthorityProjectionAdoption,
@@ -186,8 +186,8 @@ const OWNER_BASELINES = Object.freeze([
     optional: true,
   }),
   Object.freeze({
-    ownerId: "work-continuations", key: WORK_CONTINUATION_STATE_KEY, mode: "validate",
-    currentVersion: 1, supportedVersions: frozenVersions(1), optional: true,
+    ownerId: "work-continuations", key: WORK_CONTINUATION_STATE_KEY, mode: "migrate-replace",
+    currentVersion: 2, supportedVersions: frozenVersions(1, 2), optional: true,
   }),
   Object.freeze({
     ownerId: "original-repair-feedback-archive",
@@ -579,7 +579,7 @@ const PRODUCTION_OWNER_CATALOG = Object.freeze([
     normalize: normalizeAutomaticOwnPrRepairState,
   }),
   definePersistedSchemaOwner({
-    ownerId: "work-continuations", normalize: normalizeWorkContinuationState,
+    ownerId: "work-continuations", normalize: normalizeWorkContinuationState, migrate: migrateWorkContinuationState,
   }),
   definePersistedSchemaOwner({
     ownerId: "original-repair-feedback-archive",

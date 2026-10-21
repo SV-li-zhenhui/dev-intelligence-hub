@@ -382,10 +382,10 @@ async function migrateCandidate({ root, catalog, jsonByKey }) {
   const codeJobs = await migrateFixed("code-job-state");
   await migrateFixed("code-executor-state");
   const confirmation = await validateFixed("confirmation-queue");
+  await migrateFixed("work-continuations");
   for (const ownerId of [
     "task-run-execution-receipts",
     "automatic-own-pr-repair-state",
-    "work-continuations",
     "work-proposal-state",
     "attention-inbox",
     "owner-work-requests",

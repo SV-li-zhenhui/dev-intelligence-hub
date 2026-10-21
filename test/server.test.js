@@ -10,6 +10,83 @@ import test from "node:test";
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { WorkContinuationScheduler } from '../src/services/work-continuation-scheduler.js';
 
+test('automatic continuation timeout reaches the role and keeps shutdown waiting for late work', { timeout: 5_000 }, async () => {
+  const started = deferred(), cancelled = deferred(), release = deferred();
+  const item = { itemId: 'work-timeout', revision: 1, status: 'queued', currentTarget: { type: 'role', id: 'developer' } };
+  const config = { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true }, workCoordination: { leaseDurationMs: 1_000 } };
+  let now = Date.now(), state, calls = 0;
+  const scheduler = new WorkContinuationScheduler({
+    store: { async read(_key, fallback) { return structuredClone(state ?? fallback); }, async write(_key, value) { state = structuredClone(value); } },
+    ledger: {
+      async listClaimCandidates() { return { items: [structuredClone(item)], facts: [{ itemId: item.itemId, graphBlocked: false }], nextCursor: null }; },
+      async listItems() { return { items: [], nextCursor: null }; },
+      async readItemForReconciliation() { return structuredClone(item); }, async readItemProgress() { return [structuredClone(item)]; },
+    },
+    configurationReader: { async readActive() { return { configuration: config }; } },
+    roleStateReader: { async read() { return { enabled: true, paused: false }; } }, clock: () => new Date(now),
+  });
+  const timers = [];
+  const background = startApplicationBackgroundWork({ config, workContinuationScheduler: scheduler,
+    refreshService: { async refresh() {} },
+    employeeRegistry: { schedules: () => [], async runSelected(ids, { signal }) {
+      if (ids[0] !== 'developer') return;
+      calls += 1; signal.addEventListener('abort', () => cancelled.resolve(signal.reason), { once: true });
+      started.resolve(); await release.promise; signal.throwIfAborted();
+    } },
+  }, { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {}, reportError() {} });
+  try {
+    await started.promise; await background.initialRefresh;
+    await new Promise(resolve => setImmediate(resolve)); now += 1_001;
+    await timers.find(timer => timer.delay === 10_000).callback();
+    assert.equal((await cancelled.promise).code, 'WORK_CONTINUATION_TIMEOUT');
+    await timers.find(timer => timer.delay === 10_000).callback(); assert.equal(calls, 1);
+    let stopped = false; const stopping = background.stop().then(() => { stopped = true; });
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(stopped, false);
+    release.resolve(); await stopping; await background.initialRefresh;
+    assert.equal(state.records[0].receipts[0].outcome, 'timed_out');
+  } finally { release.resolve(); await background.stop(); }
+});
+
+test('continuation watchdog still stops owned work after fact refresh fails', { timeout: 5_000 }, async () => {
+  const started = deferred(), cancelled = deferred(), release = deferred();
+  const item = { itemId: 'work-timeout', revision: 1, status: 'queued', currentTarget: { type: 'role', id: 'developer' } };
+  const config = { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true }, workCoordination: { leaseDurationMs: 1_000 } };
+  let now = Date.now(), state, calls = 0, failRefresh = false;
+  const scheduler = new WorkContinuationScheduler({
+    store: { async read(_key, fallback) { return structuredClone(state ?? fallback); }, async write(_key, value) { state = structuredClone(value); } },
+    ledger: {
+      async listClaimCandidates() { return { items: [structuredClone(item)], facts: [{ itemId: item.itemId, graphBlocked: false }], nextCursor: null }; },
+      async listItems() { return { items: [], nextCursor: null }; },
+      async readItemForReconciliation() { return structuredClone(item); }, async readItemProgress() { return [structuredClone(item)]; },
+    },
+    configurationReader: { async readActive() { return { configuration: config }; } },
+    roleStateReader: { async read() { return { enabled: true, paused: false }; } }, clock: () => new Date(now),
+  });
+  const timers = [];
+  const background = startApplicationBackgroundWork({ config, workContinuationScheduler: scheduler,
+    refreshService: { async refresh() { if (failRefresh) throw new Error('facts unavailable'); } },
+    employeeRegistry: { schedules: () => [], async runSelected(ids, { signal }) {
+      if (ids[0] !== 'developer') return;
+      calls += 1; signal.addEventListener('abort', () => cancelled.resolve(signal.reason), { once: true });
+      started.resolve(); await release.promise; signal.throwIfAborted();
+    } },
+  }, { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {}, reportError() {} });
+  try {
+    await started.promise; await background.initialRefresh;
+    await new Promise(resolve => setImmediate(resolve));
+    failRefresh = true;
+    await timers.find(timer => timer.delay === 7 * 60_000).callback();
+    now += 1_001;
+    await timers.find(timer => timer.delay === 10_000).callback();
+    assert.equal((await cancelled.promise).code, 'WORK_CONTINUATION_TIMEOUT');
+    await timers.find(timer => timer.delay === 10_000).callback(); assert.equal(calls, 1);
+    let stopped = false; const stopping = background.stop().then(() => { stopped = true; });
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(stopped, false);
+    release.resolve(); await stopping; await background.initialRefresh;
+    assert.equal(state.records[0].receipts[0].outcome, 'timed_out');
+  } finally { release.resolve(); await background.stop(); }
+});
+
 test('durable continuations start automatically after fresh intake and hand off without a role timer', { timeout: 5_000 }, async () => {
   const refresh = deferred();
   const developerStarted = deferred();
@@ -25,6 +102,7 @@ test('durable continuations start automatically after fresh intake and hand off 
     store: { async read(_key, fallback) { return structuredClone(persisted ?? fallback); }, async write(_key, state) { persisted = structuredClone(state); } },
     ledger: {
       async listClaimCandidates() { assert.equal(factRead, true); return { items: [structuredClone(item)], facts: [{ itemId: item.itemId, graphBlocked: false }], nextCursor: null }; },
+      async listItems() { return { items: [], nextCursor: null }; },
       async readItemForReconciliation() { return structuredClone(item); },
       async readItemProgress() { return [structuredClone(item)]; },
     },

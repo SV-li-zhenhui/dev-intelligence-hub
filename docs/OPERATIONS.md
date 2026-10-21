@@ -901,8 +901,11 @@ GitHub action, and routing rule in the active version after an upgrade.
 
 ## Automatic work continuations
 
-In automatic mode, `work-continuations.json` records the next role to wake,
-the work-item revision, retry time, and wake receipt. Fresh intake and completed
+In automatic mode, schema 2 of `work-continuations.json` records the source task,
+next role, trigger condition, input revision, retry action, and up to five wake
+receipts per task. Waiting external results, facts, dependencies, and manual
+resumes remain visible without authorizing execution. Schema 1 migrates without
+inventing past execution receipts. Fresh intake and completed
 role runs signal the scheduler; a 10-second scan recovers missed signals. Each
 role still uses its normal claim, permission, current-input, and pause checks.
 
@@ -914,8 +917,26 @@ transaction between the ledger and wake store.
 
 Three attempts without progress produce a stalled diagnostic and a five-minute
 retry interval. They do not block the ledger or disable the existing role timers.
-`GET /api/health` includes continuation counts and bounded stalled-work details.
+The execution deadline reuses the configured claim, context, and decision budgets.
+An overdue wake persists a stop request and aborts its owned execution signal;
+its active slot and shutdown admission remain held until the real work settles.
+Recovery continues when fact refresh fails; new dispatch still waits for fresh
+facts. Ready work can replace closed waiting diagnostics when the bounded wake
+store is full, while open execution receipts remain protected.
+An already running role shared through coalescing keeps its original ownership.
+`GET /api/health` includes bounded handoff records, overdue counts, and stalled-work details.
 Backup and restore validate the continuation store alongside other state owners.
+
+Initial context-assembly timeouts schedule a delayed retry without consuming a
+model decision attempt. Errors after a model has started retain the existing
+decision budget. Historical assignment requests display their dates and do not
+represent all automatic assignments.
+
+The optional [BullMQ experiment](../experiments/bullmq-continuations/README.md)
+exercises restart durability, active-job deduplication, backoff, worker loss,
+role isolation, and an idempotent synthetic effect after a lost acknowledgement.
+It uses an isolated private package and a disposable loopback Redis container;
+the production scheduler does not depend on BullMQ or Redis.
 
 ## Live GitHub smoke-test cleanup
 

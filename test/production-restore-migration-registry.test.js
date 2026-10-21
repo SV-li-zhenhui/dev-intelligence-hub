@@ -16,6 +16,7 @@ import { digestValue } from "../src/domain/code-executor-contract.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
 import { StateStore } from "../src/lib/state-store.js";
 import { TaskRunExecutionReceipts } from "../src/services/task-run-execution-receipts.js";
+import { migrateWorkContinuationState } from "../src/services/work-continuation-state.js";
 import { ownReviewFeedbackDigest } from "../src/adapters/github-own-review-feedback.js";
 import { createOriginalRepairFeedbackSnapshot, createOriginalRepairFeedbackArchiveRecord,
   originalRepairFeedbackArchiveKey, originalRepairFeedbackArchiveReference } from "../src/domain/original-repair-feedback.js";
@@ -207,6 +208,7 @@ const OWNERS_REQUIRING_SPECIAL_ADAPTERS = Object.freeze([
   "original-repair-feedback-archive",
   "code-executor-state",
   "unified-memory-journal",
+  "work-continuations",
   "unified-memory-index",
   "legacy-authority-projection",
   "configured-role-lifecycle",
@@ -222,6 +224,7 @@ function ownerDescriptor(ownerId) {
       "code-job-state",
       "code-executor-state",
       "unified-memory-journal",
+      "work-continuations",
     ].includes(ownerId)
   ) {
     functions.migrate = noopMigrate;
@@ -318,18 +321,52 @@ test("a future ledger schema blocks the production restore before any writes", a
   assert.equal(writes, 0);
 });
 
-test("durable continuations are validated during restore without losing pending wakes", async (t) => {
+test("durable continuations migrate during restore without inventing historical execution receipts", async (t) => {
   const owner = allPersistedSchemaOwners().find(({ ownerId }) => ownerId === "work-continuations");
-  assert.equal(owner.mode, "validate");
+  assert.equal(owner.mode, "migrate-replace");
   const state = { schemaVersion: 1, records: [{ itemId: "work-one", roleId: "developer", fingerprint: "a".repeat(64),
     status: "running", attempt: 2, reason: "work_ready", nextAttemptAt: null, updatedAt: "2026-10-21T00:00:00.000Z" }] };
   const fixture = await candidateDirectory(t, { "work-continuations.json": state });
   const file = path.join(fixture.directory, "work-continuations.json");
+  await createProductionRestoreMigrationRegistry().migrate(fixture);
+  const restored = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal(restored.schemaVersion, 2);
+  assert.deepEqual(restored.records[0].receipts, []);
+  assert.equal(restored.records[0].source.itemRevision, null);
+  assert.equal(restored.records[0].status, 'running');
   const before = await readFile(file);
   await createProductionRestoreMigrationRegistry().migrate(fixture);
   assert.deepEqual(await readFile(file), before);
-  const future = await candidateDirectory(t, { "work-continuations.json": { schemaVersion: 2, records: [] } });
+  const future = await candidateDirectory(t, { "work-continuations.json": { schemaVersion: 3, records: [] } });
   await assert.rejects(createProductionRestoreMigrationRegistry().migrate(future));
+});
+
+test("malformed schema-2 handoffs reject restore before any owner write", async (t) => {
+  const at = "2026-10-21T00:00:00.000Z";
+  const valid = migrateWorkContinuationState({ schemaVersion: 1, records: [{ itemId: "work-one", roleId: "developer", fingerprint: "a".repeat(64),
+    status: "running", attempt: 1, reason: "work_ready", nextAttemptAt: null, updatedAt: at }] });
+  valid.records[0].receipts.push({ wakeId: "wake-one", roleId: "developer", fingerprint: "a".repeat(64),
+    startedAt: at, deadlineAt: at, finishedAt: null, outcome: "running", observedRevision: null, errorCode: null });
+  let writes = 0;
+  const originalWrite = StateStore.prototype.write;
+  t.mock.method(StateStore.prototype, "write", function (...args) { writes += 1; return originalWrite.apply(this, args); });
+  for (const mutate of [
+    record => { record.source.itemRevision = 0; },
+    record => { record.condition.type = "unknown"; },
+    record => { record.recovery.dueAt = 123; },
+    record => { record.receipts.push(structuredClone(record.receipts[0])); },
+    record => { record.receipts[0].finishedAt = at; },
+    record => { record.receipts[0].deadlineAt = "2026-10-20T00:00:00.000Z"; },
+    record => { record.receipts[0].observedRevision = -1; },
+  ]) {
+    const invalid = structuredClone(valid); mutate(invalid.records[0]);
+    const fixture = await candidateDirectory(t, {
+      "code-executor-state.json": { schemaVersion: 2, revision: 0, sessions: {} },
+      "work-continuations.json": invalid,
+    });
+    await assert.rejects(createProductionRestoreMigrationRegistry().migrate(fixture));
+    assert.equal(writes, 0);
+  }
 });
 
 test("execution receipts are a validated backup owner and remain byte-for-byte unchanged", async (t) => {
