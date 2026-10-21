@@ -1979,6 +1979,7 @@ test("a bounded context timeout aborts a hanging graph read before retrying", as
     leaseDurationMs: 13_000,
     resolveTimeoutMs: 1_000,
     decideTimeoutMs: 1_000,
+    maxAttempts: 1,
     roleContextAssembler: new RoleContextAssembler({
       graphReader: {
         async getSnapshot({ signal } = {}) {
@@ -2007,6 +2008,25 @@ test("a bounded context timeout aborts a hanging graph read before retrying", as
   assert.equal(graphSignal.aborted, true);
   assert.equal(graphSignal.reason.code, "ROLE_CONTEXT_TIMEOUT");
   assert.equal(ledger.items[0].status, "retry_wait");
+  assert.equal(ledger.calls.scheduleRetry.at(-1).consumeAttempt, false);
+  assert.equal(ledger.items[0].attempt, 0, "context preparation did not make a model decision");
+  assert.equal(ledger.items[0].availableAt, "2026-08-02T08:01:00.000Z");
+});
+
+test("a context-like error after a model decision still consumes the decision budget", async () => {
+  const time = controlledClock();
+  const ledger = new FakeLedger({ source: [workItem(69, { type: "role", id: "developer" })], time });
+  let decisions = 0;
+  const loop = createLoop({ ledger, time, maxAttempts: 1,
+    directory: new FakeRoleDirectory({ developer: worker({ roleId: "developer", async decide() {
+      decisions += 1; throw Object.assign(new Error('failure after model started'), { code: 'ROLE_CONTEXT_TIMEOUT' });
+    } }) }),
+    roleContextAssembler: { async assemble({ item, roleId }) { return contextPacket(item, roleId); } },
+    orchestratorService: { async execute() {} },
+  });
+  const result = await loop.runCycle({ roleId: 'developer' });
+  assert.equal(decisions, 1); assert.equal(result.blocked, 1);
+  assert.equal(ledger.items[0].attempt, 1); assert.equal(ledger.calls.scheduleRetry.length, 0);
 });
 
 test("role timeouts must be strictly shorter than the work lease", () => {

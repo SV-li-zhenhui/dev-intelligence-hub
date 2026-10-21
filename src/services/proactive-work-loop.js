@@ -1808,9 +1808,11 @@ export class ProactiveWorkLoop {
     throwIfLoopAborted(options.signal);
     let packet;
     let decision;
+    let preparingInitialContext = true;
     let failureReasons = DECISION_FAILURE_REASONS;
     try {
       packet = await this.#assembleContext(item, worker, options);
+      preparingInitialContext = false;
       ({ decision, packet } = await this.#decideWithMemory(
         item,
         worker,
@@ -1864,6 +1866,7 @@ export class ProactiveWorkLoop {
         error,
         options,
         failureReasons,
+        preparingInitialContext,
       );
     }
     return this.#stageDecision(item, worker, options, decision);
@@ -2203,12 +2206,14 @@ export class ProactiveWorkLoop {
     error,
     options,
     reasons = DECISION_FAILURE_REASONS,
+    beforeDecision = false,
   ) {
     throwIfLoopAborted(options.signal);
     if (error instanceof TaskRunControlError) return {status:error.code === 'TASK_RUN_CANCELLED' ? 'cancelled' : error.code === 'TASK_RUN_CONTROL_PENDING' ? 'control_pending' : 'paused',workerId:actorId,code:error.code};
     const code = stableFailureCode(error);
     const contention = isContextContention(error);
-    const infrastructure = brainFailureOwnerAttention(code) !== null;
+    const contextTimeout = beforeDecision && code === "ROLE_CONTEXT_TIMEOUT";
+    const infrastructure = brainFailureOwnerAttention(code) !== null || contextTimeout;
     const restoreAttempt = contention || infrastructure;
     const budget = contention ? null : persistedPullRequestDecisionAttemptBudget(item);
     const attempt = budget?.attempt ?? item.attempt;
@@ -2234,10 +2239,11 @@ export class ProactiveWorkLoop {
         return { status: "blocked", workerId: actorId, code };
       }
       const exponent = contention ? 0 : Math.min(Math.max(attempt - 1, 0), 30);
-      const delay = Math.min(
+      const normalDelay = Math.min(
         this.retryMaxMs,
         infrastructure ? Math.max(this.retryBaseMs, 60_000) : this.retryBaseMs * 2 ** exponent,
       );
+      const delay = contextTimeout ? Math.max(60_000, normalDelay) : normalDelay;
       await this.ledger.scheduleRetry({
         ...input,
         ...(restoreAttempt ? { consumeAttempt: false } : {}),

@@ -281,10 +281,19 @@ function assignmentProgressLabel(record) {
   return progress.status === "blocked" && reason ? `${label}（${reason}）` : label;
 }
 
+function assignmentTimesMarkup(record) {
+  return [["创建于", record.createdAt], ["更新于", record.updatedAt]].flatMap(([label, value]) => {
+    if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) return [];
+    return [`${label} <time datetime="${escapeHtml(value)}">${escapeHtml(new Date(value).toLocaleString("zh-CN", { hour12: false }))}</time>`];
+  }).join(" · ");
+}
+
 function assignmentRecordMarkup(record) {
   const target = record.progress?.currentTarget?.id || record.assignment?.target?.id;
+  const times = assignmentTimesMarkup(record);
   return `<p><strong>${escapeHtml(WORK_TYPE_LABELS[record.request?.workType] || "工作任务")}</strong> · ${escapeHtml(ROLE_LABELS[target] || target || "等待岗位分派")}<br>
         <span>${escapeHtml(assignmentProgressLabel(record))}</span><br>
+        ${times ? `<small>${times}</small><br>` : ""}
         <small>工作项 ${escapeHtml(record.workItemId || "待生成")} · 请求 ${escapeHtml(record.requestId)}</small></p>
         ${record.phase !== "intaken" ? `<form data-manual-work-assignment-resume="${escapeHtml(record.requestId)}">
           <button class="secondary-button" type="submit">继续原分配</button>
@@ -299,7 +308,7 @@ function assignmentHistoryMarkup(item, records) {
   return `<section class="manual-work-assignment" data-manual-work-assignment-result>
     <h3>${records.some((record) => record.phase === "intaken") ? "已分配工作" : "分配请求已保存"}</h3>
     <h4>当前分配</h4>
-    ${current.length ? current.map(assignmentRecordMarkup).join("") : "<p>当前没有进行中的分配。</p>"}
+    ${current.length ? current.map(assignmentRecordMarkup).join("") : "<p>当前没有进行中的分配请求。</p>"}
     ${history.length ? `<details data-assignment-history><summary>历史分配（${history.length}）</summary>${history.map(assignmentRecordMarkup).join("")}</details>` : ""}
     <p>可在左侧“工作台账”查看任务进度；已分配不代表已完成。</p>
     <details>

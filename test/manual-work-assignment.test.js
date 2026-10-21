@@ -177,6 +177,23 @@ test("assignment detail shows current blocking and folds retired tasks into hist
   assert.doesNotMatch(container.innerHTML, /<details[^>]* open/);
 });
 
+test("old assignments show their dates and do not imply automatic work is absent", async () => {
+  const container = { isConnected: true, innerHTML: "", querySelectorAll() { return []; } };
+  await bindManualWorkAssignment(container, pullRequest, {
+    async fetchImpl() { return { ok: true, async json() { return { items: [{
+      requestId: 'old-request', workItemId: 'old-work', phase: 'intaken', request: { workType: 'general' },
+      createdAt: '2026-10-04T08:00:00.000Z', updatedAt: '2026-10-17T09:04:02.000Z',
+      assignment: { target: { id: 'orchestrator' } }, progress: { status: 'superseded' },
+    }], nextCursor: null }; } }; },
+  });
+  assert.match(container.innerHTML, /当前没有进行中的分配请求/);
+  assert.match(container.innerHTML, /创建于/);
+  assert.match(container.innerHTML, /2026-10-04/);
+  assert.match(container.innerHTML, /更新于/);
+  assert.match(container.innerHTML, /2026-10-17/);
+  assert.doesNotMatch(container.innerHTML, /<details[^>]* open/);
+});
+
 test("failed assignment lookup offers a read retry without an unverified create form", async () => {
   let retry;
   let reads = 0;
