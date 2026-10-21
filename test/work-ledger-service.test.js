@@ -5921,6 +5921,31 @@ test("a rejected proposal stays blocked after its retained proof rotates out", a
   );
 });
 
+test('same-intake byte retention cannot release a rejected proposal cutover', async () => {
+  const seed = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  const predecessor = await rejectSealedPullRequestProposal(seed);
+  const before = seed.store.stored();
+  const proofIndex = before.timeline.findIndex(entry => entry.itemId === predecessor.itemId && entry.type === 'proposal_result_applied');
+  assert.ok(proofIndex >= 0);
+  before.timeline = before.timeline.slice(proofIndex);
+  before.timelineStartSequence = before.timeline[0].sequence;
+  seed.store.replaceStored(before);
+  const limits = { stateByteBudget: legacyLedgerCapacityBytes(before) + 20 };
+  const fixture = await createFixture({ store: seed.store, source: seed.source, time: seed.time, limits });
+  fixture.source.records.push(ownerRequestedPrAssignment(2));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  const durable = fixture.store.stored();
+  assert.ok(durable.timeline.length < 20_000);
+  assert.equal(durable.timeline.some(entry => entry.timelineId === before.timeline[0].timelineId), false);
+  const roots = durable.items.filter(item => item.kind === 'source_root');
+  const blocked = roots.find(item => item.itemId === predecessor.itemId);
+  const pending = roots.find(item => item.itemId !== predecessor.itemId);
+  assert.equal(blocked.statusReason, `pr_source_cross_root_cutover_blocker:${pending.itemId}`);
+  assert.equal(pending.status, 'blocked');
+  assert.deepEqual(durable.outbox, before.outbox);
+});
+
 test("same-intake retention rotation cannot release a rejected proposal cutover", async () => {
   const timelineLimit = 6;
   const fixture = await createFixture({
@@ -13637,6 +13662,113 @@ test("capacity rejection leaves the next assignment and cursor retryable", async
     fixture.source.calls.map(({ afterSequence }) => afterSequence),
     [0, 1],
   );
+});
+
+function legacyLedgerCapacityBytes(state) {
+  const { graphMemoryProjection: _projection, ...view } = state;
+  view.schemaVersion = 1;
+  view.items = state.items.filter(item => item.kind !== 'source_root').map(item => {
+    const { graph: _graph, ...value } = item;
+    if (value.source === null) delete value.source;
+    if (value.sourceQuarantine === null) delete value.sourceQuarantine;
+    return value;
+  });
+  return Buffer.byteLength(`${JSON.stringify(view, null, 2)}\n`);
+}
+
+for (const [name, factory] of [['local', createLocalWorkLedgerCandidateProcessor], ['worker', createWorkerWorkLedgerCandidateProcessor]]) {
+  test(`${name} byte retention lets claims and Review publication receipts advance before the timeline count limit`, async t => {
+    const seed = await createFixture({ records: [assignment(1)] });
+    await seed.service.intake();
+    const old = seed.store.stored();
+    const history = appendWorkLedgerTimeline(old, Array.from({ length: 12 }, () => ({
+      itemId: null, type: 'intake_completed', at: seed.time.clock(), actorId: 'work-ledger-system',
+      details: { note: '历史记录'.repeat(300) },
+    })), 20_000);
+    const previous = { ...old, timeline: history.timeline, timelineStartSequence: history.timelineStartSequence,
+      nextTimelineSequence: history.nextTimelineSequence };
+    seed.store.replaceStored(previous);
+    const limits = { stateByteBudget: legacyLedgerCapacityBytes(previous) + 20 };
+    const processor = factory();
+    t.after(() => processor.close());
+    const fixture = await createFixture({ store: seed.store, source: seed.source, time: seed.time, limits, candidateProcessor: processor });
+    let item = (await fixture.service.listItems()).items[0];
+    item = await fixture.service.claim({ itemId: item.itemId, expectedRevision: item.revision,
+      workerId: 'employee-pr-reviewer', leaseDurationMs: 30_000 });
+    const claimed = fixture.store.stored();
+    assert.ok(claimed.timeline.length < previous.timeline.length);
+    assert.equal(claimed.timeline.at(-1).type, 'claimed');
+    assert.equal(claimed.timeline.at(-1).sequence, previous.nextTimelineSequence);
+    assert.deepEqual(claimed.items[0].graph, previous.items[0].graph);
+    assert.deepEqual(claimed.outbox, previous.outbox);
+    const staged = await fixture.service.stageIntent({ itemId: item.itemId, expectedRevision: item.revision,
+      leaseId: item.leaseId, actorId: 'employee-pr-reviewer', roleId: 'pr-reviewer', intent: reviewIntent() });
+    let dispatch = await fixture.service.claimIntent({ intentId: staged.outbox.intentId,
+      expectedRevision: staged.outbox.revision, dispatcherId: 'confirmation-bridge', leaseDurationMs: 30_000 });
+    dispatch = await fixture.service.bindIntent({ intentId: dispatch.intentId, expectedRevision: dispatch.revision,
+      itemExpectedRevision: staged.item.revision, dispatcherId: 'confirmation-bridge',
+      dispatchLeaseId: dispatch.dispatchLeaseId, boundIntent: boundReviewIntent(staged.item) });
+    const delivered = await fixture.service.ackIntent({ intentId: dispatch.intentId,
+      expectedRevision: dispatch.revision, dispatchLeaseId: dispatch.dispatchLeaseId,
+      itemExpectedRevision: staged.item.revision, actorId: 'confirmation-bridge',
+      outcome: 'delivered', nextStatus: 'waiting_external', details: { downstreamRef: 'existing-review-proposal' } });
+    assert.equal(delivered.outbox.status, 'delivered');
+    const durable = fixture.store.stored();
+    assert.ok(legacyLedgerCapacityBytes(durable) <= limits.stateByteBudget);
+    assert.deepEqual(durable.timeline.map(e => e.sequence), Array.from({ length: durable.timeline.length }, (_, i) => durable.timelineStartSequence + i));
+    const restarted = await createFixture({ store: fixture.store, source: fixture.source, time: fixture.time, limits });
+    assert.deepEqual((await restarted.service.listTimeline({ limit: 100 })).items, durable.timeline);
+    assert.deepEqual((await restarted.service.listOutbox()).items, durable.outbox);
+  });
+}
+
+test('byte retention keeps all new receipts even when old history cannot free enough space', () => {
+  const previous = emptyWorkLedgerState();
+  const history = appendWorkLedgerTimeline(previous, [{ type: 'intake_completed',
+    at: '2026-08-02T01:00:00.000Z', details: { note: 'old' } }], 20_000);
+  Object.assign(previous, { timeline: history.timeline, timelineStartSequence: history.timelineStartSequence,
+    nextTimelineSequence: history.nextTimelineSequence });
+  const added = appendWorkLedgerTimeline(previous, [{ type: 'intake_completed',
+    at: '2026-08-02T01:01:00.000Z', details: { note: 'new receipt'.repeat(500) } }], 20_000);
+  const candidate = { ...previous, revision: 1, timeline: added.timeline,
+    timelineStartSequence: added.timelineStartSequence, nextTimelineSequence: added.nextTimelineSequence };
+  const before = clone(candidate);
+  assert.throws(() => prepareWorkLedgerCandidate({ previousState: previous, candidate,
+    limits: normalizeWorkLedgerLimits({ stateByteBudget: legacyLedgerCapacityBytes(previous) + 20 }) }),
+  error => error.code === 'WORK_LEDGER_CAPACITY_EXCEEDED');
+  assert.deepEqual(candidate, before);
+});
+
+test('byte retention accepts the hard budget when new receipts prevent reaching its optional reserve', () => {
+  const previous = emptyWorkLedgerState();
+  const history = appendWorkLedgerTimeline(previous, [{ type: 'intake_completed',
+    at: '2026-08-02T01:00:00.000Z', details: { note: 'old'.repeat(100) } }], 20_000);
+  Object.assign(previous, { timeline: history.timeline, timelineStartSequence: history.timelineStartSequence,
+    nextTimelineSequence: history.nextTimelineSequence });
+  const added = appendWorkLedgerTimeline(previous, [{ type: 'intake_completed',
+    at: '2026-08-02T01:01:00.000Z', details: { note: 'new receipt'.repeat(200) } }], 20_000);
+  const candidate = { ...previous, revision: 1, timeline: added.timeline,
+    timelineStartSequence: added.timelineStartSequence, nextTimelineSequence: added.nextTimelineSequence };
+  const suffix = { ...candidate, timeline: added.appended, timelineStartSequence: added.appended[0].sequence };
+  const limit = legacyLedgerCapacityBytes(suffix) + 20;
+  const result = prepareWorkLedgerCandidate({ previousState: previous, candidate,
+    limits: normalizeWorkLedgerLimits({ stateByteBudget: limit }) });
+  assert.deepEqual(result.timeline, added.appended);
+  assert.ok(legacyLedgerCapacityBytes(result) <= limit);
+  assert.ok(legacyLedgerCapacityBytes(result) > limit * 0.9);
+});
+
+test('byte retention cannot hide a modified historical receipt before validation', () => {
+  const previous = emptyWorkLedgerState();
+  const history = appendWorkLedgerTimeline(previous, [{ type: 'intake_completed',
+    at: '2026-08-02T01:00:00.000Z', details: { note: 'old'.repeat(500) } }], 20_000);
+  Object.assign(previous, { timeline: history.timeline, timelineStartSequence: history.timelineStartSequence,
+    nextTimelineSequence: history.nextTimelineSequence });
+  const candidate = clone({ ...previous, revision: 1 });
+  candidate.timeline[0].details.note += 'altered';
+  assert.throws(() => prepareWorkLedgerCandidate({ previousState: previous, candidate,
+    limits: normalizeWorkLedgerLimits({ stateByteBudget: legacyLedgerCapacityBytes(previous) }) }));
+  assert.equal(previous.timeline[0].details.note, 'old'.repeat(500));
 });
 
 test("timeline retention remains contiguous and recoverable", async () => {

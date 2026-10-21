@@ -4,6 +4,7 @@ import { validatePullRequestSourceTransition } from "./work-ledger-pr-source.js"
 import {
   assertWorkLedgerCapacity,
   normalizeWorkLedgerPersistedState,
+  retainWorkLedgerTimelineForCapacity,
 } from "./work-ledger-state.js";
 import { workLedgerError } from "./work-ledger-values.js";
 
@@ -54,7 +55,13 @@ export function prepareWorkLedgerCandidate({
       limits,
     );
   }
-  assertWorkLedgerCapacity(candidate, limits);
+  try {
+    assertWorkLedgerCapacity(candidate, limits);
+  } catch (error) {
+    if (error?.code !== 'WORK_LEDGER_CAPACITY_EXCEEDED') throw error;
+    candidate = retainWorkLedgerTimelineForCapacity(previousState, candidate, limits);
+    assertWorkLedgerCapacity(candidate, limits);
+  }
   let normalized;
   try {
     normalized = normalizeWorkLedgerPersistedState(candidate, limits);

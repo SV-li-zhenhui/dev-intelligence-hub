@@ -120,6 +120,7 @@ import {
   emptyWorkLedgerState,
   normalizeWorkLedgerLimits,
   normalizeWorkLedgerPersistedState,
+  retainWorkLedgerTimelineForCapacity,
   WORK_LEDGER_STATE_KEY,
   workLedgerPersistedStateDigest,
 } from "./work-ledger-state.js";
@@ -2720,14 +2721,20 @@ export class WorkLedgerService {
         deduplicated,
       },
     });
-    const invalidCutoverProofs = cutoverProofChecks.filter(
-      ({ proofs }) => !arePullRequestCutoverProofsRetained({
-        timeline: this.state.timeline,
-        timelineLimit: this.limits.timelineLimit,
-        appendedEventCount: timelineEvents.length,
-        proofs,
-      }),
+    let nextState = this.#candidateWithTimeline(
+      { ...this.state, revision: this.state.revision + 1,
+        intakeCursor: batch.nextSequence, sourceHighWatermark: batch.highWatermark,
+        items: [...itemsById.values()], outbox: [...outboxById.values()] },
+      timelineEvents,
     );
+    if (cutoverProofChecks.length > 0) {
+      nextState = retainWorkLedgerTimelineForCapacity(this.state, nextState, this.limits);
+    }
+    const retainedProofIds = new Set(nextState.timeline.map(entry => entry.timelineId));
+    const invalidCutoverProofs = cutoverProofChecks.filter(({ proofs }) =>
+      !arePullRequestCutoverProofsRetained({ timeline: this.state.timeline,
+        timelineLimit: this.limits.timelineLimit, appendedEventCount: timelineEvents.length, proofs }) ||
+      proofs.some(proof => !retainedProofIds.has(proof.timelineId)));
     if (invalidCutoverProofs.length > 0) {
       const nextDeniedCutoverProofs = new Set(deniedCutoverProofs);
       for (const { checkId } of invalidCutoverProofs) {
@@ -2766,17 +2773,6 @@ export class WorkLedgerService {
       const items = batch.items.slice(0, Math.floor(batch.items.length / 2));
       return this.#recordBatch({ ...batch, items, nextSequence: items.at(-1).sequence }, now);
     }
-    const nextState = this.#candidateWithTimeline(
-      {
-        ...this.state,
-        revision: this.state.revision + 1,
-        intakeCursor: batch.nextSequence,
-        sourceHighWatermark: batch.highWatermark,
-        items: [...itemsById.values()],
-        outbox: [...outboxById.values()],
-      },
-      timelineEvents,
-    );
     await this.#persist(nextState);
     return cloneLedgerValue({
       received,

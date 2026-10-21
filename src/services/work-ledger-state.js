@@ -528,6 +528,32 @@ function sourceRootCapacityView(state) {
     .map(workItemCapacityView);
 }
 
+export function retainWorkLedgerTimelineForCapacity(previousState, candidate, limits) {
+  const currentBytes = prettySerializedLedgerBytes(workLedgerCapacityView(candidate));
+  if (currentBytes <= limits.stateByteBudget) return candidate;
+
+  const previousBySequence = new Map(previousState.timeline.map(entry => [entry.sequence, entry]));
+  let removed = 0;
+  let releasedBytes = 0;
+  const targetBytes = Math.floor(limits.stateByteBudget * 0.9);
+  for (const entry of candidate.timeline) {
+    if (currentBytes - releasedBytes <= targetBytes) break;
+    // Only rotate genuine existing history. Never discard this transaction's
+    // receipts or hide altered history before the normal validation runs.
+    const previous = previousBySequence.get(entry.sequence);
+    if (entry.sequence >= previousState.nextTimelineSequence || previous === undefined ||
+        JSON.stringify(entry) !== JSON.stringify(previous)) break;
+    const serialized = JSON.stringify(entry, null, 2);
+    const lines = 1 + (serialized.match(/\n/g)?.length ?? 0);
+    releasedBytes += Buffer.byteLength(serialized, 'utf8') + lines * 4 + 2;
+    removed += 1;
+  }
+  if (removed === 0) return candidate;
+  const timeline = candidate.timeline.slice(removed);
+  return { ...candidate, timeline,
+    timelineStartSequence: timeline[0]?.sequence ?? candidate.nextTimelineSequence };
+}
+
 function assertGraphDeliveryHistory(items) {
   for (const item of items) {
     let pending = null;
