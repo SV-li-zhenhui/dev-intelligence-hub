@@ -496,7 +496,9 @@ function publicRoleOperations(operationsByRole) {
 
 function writablePathsForGrant(operation, executionSource, workspace) {
   if (executionSource === null) {
-    return operation === "modify" ? workspace.writablePaths : [];
+    return operation === "modify"
+      ? [...workspace.writablePaths].sort((left, right) => left.localeCompare(right, "en"))
+      : [];
   }
   if (operation !== "modify") {
     throw invalid("Conflict preparation 只能授权 modify 代码任务");

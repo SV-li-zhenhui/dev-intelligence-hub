@@ -255,6 +255,21 @@ function factory(overrides = {}) {
   });
 }
 
+test("ordinary modify grants verify with mixed-case configured paths and still reject changed permissions", async () => {
+  const workspace = {
+    id: "acme-workspace", capabilities: ["git_head_snapshot"],
+    writablePaths: ["Obsolete", "PULL_REQUEST_TEMPLATE.md", "Projects", "src"],
+    excludePaths: [], requiredProfiles: [{ id: "node-tests", configDigest: "a".repeat(64) }], authorityDigest: "d".repeat(64),
+  };
+  const original = structuredClone(workspace);
+  const grantFactory = factory({ executorAuthority: { workspaces: [workspace] } });
+  const { grant } = await grantFactory.create(proposal());
+  assert.deepEqual(await grantFactory.verify(grant), grant);
+  assert.deepEqual(workspace, original);
+  const changedFactory = factory({ executorAuthority: { workspaces: [{ ...workspace, writablePaths: ["src"] }] } });
+  await assert.rejects(async () => changedFactory.verify(grant), { code: "INVALID_CODE_JOB_AUTHORITY" });
+});
+
 test("review repair grant uses live Head authority and exact configured paths without conflict evidence", async () => {
   const { contentDigest: _contentDigest, ...current } = proposal();
   const bound = normalizeBoundWorkProposal({ ...current, binding: { ...current.binding,
