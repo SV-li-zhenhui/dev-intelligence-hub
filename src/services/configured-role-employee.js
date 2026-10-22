@@ -149,6 +149,38 @@ function stableErrorCode(error) {
   return "ROLE_RUN_FAILED";
 }
 
+function runFailureSummary(error) {
+  try {
+    const pending = [error];
+    const seen = new Set();
+    const details = [];
+    for (let index = 0; index < pending.length && index < 8; index += 1) {
+      const current = pending[index];
+      if (!current || !['object', 'function'].includes(typeof current) || seen.has(current)) continue;
+      seen.add(current);
+      const own = key => Object.getOwnPropertyDescriptor(current, key)?.value;
+      const stage = own('stage');
+      const codes = own('causeCodes');
+      if (typeof stage === 'string' && /^[a-z][a-z0-9_]{0,47}$/.test(stage) && Array.isArray(codes)) {
+        const safeCodes = [];
+        for (let i = 0; i < Math.min(Object.getOwnPropertyDescriptor(codes, 'length')?.value ?? 0, 2); i += 1) {
+          const code = Object.getOwnPropertyDescriptor(codes, String(i))?.value;
+          if (typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,127}$/.test(code)) safeCodes.push(code);
+        }
+        const detail = `${stage}${safeCodes.length ? ` [${safeCodes.join(' > ')}]` : ''}`;
+        if (Buffer.byteLength(details.concat(detail).join('; '), 'utf8') <= 460) details.push(detail);
+      }
+      const errors = own('errors');
+      if (Array.isArray(errors)) {
+        for (let i = 0; i < Math.min(Object.getOwnPropertyDescriptor(errors, 'length')?.value ?? 0, 8); i += 1) pending.push(Object.getOwnPropertyDescriptor(errors, String(i))?.value);
+      }
+    }
+    return `本轮岗位运行失败：${details.length ? details.join('; ') : stableErrorCode(error)}`;
+  } catch {
+    return `本轮岗位运行失败：${stableErrorCode(error)}`;
+  }
+}
+
 function decisionSignal(input) {
   const request = dataObject(input);
   return normalizeAbortSignal(request?.signal ?? null);
@@ -512,7 +544,7 @@ export class ConfiguredRoleEmployee {
           lastRun: {
             trigger: normalizedTrigger,
             at: isoTimestamp(clock()),
-            summary: failure ? "本轮岗位运行失败" : runSummary(outcome),
+            summary: failure ? runFailureSummary(failure) : runSummary(outcome),
           },
           lastErrorCode: failure ? stableErrorCode(failure) : "",
         });

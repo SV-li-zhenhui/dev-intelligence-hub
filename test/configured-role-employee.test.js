@@ -1648,6 +1648,39 @@ test("onRun self-control fails explicitly instead of deadlocking the role queue"
   assert.equal((await employee.view()).lastErrorCode, "ROLE_RUN_IN_PROGRESS");
 });
 
+test('coordination failures retain bounded stage and cause codes for automatic recovery diagnosis', async () => {
+  const store = new MemoryStore();
+  const failure = Object.assign(new Error('private provider response'), {
+    code: 'WORK_COORDINATION_STAGE_FAILED', stage: 'work', causeCodes: ['ORCHESTRATOR_CONTEXT_STALE'],
+  });
+  const employee = new ConfiguredRoleEmployee({ definition: definition('orchestrator'),
+    permissions: permissions('complete'), brain: brain(), decisionEngine: fakeDecisionEngine('orchestrator'),
+    store, onRun: async () => { throw failure; } });
+  await assert.rejects(employee.run({ trigger: 'scheduled' }), e => e === failure);
+  const persisted = await store.read('configured-role-orchestrator-state');
+  assert.match(persisted.lastRun.summary, /work.*ORCHESTRATOR_CONTEXT_STALE/);
+  assert.doesNotMatch(JSON.stringify(persisted), /private provider response/);
+});
+
+test('failure diagnostics preserve original errors without invoking accessor properties', async (t) => {
+  let getterCalls = 0;
+  const accessors = Object.assign(new Error('private'), { stage: 'work' });
+  for (const name of ['causeCodes', 'errors']) Object.defineProperty(accessors, name, { get() { getterCalls += 1; throw new Error('accessed'); } });
+  const { proxy, revoke } = Proxy.revocable({}, {}); revoke();
+  for (const [name, failure] of [['accessors', accessors], ['revoked-proxy', proxy]]) {
+    await t.test(name, async () => {
+      const store = new MemoryStore();
+      const employee = new ConfiguredRoleEmployee({ definition: definition('tester'), permissions: permissions('complete'),
+        brain: brain(), decisionEngine: fakeDecisionEngine('tester'), store, onRun: async () => { throw failure; } });
+      let caught;
+      try { await employee.run({ trigger: 'scheduled' }); } catch (error) { caught = error; }
+      assert.equal(caught, failure);
+      assert.equal((await store.read('configured-role-tester-state')).lastErrorCode, 'ROLE_RUN_FAILED');
+    });
+  }
+  assert.equal(getterCalls, 0);
+});
+
 test("persisted failures and public state never contain provider secrets", async () => {
   const store = new MemoryStore();
   const secret = "provider-secret-value";
