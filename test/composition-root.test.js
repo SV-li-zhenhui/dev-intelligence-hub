@@ -4467,6 +4467,8 @@ test("automatic own PR repair composes internal push with ownership guards and c
         },
       });
       try {
+        assert.deepEqual(Object.keys(application.localCodeProposalRecovery), ["runCycle"]);
+        assert.equal(Object.isFrozen(application.localCodeProposalRecovery), true);
         assert.equal(calls.codeRunner.handlerTimeoutMs, scenario.expectedBudget);
         assert.equal(calls.codeRunner.leaseDurationMs, scenario.leaseDurationMs ?? 120_000);
         assert.ok(calls.codeRunner.handlerTimeoutMs < calls.codeRunner.leaseDurationMs);

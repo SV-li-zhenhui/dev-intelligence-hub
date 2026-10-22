@@ -87,6 +87,65 @@ test('continuation watchdog still stops owned work after fact refresh fails', { 
   } finally { release.resolve(); await background.stop(); }
 });
 
+test('automatic local proposal retries run during long code work and remain in lifecycle drain', { timeout: 5_000 }, async () => {
+  const refreshed = deferred(), codeStarted = deferred(), releaseCode = deferred();
+  const retried = deferred(), releaseRetry = deferred(); const timers = []; let polls = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    refreshService: { async refresh() { await refreshed.promise; } },
+    employeeRegistry: { schedules: () => [], async runSelected() {} },
+    workCoordination: { async intake() {}, async runCycle() { codeStarted.resolve(); await releaseCode.promise; } },
+    localCodeProposalRecovery: { async runCycle() { polls += 1; if (polls > 1) { retried.resolve(); await releaseRetry.promise; } } },
+  }, { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {} });
+  const initial = background.initialRefresh.catch(error => {
+    if (error.code !== 'LIFECYCLE_SHUTDOWN_ABORTED') throw error;
+  });
+  try {
+    const tick = timers.find(t => t.delay === 10_000);
+    await tick.callback(); assert.equal(polls, 0, 'fresh facts are required');
+    refreshed.resolve(); await codeStarted.promise;
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(polls, 1);
+    await tick.callback(); await retried.promise;
+    await tick.callback(); assert.equal(polls, 2, 'duplicate ticks coalesce');
+    assert.ok(background.drainStatus().activeParticipants.some(p => p.id === DRAIN_PARTICIPANTS.localCodeProposalRecovery.id));
+    let stopped = false; const stopping = background.stop().then(() => { stopped = true; });
+    releaseCode.resolve(); await new Promise(resolve => setImmediate(resolve)); assert.equal(stopped, false);
+    releaseRetry.resolve(); await stopping; await initial;
+    await tick.callback(); assert.equal(polls, 2);
+  } finally { refreshed.resolve(); releaseCode.resolve(); releaseRetry.resolve(); await background.stop(); }
+});
+
+test('a first local proposal recovery tick cannot enter closed maintenance admission', async () => {
+  const gate = new OperationalQuiescenceGate(); const timers = []; let polls = 0; let token;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    operations: { admission: { run: gate.run.bind(gate) } },
+    refreshService: { async refresh() {} }, employeeRegistry: { schedules: () => [], async runSelected() {} },
+    localCodeProposalRecovery: { async runCycle() { polls += 1; } },
+  }, { reportError() {}, setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {} });
+  try {
+    await background.initialRefresh; await new Promise(resolve => setImmediate(resolve));
+    const before = polls; const tick = timers.find(t => t.delay === 10_000);
+    token = await gate.enter();
+    await tick.callback(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(polls, before);
+    gate.leave(token); token = null;
+    await tick.callback(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(polls, before + 1);
+  } finally { if (token) gate.leave(token); await background.stop(); }
+});
+
+test('manual mode does not poll the automatic local proposal recovery port', async () => {
+  const timers = []; let polls = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: false } },
+    refreshService: { async refresh() {} }, employeeRegistry: { schedules: () => [], async runSelected() {} },
+    localCodeProposalRecovery: { async runCycle() { polls += 1; } },
+  }, { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {} });
+  try { await background.initialRefresh; await timers.find(t => t.delay === 10_000).callback(); assert.equal(polls, 0); }
+  finally { await background.stop(); }
+});
+
 test('durable continuations start automatically after fresh intake and hand off without a role timer', { timeout: 5_000 }, async () => {
   const refresh = deferred();
   const developerStarted = deferred();
@@ -2265,7 +2324,7 @@ test("production drain participants reject every public trigger before execution
   const reportedErrors = [];
   const executed = [];
   const participantIds = Object.values(DRAIN_PARTICIPANTS).filter(
-    (participant) => participant !== DRAIN_PARTICIPANTS.reviewHandoffRecovery && participant !== DRAIN_PARTICIPANTS.workContinuation,
+    (participant) => participant !== DRAIN_PARTICIPANTS.reviewHandoffRecovery && participant !== DRAIN_PARTICIPANTS.workContinuation && participant !== DRAIN_PARTICIPANTS.localCodeProposalRecovery,
   ).map(
     (participant) => participant.id,
   );

@@ -919,6 +919,12 @@ The controlled executor's session limit counts active, interrupted or
 cleanup-pending sessions. Completed, failed and cancelled history without a
 cleanup fence remains readable and does not consume execution capacity.
 
+Existing local code proposals are also polled on the 10-second automatic
+continuation tick after fresh facts are admitted. This uses the same leased
+proposal runner as ordinary coordination and coalesces concurrent polls, so
+pending authorization retries do not wait behind a native code model run.
+The independent poll participates in operational admission and shutdown drain.
+
 ## Automatic work continuations
 
 In automatic mode, schema 2 of `work-continuations.json` records the source task,

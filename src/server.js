@@ -63,6 +63,7 @@ export const DRAIN_PARTICIPANTS = Object.freeze({
   ),
   workCoordinationCycle: drainParticipant("workCoordination.runCycle"),
   workContinuation: drainParticipant("workContinuationScheduler.runCycle"),
+  localCodeProposalRecovery: drainParticipant("localCodeProposalRecovery.runCycle"),
   reviewHandoffRecovery: drainParticipant("reviewHandoffReconciler.runCycle"),
   employeeExecution: drainParticipant(
     "employeeRegistry.runSelected/runAll/run",
@@ -4591,7 +4592,18 @@ export function startApplicationBackgroundWork(
   }
 
   function signalWorkContinuations() {
-    if (stopped || !application.workContinuationScheduler) return Promise.resolve();
+    if (stopped) return Promise.resolve();
+    if (application.config.githubActions?.enabled === true &&
+        application.config.githubActions.automaticOwnPrRepair === true &&
+        independentEmployeeFactsReady() && typeof application.localCodeProposalRecovery?.runCycle === "function") {
+      // Existing proposals must be polled even while a native code job owns a
+      // long-running employee cycle. The shared runner coalesces concurrent polls.
+      runCoalescedTracked(coalescedAgencyCycles, "local-code-proposal-recovery", signal =>
+        runDrainParticipant(DRAIN_PARTICIPANTS.localCodeProposalRecovery, () =>
+          application.localCodeProposalRecovery.runCycle({ signal })),
+      { rethrow: true }).catch(reportBackgroundError);
+    }
+    if (!application.workContinuationScheduler) return Promise.resolve();
     return runCoalescedTracked(coalescedAgencyCycles, "work-continuations", (signal) =>
       runDrainParticipant(DRAIN_PARTICIPANTS.workContinuation, () => application.workContinuationScheduler.runCycle({
         signal,
@@ -4684,7 +4696,7 @@ export function startApplicationBackgroundWork(
     { rethrow: true },
   );
 
-  if (application.workContinuationScheduler) {
+  if (application.workContinuationScheduler || application.localCodeProposalRecovery) {
     timers.push(setIntervalFn(signalWorkContinuations, 10_000));
   }
 

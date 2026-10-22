@@ -1064,6 +1064,7 @@ export async function createApplication({
   let changePackageRuntime = null;
   let automaticOwnPrRepair = null;
   let automaticLocalCodeAuthorization = null;
+  let localCodeProposalRecovery = null;
   let codeAuthorizationRoleRegistry = null;
   let automaticReviewScopeExitReader = null;
   let workflowRouting = null;
@@ -2231,8 +2232,7 @@ export async function createApplication({
       );
     }
     if (localCodeExecutionEnabled) {
-      proposalRunners.push(
-        codeActionProposalRunnerFactory({
+      const codeProposalRunner = codeActionProposalRunnerFactory({
           enabled: true,
           runner: workProposalRuntime.runners[CODE_ACTION_PROPOSAL_RUNNER_ID],
           confirmationProducer: confirmationRuntime.producerQueue,
@@ -2259,8 +2259,11 @@ export async function createApplication({
           ...(workCoordinationDependencies.clock
             ? { clock: workCoordinationDependencies.clock }
             : {}),
-        }),
-      );
+        });
+      proposalRunners.push(codeProposalRunner);
+      if (automaticLocalCodeAuthorization !== null) {
+        localCodeProposalRecovery = frozenPort(codeProposalRunner, ["runCycle"], "local code proposal recovery");
+      }
     }
     if (configurationProposalExecutionEnabled) {
       proposalRunners.push(
@@ -2998,6 +3001,7 @@ export async function createApplication({
       attentionCoordinator,
       workCoordination,
       workContinuationScheduler,
+      localCodeProposalRecovery,
       ownerWorkRetry,
       ownerWorkRequests,
       reviewHandoffReconciler,
