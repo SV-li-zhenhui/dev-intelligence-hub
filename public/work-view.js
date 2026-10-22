@@ -1030,7 +1030,7 @@ export function renderWorkView(state, { now = Date.now() } = {}) {
     </section>
     <div class="work-safeguards" role="note">
       <span class="status-pill ${safeguards.prEmployeePaused ? "status-paused" : "status-working"}">PR 新循环：${safeguards.prEmployeePaused ? "暂停 / 旧员工独占" : "已启用"}</span>
-      <span class="status-pill ${safeguards.externalActionsEnabled ? "status-waiting_user" : "status-disabled"}">GitHub 外部写：${safeguards.automaticReviewEnabled ? "近期 Assign 的 PR 自动 Review" : safeguards.externalActionsEnabled ? "逐项确认" : "关闭"}</span>
+      <span class="status-pill ${safeguards.externalActionsEnabled ? "status-waiting_user" : "status-disabled"}">GitHub 外部写：${safeguards.automaticReviewEnabled ? "当前分配的 PR 自动 Review" : safeguards.externalActionsEnabled ? "逐项确认" : "关闭"}</span>
       <small>模型只生成结构化判断；代码执行和外部写入不能绕过受控执行器与确认队列。</small>
     </div>
     <details class="work-audit-graph">

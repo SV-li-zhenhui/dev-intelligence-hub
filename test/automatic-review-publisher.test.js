@@ -28,6 +28,15 @@ test("eligible proposals publish using durable approval and configured testing h
   assert.deepEqual(calls[0][1].reviewHandoff, { workType: "testing", responsiblePerson: { login: "tester", product: "qt" } });
 });
 
+test('an automatic current-assignee Review publishes without assignment-age or CI confirmation', async () => {
+  const { publisher, item, calls } = fixture({ event: 'COMMENT', facts: {
+    assignees: ['me'], reviewReceivedAt: '2026-10-01T09:00:00Z', ciStatus: 'PENDING',
+  }, admission: { kind: 'owner_requested', admittedAt: '2026-10-09T09:50:00Z' } });
+  assert.equal(await publisher.verify({ ...item, action: item.display.payload.action }), true);
+  assert.equal((await publisher.publish(item)).status, 'completed');
+  assert.equal(calls.length, 1);
+});
+
 test("an admitted failed-CI review publishes and passes execution verification after its intake window expires", async () => {
   const receivedAt = "2026-10-08T09:00:00Z";
   const { publisher, item, calls } = fixture({ event: "COMMENT", facts: { ciStatus: "FAILURE", reviewReceivedAt: receivedAt },

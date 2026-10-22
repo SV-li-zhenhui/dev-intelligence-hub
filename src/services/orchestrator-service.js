@@ -632,16 +632,16 @@ function cancelledConflictChildWithoutDelivery(task) {
     task.responsibility.id === "developer" && task.deliveries.length === 0;
 }
 
-function assertStructuredPrTriageAction(packet, children, action, tasksById) {
+function assertStructuredPrTriageAction(packet, children, action, tasksById, automaticMode, capabilityRoles) {
   const triage = structuredPrTriage(packet);
   if (triage === null) return;
-  if (children.size === 0 && action.type !== "decompose") {
+  if (!automaticMode && children.size === 0 && action.type !== "decompose") {
     throw denied("Initial structured PR triage must be decomposed");
   }
   const controlledChild = children.has(action.sourceTaskId) ? tasksById.get(action.sourceTaskId) : null;
   const childLedgerStatus = packet.context.requirements.coordination.directChildren.find(
     ({ taskId }) => taskId === action.sourceTaskId)?.ledgerStatus;
-  if (isExternalRereview(packet) && action.type === "pause" && controlledChild &&
+  if (!automaticMode && isExternalRereview(packet) && action.type === "pause" && controlledChild &&
       ["queued", "retry_wait", "blocked"].includes(childLedgerStatus) &&
       malformedReviewChildWithSettledDeliveries(controlledChild)) {
     throw denied("A settled malformed external rereview child must be cancelled before authoritative replacement");
@@ -651,17 +651,26 @@ function assertStructuredPrTriageAction(packet, children, action, tasksById) {
     throw denied("Automatic rereview correction must preserve an intentionally paused Review child");
   }
   if (action.type !== "decompose") return;
-  const replaceCancelledConflict = triage.nextAction === "resolve_conflict" &&
+  if (automaticMode && [...children].some((taskId) => {
+    const child = tasksById.get(taskId);
+    return child.status === "paused" && child.responsibility.type === "role" &&
+      (child.responsibility.id === capabilityRoles.get(action.capability) ||
+       (action.capability === "pr-review" && reviewChildResponsibility(child)));
+  })) {
+    throw denied("Automatic coordination must preserve an intentionally paused child");
+  }
+  const replaceCancelledConflict = !automaticMode && triage.nextAction === "resolve_conflict" &&
     triage.suggestedCapability === "development" &&
     [...children].every((taskId) => cancelledConflictChildWithoutDelivery(tasksById.get(taskId)));
-  if (children.size !== 0 && !replaceCancelledConflict && !(isExternalRereview(packet) &&
+  if (!automaticMode && children.size !== 0 && !replaceCancelledConflict && !(isExternalRereview(packet) &&
       [...children].every((taskId) => cancelledMalformedReviewChild(tasksById.get(taskId))))) {
     throw denied("Structured PR triage permits only one direct child");
   }
-  if (action.capability !== triage.suggestedCapability) {
+  if (!automaticMode && action.capability !== triage.suggestedCapability) {
     throw denied("Structured PR triage capability does not match trusted intake");
   }
-  if (isExternalRereview(packet) && !requiredReviewDeliverable(action.acceptanceContract)) {
+  if (isExternalRereview(packet) && (!automaticMode || action.capability === "pr-review") &&
+      !requiredReviewDeliverable(action.acceptanceContract)) {
     throw denied("External rereview requires a required authoritative Review delivery");
   }
 }
@@ -1270,7 +1279,8 @@ async function planDeliveryDecision({
   const submitted = latestSubmitted(source, action.submittedDeliveryRevision);
   let verifiedEvidence = false;
   if (action.type === "accept_delivery") {
-    if (isExternalRereview(packet) && !requiredReviewDeliverable(latestContract(source))) {
+    if (isExternalRereview(packet) && reviewChildResponsibility(source) &&
+        !requiredReviewDeliverable(latestContract(source))) {
       throw denied("External rereview cannot be accepted from a local report");
     }
     const acceptedInputs = deriveAcceptedInputs(source, tasksById);
@@ -1408,6 +1418,7 @@ export class OrchestratorService {
   #clock;
   #capabilityRoles;
   #admitAction;
+  #automaticMode;
 
   constructor({
     contextAssembler,
@@ -1422,6 +1433,7 @@ export class OrchestratorService {
     clock = () => new Date(),
     capabilityRoles = {},
     actionAdmissionGate,
+    automaticMode = false,
   } = {}) {
     this.#contextAssembler = requirePort(
       contextAssembler,
@@ -1452,6 +1464,7 @@ export class OrchestratorService {
     this.#clock = clock;
     this.#capabilityRoles = normalizeCapabilityRoles(capabilityRoles);
     this.#admitAction = actionAdmissionRun(actionAdmissionGate);
+    this.#automaticMode = automaticMode === true;
     Object.freeze(this);
   }
 
@@ -1566,7 +1579,7 @@ export class OrchestratorService {
     assertOrchestrator(worker, bindingTask);
     const children = directChildIds(packet);
     const action = intent.action;
-    assertStructuredPrTriageAction(packet, children, action, tasksById);
+    assertStructuredPrTriageAction(packet, children, action, tasksById, this.#automaticMode, this.#capabilityRoles);
     const source = assertActionSource(
       action,
       graph,

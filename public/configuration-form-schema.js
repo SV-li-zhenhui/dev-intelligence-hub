@@ -136,7 +136,7 @@ const LABELS = deepFreeze({
   gitCommand: "固定 Git 命令",
   gitTimeoutMs: "Git 超时（毫秒）",
   githubActions: "GitHub 动作",
-  automaticReview: "自动 Review（最近 24 小时 Assign 给我的 PR，自动发布）",
+  automaticReview: "自动 Review（当前 Assign 给我的 PR，自动发布与交接）",
   assignAfterAutomaticReview: "自动分配 Review 后续（通过交测试，需修改或评论交作者）",
   automaticOwnPrRepair: "自动修复我的 PR",
   enabledActions: "启用的 PR 外部动作",

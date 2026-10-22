@@ -518,6 +518,55 @@ async function createCompletedSessionWithRead(setup) {
   return { read, failedCompletion, completed };
 }
 
+test('terminal execution history does not exhaust active session capacity and its proof remains readable', async (t) => {
+  const setup = await fixture(t);
+  const { read, completed } = await createCompletedSessionWithRead(setup);
+  const { executor } = setup.createExecutor({ limits: { maxSessions: 1 } });
+  await executor.recover();
+  const next = await executor.start(startRequest({ sessionId: 'session-two' }));
+  assert.equal(next.status, 'active');
+  const old = await executor.getActionResult({ sessionId: completed.session.id, actionId: read.action.id });
+  assert.equal(old.action.id, read.action.id);
+  assert.deepEqual(old.result, read.result);
+  await assert.rejects(executor.start(startRequest({ sessionId: 'session-three' })), { code: 'SESSION_LIMIT' });
+  assert.equal((await executor.start(startRequest({ sessionId: 'session-two' }))).id, next.id);
+});
+
+test('failed and cancelled sessions release capacity while interrupted sessions retain it', async (t) => {
+  for (const status of ['failed', 'cancelled']) {
+    const setup = await fixture(t);
+    if (status === 'failed') {
+      const broker = overrideBroker(setup.createBroker(), { async createExecution() { throw new Error('creation failed'); } });
+      const { executor } = setup.createExecutor({ broker });
+      await executor.recover();
+      await assert.rejects(executor.start(startRequest()), { code: 'START_FAILED' });
+    } else {
+      const { executor } = setup.createExecutor();
+      await executor.recover();
+      const session = await executor.start(startRequest());
+      await executor.reconcileCancellation(cancellationRequest(session));
+    }
+    const { executor } = setup.createExecutor({ limits: { maxSessions: 1 } });
+    await executor.recover();
+    assert.equal((await executor.start(startRequest({ sessionId: 'next' }))).status, 'active');
+    const retained = await setup.innerStore.read('code-executor-state');
+    assert.equal(retained.sessions['session-one'].status, status);
+    const restarted = setup.createExecutor({ limits: { maxSessions: 1 } }).executor;
+    await restarted.recover();
+    assert.equal((await restarted.view({ sessionId: 'next' })).status, 'interrupted');
+    await assert.rejects(restarted.start(startRequest({ sessionId: 'third' })), { code: 'SESSION_LIMIT' });
+  }
+});
+
+test('concurrent new sessions cannot exceed active capacity', async (t) => {
+  const setup = await fixture(t);
+  const { executor } = setup.createExecutor({ limits: { maxSessions: 1 } });
+  await executor.recover();
+  const results = await Promise.allSettled(['a', 'b'].map(sessionId => executor.start(startRequest({ sessionId }))));
+  assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+  assert.equal(results.find(r => r.status === 'rejected').reason.code, 'SESSION_LIMIT');
+});
+
 async function createCompletedSessionWithChanges(setup) {
   const first = setup.createExecutor();
   await first.executor.recover();
@@ -2816,7 +2865,7 @@ test("cancellation remains retryable until sandbox cleanup is confirmed", async 
     cleanupResults: [cleanupPendingError("still cleaning"), undefined],
   });
   const setup = await fixture(t, { sandbox });
-  const { executor } = setup.createExecutor();
+  const { executor } = setup.createExecutor({ limits: { maxSessions: 1 } });
   await executor.recover();
   const session = await executor.start(startRequest());
   const profileAction = {
@@ -2846,6 +2895,7 @@ test("cancellation remains retryable until sandbox cleanup is confirmed", async 
   const pending = await executor.view({ sessionId: session.id });
   assert.equal(pending.status, "cancelling");
   assert.equal(pending.cleanupPending, true);
+  await assert.rejects(executor.start(startRequest({ sessionId: "while-cleaning" })), { code: "SESSION_LIMIT" });
   assert.equal(sandbox.cleanupCalls.length, 1);
   assert.equal(
     await readFile(attemptFile(setup, session.id, 1), "utf8"),
@@ -2857,6 +2907,7 @@ test("cancellation remains retryable until sandbox cleanup is confirmed", async 
   assert.equal(settled.session.cleanupPending, false);
   assert.equal(settled.proof.sandboxCleanupConfirmed, true);
   assert.equal(sandbox.cleanupCalls.length, 2);
+  assert.equal((await executor.start(startRequest({ sessionId: "after-cleanup" }))).status, "active");
   await assert.rejects(
     readFile(attemptFile(setup, session.id, 1)),
     (error) => error?.code === "ENOENT",

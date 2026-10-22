@@ -899,6 +899,26 @@ must complete before employees are resumed. Privileged settings remain disabled
 in `config.example.json`; review every enabled role, brain data class, workspace,
 GitHub action, and routing rule in the active version after an upgrade.
 
+## Automatic authority and execution capacity
+
+With automatic Review or own-PR repair enabled, routine grants for current,
+trusted owner-requested local work are approved by the system after checking
+its live Head/Base, task, role, workspace and execution binding. Draft status
+alone does not prevent local inspection or verification. Automatic Review
+uses the current assignee list; old assignment timestamps and pending CI do
+not require another confirmation. A removed assignee, a same-Head published
+Review, explicit task pauses and rejected proposals remain authoritative.
+
+Automatic coordination can delegate subsequent configured capabilities and
+replace cancelled children without a one-child historical limit. It preserves
+paused children rather than replacing their work. An authority-rejected root
+yields the next cycle of its role, so other roles cannot accidentally consume
+that deferral and let it monopolize the queue again.
+
+The controlled executor's session limit counts active, interrupted or
+cleanup-pending sessions. Completed, failed and cancelled history without a
+cleanup fence remains readable and does not consume execution capacity.
+
 ## Automatic work continuations
 
 In automatic mode, schema 2 of `work-continuations.json` records the source task,

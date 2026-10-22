@@ -2595,6 +2595,8 @@ export async function createApplication({
             }),
       });
       const orchestratorService = orchestratorServiceFactory({
+        automaticMode: config.githubActions?.enabled === true &&
+          (config.githubActions.automaticReview === true || config.githubActions.automaticOwnPrRepair === true),
         contextAssembler: roleContextAssembler,
         graphReader: workLedgerRuntime.graphReader,
         scopedGraphPlannerFactory:

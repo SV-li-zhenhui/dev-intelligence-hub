@@ -4344,6 +4344,27 @@ test("a pre-write root authority rejection stays local to one orchestration outc
   assert.equal(ledger.calls.transition.length, 0);
 });
 
+test('a rejected root yields the next cycle so another root can advance', async () => {
+  const time = controlledClock();
+  const roots = [workItem(65, { type: 'role', id: 'orchestrator' }), workItem(66, { type: 'role', id: 'orchestrator' })];
+  const ledger = new FakeLedger({ source: roots, time }); const processed = [];
+  const loop = createLoop({ ledger, time,
+    directory: new FakeRoleDirectory({ orchestrator: worker({ roleId: 'orchestrator', workerId: 'employee-orchestrator',
+      decide: async ({ item }) => orchestrationDecision(item) }) }),
+    roleContextAssembler: { async assemble({ roleId, item }) { return contextPacket(item, roleId); } },
+    orchestratorService: { async execute({ item }) {
+      processed.push(item.itemId);
+      if (item.itemId === roots[0].itemId) throw new OrchestratorServiceError('ORCHESTRATOR_AUTHORITY_DENIED', 'invalid dependency', 403);
+      return { applied: true };
+    } },
+  });
+  await loop.runCycle({ roleId: 'orchestrator', workLimit: 1 });
+  await loop.runCycle({ roleId: 'developer', workLimit: 1 });
+  await loop.runCycle({ roleId: 'orchestrator', workLimit: 1 });
+  assert.deepEqual(processed, roots.map(r => r.itemId));
+  assert.equal(ledger.calls.claim.length, 0);
+});
+
 test("non-root orchestrator tasks never use the configured-root path", async (t) => {
   await t.test("graph-blocked child stays unclaimed", async () => {
     const time = controlledClock();

@@ -2,13 +2,22 @@ const DAY_MS = 86_400_000;
 const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 const sameLogin = (left, right) => typeof left === "string" && typeof right === "string" && left.toLowerCase() === right.toLowerCase();
 
-// These facts come from GitHub assignment events. PR activity or review requests
-// and local observation times are deliberately not substitutes for receipt time.
+// Live assignees authorize standing automatic work. Legacy projections without
+// that list use their original assignment-event admission.
 export function automaticReviewEligibility(item, account, now = new Date()) {
   if (!LOGIN.test(account || "") || item?.kind !== "pull_request") return "INVALID_TARGET";
   if (item.state?.toLowerCase() !== "open" || item.isDraft !== false) return "PR_NOT_READY";
-  if (item.ciStatus && !["NONE", "SUCCESS", "FAILURE", "ERROR"].includes(item.ciStatus)) return "CI_NOT_READY";
   if (!LOGIN.test(item.author || "") || sameLogin(item.author, account)) return "SELF_AUTHORED";
+  // Live assignment is sufficient in automatic mode. Older stored projections
+  // without an assignee list retain their original admission fallback.
+  if (Array.isArray(item.assignees)) {
+    if (!item.assignees.some(login => sameLogin(login, account))) return "NO_CURRENT_INCOMING_REQUEST";
+    if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(item.headRefOid || "")) return "HEAD_UNKNOWN";
+    if (["APPROVED", "CHANGES_REQUESTED"].includes(item.myReviewState) && item.myReviewCommitOid === item.headRefOid) return "HEAD_ALREADY_REVIEWED";
+    if (item.myLatestPublishedReviewCommitOid === item.headRefOid) return "HEAD_ALREADY_REVIEWED";
+    return null;
+  }
+  if (item.ciStatus && !["NONE", "SUCCESS", "FAILURE", "ERROR"].includes(item.ciStatus)) return "CI_NOT_READY";
   if (item.incomingReviewFactsAvailable !== true || !sameLogin(item.reviewRecipient, account) ||
       !LOGIN.test(item.reviewReceivedFrom || "") || sameLogin(item.reviewReceivedFrom, account) ||
       item.reviewReceivedVia !== "assignee" || !item.reviewRequestEventId) return "NO_CURRENT_INCOMING_REQUEST";
@@ -30,13 +39,13 @@ export function automaticReviewWorkAdmission(root, inputRevision = root?.source?
   if (source?.kind !== "pull_request" || root.sourceQuarantine !== null || source.scope?.active !== true) return null;
   const event = source.current?.event;
   if (!event?.source || source.identity?.provider !== event.source.provider || source.identity?.scopeId !== event.source.scopeId) return null;
-  const orchestratedRereview = event.payload?.workType === "general" &&
-    source.identity.targetRoleId === "orchestrator" && event.payload.nextAction === "rereview" &&
+  const orchestratedReview = event.payload?.workType === "general" &&
+    source.identity.targetRoleId === "orchestrator" && ["review", "rereview"].includes(event.payload.nextAction) &&
     event.payload.suggestedCapability === "pr-review" &&
     /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(source.current.headRefOid || "") &&
     event.payload.expectedHeadRefOid === source.current.headRefOid && event.payload.headRefOid === source.current.headRefOid;
   if (event.source.provider === "local-owner" && source.scope.kind === "owner_requested" &&
-      event.eventType === "pull_request.owner_requested" && (event.payload?.workType === "pull_request" || orchestratedRereview)) {
+      event.eventType === "pull_request.owner_requested" && (event.payload?.workType === "pull_request" || orchestratedReview)) {
     return { kind: "owner_requested", admittedAt: root.createdAt };
   }
   const facts = event?.payload;
@@ -61,6 +70,10 @@ export function automaticReviewWorkAdmission(root, inputRevision = root?.source?
 export function automaticReviewContinuationEligibility(item, account, now, admission) {
   const timestamp = now instanceof Date ? now.getTime() : Date.parse(now);
   const admittedAt = Date.parse(admission?.admittedAt);
+  if (Array.isArray(item?.assignees) && ["assigned", "owner_requested"].includes(admission?.kind) &&
+      Number.isFinite(timestamp) && Number.isFinite(admittedAt) && admittedAt <= timestamp) {
+    return automaticReviewEligibility(item, account, now);
+  }
   const receivedAt = Date.parse(item?.reviewReceivedAt);
   if (!Number.isFinite(timestamp) || !Number.isFinite(admittedAt) || admittedAt > timestamp ||
       !Number.isFinite(receivedAt) || receivedAt > timestamp) return "INVALID_REVIEW_ADMISSION";

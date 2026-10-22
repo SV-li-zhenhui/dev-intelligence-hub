@@ -1124,6 +1124,7 @@ export class GitHubAdapter {
     return {
       ...projectIncomingReview(pr, account), kind: "pull_request", state: pr.state.toLowerCase(),
       author: pr.author?.login || "", currentUser: account, headRefOid: pr.headRefOid,
+      assignees: pr.assignees.nodes.map(user => user.login),
       isDraft: pr.isDraft, title: pr.title, repo: repository, labels: pr.labels?.nodes?.map((label) => label.name) || [],
       ciStatus: pr.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state || "NONE",
       gitTarget: { baseRefName: pr.baseRefName, headRefName: pr.headRefName },

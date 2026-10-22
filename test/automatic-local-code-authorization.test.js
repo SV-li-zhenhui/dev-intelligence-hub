@@ -45,7 +45,6 @@ for (const [name, mutate] of [
   ['changed Head', f => { f.facts.headRefOid = '9'.repeat(40); }],
   ['changed Base', f => { f.facts.baseRefOid = '9'.repeat(40); }],
   ['closed PR', f => { f.facts.state = 'closed'; }],
-  ['draft PR', f => { f.facts.isDraft = true; }],
   ['paused task', f => { f.root.status = 'paused'; }],
   ['paused role', f => { f.roleState.paused = true; }],
   ['revoked scope', f => { f.root.source.scope.active = false; }],
@@ -58,6 +57,25 @@ for (const [name, mutate] of [
     assert.equal(f.calls.length, 0);
   });
 }
+
+test('automatic local work accepts an authored Draft and trusted owner intake without a legacy relation tag', async () => {
+  for (const operation of ['inspect', 'modify', 'verify']) {
+    const f = fixture('developer', operation);
+    f.root.event = { eventType: 'pull_request.owner_requested', payload: { workType: 'general' } };
+    f.facts.isDraft = true;
+    assert.equal((await f.service.approveCodeJob(f.item)).status, 'completed');
+    assert.equal(f.calls.length, 1);
+  }
+});
+
+test('an existing trusted owner-requested local task does not ask again based on PR authorship', async () => {
+  const f = fixture('tester', 'verify');
+  f.facts.author = 'other';
+  f.root.source.scope.kind = 'owner_requested';
+  f.root.source.identity = { provider: 'local-owner' };
+  assert.equal((await f.service.approveCodeJob(f.item)).status, 'completed');
+  assert.equal(f.calls.length, 1);
+});
 
 test('tester cannot modify; stale and rejected authorizations cannot be revived', async () => {
   const f = fixture('tester', 'modify');

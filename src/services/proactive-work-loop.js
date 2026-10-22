@@ -894,7 +894,7 @@ export class ProactiveWorkLoop {
     this.stalePrFactSweeps = new Map();
     this.prPreparationSweeps = new Map();
     this.blockedRootSweeps = new Map();
-    this.claimCycleSequence = 0;
+    this.claimCycleSequences = new Map();
   }
 
   runCycle(input = {}) {
@@ -937,11 +937,12 @@ export class ProactiveWorkLoop {
     );
     const items = candidateWindow.items;
     throwIfLoopAborted(options.signal);
-    const claimCycleSequence = ++this.claimCycleSequence;
+    const scope = options.roleId ?? "*";
+    const claimCycleSequence = (this.claimCycleSequences.get(scope) ?? 0) + 1;
+    this.claimCycleSequences.set(scope, claimCycleSequence);
     const itemRevisions = new Map(
       items.map((item) => [item.itemId, item.revision]),
     );
-    const scope = options.roleId ?? "*";
     const stalePrFactSweep = this.stalePrFactSweeps.get(scope) ?? new Map();
     this.stalePrFactSweeps.set(scope, stalePrFactSweep);
     for (const [itemId, revision] of stalePrFactSweep) {
@@ -958,7 +959,7 @@ export class ProactiveWorkLoop {
           itemRevisions.has(itemId) &&
           itemRevisions.get(itemId) !== deferral.revision
         ) ||
-        deferral.retryAfterCycle < claimCycleSequence
+        (deferral.scope === scope && deferral.retryAfterCycle < claimCycleSequence)
       ) {
         this.fencedClaimDeferrals.delete(itemId);
       }
@@ -1026,6 +1027,7 @@ export class ProactiveWorkLoop {
       const fencedDeferral = this.fencedClaimDeferrals.get(item.itemId);
       if (
         fencedDeferral?.revision === item.revision &&
+        fencedDeferral.scope === scope &&
         fencedDeferral.retryAfterCycle >= claimCycleSequence
       ) {
         continue;
@@ -1201,9 +1203,16 @@ export class ProactiveWorkLoop {
               this.fencedClaimDeferrals.set(item.itemId, {
                 revision: item.revision,
                 retryAfterCycle: claimCycleSequence + 1,
+                scope,
               });
             }
-            if (configuredResultConsumesWorkBudget(processed)) {
+            if (processed.outcome.status === "orchestration_rejected") {
+              this.fencedClaimDeferrals.set(item.itemId, {
+                revision: item.revision,
+                retryAfterCycle: claimCycleSequence + 1,
+                scope,
+              });
+            } else if (configuredResultConsumesWorkBudget(processed)) {
               this.fencedClaimDeferrals.delete(item.itemId);
             }
             claimAttempts += processed.claimAttempted ? 1 : 0;
@@ -1223,6 +1232,7 @@ export class ProactiveWorkLoop {
               this.fencedClaimDeferrals.set(item.itemId, {
                 revision: item.revision,
                 retryAfterCycle: claimCycleSequence + 1,
+                scope,
               });
             }
             outcomes.push({ itemId: item.itemId, ...claimFailureOutcome(claim) });

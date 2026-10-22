@@ -2118,7 +2118,9 @@ export class ControlledCodeExecutor {
         }
         return { changed: false, value: { existing: true } };
       }
-      if (Object.keys(state.sessions).length >= this.limits.maxSessions) {
+      const occupied = Object.values(state.sessions).filter(session =>
+        !["completed", "failed", "cancelled"].includes(session.status) || session.cleanupFence !== null);
+      if (occupied.length >= this.limits.maxSessions) {
         throw executorError("SESSION_LIMIT", "代码执行会话数量已达上限");
       }
       const at = this.#now();

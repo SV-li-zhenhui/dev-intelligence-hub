@@ -1,7 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import { OperationQueue } from '../lib/operation-queue.js';
 import { samePullRequestExecutionBinding } from '../domain/pull-request-execution-binding.js';
-import { currentWorkItemEvent } from './work-ledger-pr-source.js';
 import { approveOwnPrAction } from './automatic-own-pr-repair-authorization.js';
 
 const sameLogin = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
@@ -43,16 +42,17 @@ export class AutomaticLocalCodeAuthorization {
     const roleState = await this.roleStateReader.read(role);
     if (roleState?.enabled !== true || roleState.paused !== false) return null;
     const context = await this.ledger.readPullRequestExecutionContext(binding);
-    if (!samePullRequestExecutionBinding(context.inputBinding, binding) || !sameLogin(context.author, actor)) return null;
+    if (!samePullRequestExecutionBinding(context.inputBinding, binding)) return null;
     const root = await this.ledger.readItemForReconciliation({ itemId: binding.rootItemId });
     const task = item.requestedBy.workItemId === binding.rootItemId ? root :
       await this.ledger.readItemForReconciliation({ itemId: item.requestedBy.workItemId });
     if (!root || !task || !ACTIVE.has(root.status) || !ACTIVE.has(task.status) ||
-        root.source?.scope?.active !== true || task.currentTarget?.type !== 'role' || task.currentTarget.id !== role ||
-        currentWorkItemEvent(root)?.payload?.relation !== 'authored') return null;
+        root.source?.scope?.active !== true || task.currentTarget?.type !== 'role' || task.currentTarget.id !== role) return null;
+    const ownerRequested = root.source.scope.kind === 'owner_requested' && root.source.identity?.provider === 'local-owner';
+    if (!sameLogin(context.author, actor) && !ownerRequested) return null;
     const facts = await this.github.readOwnPullRequestConflict({ repository: binding.repository,
       number: binding.pullRequestNumber, account: actor });
-    if (facts.state !== 'open' || facts.isDraft !== false || !sameLogin(facts.author, actor) ||
+    if (facts.state !== 'open' || !sameLogin(facts.author, context.author) ||
         facts.headRefOid !== binding.headRefOid || facts.baseRefOid !== binding.gitTarget.baseRefOid) return null;
     try {
       if (!isDeepStrictEqual(await this.grantVerifier.verify(grant), grant)) return null;

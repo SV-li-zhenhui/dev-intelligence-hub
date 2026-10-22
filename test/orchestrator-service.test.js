@@ -685,6 +685,42 @@ test("structured PR triage creates exactly one child for its trusted capability"
   }
 });
 
+test('automatic coordination can replace cancelled Review work and delegate a follow-up capability', async () => {
+  const root = task({ taskId: 'automatic-root' });
+  const child = task({ taskId: 'automatic-root/old', parentTaskId: root.taskId, role: 'orchestrator', status: 'cancelled' });
+  const view = graphView([root, child], 3);
+  const event = structuredTriageEvent('pr-review');
+  event.payload.nextAction = 'rereview';
+  const packet = packetFor(view, root, { directChildren: [child], event });
+  const fakes = fakePorts({ packet, views: view });
+  const service = new OrchestratorService({ ...fakes.ports, automaticMode: true, capabilityRoles: { testing: 'tester' } });
+  const result = await service.execute({
+    worker: { roleId: 'orchestrator', workerId: 'employee-orchestrator' }, item: itemFor(root), contextPacket: packet,
+    intent: orchestrate({ ...commonAction('decompose', root, view), childKey: 'follow-up',
+      work: { title: 'Verify current implementation', description: 'Delegate the next step' },
+      capability: 'testing', dependsOn: [], acceptanceContract: contract({ kind: 'text-report' }) }),
+  });
+  assert.equal(result.action, 'decompose');
+  assert.deepEqual(fakes.calls.planner[0].command.target, { type: 'role', id: 'tester' });
+});
+
+test('automatic coordination preserves a paused Review when creating a fresh child', async () => {
+  const root = task({ taskId: 'paused-root' });
+  const child = task({ taskId: 'paused-root/old', parentTaskId: root.taskId, role: 'pr-engineer', status: 'paused' });
+  const view = graphView([root, child], 3);
+  const event = structuredTriageEvent('pr-review'); event.payload.nextAction = 'rereview';
+  const packet = packetFor(view, root, { directChildren: [child], event });
+  const fakes = fakePorts({ packet, views: view });
+  const service = new OrchestratorService({ ...fakes.ports, automaticMode: true, capabilityRoles: { 'pr-review': 'pr-engineer' } });
+  await assert.rejects(service.execute({
+    worker: { roleId: 'orchestrator', workerId: 'employee-orchestrator' }, item: itemFor(root), contextPacket: packet,
+    intent: orchestrate({ ...commonAction('decompose', root, view), childKey: 'fresh-review',
+      work: { title: 'Review again', description: 'Do not bypass a pause' },
+      capability: 'pr-review', dependsOn: [], acceptanceContract: contract({ kind: 'github-review' }) }),
+  }), { code: 'ORCHESTRATOR_AUTHORITY_DENIED' });
+  assertNoTrustedMutation(fakes.calls);
+});
+
 test("conflict triage replaces only cancelled development work without deliveries", async (t) => {
   for (const scenario of [
     ...["cancelled", "in_progress", "paused", "completed"].map(status => ({ status })),
@@ -843,6 +879,23 @@ test("external rereview can return but cannot accept a local text report", async
     if (type === "accept_delivery") { await assert.rejects(operation(), { code: "ORCHESTRATOR_AUTHORITY_DENIED" }); assertNoTrustedMutation(fakes.calls); }
     else assert.equal((await operation()).action, "return_delivery");
   }
+});
+
+test('external rereview accepts its subsequent tester text delivery without requiring another Review', async () => {
+  const root = task({ taskId: 'rereview-root', revision: 1 });
+  const child = task({ taskId: 'rereview-root/testing', revision: 2, parentTaskId: root.taskId,
+    status: 'in_progress', role: 'tester', acceptanceContract: contract({ kind: 'text-report' }) });
+  child.deliveries = [{ revision: 1, contractRevision: 1, deliverableId: 'implementation', status: 'submitted',
+    summary: 'Verification results', evidence: [workInputEvidence(child)] }];
+  const view = graphView([root, child], 3);
+  const event = structuredTriageEvent('pr-review'); event.payload.nextAction = 'rereview';
+  const packet = packetFor(view, root, { directChildren: [child], event });
+  const fakes = fakePorts({ packet, views: view });
+  const result = await serviceFrom(fakes).execute({ worker: { roleId: 'orchestrator', workerId: 'employee-orchestrator' },
+    item: itemFor(root), contextPacket: packet,
+    intent: orchestrate({ ...commonAction('accept_delivery', child, view), submittedDeliveryRevision: 1 }) });
+  assert.equal(result.action, 'accept_delivery');
+  assert.equal(fakes.calls.planner.length, 1);
 });
 
 test("rejects oversized requirement input sets before creating a graph planner", async () => {

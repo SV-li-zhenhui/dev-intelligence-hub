@@ -10,6 +10,17 @@ const item = {
   reviewReceivedAt: "2026-10-09T09:00:00Z", reviewReceivedFrom: "developer",
   reviewReceivedVia: "assignee", reviewRequestEventId: "event-1",
 };
+test('automatic Review uses the current assignment without an age, sender, or CI permission gate', () => {
+  assert.equal(automaticReviewEligibility({ ...item, assignees: ['reviewer'],
+    incomingReviewFactsAvailable: false, reviewRecipient: null, reviewReceivedAt: null,
+    reviewReceivedFrom: null, reviewRequestEventId: null, ciStatus: 'PENDING' }, 'reviewer', now), null);
+});
+
+test('live automatic Review still requires the current assignee and avoids republishing the same Head', () => {
+  assert.equal(automaticReviewEligibility({ ...item, assignees: [] }, 'reviewer', now), 'NO_CURRENT_INCOMING_REQUEST');
+  assert.equal(automaticReviewEligibility({ ...item, assignees: ['reviewer'], myLatestPublishedReviewCommitOid: item.headRefOid }, 'reviewer', now), 'HEAD_ALREADY_REVIEWED');
+  assert.equal(automaticReviewEligibility({ ...item, assignees: ['reviewer'], myLatestPublishedReviewCommitOid: 'b'.repeat(40), myLatestPublishedReviewAt: now }, 'reviewer', now), null);
+});
 test("automatic Review uses incoming request time rather than PR creation or activity", () => {
   assert.equal(automaticReviewEligibility({ ...item, createdAt: "2025-01-01T00:00:00Z" }, "reviewer", now), null);
   for (const reviewReceivedAt of ["2026-10-08T09:59:59Z", "2026-10-09T10:00:01Z", null]) {
@@ -102,6 +113,15 @@ test("a Head-bound orchestrated rereview grants continuation while other general
   }
   root.source.identity.targetRoleId = "developer";
   assert.equal(automaticReviewWorkAdmission(root), null);
+});
+
+test('a current orchestrated initial Review grants the same automatic publication admission as rereview', () => {
+  const root = admittedRoot({ provider: 'local-owner', workType: 'general', facts: {
+    nextAction: 'review', suggestedCapability: 'pr-review', expectedHeadRefOid: item.headRefOid,
+  } });
+  root.source.identity.targetRoleId = 'orchestrator';
+  root.source.current.headRefOid = item.headRefOid;
+  assert.deepEqual(automaticReviewWorkAdmission(root), { kind: 'owner_requested', admittedAt: root.createdAt });
 });
 
 test("replacement Assign retains its own timely intake across later snapshots", () => {
