@@ -4,6 +4,7 @@ import { samePullRequestExecutionBinding } from '../domain/pull-request-executio
 import { approveOwnPrAction } from './automatic-own-pr-repair-authorization.js';
 
 const sameLogin = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
+const STALE_TARGET = Symbol('stale local code target');
 const ACTIVE = new Set(['queued', 'working', 'dispatch_pending', 'waiting_external', 'waiting_condition']);
 const OPERATIONS = { developer: new Set(['inspect', 'modify', 'verify']), tester: new Set(['inspect', 'verify']) };
 
@@ -25,10 +26,18 @@ export class AutomaticLocalCodeAuthorization {
       if (!grant?.inputBinding || Object.hasOwn(grant, 'executionSource') || !OPERATIONS[role]?.has(grant.operation)) return specialized;
       const current = await this.#current(specialized, grant);
       if (!current) return specialized;
+      if (current === STALE_TARGET) return this.#invalidate(specialized);
       await this.objectSync.prepare({ configuration: current, inputBinding: grant.inputBinding });
-      if (!await this.#current(specialized, grant)) return specialized;
+      const rechecked = await this.#current(specialized, grant);
+      if (!rechecked) return specialized;
+      if (rechecked === STALE_TARGET) return this.#invalidate(specialized);
       return approveOwnPrAction(this.confirmations, specialized);
     });
+  }
+
+  #invalidate(item) {
+    return this.confirmations.invalidate(item.id, { requestedBy: item.requestedBy,
+      approvalBindingDigest: item.approvalBindingDigest, reason: 'authorization_changed' });
   }
 
   async #current(item, grant) {
@@ -52,8 +61,8 @@ export class AutomaticLocalCodeAuthorization {
     if (!sameLogin(context.author, actor) && !ownerRequested) return null;
     const facts = await this.github.readPullRequestLocalWorkFacts({ repository: binding.repository,
       number: binding.pullRequestNumber, account: actor, authorAccountId: context.author });
-    if (facts.state !== 'open' || !sameLogin(facts.author, context.author) ||
-        facts.headRefOid !== binding.headRefOid || facts.baseRefOid !== binding.gitTarget.baseRefOid) return null;
+    if (facts.state !== 'open' || (context.author !== null && !sameLogin(facts.author, context.author)) ||
+        facts.headRefOid !== binding.headRefOid || facts.baseRefOid !== binding.gitTarget.baseRefOid) return STALE_TARGET;
     try {
       if (!isDeepStrictEqual(await this.grantVerifier.verify(grant), grant)) return null;
     } catch (error) {

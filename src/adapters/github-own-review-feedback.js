@@ -299,7 +299,11 @@ export async function readOwnPullRequestConflict(run, identity, options = {}) {
 export async function readPullRequestLocalWorkFacts(run, identity, options = {}) {
   const [owner, name] = identity.repository.split("/");
   const result = await graphql(run, CONFLICT_QUERY, { owner, name, number: identity.number }, options);
-  const pr = assertPullRequest(result.repository?.pullRequest, { ...identity, account: identity.authorAccountId });
+  // Legacy owner requests bind the PR without recording its author. This is a
+  // read-only observation; the caller still validates the root's authority.
+  const expectedAuthor = identity.authorAccountId ?? result.repository?.pullRequest?.author?.login;
+  if (typeof expectedAuthor !== 'string' || !/^[A-Za-z0-9-]+$/.test(expectedAuthor)) throw invalid('author is unavailable');
+  const pr = assertPullRequest(result.repository?.pullRequest, { ...identity, account: expectedAuthor });
   if (typeof pr.isDraft !== "boolean" || typeof pr.mergeStateStatus !== "string") throw invalid("conflict identity is unavailable");
   const target = pr.state === "OPEN" ? githubCurrentPullRequestGitTarget(pr, {
     baseRepository: identity.repository, sourceAccountId: identity.account,

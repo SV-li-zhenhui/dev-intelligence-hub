@@ -166,6 +166,10 @@ test('trusted local work reads a pinned external author without widening own-PR 
   assert.equal(facts.author, 'contributor');
   assert.equal(facts.isDraft, true);
   assert.equal(facts.baseRefOid, 'b'.repeat(40));
+  const legacy = await adapter.readPullRequestLocalWorkFacts({ ...identity, authorAccountId: null });
+  assert.equal(legacy.author, 'contributor');
+  assert.equal(legacy.baseRefOid, facts.baseRefOid);
+  await assert.rejects(adapter.readPullRequestLocalWorkFacts({ ...identity, account: 'different-account', authorAccountId: null }), /account changed/);
   await assert.rejects(adapter.readOwnPullRequestConflict(identity), /author changed/);
   await assert.rejects(adapter.readPullRequestLocalWorkFacts({ ...identity, authorAccountId: 'different-author' }), /author changed/);
   await assert.rejects(adapter.readPullRequestLocalWorkFacts({ ...identity, account: 'different-account', authorAccountId: 'contributor' }), /account changed/);

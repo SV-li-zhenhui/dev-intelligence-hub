@@ -23,7 +23,10 @@ function fixture(role = 'developer', operation = 'modify') {
     ledger: { async readPullRequestExecutionContext() { return { inputBinding: binding, author: facts.author }; },
       async readItemForReconciliation() { return root; } },
     github: { async readPullRequestLocalWorkFacts() { return facts; } },
-    confirmations: { async approve(id, request) { calls.push({ id, request }); return { ...item, status: 'completed' }; } },
+    confirmations: { async approve(id, request) { calls.push({ id, request }); return { ...item, status: 'completed' }; },
+      async invalidate(id, request) { assert.equal(id, item.id); assert.equal(request.reason, 'authorization_changed');
+        assert.deepEqual(request.requestedBy, item.requestedBy); assert.equal(request.approvalBindingDigest, item.approvalBindingDigest);
+        return { ...item, status: 'stale' }; } },
     grantVerifier: { async verify(value) { return value; } }, objectSync: { async prepare() {} },
     roleStateReader: { async read() { return roleState; } } };
   return { config, root, facts, roleState, ports, item, grant, calls, service: new AutomaticLocalCodeAuthorization(ports) };
@@ -53,7 +56,7 @@ for (const [name, mutate] of [
 ]) {
   test(`automatic local authorization preserves ${name}`, async () => {
     const f = fixture(); mutate(f);
-    assert.equal((await f.service.approveCodeJob(f.item)).status, 'pending');
+    assert.equal((await f.service.approveCodeJob(f.item)).status, ['changed Head', 'changed Base', 'closed PR'].includes(name) ? 'stale' : 'pending');
     assert.equal(f.calls.length, 0);
   });
 }
@@ -87,6 +90,27 @@ test('tester cannot modify; stale and rejected authorizations cannot be revived'
   assert.equal(f.calls.length, 0);
 });
 
+test('legacy owner-requested work with no author uses observed PR identity and retires an obsolete Base', async () => {
+  const f = fixture('tester', 'verify');
+  f.root.source.scope.kind = 'owner_requested';
+  f.root.source.identity = { provider: 'local-owner' };
+  f.ports.ledger.readPullRequestExecutionContext = async () => ({ inputBinding: f.grant.inputBinding, author: null });
+  f.facts.author = 'contributor';
+  const observed = f.ports.github.readPullRequestLocalWorkFacts;
+  f.ports.github.readPullRequestLocalWorkFacts = async request => {
+    assert.equal(request.authorAccountId, null);
+    return observed(request);
+  };
+  assert.equal((await f.service.approveCodeJob(f.item)).status, 'completed');
+  f.calls.length = 0;
+  f.facts.baseRefOid = '9'.repeat(40);
+  assert.equal((await f.service.approveCodeJob(f.item)).status, 'stale');
+  assert.equal(f.calls.length, 0);
+  f.root.source.scope.kind = 'automatic';
+  f.ports.github.readPullRequestLocalWorkFacts = async () => assert.fail('untrusted authorless intake cannot read for authorization');
+  assert.equal((await f.service.approveCodeJob(f.item)).status, 'pending');
+});
+
 test('unknown facts defer; authority is checked again after object preparation', async () => {
   const f = fixture();
   f.ports.github.readPullRequestLocalWorkFacts = async () => { throw new Error('offline'); };
@@ -95,5 +119,12 @@ test('unknown facts defer; authority is checked again after object preparation',
   f.ports.github.readPullRequestLocalWorkFacts = async () => f.facts;
   f.ports.objectSync.prepare = async () => { f.roleState.paused = true; };
   assert.equal((await f.service.approveCodeJob(f.item)).status, 'pending');
+  assert.equal(f.calls.length, 0);
+});
+
+test('a target change after preparation invalidates the old grant without approval', async () => {
+  const f = fixture();
+  f.ports.objectSync.prepare = async () => { f.facts.baseRefOid = '9'.repeat(40); };
+  assert.equal((await f.service.approveCodeJob(f.item)).status, 'stale');
   assert.equal(f.calls.length, 0);
 });

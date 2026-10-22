@@ -1107,7 +1107,8 @@ export class GitHubAdapter {
 
   async readPullRequestLocalWorkFacts({ repository, number, account, authorAccountId }, options = {}) {
     if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository) || !Number.isSafeInteger(number) || number < 1 ||
-        typeof account !== "string" || !account || typeof authorAccountId !== "string" || !/^[A-Za-z0-9-]+$/.test(authorAccountId)) throw new TypeError("Invalid local PR work target");
+        typeof account !== "string" || !account || (authorAccountId !== null &&
+        (typeof authorAccountId !== "string" || !/^[A-Za-z0-9-]+$/.test(authorAccountId)))) throw new TypeError("Invalid local PR work target");
     if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
     const facts = await readPullRequestLocalWorkFacts(this.run, { repository, number, account, authorAccountId }, options);
     if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
