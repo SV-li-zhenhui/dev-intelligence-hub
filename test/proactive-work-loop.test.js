@@ -3113,6 +3113,17 @@ test("stale PR facts defer only their root before claim and preserve the healthy
   assert.equal(ledger.calls.scheduleRetry.length, 0);
 });
 
+test('obsolete ledger execution bindings defer their root and leave healthy roots runnable', async () => {
+  const failure = new RoleContextAssemblerError('ROLE_CONTEXT_PR_FACT_UNAVAILABLE', 'old binding', 503,
+    { cause: Object.assign(new Error('old Head'), { code: 'WORK_LEDGER_PR_EXECUTION_BINDING_STALE', statusCode: 409 }) });
+  const { loop, ledger, sources, executions } = staleFactsRootLoop({ failures: [failure] });
+  const result = await loop.runCycle({ roleId: 'orchestrator', workLimit: 1 });
+  assert.equal(result.workAttempts, 1);
+  assert.deepEqual(executions, [sources[1].itemId]);
+  assert.equal(ledger.calls.claim.length, 0);
+  assert.equal(ledger.calls.scheduleRetry.length, 0);
+});
+
 test("stale PR facts respect each cycle read budget and eventually reach a healthy root beyond two windows", async () => {
   const failures = Array.from({ length: 13 }, () => stalePullRequestFactsFailure());
   const { loop, ledger, sources, cancelled, assemblies, executions } = staleFactsRootLoop({ failures });

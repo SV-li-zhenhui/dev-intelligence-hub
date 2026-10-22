@@ -65,6 +65,17 @@ test("automatic owner source refresh precedes global and PR engineer work withou
   assert.equal(refreshed.length, 2);
 });
 
+test('pending proposal authorizations advance before long running code work', async () => {
+  const started = deferred(), release = deferred(); let approvals = 0;
+  const { service } = fixture({
+    proposalRunner: { async runCycle() { approvals += 1; return {}; } },
+    codeJobRunner: { async runCycle() { started.resolve(); await release.promise; return {}; } },
+  });
+  const running = service.runCycle({ includeWork: false });
+  await started.promise;
+  try { assert.equal(approvals, 1); } finally { release.resolve(); await running; }
+});
+
 test("agency executes proposals before reconciling their durable results", async () => {
   const { service, calls } = fixture({
     intakeLimit: 61,
@@ -80,11 +91,11 @@ test("agency executes proposals before reconciling their durable results", async
   const result = await service.runCycle({ trigger: "refresh_completed" });
 
   assert.deepEqual(calls, [
+    ["proposal_execution", { limit: 11 }],
     ["code_jobs", { limit: 6 }],
     ["code_job_change_packages", { limit: 6 }],
     ["change_package_application_results", undefined],
     ["code_job_memory", { limit: 13 }],
-    ["proposal_execution", { limit: 11 }],
     ["proposals", { limit: 11 }],
     ["attention", { limit: 9 }],
     ["conditions", { limit: 10 }],
@@ -113,7 +124,7 @@ test("own repair publication follows completed packages and remains outside inde
     automaticOwnPrRepair: { async runCycle(options) { calls.push(["own_pr_repairs", options]); return { scanned: 1 }; } },
   });
   const result = await service.runCycle({ includeWork: false });
-  assert.deepEqual(calls.slice(0, 4).map(([name]) => name), ["code_jobs", "code_job_change_packages", "own_pr_repairs", "change_package_application_results"]);
+  assert.deepEqual(calls.slice(0, 5).map(([name]) => name), ["proposal_execution", "code_jobs", "code_job_change_packages", "own_pr_repairs", "change_package_application_results"]);
   assert.equal(result.stages.own_pr_repairs.ok, true);
   calls.length = 0;
   await service.runCycle({ roleId: "pr-engineer" });
@@ -125,8 +136,8 @@ test("automatic developer cycles advance admitted jobs and proposals without gen
     automaticOwnPrRepair: { async runCycle(options) { calls.push(["own_pr_repairs", options]); return {}; } },
   });
   await service.runCycle({ roleId: "developer" });
-  assert.deepEqual(calls.map(([name]) => name), ["code_jobs", "code_job_change_packages",
-    "proposal_execution", "proposals", "own_pr_repairs", "work", "dispatch"]);
+  assert.deepEqual(calls.map(([name]) => name), ["proposal_execution", "code_jobs", "code_job_change_packages",
+    "proposals", "own_pr_repairs", "work", "dispatch"]);
 });
 
 for (const roleId of [null, "developer"]) {
@@ -142,7 +153,7 @@ for (const roleId of [null, "developer"]) {
     const options = { includeWork: roleId !== null, ...(roleId === null ? {} : { roleId }) };
     const running = service.runCycle(options);
     await started.promise;
-    assert.deepEqual(calls.map(([name]) => name), ["recovery", "code_jobs"]);
+    assert.deepEqual(calls.map(([name]) => name), ["recovery", "proposal_execution", "code_jobs"]);
     const coalesced = service.runCycle(options);
     assert.equal(recovered.length, 1);
     blocked.resolve();
@@ -186,6 +197,8 @@ for (const roleId of ["orchestrator", "tester"]) {
     const general = service.runCycle({ includeWork: false });
     try {
       await started.promise;
+      assert.deepEqual(calls, [["proposal_execution", { limit: 50 }]]);
+      calls.length = 0;
       await service.runCycle({ roleId });
       assert.deepEqual(calls, [
         ["work", { trigger: "scheduled", intakeLimit: 100, workLimit: 20, roleId }],
@@ -238,11 +251,11 @@ test("housekeeping cycles reconcile and dispatch without making role decisions",
   });
 
   assert.deepEqual(calls, [
+    ["proposal_execution", { limit: 12 }],
     ["code_jobs", { limit: 10 }],
     ["code_job_change_packages", { limit: 10 }],
     ["change_package_application_results", undefined],
     ["code_job_memory", { limit: 50 }],
-    ["proposal_execution", { limit: 12 }],
     ["proposals", { limit: 12 }],
     ["attention", { limit: 50 }],
     ["conditions", { limit: 50 }],
@@ -630,11 +643,11 @@ test("all independent stage failures are reported after every stage is attempted
   await assert.rejects(service.runCycle(), (error) => {
     assert.ok(error instanceof AggregateError);
     assert.deepEqual(error.errors.map(({ stage }) => stage), [
+      "proposal_execution",
       "code_jobs",
       "code_job_change_packages",
       "change_package_application_results",
       "code_job_memory",
-      "proposal_execution",
       "proposal_results",
       "attention_results",
       "conditions",
@@ -644,11 +657,11 @@ test("all independent stage failures are reported after every stage is attempted
     return true;
   });
   assert.deepEqual(calls, [
+    "proposal_execution",
     "code_jobs",
     "code_job_change_packages",
     "change_package_application_results",
     "code_job_memory",
-    "proposal_execution",
     "proposals",
     "attention",
     "conditions",

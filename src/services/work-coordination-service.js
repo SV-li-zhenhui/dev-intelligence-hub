@@ -504,6 +504,11 @@ export class WorkCoordinationService {
     throwIfAborted(options.signal);
     const stages = options.roleId === null
       ? [
+          ["proposal_execution", () =>
+            this.#runProposals({
+              limit: this.#defaults.proposalLimit,
+              ...(options.signal === null ? {} : { signal: options.signal }),
+            })],
           ["code_jobs", () =>
             this.#runCodeJobs({ limit: this.#defaults.codeJobLimit })],
           ["code_job_change_packages", () =>
@@ -518,11 +523,6 @@ export class WorkCoordinationService {
           ["code_job_memory", () =>
             this.#projectCodeJobMemory({
               limit: this.#defaults.codeJobMemoryLimit,
-            })],
-          ["proposal_execution", () =>
-            this.#runProposals({
-              limit: this.#defaults.proposalLimit,
-              ...(options.signal === null ? {} : { signal: options.signal }),
             })],
           ["proposal_results", () =>
             this.#reconcileProposals({ limit: this.#defaults.proposalLimit })],
@@ -540,10 +540,10 @@ export class WorkCoordinationService {
         // Housekeeping owns global memory projection. Result reconciliation
         // still requires its receipts, without blocking other developer work.
         ? [
-            ["code_jobs", () => this.#runCodeJobs({ limit: this.#defaults.codeJobLimit })],
-            ["code_job_change_packages", () => this.#dispatchCodeJobChangePackages({ limit: this.#defaults.codeJobLimit })],
             ["proposal_execution", () => this.#runProposals({ limit: this.#defaults.proposalLimit,
               ...(options.signal === null ? {} : { signal: options.signal }) })],
+            ["code_jobs", () => this.#runCodeJobs({ limit: this.#defaults.codeJobLimit })],
+            ["code_job_change_packages", () => this.#dispatchCodeJobChangePackages({ limit: this.#defaults.codeJobLimit })],
             ["proposal_results", () => this.#reconcileProposals({ limit: this.#defaults.proposalLimit })],
             ["own_pr_repairs", () => this.#runOwnPrRepairs({ limit: this.#defaults.codeJobLimit,
               ...(this.#runOwnPrRecoveries === null ? {} : { includeRecovery: false }) })],

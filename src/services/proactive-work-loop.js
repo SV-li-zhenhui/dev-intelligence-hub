@@ -586,7 +586,7 @@ function ownErrorData(error, name) {
 }
 
 function isStalePullRequestFactContext(error) {
-  // Only a GitHub target mismatch may defer an unclaimed root. Other context
+  // A changed GitHub target or obsolete ledger binding defers its root. Other context
   // failures retain their existing admission, durability, or failure behavior.
   try {
     if (
@@ -595,6 +595,9 @@ function isStalePullRequestFactContext(error) {
       ownErrorData(error, "statusCode") !== 503
     ) return false;
     const refresh = ownErrorData(error, "cause");
+    if (refresh instanceof Error &&
+        ownErrorData(refresh, "code") === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE" &&
+        ownErrorData(refresh, "statusCode") === 409 && ownErrorData(refresh, "cause") === undefined) return true;
     if (
       !(refresh instanceof PrEngineerServiceError) ||
       ownErrorData(refresh, "code") !== "PR_FACT_REFRESH_FAILED" ||
