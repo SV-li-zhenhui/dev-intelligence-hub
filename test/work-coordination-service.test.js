@@ -265,6 +265,21 @@ test("housekeeping cycles reconcile and dispatch without making role decisions",
   assert.equal("work" in result.stages, false);
 });
 
+test('shutdown abort is forwarded to long code execution before later dispatch', async () => {
+  const started = deferred(); const controller = new AbortController(); const reason = new Error('shutdown');
+  let dispatches = 0;
+  const { service } = fixture({ codeJobRunner: { async runCycle({ signal }) {
+    started.resolve(signal);
+    return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  } }, dispatcher: { async dispatchPending() { dispatches += 1; } } });
+  const running = service.runCycle({ signal: controller.signal });
+  assert.equal(await started.promise, controller.signal);
+  const failed = assert.rejects(running, error => error === reason);
+  controller.abort(reason);
+  await failed;
+  assert.equal(dispatches, 0);
+});
+
 test("shutdown abort cancels active role work and prevents later dispatch", async () => {
   const started = deferred();
   let dispatches = 0;

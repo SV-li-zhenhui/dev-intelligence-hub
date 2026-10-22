@@ -510,7 +510,7 @@ export class WorkCoordinationService {
               ...(options.signal === null ? {} : { signal: options.signal }),
             })],
           ["code_jobs", () =>
-            this.#runCodeJobs({ limit: this.#defaults.codeJobLimit })],
+            this.#runCodeJobs({ limit: this.#defaults.codeJobLimit, ...(options.signal === null ? {} : { signal: options.signal }) })],
           ["code_job_change_packages", () =>
             this.#dispatchCodeJobChangePackages({
               limit: this.#defaults.codeJobLimit,
@@ -542,7 +542,7 @@ export class WorkCoordinationService {
         ? [
             ["proposal_execution", () => this.#runProposals({ limit: this.#defaults.proposalLimit,
               ...(options.signal === null ? {} : { signal: options.signal }) })],
-            ["code_jobs", () => this.#runCodeJobs({ limit: this.#defaults.codeJobLimit })],
+            ["code_jobs", () => this.#runCodeJobs({ limit: this.#defaults.codeJobLimit, ...(options.signal === null ? {} : { signal: options.signal }) })],
             ["code_job_change_packages", () => this.#dispatchCodeJobChangePackages({ limit: this.#defaults.codeJobLimit })],
             ["proposal_results", () => this.#reconcileProposals({ limit: this.#defaults.proposalLimit })],
             ["own_pr_repairs", () => this.#runOwnPrRepairs({ limit: this.#defaults.codeJobLimit,

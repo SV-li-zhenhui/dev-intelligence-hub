@@ -1,3 +1,4 @@
+import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { digestValue } from "../domain/code-executor-contract.js";
 import { normalizeWorkspacePath } from "../domain/code-execution-policy.js";
 import { codeExecutionSourceAllowsWrite } from "../domain/code-execution-source.js";
@@ -89,7 +90,7 @@ export function normalizeCycleOptions(value = {}) {
     typeof value !== "object" ||
     Array.isArray(value) ||
     Object.getPrototypeOf(value) !== Object.prototype ||
-    Object.keys(value).some((key) => !["limit", "roleId"].includes(key))
+    Object.keys(value).some((key) => !["limit", "roleId", "signal"].includes(key))
   ) {
     throw new TypeError("code job worker options are invalid");
   }
@@ -103,6 +104,7 @@ export function normalizeCycleOptions(value = {}) {
   return {
     limit: positiveInteger(value.limit ?? 10, "code job worker limit", 100),
     roleId,
+    signal: normalizeAbortSignal(value.signal ?? null),
   };
 }
 

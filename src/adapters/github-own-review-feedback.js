@@ -293,9 +293,13 @@ export async function readOwnPullRequestHandoff(run, identity, options = {}) {
 }
 
 export async function readOwnPullRequestConflict(run, identity, options = {}) {
+  return readPullRequestLocalWorkFacts(run, { ...identity, authorAccountId: identity.account }, options);
+}
+
+export async function readPullRequestLocalWorkFacts(run, identity, options = {}) {
   const [owner, name] = identity.repository.split("/");
   const result = await graphql(run, CONFLICT_QUERY, { owner, name, number: identity.number }, options);
-  const pr = assertPullRequest(result.repository?.pullRequest, identity);
+  const pr = assertPullRequest(result.repository?.pullRequest, { ...identity, account: identity.authorAccountId });
   if (typeof pr.isDraft !== "boolean" || typeof pr.mergeStateStatus !== "string") throw invalid("conflict identity is unavailable");
   const target = pr.state === "OPEN" ? githubCurrentPullRequestGitTarget(pr, {
     baseRepository: identity.repository, sourceAccountId: identity.account,

@@ -22,7 +22,7 @@ function fixture(role = 'developer', operation = 'modify') {
     configurationReader: { async readActive() { return { configuration: config }; } },
     ledger: { async readPullRequestExecutionContext() { return { inputBinding: binding, author: facts.author }; },
       async readItemForReconciliation() { return root; } },
-    github: { async readOwnPullRequestConflict() { return facts; } },
+    github: { async readPullRequestLocalWorkFacts() { return facts; } },
     confirmations: { async approve(id, request) { calls.push({ id, request }); return { ...item, status: 'completed' }; } },
     grantVerifier: { async verify(value) { return value; } }, objectSync: { async prepare() {} },
     roleStateReader: { async read() { return roleState; } } };
@@ -89,10 +89,10 @@ test('tester cannot modify; stale and rejected authorizations cannot be revived'
 
 test('unknown facts defer; authority is checked again after object preparation', async () => {
   const f = fixture();
-  f.ports.github.readOwnPullRequestConflict = async () => { throw new Error('offline'); };
+  f.ports.github.readPullRequestLocalWorkFacts = async () => { throw new Error('offline'); };
   await assert.rejects(f.service.approveCodeJob(f.item), /offline/);
   assert.equal(f.calls.length, 0);
-  f.ports.github.readOwnPullRequestConflict = async () => f.facts;
+  f.ports.github.readPullRequestLocalWorkFacts = async () => f.facts;
   f.ports.objectSync.prepare = async () => { f.roleState.paused = true; };
   assert.equal((await f.service.approveCodeJob(f.item)).status, 'pending');
   assert.equal(f.calls.length, 0);

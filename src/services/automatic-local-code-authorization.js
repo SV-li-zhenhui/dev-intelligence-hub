@@ -50,8 +50,8 @@ export class AutomaticLocalCodeAuthorization {
         root.source?.scope?.active !== true || task.currentTarget?.type !== 'role' || task.currentTarget.id !== role) return null;
     const ownerRequested = root.source.scope.kind === 'owner_requested' && root.source.identity?.provider === 'local-owner';
     if (!sameLogin(context.author, actor) && !ownerRequested) return null;
-    const facts = await this.github.readOwnPullRequestConflict({ repository: binding.repository,
-      number: binding.pullRequestNumber, account: actor });
+    const facts = await this.github.readPullRequestLocalWorkFacts({ repository: binding.repository,
+      number: binding.pullRequestNumber, account: actor, authorAccountId: context.author });
     if (facts.state !== 'open' || !sameLogin(facts.author, context.author) ||
         facts.headRefOid !== binding.headRefOid || facts.baseRefOid !== binding.gitTarget.baseRefOid) return null;
     try {

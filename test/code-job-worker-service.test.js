@@ -800,6 +800,27 @@ function continuousDecision(action) {
   return { schemaVersion: 1, confidence: 100, summary: "Controlled development", reason: "Current evidence", action };
 }
 
+for (const continuous of [false, true]) {
+  test(`shutdown abort reaches an active ${continuous ? 'continuous' : 'single-turn'} code model and preserves its checkpoint`, async () => {
+    const f = continuousFixture(async () => continuousDecision({ type: 'complete', outcome: 'done', evidence: [] }));
+    const started = deferred(); const controller = new AbortController(); const reason = new Error('shutdown');
+    const worker = new CodeJobWorkerService({ jobStore: f.jobs, executor: f.executor, grantVerifier: verifier([]),
+      brainDirectory: { describe: () => ({ supportsCodeExecution: continuous }),
+        async decide(_input, { signal }) {
+          started.resolve(signal);
+          return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+        } } });
+    const running = worker.runCycle({ signal: controller.signal });
+    const observed = await started.promise;
+    const failed = assert.rejects(running, e => e === reason);
+    controller.abort(reason);
+    await failed;
+    assert.equal(observed.aborted, true);
+    assert.equal((await f.jobs.getForWorker(f.initial.jobId)).status, 'active');
+    assert.equal(f.executor.calls.filter(c => c.method === 'perform').length, 0);
+  });
+}
+
 test('repaging already consumed audited content cannot keep continuous code work alive for ten hours', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const watchdog = createCodeExecutionWatchdog({ startupMs: 1000 }); startCodeExecutionTurn(watchdog);

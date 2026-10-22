@@ -151,6 +151,26 @@ test("own conflict admission reads fresh Base and merge state without paging rev
   assert.equal(calls, 1);
 });
 
+test('trusted local work reads a pinned external author without widening own-PR admission', async () => {
+  const adapter = new GitHubAdapter({ run: async (_command, args) => {
+    if (args.at(-1) === 'user') return { login: ACCOUNT };
+    return { data: { repository: { pullRequest: pullRequest({ author: { login: 'contributor' }, isDraft: true,
+      baseRefOid: 'c'.repeat(40), baseRefName: 'main',
+      baseRef: { name: 'main', repository: { nameWithOwner: 'acme/repo' }, target: { oid: 'b'.repeat(40) } },
+      headRefName: 'fix/local', headRepository: { nameWithOwner: 'acme/repo' },
+      headRef: { name: 'fix/local', repository: { nameWithOwner: 'acme/repo' }, target: { oid: HEAD } },
+      mergeStateStatus: 'CLEAN' }) } } };
+  } });
+  const identity = { repository: 'acme/repo', number: 42, account: ACCOUNT };
+  const facts = await adapter.readPullRequestLocalWorkFacts({ ...identity, authorAccountId: 'contributor' });
+  assert.equal(facts.author, 'contributor');
+  assert.equal(facts.isDraft, true);
+  assert.equal(facts.baseRefOid, 'b'.repeat(40));
+  await assert.rejects(adapter.readOwnPullRequestConflict(identity), /author changed/);
+  await assert.rejects(adapter.readPullRequestLocalWorkFacts({ ...identity, authorAccountId: 'different-author' }), /author changed/);
+  await assert.rejects(adapter.readPullRequestLocalWorkFacts({ ...identity, account: 'different-account', authorAccountId: 'contributor' }), /account changed/);
+});
+
 for (const driftAt of ["Reviews", "Threads", "ThreadComments", "Identity"]) {
   test(`live own feedback rejects a Draft change during ${driftAt}`, async () => {
     const run = async (_command, args) => {

@@ -291,6 +291,7 @@ export class CodeJobWorkerService {
   #preferReconcilable;
   #cancellationControllers;
   #continuousControllers;
+  #cycleSignal = null;
   #recordTimeoutContinuation;
   #clock;
   #maintenanceRetryNotBefore = new Map();
@@ -399,7 +400,21 @@ export class CodeJobWorkerService {
 
   runCycle(value = {}) {
     const options = normalizeCycleOptions(value);
-    return this.#queue.enqueue(() => this.#runCycle(options));
+    return this.#queue.enqueue(async () => {
+      options.signal?.throwIfAborted();
+      this.#cycleSignal = options.signal;
+      const onAbort = () => {
+        for (const controller of [...this.#cancellationControllers.values(), ...this.#continuousControllers.values()]) {
+          controller.abort(options.signal.reason);
+        }
+      };
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      try { return await this.#runCycle(options); }
+      finally {
+        options.signal?.removeEventListener("abort", onAbort);
+        this.#cycleSignal = null;
+      }
+    });
   }
 
   requestCancellation(jobId) {
@@ -450,6 +465,7 @@ export class CodeJobWorkerService {
     if (lastRunnable) this.#runnableCursor = lastRunnable.sequence;
     const outcomes = [];
     for (const selectedJob of selected.items) {
+      options.signal?.throwIfAborted();
       if (selectedJob.status === "active" && this.#maintenanceRetryNotBefore.has(selectedJob.jobId)) {
         outcomes.push({ jobId: selectedJob.jobId, status: "retry", actionType: null, code: "CODE_JOB_MAINTENANCE_BACKOFF" });
         continue;
@@ -457,6 +473,7 @@ export class CodeJobWorkerService {
       try {
         outcomes.push(await this.#process(selectedJob.jobId));
       } catch (error) {
+        options.signal?.throwIfAborted();
         outcomes.push(await this.#handleFailure(selectedJob.jobId, error));
       }
     }
@@ -689,11 +706,13 @@ export class CodeJobWorkerService {
       {
         beforeGenerate: () => this.#verifyAuthority(job.grant),
         brainDigest: job.grant.brainDigest,
+        ...(this.#cycleSignal === null ? {} : { signal: this.#cycleSignal }),
       },
     );
     const decision = this.#taskRuns ? await this.#taskRuns.run({kind:'code-job',taskId:job.jobId,
       roleId:job.grant.requestedBy.roleId,title:job.grant.objective,
       subject:job.grant.repository,revision:job.revision},decide) : await decide();
+    this.#cycleSignal?.throwIfAborted();
     if (reviewRepairFeedback !== null) {
       const currentFeedback = await this.#readReviewRepairFeedback(job);
       if (currentFeedback.reviewFeedbackDigest !== reviewRepairFeedback.reviewFeedbackDigest) throw workerError("CODE_REVIEW_REPAIR_CONTEXT_STALE", "Review feedback changed while the code brain was deciding");
@@ -1016,6 +1035,7 @@ export class CodeJobWorkerService {
       }
     };
     this.#continuousControllers.set(initial.jobId, controller);
+    if (this.#cycleSignal?.aborted) controller.abort(this.#cycleSignal.reason);
     try {
       return await (this.#taskRuns ? this.#taskRuns.run({ kind: "code-job", taskId: initial.jobId, roleId: initial.grant.requestedBy.roleId,
         title: initial.grant.objective, subject: initial.grant.repository, revision: initial.revision }, execute,
@@ -1448,7 +1468,7 @@ export class CodeJobWorkerService {
       reconciled = null,
       acceptInterrupted = false,
       continuous = false,
-      signal = null,
+      signal = this.#cycleSignal,
     } = {},
   ) {
     const pending = job.execution.pendingAction;
