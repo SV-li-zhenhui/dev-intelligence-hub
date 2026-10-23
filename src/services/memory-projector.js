@@ -1,3 +1,4 @@
+import { authorityLifecycleMemoryRecord } from "../domain/memory-authority-lifecycle.js";
 import { createHash } from "node:crypto";
 import {
   createWorkGraphSourceAuthority,
@@ -1465,54 +1466,6 @@ function authorityProjectionEntry({
   };
 }
 
-function authorityLifecycleMemoryRecord(entry) {
-  const binding = entry.binding;
-  const authority = binding === null
-    ? {
-        applies: false,
-        current: false,
-        bindingDigest: null,
-        inputBinding: null,
-      }
-    : authorityContent(binding, false);
-  const content = {
-    memoryType: entry.sourceKind,
-    lifecycleOnly: true,
-    priorRecordId: entry.recordId,
-    reason: binding === null
-      ? "projection_state_migrated"
-      : "input_authority_superseded",
-    authority,
-  };
-  const sourceKey = `${entry.key}:authority-obsolete:${digestValue({
-    priorRecordId: entry.recordId,
-    authority,
-  })}`;
-  return {
-    schemaVersion: 1,
-    source: {
-      kind: entry.sourceKind,
-      id: `${sourceKey}:${digestValue({
-        sourceKind: entry.sourceKind,
-        sourceKey,
-        content,
-      })}`,
-    },
-    occurredAt: entry.occurredAt,
-    roleId: null,
-    repository: binding?.repository ?? null,
-    eventType: `${entry.sourceKind.replaceAll("-", "_")}.authority_obsolete`,
-    title: `${entry.sourceKind} 权威已失效`,
-    summary: binding === null
-      ? "旧投影状态已安全失效"
-      : `${binding.repository}#${binding.pullRequestNumber} · ${binding.headRefOid}`,
-    content: JSON.stringify(content),
-    evidence: [`supersedes:${entry.recordId}`],
-    tags: [entry.sourceKind, "authority_obsolete", "obsolete"],
-    sourceUrl: null,
-    subjectNumber: binding?.pullRequestNumber ?? null,
-  };
-}
 
 function normalizeGraphProjectionBatch(value) {
   const message = "task graph memory projection source batch is invalid";
@@ -1898,7 +1851,7 @@ export async function planAuthorityBoundProjectionCandidate(value) {
   for (const [key, entry] of entries) {
     if (observedKeys.has(key)) continue;
     if (entry.current !== true || entry.binding === null) {
-      if (entry.current === null) {
+      if (entry.current !== false) {
         records.push(authorityLifecycleMemoryRecord(entry));
         lifecycleInvalidations += 1;
       }

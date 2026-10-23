@@ -15,7 +15,7 @@ import {
 } from "../src/services/local-memory-journal.js";
 import { createMemoryRuntime } from "../src/memory-runtime.js";
 import { MemoryContextRetriever } from "../src/services/memory-context-retriever.js";
-import { MemoryProjector } from "../src/services/memory-projector.js";
+import { MemoryProjector, planAuthorityBoundProjectionCandidate } from "../src/services/memory-projector.js";
 import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
 import {
   externalActionControlledCommit,
@@ -2267,4 +2267,37 @@ test("a lost graph append response replays idempotently before batch acknowledge
   assert.equal(records.size, 1);
   assert.equal(appendCalls, 2);
   assert.deepEqual(source.acknowledgements.map(({ length }) => length), [1]);
+});
+
+
+test("an unbound consultation leaving the projection window is explicitly retired and survives restart", async () => {
+  const values = new Map();
+  const store = { read: async (key, fallback = null) => structuredClone(values.get(key) ?? fallback),
+    write: async (key, value) => { values.set(key, structuredClone(value)); } };
+  const journal = new LocalMemoryJournal({ store, exclusiveLease: { run: operation => operation() } });
+  await journal.recover();
+  const candidate = { schemaVersion: 1, source: { kind: "consultation-request", id: "window-consultation" },
+    occurredAt: "2026-08-02T01:00:00.000Z", roleId: null, repository: null,
+    eventType: "consultation_request.fixture", title: "Historical consultation", summary: "Read-only history",
+    content: JSON.stringify({ memoryType: "consultation-request", authority: {
+      applies: false, current: true, bindingDigest: null, inputBinding: null,
+    } }), evidence: [], tags: ["consultation-request"], sourceUrl: null, subjectNumber: null };
+  const record = normalizeMemoryRecord(candidate);
+  await journal.appendAuthorityProjection({ records: [candidate], projectionState: {
+    schemaVersion: 4, revision: 1, workLedgerRevision: 0, authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST,
+    confirmationHighWatermark: 0, entries: [{ key: "consultation-request:window", fingerprint: "a".repeat(64),
+      recordId: record.recordId, sourceKind: "consultation-request", binding: null, current: true, occurredAt: candidate.occurredAt }],
+  } });
+  const planned = await planAuthorityBoundProjectionCandidate({ stored: journal.getAuthorityProjectionState(),
+    snapshot: { ledgerRevision: 0, items: [], timeline: [], graph: { cursor: 0, highWatermark: 0,
+      checkpointDigest: null, highWatermarkDigest: null, authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST, items: [] } },
+    confirmationSnapshot: { highWatermark: 0, items: [] }, verifyInputAuthority: async () => assert.fail("no PR binding"),
+    requiresJournalAdoption: false, strictBindings: true });
+  assert.equal(planned.lifecycleInvalidations, 1);
+  assert.deepEqual(planned.records[0].evidence, [`supersedes:${record.recordId}`]);
+  assert.deepEqual(planned.projectionState.entries, []);
+  await journal.appendAuthorityProjection({ records: planned.records, projectionState: planned.projectionState });
+  const restarted = new LocalMemoryJournal({ store, exclusiveLease: { run: operation => operation() } });
+  await restarted.recover();
+  assert.equal(restarted.readRecords({ recordIds: [record.recordId] }).items[0].labels.lifecycle, "obsolete");
 });
