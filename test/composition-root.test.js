@@ -4545,6 +4545,7 @@ test("automatic own PR repair composes internal push with ownership guards and c
         assert.ok(calls.codeRunner.automaticOwnPrRepair.specialized.ciRepairContextReader instanceof CiRepairContextReader);
         assert.deepEqual(await application.reviewHandoffReconciler.runCycle(), [{ assigned: 0, already: 0, pending: 0 }]);
         assert.equal(application.prEmployee.config.automaticOwnPrRepair, true);
+        assert.equal(calls.codeJobRuntime.workerLimits.concurrency, 2);
         assert.deepEqual(calls.externalExecutor.enabledActions, ["push"]);
         assert.deepEqual(config.githubActions.enabledActions, explicitPush ? ["push"] : []);
         assert.equal(typeof calls.codeJobRuntime.reviewRepairContextReader.read, "function");

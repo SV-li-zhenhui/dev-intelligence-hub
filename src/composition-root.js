@@ -1709,6 +1709,8 @@ export async function createApplication({
           "codeJobBrainDirectory",
         ),
         workerLimits: {
+          ...(config.githubActions?.enabled === true && config.githubActions.automaticOwnPrRepair === true
+            ? { concurrency: 2 } : {}),
           ...(coordinationConfig.codeJobMaximumTurns === undefined
             ? {}
             : { maxTurns: coordinationConfig.codeJobMaximumTurns }),

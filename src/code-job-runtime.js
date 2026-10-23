@@ -152,7 +152,7 @@ function normalizeWorkerLimits(value) {
     Array.isArray(value) ||
     Object.getPrototypeOf(value) !== Object.prototype ||
     Object.keys(value).some(
-      (key) => !["maxTurns", "observationLimit"].includes(key),
+      (key) => !["maxTurns", "observationLimit", "concurrency"].includes(key),
     )
   ) {
     throw new TypeError("workerLimits is invalid");

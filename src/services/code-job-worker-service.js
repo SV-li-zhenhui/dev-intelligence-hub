@@ -285,6 +285,7 @@ export class CodeJobWorkerService {
   #queue;
   #sessionTransitions;
   #maxTurns;
+  #concurrency;
   #observationLimit;
   #changePackageDeliveryEnabled;
   #runnableCursor;
@@ -311,6 +312,7 @@ export class CodeJobWorkerService {
     sessionTransitionLease: suppliedSessionTransitionLease =
       sessionTransitionLease(),
     maxTurns = 64,
+    concurrency = 1,
     observationLimit = 20,
     changePackageDeliveryEnabled = false,
     clock = () => new Date(),
@@ -385,6 +387,7 @@ export class CodeJobWorkerService {
       "code job session transition lease",
     );
     this.#maxTurns = positiveInteger(maxTurns, "maxTurns", 128);
+    this.#concurrency = positiveInteger(concurrency, "concurrency", 8);
     this.#observationLimit = positiveInteger(
       observationLimit,
       "observationLimit",
@@ -464,20 +467,33 @@ export class CodeJobWorkerService {
     );
     if (lastReconcilable) this.#reconcilableCursor = lastReconcilable.sequence;
     if (lastRunnable) this.#runnableCursor = lastRunnable.sequence;
-    const outcomes = [];
-    for (const selectedJob of selected.items) {
+    const processSelected = async selectedJob => {
       options.signal?.throwIfAborted();
       if (selectedJob.status === "active" && this.#maintenanceRetryNotBefore.has(selectedJob.jobId)) {
-        outcomes.push({ jobId: selectedJob.jobId, status: "retry", actionType: null, code: "CODE_JOB_MAINTENANCE_BACKOFF" });
-        continue;
+        return { jobId: selectedJob.jobId, status: "retry", actionType: null, code: "CODE_JOB_MAINTENANCE_BACKOFF" };
       }
       try {
-        outcomes.push(await this.#process(selectedJob.jobId));
+        return await this.#process(selectedJob.jobId);
       } catch (error) {
         options.signal?.throwIfAborted();
-        outcomes.push(await this.#handleFailure(selectedJob.jobId, error));
+        return this.#handleFailure(selectedJob.jobId, error);
       }
-    }
+    };
+    const outcomes = new Array(selected.items.length);
+    let nextIndex = 0, failed = false;
+    const consume = async () => {
+      try {
+        while (!failed && nextIndex < selected.items.length) {
+          const index = nextIndex++;
+          outcomes[index] = await processSelected(selected.items[index]);
+        }
+      } catch (error) { failed = true; throw error; }
+    };
+    // Keep ownership of every admitted job until it settles, including late
+    // cancellation. A rejected lane must not release the cycle's shared signal.
+    const settled = await Promise.allSettled(Array.from({ length: Math.min(this.#concurrency, selected.items.length) }, consume));
+    const rejected = settled.find(result => result.status === 'rejected');
+    if (rejected) throw rejected.reason;
     return {
       selected: selected.items.length,
       processed: outcomes.length,

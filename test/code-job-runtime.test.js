@@ -184,6 +184,7 @@ async function runtimeFixture({
   brainDirectory,
   reviewRepairContextReader,
   workerFactory,
+  workerLimits,
   memoryReceiptVerifier,
   completedChangeExporter,
   changePackageProducer,
@@ -207,6 +208,7 @@ async function runtimeFixture({
     ...(brainDirectory === undefined ? {} : { brainDirectory }),
     ...(reviewRepairContextReader === undefined ? {} : { reviewRepairContextReader }),
     ...(workerFactory === undefined ? {} : { workerFactory }),
+    ...(workerLimits === undefined ? {} : { workerLimits }),
     ...(memoryReceiptVerifier === undefined
       ? {}
       : { memoryReceiptVerifier }),
@@ -231,6 +233,15 @@ test("runtime forwards the trusted own PR feedback reader to the worker", async 
   });
   assert.equal(captured.reviewRepairContextReader, reader);
   await runtime.close();
+});
+
+test('runtime forwards bounded worker concurrency without changing the shared cycle queue', async () => {
+  let captured;
+  const { runtime } = await runtimeFixture({ executor: {}, brainDirectory: {}, workerLimits: { concurrency: 2 },
+    workerFactory(options) { captured = options; return { async runCycle() { return { selected: 0, outcomes: [] }; }, requestCancellation() { return false; } }; },
+  });
+  try { assert.equal(captured.concurrency, 2); assert.ok(captured.operationQueue instanceof OperationQueue); }
+  finally { await runtime.close(); }
 });
 
 test("runtime acquires and recovers before exposing local approval and reader ports", async () => {

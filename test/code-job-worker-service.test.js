@@ -2613,6 +2613,91 @@ function currentReadJob(observations) {
   } });
 }
 
+function concurrentWorkerFixture(count, decide, concurrency, continuous = false) {
+  const initial = Array.from({ length: count }, (_, index) => {
+    const value = currentReadJob([]);
+    value.jobId = `code-job-${String(index + 1).repeat(55)}`;
+    value.sequence = index + 1;
+    value.execution.sessionId = value.jobId;
+    value.grant.objective = `job-${index + 1}`;
+    return value;
+  });
+  const jobs = new FakeJobStore(initial);
+  const executors = new Map(initial.map(value => [value.jobId, new FakeExecutor(value)]));
+  const executor = Object.fromEntries(['start', 'view', 'resume', 'perform', 'getActionResult', 'reconcileAction', 'reconcileCancellation']
+    .map(method => [method, (value, options) => executors.get(value.sessionId)[method](value, options)]));
+  const worker = new CodeJobWorkerService({ jobStore: jobs, executor, brainDirectory: { decide,
+    ...(continuous ? { describe: () => ({ supportsCodeExecution: true }) } : {}) },
+    grantVerifier: verifier([]), ...(concurrency === undefined ? {} : { concurrency }) });
+  return { worker, jobs, initial };
+}
+
+test('bounded worker concurrency lets queued jobs progress while one decision remains active', async () => {
+  const entered = Array.from({ length: 3 }, deferred), release = Array.from({ length: 3 }, deferred);
+  const started = [], finished = []; let active = 0, maximum = 0;
+  const { worker, jobs, initial } = concurrentWorkerFixture(3, async ({ task }) => {
+    const index = Number(task.objective.slice(-1)) - 1;
+    started.push(index); active += 1; maximum = Math.max(maximum, active); entered[index].resolve();
+    await release[index].promise;
+    active -= 1; finished.push(index);
+    return { schemaVersion: 1, confidence: 90, summary: 'Read code', reason: 'Inspect the bound source', action: { type: 'read_text', path: 'src/app.js' } };
+  }, 2);
+  let settled = false; const running = worker.runCycle().finally(() => { settled = true; });
+  try {
+    await entered[0].promise;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(started, [0, 1]);
+    release[1].resolve(); await entered[2].promise;
+    release[2].resolve(); await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(finished, [1, 2]); assert.equal(maximum, 2); assert.equal(settled, false);
+    assert.equal((await jobs.getForWorker(initial[1].jobId)).execution.turn, 1);
+    assert.equal((await jobs.getForWorker(initial[0].jobId)).execution.turn, 0);
+    release[0].resolve();
+    const result = await running;
+    assert.deepEqual(result.outcomes.map(value => value.jobId), initial.map(value => value.jobId));
+    assert.equal(result.processed, 3);
+  } finally { release.forEach(value => value.resolve()); await running; }
+});
+
+for (const continuous of [false, true]) test(`concurrent ${continuous ? 'continuous' : 'single-turn'} worker abort waits for owned late decisions and does not start another queued job`, async () => {
+  const entered = [], release = Array.from({ length: 2 }, deferred), controller = new AbortController();
+  const reason = new Error('stop this cycle');
+  const { worker } = concurrentWorkerFixture(3, async ({ task }, { signal }) => {
+    entered.push(task.objective);
+    await release[Number(task.objective.slice(-1)) - 1].promise;
+    signal.throwIfAborted();
+  }, 2, continuous);
+  let settled = false;
+  const running = worker.runCycle({ signal: controller.signal }).then(() => null, error => error).finally(() => { settled = true; });
+  try {
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(entered.length, 2);
+    controller.abort(reason);
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(settled, false);
+    release[0].resolve();
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(settled, false, 'the other admitted decision still owns late work');
+    release[1].resolve(); assert.strictEqual(await running, reason);
+    assert.equal(entered.length, 2);
+  } finally { release.forEach(value => value.resolve()); await running; }
+});
+
+test('worker concurrency defaults to serial and rejects invalid bounds', async () => {
+  const release = deferred(), entered = [];
+  const decide = async ({ task }) => {
+    entered.push(task.objective);
+    await release.promise;
+    return { schemaVersion: 1, confidence: 90, summary: 'Read code', reason: 'Inspect source', action: { type: 'read_text', path: 'src/app.js' } };
+  };
+  const { worker } = concurrentWorkerFixture(2, decide);
+  const running = worker.runCycle();
+  try {
+    await new Promise(resolve => setImmediate(resolve)); assert.deepEqual(entered, ['job-1']);
+    release.resolve(); await running; assert.deepEqual(entered, ['job-1', 'job-2']);
+  } finally { release.resolve(); await running; }
+  for (const concurrency of [0, -1, 9, 1.5, '2', null]) {
+    assert.throws(() => concurrentWorkerFixture(1, decide, concurrency), /concurrency/);
+  }
+});
+
 test("native code reading rejects mismatched audited file bindings before deciding", async (t) => {
   const mutations = [
     ["action id", (entry) => { entry.action.id = "other-read"; }],
