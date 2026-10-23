@@ -138,24 +138,16 @@ export class ControlledGitCommitBuilder {
       evidenceIds.push(entry.name);
     }
     evidenceIds.sort((left, right) => left.localeCompare(right, "en"));
-    const stalePreparationEvidenceIds = [];
     for (const evidenceId of evidenceIds) {
-      try {
-        await this.verify(evidenceId);
-      } catch (error) {
-        // verify loads and validates the sealed local record first. A later
-        // mirror change fences its use, but must not disable unrelated work.
-        // Execution and publication still perform the complete verification.
-        if (error?.code !== "CONTROLLED_GIT_BOUNDARY_CHANGED") throw error;
-        stalePreparationEvidenceIds.push(evidenceId);
-      }
+      // Startup authenticates the local sealed store. Rebuilding every historical
+      // commit against live mirrors blocks unrelated work; every use through
+      // create/find/verify and publication still performs the full verification.
+      await this.#load(evidenceId);
     }
     return Object.freeze({
       commits: evidenceIds.length,
       removedScratchDirectories,
-      ...(stalePreparationEvidenceIds.length > 0
-        ? { stalePreparationEvidenceIds: Object.freeze(stalePreparationEvidenceIds) }
-        : {}),
+      deferredVerificationEvidenceIds: Object.freeze(evidenceIds),
     });
   }
 
@@ -225,6 +217,10 @@ export class ControlledGitCommitBuilder {
       );
     }
     return this.verify(matches[0]);
+  }
+
+  async readSealed(evidenceId) {
+    return (await this.#load(evidenceId)).evidence;
   }
 
   async verify(evidenceId) {

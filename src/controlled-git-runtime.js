@@ -546,6 +546,7 @@ function createPorts(service, { baseMirrors, headMirrors }) {
     "verifyControlledCommit",
     "ControlledGitService",
   );
+  const readSealedControlledCommit = method(service, "readSealedControlledCommit", "ControlledGitService");
   const publishControlledCommit = method(
     service,
     "publishControlledCommit",
@@ -572,6 +573,7 @@ function createPorts(service, { baseMirrors, headMirrors }) {
     create: (request) => createControlledCommit(request),
     find: (request) => findControlledCommit(request),
     verify: (request) => verifyControlledCommit(request),
+    readSealed: (request) => readSealedControlledCommit(request),
   });
   const publisher = Object.freeze({
     publish: (request) => publishControlledCommit(request),

@@ -360,6 +360,28 @@ test("recovery fails closed before serving a tampered durable receipt", async ()
   assert.equal(setup.builder.state.createCalls, 1);
 });
 
+test("sealed historical delivery recovery defers Git verification and cannot authorize delivery", async () => {
+  const setup = fixture();
+  await setup.service.recover();
+  await setup.service.delivery().deliver(setup.request);
+  const stored = structuredClone(setup.store.value);
+  const verifyCalls = setup.builder.state.verifyCalls;
+  let reads = 0;
+  setup.builder.port.readSealed = async () => { reads++; return structuredClone(setup.evidence); };
+  setup.builder.port.verify = async () => { throw Object.assign(new Error("current preparation unavailable"), { code: "CONTROLLED_GIT_BOUNDARY_CHANGED" }); };
+  const restarted = new ChangePackageControlledCommitService({
+    packageReader: setup.packageReader, controlledCommitBuilder: setup.builder.port,
+    store: setup.store, exclusiveLease: { async run(operation) { return operation(); } },
+  });
+  assert.deepEqual(await restarted.recover(), { deliveries: 1, committed: 1, pending: 0 });
+  assert.equal(reads, 1);
+  assert.equal(setup.builder.state.verifyCalls, verifyCalls);
+  assert.deepEqual(setup.store.value, stored);
+  await assert.rejects(restarted.delivery().deliver(setup.request), { code: "CONTROLLED_GIT_BOUNDARY_CHANGED" });
+  setup.store.value.deliveries[0].receipt.commitOid = "f".repeat(40);
+  await assert.rejects(restarted.recover(), { code: "CONTROLLED_COMMIT_DELIVERY_STATE_CORRUPTED" });
+});
+
 test("stale preparation history does not block recovery or authorize delivery", async () => {
   const setup = fixture();
   await setup.service.recover();

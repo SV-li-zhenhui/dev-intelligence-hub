@@ -1256,7 +1256,7 @@ export async function createApplication({
             : {
                 controlledCommitBuilder: frozenPort(
                   codeExecutorRuntime.controlledCommitBuilder,
-                  ["create", "find", "verify"],
+                  ["create", "find", "verify", ...(typeof Object.getOwnPropertyDescriptor(codeExecutorRuntime.controlledCommitBuilder, "readSealed")?.value === "function" ? ["readSealed"] : [])],
                   "codeExecutorRuntime.controlledCommitBuilder",
                 ),
               }),

@@ -5167,6 +5167,7 @@ test("local code and change package composition injects only frozen delivery por
       completedChangeExporter: { async export() {} },
       controlledCommitBuilder: {
         async create() {}, async find() {}, async verify() {},
+        async readSealed(value) { calls.sealedCommitRead = value; return { evidenceId: value.evidenceId }; },
       },
       auditArtifactReader: {
         async read(value) { return Buffer.from(JSON.stringify(value)); },
@@ -5264,8 +5265,10 @@ test("local code and change package composition injects only frozen delivery por
 
   assert.deepEqual(
     Object.keys(calls.changePackageRuntime.controlledCommitBuilder),
-    ["create", "find", "verify"],
+    ["create", "find", "verify", "readSealed"],
   );
+  assert.deepEqual(await calls.changePackageRuntime.controlledCommitBuilder.readSealed({ evidenceId: "historical-commit" }), { evidenceId: "historical-commit" });
+  assert.deepEqual(calls.sealedCommitRead, { evidenceId: "historical-commit" });
   assert.equal(
     Object.isFrozen(calls.changePackageRuntime.controlledCommitBuilder),
     true,

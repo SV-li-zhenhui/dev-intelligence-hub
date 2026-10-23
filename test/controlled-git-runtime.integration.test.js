@@ -805,6 +805,7 @@ test(
     );
     await mkdir(orphanScratch);
     await writeFile(path.join(orphanScratch, "partial"), "crash residue");
+    const restartRunner = new RecordingProcessRunner();
     const restart = () => createControlledGitRuntimeBundle({
       enabled: true,
       gitCommand,
@@ -813,8 +814,9 @@ test(
       headMirrorsByRepository: {
         "contributor/runtime-test": setup.headMirrorRoot,
       },
-    });
+    }, { processRunner: restartRunner });
     const restarted = await restart();
+    assert.equal(restartRunner.calls.length, 0, "startup checks local sealed evidence without rebuilding historical commits");
     await assert.rejects(lstat(orphanScratch), (error) => error?.code === "ENOENT");
     assert.deepEqual(
       await restarted.commitBuilder.verify({ evidenceId: evidence.evidenceId }),
@@ -849,10 +851,7 @@ test(
     await writeFile(growthFile, "a later independent Git fetch adds this object\n");
     await git(gitCommand, setup.headMirrorRoot, ["hash-object", "-w", growthFile]);
     const grown = await restart();
-    await assert.rejects(
-      grown.commitBuilder.verify({ evidenceId: evidence.evidenceId }),
-      (error) => error?.code === "CONTROLLED_GIT_BOUNDARY_CHANGED",
-    );
+    assert.deepEqual(await grown.commitBuilder.verify({ evidenceId: evidence.evidenceId }), evidence);
 
     const tamperedObject = await firstLooseObject(commitObjects);
     await rm(tamperedObject, { force: true });
@@ -924,6 +923,7 @@ test(
     let loseCreateResponse = true;
     let loseVerifyResponse = true;
     const controlledCommitBuilder = {
+      readSealed: request => bundle.commitBuilder.readSealed(request),
       async create(request) {
         calls.create += 1;
         const evidence = await bundle.commitBuilder.create(request);
@@ -998,6 +998,12 @@ test(
     assert.equal(calls.create, 1);
     assert.ok(calls.find >= 2);
     assert.ok(calls.verify >= 2);
+    const gitCallsBeforeLocalRecovery = runner.calls.length;
+    const localRestart = new ChangePackageControlledCommitService(serviceOptions);
+    assert.deepEqual(await localRestart.recover(), { deliveries: 1, committed: 1, pending: 0 });
+    assert.equal(runner.calls.length, gitCallsBeforeLocalRecovery, "committed delivery startup does not rebuild Git history");
+    await localRestart.delivery().deliver(request);
+    assert.ok(runner.calls.length > gitCallsBeforeLocalRecovery, "delivery still verifies the complete current Git evidence");
 
     const commitEntries = await readdir(
       path.join(setup.preparationRoot, "commits"),
@@ -1024,9 +1030,9 @@ test(
     await git(gitCommand, setup.headMirrorRoot, ["hash-object", "-w", growthFile]);
     const stale = new ChangePackageControlledCommitService(serviceOptions);
     assert.deepEqual(await stale.recover(), {
-      deliveries: 1, committed: 0, pending: 1, stalePreparationDeliveryIds: [receipt.deliveryId],
+      deliveries: 1, committed: 1, pending: 0,
     });
-    await assert.rejects(stale.delivery().deliver(request), { code: "CONTROLLED_GIT_BOUNDARY_CHANGED" });
+    assert.deepEqual(await stale.delivery().deliver(request), receipt);
     assert.equal(calls.create, 1);
   },
 );

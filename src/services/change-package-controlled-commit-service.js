@@ -258,7 +258,7 @@ export class ChangePackageControlledCommitService {
     );
     this.#builder = requirePort(
       controlledCommitBuilder,
-      ["create", "find", "verify"],
+      ["create", "find", "verify", ...(typeof Object.getOwnPropertyDescriptor(controlledCommitBuilder, "readSealed")?.value === "function" ? ["readSealed"] : [])],
       "controlledCommitBuilder",
     );
     this.#store = requirePort(store, ["read", "write"], "store");
@@ -296,7 +296,9 @@ export class ChangePackageControlledCommitService {
             const record = findRecord(this.#state, request.deliveryId);
             let recovered;
             try {
-              recovered = await this.#recoverRecord(record, request, manifest);
+              recovered = record.status === "committed" && this.#builder.readSealed
+                ? await this.#verifyCommitted(record, request, manifest, { localOnly: true })
+                : await this.#recoverRecord(record, request, manifest);
             } catch (error) {
               // Historical preparation drift is not current delivery authority.
               // deliver() still verifies the record before returning a receipt.
@@ -441,11 +443,11 @@ export class ChangePackageControlledCommitService {
     });
   }
 
-  async #verifyCommitted(record, request, manifest) {
+  async #verifyCommitted(record, request, manifest, { localOnly = false } = {}) {
     const verified = this.#normalizeBoundEvidence(
       request,
       manifest,
-      await this.#builder.verify({ evidenceId: record.evidenceId }),
+      await (localOnly ? this.#builder.readSealed : this.#builder.verify)({ evidenceId: record.evidenceId }),
     );
     const expected = createChangePackageControlledCommitReceipt(
       requestProjection(request),

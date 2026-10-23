@@ -2050,6 +2050,15 @@ export class ControlledGitService {
     }
   }
 
+  async readSealedControlledCommit(value) {
+    const fields = exactDataObject(value, ["evidenceId"]);
+    const evidenceId = fields.get("evidenceId");
+    if (!CONTROLLED_COMMIT_ID.test(evidenceId)) {
+      throw controlledGitError("INVALID_CONTROLLED_GIT_REQUEST", "Controlled commit evidenceId 无效");
+    }
+    return this.#commitBuilder.readSealed(evidenceId);
+  }
+
   async verifyControlledCommit(value) {
     const fields = exactDataObject(value, ["evidenceId"]);
     const evidenceId = fields.get("evidenceId");

@@ -130,6 +130,9 @@ function fakeService(preparation) {
       calls.verifyCommit.push(request);
       return { evidenceId: request.evidenceId };
     },
+    async readSealedControlledCommit(request) {
+      return { evidenceId: request.evidenceId };
+    },
     async publishControlledCommit(request) {
       calls.publishCommit.push(request);
       return { status: "stale" };
@@ -194,7 +197,7 @@ test("one Controlled Git service is hidden behind frozen least-authority ports",
     "inspectionReader",
   ]);
   assert.equal(Object.isFrozen(bundle), true);
-  assert.deepEqual(Object.keys(bundle.commitBuilder), ["create", "find", "verify"]);
+  assert.deepEqual(Object.keys(bundle.commitBuilder), ["create", "find", "verify", "readSealed"]);
   assert.deepEqual(Object.keys(bundle.materializer), ["materialize"]);
   assert.deepEqual(Object.keys(bundle.publisher), ["publish"]);
   assert.deepEqual(Object.keys(bundle.verifier), ["verify"]);
