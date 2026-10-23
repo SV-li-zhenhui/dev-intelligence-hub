@@ -563,6 +563,37 @@ function unavailablePrContext() {
   throw Object.assign(new Error('Current PR facts unavailable'), { code: 'ROLE_CONTEXT_PR_FACT_UNAVAILABLE' });
 }
 
+test('a fresh Base automatically requeues an own PR blocked on obsolete facts and preserves its history', async () => {
+  const makeRecord = (sequence, baseRefOid = 'd'.repeat(40)) => {
+    const record = prAssignment(sequence, { gitFacts: { ...prGitFacts(PR_HEAD_A, { baseRefOid }),
+      relation: 'authored', nextAction: 'resolve_conflict', actionState: 'action_now', isDraft: true } });
+    record.assignment.target.id = 'developer'; record.assignment.ruleId = AUTHORED_PR_SELF_FIX_RULE_ID;
+    return record;
+  };
+  const fixture = await createFixture({ records: [makeRecord(1)] });
+  await fixture.service.intake();
+  const initial = (await fixture.service.listItems()).items[0];
+  const claim = await fixture.service.claim({ itemId: initial.itemId, expectedRevision: initial.revision,
+    workerId: 'developer-worker', leaseDurationMs: 60_000 });
+  await fixture.service.transition({ itemId: initial.itemId, expectedRevision: claim.revision, leaseId: claim.leaseId,
+    actorId: 'developer-worker', toStatus: 'blocked', reason: 'decision_attempts_exhausted',
+    details: { code: 'ROLE_CONTEXT_PR_FACT_UNAVAILABLE' } });
+  const blocked = (await fixture.service.listItems()).items[0];
+  fixture.source.records.push(makeRecord(2, 'e'.repeat(40))); fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  const refreshed = (await fixture.service.listItems()).items[0];
+  assert.equal(refreshed.status, 'queued');
+  assert.equal(refreshed.statusReason, 'pr_source_revised');
+  assert.equal(refreshed.attempt, blocked.attempt);
+  assert.deepEqual(refreshed.source.decisionBudget, blocked.source.decisionBudget);
+  assert.equal(refreshed.source.current.event.payload.gitTarget.baseRefOid, 'e'.repeat(40));
+  const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  assert.deepEqual((await restarted.service.listItems()).items[0], refreshed);
+  const history = (await restarted.service.listTimeline({ itemId: initial.itemId, limit: 100 })).items;
+  assert.equal(history.filter(entry => entry.details?.context?.code === 'ROLE_CONTEXT_PR_FACT_UNAVAILABLE').length, 1);
+  assert.equal(history.at(-1).type, 'pr_source_revised');
+});
+
 test('replaced pending Heads bind the decision budget to the actual A-to-C activation', async () => {
   const fixture = await exhaustedOldHeadWaitsFixture({ conditionForWait: turn => turn === 3 ?
     { kind: 'time', notBefore: '2026-08-02T02:01:00.000Z' } :

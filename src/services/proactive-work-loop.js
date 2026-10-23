@@ -2226,7 +2226,9 @@ export class ProactiveWorkLoop {
     const code = stableFailureCode(error);
     const contention = isContextContention(error);
     const contextTimeout = beforeDecision && code === "ROLE_CONTEXT_TIMEOUT";
-    const infrastructure = brainFailureOwnerAttention(code) !== null || contextTimeout;
+    const unavailablePrFacts = beforeDecision && error instanceof RoleContextAssemblerError &&
+      code === "ROLE_CONTEXT_PR_FACT_UNAVAILABLE" && error.statusCode === 503;
+    const infrastructure = brainFailureOwnerAttention(code) !== null || contextTimeout || unavailablePrFacts;
     const restoreAttempt = contention || infrastructure;
     const budget = contention ? null : persistedPullRequestDecisionAttemptBudget(item);
     const attempt = budget?.attempt ?? item.attempt;

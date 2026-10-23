@@ -1960,6 +1960,53 @@ test("shutdown abort reaches an active role decision and stages no later intent"
   assert.equal(ledger.calls.transition.length, 0);
 });
 
+test("host PR fact preparation failures retry without spending a model decision", async () => {
+  const time = controlledClock();
+  const sourceItem = workItem(468, { type: "role", id: "developer" });
+  const ledger = new FakeLedger({ source: [sourceItem], time });
+  let assemblies = 0, decisions = 0;
+  const loop = createLoop({ ledger, time, maxAttempts: 1,
+    directory: new FakeRoleDirectory({ developer: worker({ roleId: "developer", decide: async () => {
+      decisions++; return completeDecision();
+    } }) }),
+    roleContextAssembler: { async assemble({ item, roleId }) {
+      if (++assemblies === 1) throw new RoleContextAssemblerError(
+        "ROLE_CONTEXT_PR_FACT_UNAVAILABLE", "temporary PR fact failure", 503);
+      return contextPacket(item, roleId);
+    } },
+    orchestratorService: { async execute() {} },
+  });
+  const first = await loop.runCycle({ roleId: "developer" });
+  assert.equal(first.retried, 1);
+  assert.equal(decisions, 0);
+  assert.equal(ledger.items[0].attempt, 0);
+  assert.equal(ledger.calls.scheduleRetry.at(-1).consumeAttempt, false);
+  assert.equal(ledger.calls.scheduleRetry.at(-1).reason, "system_maintenance_auto_retry");
+  time.advance(60_000);
+  assert.equal((await loop.runCycle({ roleId: "developer" })).staged, 1);
+  assert.equal(decisions, 1);
+  assert.equal(ledger.items[0].attempt, 1);
+});
+
+test("PR fact error codes cannot refund a failed model decision or an untyped preparation failure", async (t) => {
+  for (const fromModel of [false, true]) await t.test(`from model: ${fromModel}`, async () => {
+    const time = controlledClock(), ledger = new FakeLedger({ source: [workItem(469, { type: "role", id: "developer" })], time });
+    const failure = fromModel ? new RoleContextAssemblerError("ROLE_CONTEXT_PR_FACT_UNAVAILABLE", "model failed", 503) :
+      Object.assign(new Error("untyped failure"), { code: "ROLE_CONTEXT_PR_FACT_UNAVAILABLE", statusCode: 503 });
+    const loop = createLoop({ ledger, time, maxAttempts: 1,
+      directory: new FakeRoleDirectory({ developer: worker({ roleId: "developer", decide: async () => { throw failure; } }) }),
+      roleContextAssembler: { async assemble({ item, roleId }) {
+        if (!fromModel) throw failure;
+        return contextPacket(item, roleId);
+      } },
+      orchestratorService: { async execute() {} },
+    });
+    assert.equal((await loop.runCycle({ roleId: "developer" })).blocked, 1);
+    assert.equal(ledger.items[0].attempt, 1);
+    assert.equal(ledger.calls.scheduleRetry.length, 0);
+  });
+});
+
 test("a bounded context timeout aborts a hanging graph read before retrying", async () => {
   const time = controlledClock();
   const sourceItem = workItem(69, { type: "role", id: "developer" });
