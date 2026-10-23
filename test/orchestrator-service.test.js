@@ -29,6 +29,8 @@ import { normalizeBoundWorkProposal, createWorkProposalResult } from "../src/dom
 import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
 import { AutomaticReviewPublisher } from "../src/services/automatic-review-publisher.js";
 import { GitHubReviewProposalHandler } from "../src/services/github-review-proposal-handler.js";
+import { JenkinsCiDiagnostics } from "../src/services/jenkins-ci-diagnostics.js";
+import { canonicalJsonDigest } from "../src/lib/canonical-json-digest.js";
 
 const INPUT_DIGEST = "a".repeat(64);
 const CONTEXT_DIGEST = "b".repeat(64);
@@ -1362,10 +1364,11 @@ test("scoped rebase rejects changed inputs, forged digests and intent revisions"
   }
 });
 
-async function refreshedPrDeliveryFixture({ workerId = "employee-pr-engineer", evidenceCatalog } = {}) {
+async function refreshedPrDeliveryFixture({ workerId = "employee-pr-engineer", evidenceCatalog,
+  ciDiagnosticReader, checks = [] } = {}) {
   const originalAt = "2026-10-15T18:23:34.401Z";
   const refreshedAt = "2026-10-15T18:39:53.208Z";
-  const state = { observedAt: originalAt, factObservedAt: originalAt, facts: {}, mutatePacket: null };
+  const state = { observedAt: originalAt, factObservedAt: originalAt, facts: { checks }, mutatePacket: null };
   const values = new Map();
   let writes = 0;
   const store = {
@@ -1413,7 +1416,7 @@ async function refreshedPrDeliveryFixture({ workerId = "employee-pr-engineer", e
   let item = (await ledger.listItems()).items.find(({ kind }) => kind === "graph_task");
   item = await ledger.claim({ itemId: item.itemId, expectedRevision: item.revision,
     workerId, leaseDurationMs: 600_000 });
-  const assembler = new RoleContextAssembler({ graphReader, evidenceCatalog,
+  const assembler = new RoleContextAssembler({ graphReader, evidenceCatalog, ciDiagnosticReader,
     factSource: { async read({ fact }) { return { healthy: true, fresh: true,
       value: fact === "state" ? "open" : null, observedAt: state.factObservedAt }; } },
     pullRequestContextReader: { async read(input) {
@@ -1791,6 +1794,121 @@ test("complete unchanged PR facts refresh without repeating the specialist decis
       assert.equal(fixture.original.context.code.pullRequest.observedAt, "2026-10-15T18:23:34.401Z");
     });
   }
+});
+
+async function refreshedJenkinsDeliveryFixture() {
+  const buildUrl = "http://jenkins.example/job/QuickTest/1758/";
+  const state = { now: Date.parse("2026-10-15T18:23:34.401Z"), building: false,
+    result: "FAILURE", console: `HEAD is now at ${"b".repeat(11)} merge base
+[INFO] Branch: fix  SHA: ${"b".repeat(40)}
+[ RUN      ] CodeTest.Includes
+${"unchanged failure detail\n".repeat(240)}
+[  FAILED  ] CodeTest.Includes (12 ms)
+Finished: FAILURE` };
+  const ciDiagnosticReader = new JenkinsCiDiagnostics({ clock: () => state.now,
+    credentialSource: { async acquire() { return { username: "fixture", password: "fixture", version: "v1" }; } },
+    fetchImpl: async (url) => new Response(url.endsWith("api/json")
+      ? JSON.stringify({ number: 1758, building: state.building, result: state.result }) : state.console),
+  });
+  const fixture = await refreshedPrDeliveryFixture({ ciDiagnosticReader,
+    checks: [{ kind: "check_run", name: "QuickTest", status: "COMPLETED", conclusion: "FAILURE",
+      url: buildUrl, startedAt: null, completedAt: null, requirement: "required" }] });
+  assert.equal(fixture.original.context.code.ciDiagnostics.reports[0].state, "available");
+  return { ...fixture, jenkins: state, refresh() {
+    state.now = Date.parse(fixture.refreshedAt);
+    fixture.state.observedAt = fixture.refreshedAt;
+    fixture.state.factObservedAt = fixture.refreshedAt;
+  } };
+}
+
+test("expired Jenkins cache refresh with identical terminal build evidence preserves the pending decision", async () => {
+  const fixture = await refreshedJenkinsDeliveryFixture();
+  fixture.refresh();
+  const before = structuredClone(fixture.original);
+  const result = await fixture.execute();
+  assert.equal(result.applied, true);
+  assert.equal(fixture.deliveryCalls(), 1);
+  assert.deepEqual(fixture.original, before, "refresh must not rewrite the model's original evidence");
+});
+
+test("root CI repair decomposition survives a Jenkins refresh and unrelated graph progress", async () => {
+  const ci = await refreshedJenkinsDeliveryFixture();
+  const fixture = rootFixture();
+  fixture.packet.context.code = structuredClone(ci.original.context.code);
+  fixture.packet.context.code.sourceEvent.payload.nextAction = "fix_ci";
+  fixture.packet.context.code.sourceEvent.payload.suggestedCapability = "development";
+  const original = signedContextPacket(fixture.packet, fixture.view);
+  ci.refresh();
+  const refreshed = await ci.assembler.assemble({ roleId: "pr-engineer", item: ci.item,
+    trigger: "employee:pr-engineer" });
+  const progressed = graphView([...fixture.view.graph.tasks, task({ taskId: "unrelated" })], fixture.view.graph.revision + 1);
+  const fresh = signedContextPacket({ ...original, context: { ...original.context,
+    code: { ...original.context.code, ciDiagnostics: refreshed.context.code.ciDiagnostics } } }, progressed);
+  const fakes = fakePorts({ packet: fresh, views: progressed });
+  const result = await new OrchestratorService({ ...fakes.ports, automaticMode: true,
+    capabilityRoles: { development: "developer" } }).execute({
+    worker: { roleId: "orchestrator", workerId: "employee-orchestrator" }, item: fixture.item,
+    contextPacket: original, intent: orchestrate({ ...commonAction("decompose", fixture.root, fixture.view),
+      childKey: "ci-repair-continuation", work: { title: "Continue CI repair", description: "Use current host CI evidence" },
+      capability: "development", dependsOn: [], acceptanceContract: contract() }),
+  });
+  assert.equal(result.applied, true);
+  assert.equal(fakes.calls.planner.length, 1);
+  assert.equal(fakes.calls.planner[0].method, "createChild");
+  assert.equal(fakes.calls.planner[0].command.expectedGraphRevision, progressed.graph.revision);
+});
+
+test("Jenkins observation refresh retains material, complete-log and digest stale checks", async (t) => {
+  const changes = {
+    "different failure": (f) => { f.jenkins.console = f.jenkins.console.replace("unchanged failure detail", "new failure detail"); },
+    "hidden console content": (f) => { f.jenkins.console = f.jenkins.console.replace(
+      "unchanged failure detail\n".repeat(100), "unchanged failure detail\n".repeat(99) + "hidden new failure detail\n"); },
+    "different result": (f) => { f.jenkins.result = "UNSTABLE"; },
+    "still building": (f) => { f.jenkins.building = true; f.jenkins.result = null; },
+    "checkout changed": (f) => { f.jenkins.console = f.jenkins.console.replaceAll("b".repeat(40), "c".repeat(40)); },
+    "observation rollback": (f) => { f.jenkins.now = Date.parse("2026-10-15T18:20:00.000Z"); },
+  };
+  const packetChanges = {
+    "invalid report digest": (d) => { d.reports[0].contentDigest = "f".repeat(64); },
+    "missing complete material digest": (d) => { delete d.reports[0].materialDigest; },
+    "changed complete material digest": (d) => { d.reports[0].materialDigest = "f".repeat(64); },
+    "different build": (d) => { d.reports[0].buildNumber += 1; },
+    "different repository": (d) => { d.repository = "acme/other"; },
+    "different Head": (d) => { d.headRefOid = "d".repeat(40); },
+    "new evidence field": (d) => { d.reports[0].newEvidence = "changed"; },
+    "changed truncation": (d) => { d.reports[0].failuresTruncated = !d.reports[0].failuresTruncated; },
+  };
+  for (const [name, mutate] of Object.entries(packetChanges)) changes[name] = (fixture) => {
+    fixture.state.mutatePacket = (packet) => {
+      const d = packet.context.code.ciDiagnostics;
+      mutate(d);
+      if (name !== "invalid report digest") {
+        const { contentDigest, ...material } = d.reports[0];
+        d.reports[0].contentDigest = canonicalJsonDigest(material);
+      }
+      const { contentDigest, ...material } = d;
+      d.contentDigest = canonicalJsonDigest(material);
+      return signedContextPacket(packet, { graph: { graphId: packet.binding.graphId,
+        revision: packet.binding.graphRevision, contentDigest: packet.binding.graphContentDigest } });
+    };
+  };
+  for (const [name, mutate] of Object.entries(changes)) await t.test(name, async () => {
+    const fixture = await refreshedJenkinsDeliveryFixture();
+    fixture.refresh();
+    mutate(fixture);
+    if (name === "hidden console content") {
+      const fresh = await fixture.assembler.assemble({ roleId: "pr-engineer", item: fixture.item,
+        trigger: "employee:pr-engineer" });
+      const originalReport = fixture.original.context.code.ciDiagnostics.reports[0];
+      const freshReport = fresh.context.code.ciDiagnostics.reports[0];
+      assert.deepEqual(freshReport.failures, originalReport.failures, "the changed log lies outside visible excerpts");
+      assert.notEqual(freshReport.materialDigest, originalReport.materialDigest);
+    }
+    const writes = fixture.writes();
+    await assert.rejects(fixture.execute(), { code: "ORCHESTRATOR_CONTEXT_STALE" });
+    assert.equal(fixture.deliveryCalls(), 0);
+    assert.equal(fixture.writes(), writes);
+  });
 });
 
 test("PR observation refresh preserves material, authority and full packet stale checks", async (t) => {

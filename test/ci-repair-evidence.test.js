@@ -42,6 +42,22 @@ test('CI evidence rejects a successful trigger, credentials in URLs, wrong check
   }
 });
 
+test('complete log material digest is optional for legacy archives and strictly validated when present', () => {
+  const value = input(); value.diagnostics = [report()];
+  const legacy = createCiRepairEvidence(value);
+  assert.deepEqual(normalizeCiRepairEvidence(legacy), legacy);
+  value.diagnostics[0].materialDigest = 'd'.repeat(64);
+  const current = createCiRepairEvidence(value);
+  assert.equal(current.diagnostics[0].materialDigest, 'd'.repeat(64));
+  assert.deepEqual(normalizeCiRepairEvidence(current), current);
+  assert.notEqual(current.contentDigest, legacy.contentDigest);
+  assert.equal(current.triggerDigest, legacy.triggerDigest);
+  for (const invalidDigest of [null, [], ['d'.repeat(64)], {}, 12, 'not-a-digest', 'D'.repeat(64)]) {
+    value.diagnostics[0].materialDigest = invalidDigest;
+    assert.throws(() => createCiRepairEvidence(value), { code: 'CI_REPAIR_EVIDENCE_INVALID' });
+  }
+});
+
 test('CI evidence rejects tampering, oversized logs and accessors without evaluating them', () => {
   const value = input(), evidence = createCiRepairEvidence(value);
   evidence.checks[0].name = 'tampered';

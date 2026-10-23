@@ -6,7 +6,7 @@ export const FAILED_CI_CONCLUSIONS = new Set(['FAILURE', 'ERROR', 'TIMED_OUT', '
 const FIELDS = ['schemaVersion', 'repository', 'number', 'headRefOid', 'headRefName', 'checks', 'diagnostics'];
 const REPORT_FIELDS = new Set(['check', 'schemaVersion', 'buildUrl', 'buildNumber', 'repository', 'headRefOid',
   'state', 'result', 'consoleHasReplacementCharacters', 'untrustedEvidence', 'checkout', 'failures',
-  'failuresTruncated', 'failureSummary', 'code', 'observedAt', 'contentDigest']);
+  'failuresTruncated', 'failureSummary', 'code', 'observedAt', 'contentDigest', 'materialDigest']);
 const oid = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
 const invalid = () => Object.assign(new Error('CI 修复证据无效'), { code: 'CI_REPAIR_EVIDENCE_INVALID' });
 
@@ -62,6 +62,8 @@ function stableReport(value, material) {
   const entries = fields(value);
   if (entries.some(([key]) => !REPORT_FIELDS.has(key))) throw invalid();
   const report = json(Object.fromEntries(entries.filter(([key]) => !['observedAt', 'contentDigest'].includes(key))));
+  if (Object.hasOwn(report, 'materialDigest') &&
+      (typeof report.materialDigest !== 'string' || !/^[a-f0-9]{64}$/u.test(report.materialDigest))) throw invalid();
   const matching = material.checks.filter(check => check.name === report.check);
   if (matching.length === 0 || !['available', 'building', 'version_mismatch', 'unavailable'].includes(report.state)) throw invalid();
   if (report.buildUrl && !matching.some(check => check.url === report.buildUrl)) throw invalid();

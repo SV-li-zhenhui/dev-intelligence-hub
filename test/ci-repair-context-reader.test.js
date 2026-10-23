@@ -4,6 +4,8 @@ import { CiRepairContextReader } from '../src/services/ci-repair-context-reader.
 import { createPullRequestReadFacts, createPullRequestReadIdentity } from '../src/domain/pull-request-read-facts.js';
 import { normalizeWorkflowEvent } from '../src/domain/workflow-events.js';
 import { createPullRequestExecutionBinding } from '../src/domain/pull-request-execution-binding.js';
+import { JenkinsCiDiagnostics } from '../src/services/jenkins-ci-diagnostics.js';
+import { normalizeCiRepairEvidence } from '../src/domain/ci-repair-evidence.js';
 
 function fixture({ ownerRequested = false } = {}) {
   const target = { schemaVersion: 1, provider: 'github', sourceAccountId: 'me', baseRepository: 'acme/repo',
@@ -33,6 +35,22 @@ test('host CI evidence uses current GitHub checks and exact target even for an o
   assert.equal(value.ciEvidence.checks[0].conclusion, 'FAILURE');
   assert.equal(value.ciEvidence.headRefOid, f.input.inputBinding.headRefOid);
   assert.deepEqual(f.calls, ['target', 'checks', 'diagnostics', 'target']);
+});
+
+test('complete Jenkins material evidence survives host CI capture and immutable evidence normalization', async () => {
+  const f = fixture({ ownerRequested: true });
+  const diagnostics = new JenkinsCiDiagnostics({
+    credentialSource: { async acquire() { return { username: 'fixture', password: 'fixture', version: 'v1' }; } },
+    fetchImpl: async url => new Response(url.endsWith('api/json')
+      ? JSON.stringify({ number: 12, building: false, result: 'FAILURE' })
+      : `HEAD is now at ${'b'.repeat(11)} base\n[INFO] Branch: fix/ci  SHA: ${'b'.repeat(40)}\n` +
+        '[ RUN      ] CodeTest.Includes\nmissing include\n[  FAILED  ] CodeTest.Includes (1 ms)\nFinished: FAILURE'),
+  });
+  const reader = new CiRepairContextReader({ github: f.github, diagnostics });
+  const { ciEvidence } = await reader.read(f.input);
+  assert.match(ciEvidence.diagnostics[0].materialDigest, /^[a-f0-9]{64}$/u);
+  assert.equal(ciEvidence.diagnostics[0].state, 'available');
+  assert.deepEqual(normalizeCiRepairEvidence(ciEvidence), ciEvidence);
 });
 
 test('an explicit owner CI request reads fresh own-author checks without inventing an authored event', async () => {

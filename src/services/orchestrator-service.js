@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 
 import { deliveryAcceptanceContractDigest } from "../domain/delivery-evidence-contract.js";
 import {
@@ -468,6 +469,41 @@ function rebasePullRequestObservations(rebased, fresh) {
   }
 }
 
+function hasValidDiagnosticDigest(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const { contentDigest, ...material } = value;
+  return typeof contentDigest === "string" && SHA256.test(contentDigest) &&
+    canonicalJsonDigest(material) === contentDigest;
+}
+
+function rebaseCiDiagnosticObservations(rebased, fresh) {
+  const original = rebased.context?.code?.ciDiagnostics;
+  const current = fresh.context?.code?.ciDiagnostics;
+  if (!hasValidDiagnosticDigest(original) || !hasValidDiagnosticDigest(current) ||
+      original.schemaVersion !== 1 || current.schemaVersion !== 1 ||
+      original.repository !== current.repository || original.headRefOid !== current.headRefOid ||
+      !Array.isArray(original.reports) || !Array.isArray(current.reports) ||
+      original.reports.length !== current.reports.length || original.reports.length > 3) return;
+  for (let index = 0; index < original.reports.length; index += 1) {
+    const previous = original.reports[index];
+    const next = current.reports[index];
+    if (sameValue(previous, next)) continue;
+    if (!hasValidDiagnosticDigest(previous) || !hasValidDiagnosticDigest(next) ||
+        previous.schemaVersion !== 1 || previous.state !== "available" ||
+        !["SUCCESS", "FAILURE", "UNSTABLE", "ABORTED", "NOT_BUILT"].includes(previous.result) ||
+        previous.repository !== original.repository || previous.headRefOid !== original.headRefOid ||
+        previous.checkout?.matched !== true || previous.checkout.sha !== original.headRefOid ||
+        typeof previous.materialDigest !== "string" || !SHA256.test(previous.materialDigest) ||
+        !observationAdvanced(previous.observedAt, next.observedAt)) return;
+    const { observedAt: previousAt, contentDigest: previousDigest, ...previousMaterial } = previous;
+    const { observedAt: nextAt, contentDigest: nextDigest, ...nextMaterial } = next;
+    if (!sameValue(previousMaterial, nextMaterial)) return;
+    original.reports[index] = checkedClone(next);
+  }
+  const { contentDigest, ...material } = original;
+  original.contentDigest = canonicalJsonDigest(material);
+}
+
 function assertPacketIsFresh(original, fresh) {
   const normalizedFresh = checkedClone(fresh);
   if (sameValue(original, normalizedFresh)) return normalizedFresh;
@@ -482,14 +518,15 @@ function assertPacketIsFresh(original, fresh) {
   ) {
     throw stale("Role context changed before the requested action could execute");
   }
-  // Rebase only graph metadata and complete, identical PR material observed
-  // again. Validate both packet digests; every other scoped field still compares.
+  // Rebase graph metadata and identical PR/build evidence observed again.
+  // Complete material digests and every other scoped field still compare.
   const rebased = checkedClone(original);
   rebased.binding.graphRevision = normalizedFresh.binding.graphRevision;
   rebased.binding.graphContentDigest = normalizedFresh.binding.graphContentDigest;
   rebased.context.requirements.graph.revision = normalizedFresh.context.requirements.graph.revision;
   rebased.context.requirements.graph.contentDigest = normalizedFresh.context.requirements.graph.contentDigest;
   rebasePullRequestObservations(rebased, normalizedFresh);
+  rebaseCiDiagnosticObservations(rebased, normalizedFresh);
   rebased.contextDigest = roleContextDigest(rebased);
   if (!sameValue(rebased, normalizedFresh)) {
     throw stale("Role context changed before the requested action could execute");

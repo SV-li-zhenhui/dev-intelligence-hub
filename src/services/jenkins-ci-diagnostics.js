@@ -23,7 +23,10 @@ function excerpt(text, maximum = 4000) {
 }
 
 export function parseJenkinsGoogleTestConsole(text, { headRefOid, headRefName, secrets = [] }) {
-  const log = redact(text, secrets);
+  return parseRedactedJenkinsConsole(redact(text, secrets), { headRefOid, headRefName });
+}
+
+function parseRedactedJenkinsConsole(log, { headRefOid, headRefName }) {
   const lines = log.split(/\r?\n/u);
   const firstTest = lines.findIndex(line => /^\[\s*RUN\s*\]/u.test(line));
   const prefix = lines.slice(0, firstTest < 0 ? lines.length : firstTest);
@@ -133,16 +136,22 @@ export class JenkinsCiDiagnostics {
     const metadata = JSON.parse(metadataText);
     if (metadata.number !== identity.buildNumber || typeof metadata.building !== 'boolean') throw failure('JENKINS_RESPONSE_INVALID');
     const secrets = [credential.password, Buffer.from(credential.password).toString('base64'), encodeURIComponent(credential.password), authorization, authorization.slice(6)];
-    const parsed = parseJenkinsGoogleTestConsole(consoleText, { ...request, secrets });
+    const redactedConsole = redact(consoleText, secrets);
+    const parsed = parseRedactedJenkinsConsole(redactedConsole, request);
     const value = { schemaVersion: 1, buildUrl: identity.buildUrl, buildNumber: identity.buildNumber,
       repository: request.repository, headRefOid: request.headRefOid, observedAt: new Date(this.clock()).toISOString(),
       state: !parsed.checkout.matched ? 'version_mismatch' : metadata.building ? 'building' : 'available',
       result: ['SUCCESS', 'FAILURE', 'UNSTABLE', 'ABORTED', 'NOT_BUILT'].includes(metadata.result) ? metadata.result : null,
+      // Keep full console identity before excerpts are bounded for model context.
+      materialDigest: digest({ domain: 'mydashboard-jenkins-build-material/v1',
+        repository: request.repository, headRefOid: request.headRefOid,
+        buildUrl: identity.buildUrl, buildNumber: metadata.number, checkout: parsed.checkout,
+        building: metadata.building, result: metadata.result, console: redactedConsole }),
       consoleHasReplacementCharacters: consoleText.includes('\uFFFD'),
       untrustedEvidence: true, ...parsed };
     if (!parsed.checkout.matched) value.failures = [];
     if (parsed.checkout.matched && metadata.result === 'FAILURE' && value.failures.length === 0) {
-      value.failureSummary = excerpt(redact(consoleText, secrets), 3000);
+      value.failureSummary = excerpt(redactedConsole, 3000);
     }
     value.contentDigest = digest(value);
     if (!metadata.building) {
