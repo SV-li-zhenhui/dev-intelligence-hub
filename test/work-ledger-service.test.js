@@ -12931,6 +12931,59 @@ test("new host facts retire only the obsolete question and give its parent one n
   assert.equal(hostContextRecoveryCandidate(duplicateState, duplicateParent), null);
 });
 
+test("host-recovered parent can create a fresh child after restart without changing the failed delivery", async () => {
+  const fixture = await pendingHostContextFixture();
+  assert.equal((await fixture.retry()).retried, 1);
+  const before = clone(fixture.store.stored());
+  const parent = before.items.find(item => item.itemId === fixture.parentId);
+  assert.equal(hasPendingHostContextRecovery(before, parent), true);
+  const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  const command = prGraphChildCommand(parent, before.revision, "repair-after-host-recovery");
+  const created = await restarted.service.createGraphChild(command);
+  const after = clone(fixture.store.stored());
+  const currentParent = after.items.find(item => item.itemId === parent.itemId);
+  const child = after.items.find(item => item.itemId === created.taskId);
+  assert.equal(currentParent.status, "queued");
+  assert.equal(currentParent.statusReason, "waiting_for_children");
+  assert.equal(currentParent.revision, parent.revision + 1);
+  assert.equal(hasPendingHostContextRecovery(after, currentParent), false);
+  assert.equal(child.currentTarget.id, "developer");
+  assert.equal(child.status, "queued");
+  assert.deepEqual(after.items.find(item => item.itemId === fixture.childId), before.items.find(item => item.itemId === fixture.childId));
+  assert.deepEqual(after.outbox, before.outbox);
+  assert.equal((await restarted.service.createGraphChild(command)).taskId, child.itemId);
+  assert.deepEqual(fixture.store.stored(), after, "replay returns the existing child without another write");
+  const claimed = await restarted.service.claim({ itemId: child.itemId, expectedRevision: child.revision,
+    workerId: "employee-developer", leaseDurationMs: 30_000 });
+  assert.equal(claimed.status, "working");
+});
+
+test("host-recovery child creation rejects missing, changed or held proof and stale commands", async t => {
+  for (const boundary of ["missing-proof", "proof-digest", "child-revision", "parent-revision", "root-pause", "ordinary-retry", "graph-revision"]) {
+    await t.test(boundary, async () => {
+      const fixture = await pendingHostContextFixture();
+      assert.equal((await fixture.retry()).retried, 1);
+      const state = clone(fixture.store.stored());
+      const parent = state.items.find(item => item.itemId === fixture.parentId);
+      const command = prGraphChildCommand(parent, state.revision, "repair-after-host-recovery");
+      const proof = state.outbox.find(entry => entry.intentId === fixture.askId).outcome.details.hostContextRetirement;
+      if (boundary === "missing-proof") delete state.outbox.find(entry => entry.intentId === fixture.askId).outcome.details.hostContextRetirement;
+      if (boundary === "proof-digest") proof.digest = "f".repeat(64);
+      if (boundary === "child-revision") state.items.find(item => item.itemId === fixture.childId).revision++;
+      if (boundary === "parent-revision") { parent.revision++; command.command.expectedTaskRevisions[0].revision = parent.revision; }
+      if (boundary === "root-pause") { parent.status = "paused"; parent.availableAt = null; }
+      if (boundary === "ordinary-retry") parent.statusReason = "retry-backoff";
+      if (boundary === "graph-revision") command.command.expectedGraphRevision--;
+      fixture.store.replaceStored(state);
+      const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+      const before = clone(fixture.store.stored());
+      await assert.rejects(restarted.service.createGraphChild(command), error =>
+        error.code === (boundary === "graph-revision" ? "WORK_LEDGER_STATE_REVISION_CONFLICT" : "WORK_LEDGER_GRAPH_PARENT_CONFLICT"));
+      assert.deepEqual(fixture.store.stored(), before, boundary);
+    });
+  }
+});
+
 test("host fact recovery preserves owner controls, unanswered real questions and unproven state", async t => {
   for (const variant of ["disabled", "paused", "pending", "active", "unknown-stop", "wrong-receipt", "no-receipt", "future-receipt",
     "wrong-actor", "real-question", "multiple-choices", "wrong-revision", "wrong-child", "bound-child", "backlog", "answered", "unsealed",
