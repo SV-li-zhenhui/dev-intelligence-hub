@@ -10,6 +10,8 @@ const WAITING = new Set(['waiting_external', 'waiting_condition', 'dispatch_pend
 const TERMINAL = new Set(['completed', 'cancelled', 'superseded']);
 const timeout = () => Object.assign(new Error('Work continuation execution exceeded its lease budget'), { code: 'WORK_CONTINUATION_TIMEOUT' });
 const recovery = (action, reason, dueAt = null) => ({ action, reason, dueAt });
+const graphProgress = value => typeof value?.graphProgressDigest === 'string' && /^[a-f0-9]{64}$/.test(value.graphProgressDigest)
+  ? value.graphProgressDigest : null;
 function conditionFor(item, fact) {
   let type = 'claimable';
   if (item.status === 'paused') type = 'manual_resume';
@@ -17,7 +19,9 @@ function conditionFor(item, fact) {
   else if (item.status === 'waiting_condition') type = 'fact_change';
   else if (item.status === 'retry_wait') type = 'retry_due';
   else if (fact?.graphBlocked) type = 'child_delivery';
-  return { type, reference: ['intent_result', 'fact_change'].includes(type) ? item.activeIntentId ?? null : null };
+  const progress = graphProgress(fact);
+  return { type, reference: ['intent_result', 'fact_change'].includes(type) ? item.activeIntentId ?? null :
+    ['claimable', 'child_delivery'].includes(type) && progress !== null ? `graph:${progress}` : null };
 }
 function sourceFor(item) {
   const binding = currentWorkItemInputBinding(item);
@@ -196,7 +200,8 @@ export class WorkContinuationScheduler {
   #record(state, item, condition, canRun, now) {
     const fingerprint = continuationFingerprint(item);
     let record = state.records.find(record => record.itemId === item.itemId);
-    if (!record || record.fingerprint !== fingerprint) {
+    const conditionChanged = record && (record.condition.type !== condition.type || record.condition.reference !== condition.reference);
+    if (!record || record.fingerprint !== fingerprint || conditionChanged) {
       if (!record && state.records.length >= CONTINUATION_MAX_RECORDS) {
         const inactive = record => record.receipts.every(receipt => receipt.outcome !== 'running');
         let discard = state.records.findIndex(record => ['delivered', 'superseded'].includes(record.status) && inactive(record));
@@ -231,7 +236,7 @@ export class WorkContinuationScheduler {
   }
 
   async #execute(claim, dispatch, signal) {
-    let result, observedRevision = null, errorCode = null;
+    let result, observedRevision = null, errorCode = null, relatedProgressed = false;
     try {
       signal.throwIfAborted();
       const role = await this.#ports.roleStateReader.read(claim.roleId);
@@ -240,6 +245,8 @@ export class WorkContinuationScheduler {
       else if (!item || continuationFingerprint(item) !== claim.fingerprint) result = 'input_changed';
       else if (this.#ports.taskRuns && (await this.#ports.taskRuns.order([item], 'work-item', 'itemId')).length === 0) result = 'runtime_deferred';
       else {
+        const beforeProgress = /^graph:[a-f0-9]{64}$/.test(claim.condition.reference ?? '')
+          ? await this.#relatedProgress(claim.itemId) : null;
         const dispatched = await dispatch({ roleId: claim.roleId, signal,
           continuationTarget: { itemId: claim.itemId, fingerprint: claim.fingerprint } });
         signal.throwIfAborted();
@@ -247,7 +254,11 @@ export class WorkContinuationScheduler {
         else {
           const latest = await this.#ports.ledger.readItemForReconciliation({ itemId: claim.itemId });
           observedRevision = latest?.revision ?? null;
-          result = latest === null ? 'input_changed' : observedRevision === item.revision ? 'no_progress' : 'role_woken';
+          if (latest !== null && observedRevision === item.revision && beforeProgress !== null) {
+            const afterProgress = await this.#relatedProgress(claim.itemId);
+            relatedProgressed = beforeProgress !== null && afterProgress !== null && beforeProgress !== afterProgress;
+          }
+          result = latest === null ? 'input_changed' : observedRevision !== item.revision || relatedProgressed ? 'role_woken' : 'no_progress';
         }
       }
     } catch (error) {
@@ -264,16 +275,31 @@ export class WorkContinuationScheduler {
       const outcomes = { role_woken: 'progressed', input_changed: 'superseded', runtime_deferred: 'deferred', no_progress: 'no_progress', wake_failed: 'failed', execution_timeout: 'timed_out' };
       Object.assign(receipt, { finishedAt: now, outcome: outcomes[result], observedRevision, errorCode });
       if (record.fingerprint === claim.fingerprint && record.status === 'running') {
-        if (result === 'runtime_deferred') record.attempt = Math.max(0, record.attempt - 1);
-        const done = ['role_woken', 'input_changed'].includes(result);
-        const nextAttemptAt = done ? null : new Date(Date.parse(now) + (record.attempt >= 3 ? 300_000 : 30_000 * Math.max(1, record.attempt))).toISOString();
-        const status = done ? (result === 'role_woken' ? 'delivered' : 'superseded') : record.attempt >= 3 ? 'stalled' : 'retry_wait';
-        Object.assign(record, { reason: result, updatedAt: now, status, nextAttemptAt,
-          recovery: recovery(done ? 'none' : 'retry', result, nextAttemptAt) });
+        if (relatedProgressed && result === 'role_woken') {
+          Object.assign(record, { status: 'pending', attempt: 0, reason: result, nextAttemptAt: now, updatedAt: now,
+            recovery: recovery('none', result) });
+        } else {
+          if (result === 'runtime_deferred') record.attempt = Math.max(0, record.attempt - 1);
+          const done = ['role_woken', 'input_changed'].includes(result);
+          const nextAttemptAt = done ? null : new Date(Date.parse(now) + (record.attempt >= 3 ? 300_000 : 30_000 * Math.max(1, record.attempt))).toISOString();
+          const status = done ? (result === 'role_woken' ? 'delivered' : 'superseded') : record.attempt >= 3 ? 'stalled' : 'retry_wait';
+          Object.assign(record, { reason: result, updatedAt: now, status, nextAttemptAt,
+            recovery: recovery(done ? 'none' : 'retry', result, nextAttemptAt) });
+        }
       }
       await this.#ports.store.write(WORK_CONTINUATION_STATE_KEY, normalizeWorkContinuationState(state));
       this.#project(state);
     });
+  }
+
+  async #relatedProgress(itemId) {
+    try {
+      const items = await this.#ports.ledger.readItemProgress([itemId]);
+      return graphProgress(items.find(item => item.itemId === itemId));
+    } catch {
+      this.#status.lastError = 'progress_observation_failed';
+      return null;
+    }
   }
 
   #project(state) {

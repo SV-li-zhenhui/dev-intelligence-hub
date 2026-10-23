@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import { automaticRoleHandoffCandidate } from "../src/services/work-ledger-role-handoff.js";
+import { indexWorkLedgerGraphProgress } from "../src/services/work-ledger-graph-progress.js";
 import { unstartedDeliveryContractFailure } from "../src/services/work-ledger-delivery-failure.js";
 import { hostContextRecoveryCandidate, planHostContextRecovery, hasPendingHostContextRecovery } from "../src/services/work-ledger-host-context-recovery.js";
 import { WorkContinuationScheduler } from "../src/services/work-continuation-scheduler.js";
@@ -2217,6 +2218,23 @@ test("claim candidate pagination survives its cursor being claimed", async () =>
   assert.equal(thirdPage.nextCursor, null);
 });
 
+test("related progress supports a full-capacity ledger without widening raw value budgets", () => {
+  const parent = { itemId: "root", revision: 1, status: "queued", graph: {} };
+  const children = Array.from({ length: 4_999 }, (_, index) => ({
+    itemId: `child-${index}`, revision: 1, status: "queued",
+    graph: { parentItemId: parent.itemId },
+  }));
+  for (const dependencies of [[], children.map(({ itemId }) => itemId)]) {
+    parent.graph.dependsOnItemIds = dependencies;
+    const items = [parent, ...children];
+    const digest = indexWorkLedgerGraphProgress(items).graphProgressDigest(parent);
+    assert.match(digest, /^[a-f0-9]{64}$/);
+    assert.equal(indexWorkLedgerGraphProgress([...items].reverse()).graphProgressDigest(parent), digest);
+    children[0].revision += 1;
+    assert.notEqual(indexWorkLedgerGraphProgress(items).graphProgressDigest(parent), digest);
+  }
+});
+
 test("claim candidate pages retain facts from the complete dependency graph", async () => {
   const fixture = await createFixture({
     records: Array.from(
@@ -2260,6 +2278,7 @@ test("claim candidate pages retain facts from the complete dependency graph", as
   assert.deepEqual(firstPage.items.map(({ itemId }) => itemId), [parent.itemId]);
   assert.deepEqual(firstPage.facts, [{
     itemId: parent.itemId,
+    graphProgressDigest: indexWorkLedgerGraphProgress(durable.items).graphProgressDigest(parent),
     graphBlocked: true,
     submittedChildren: 0,
     satisfiedChildren: 1,
@@ -2267,6 +2286,7 @@ test("claim candidate pages retain facts from the complete dependency graph", as
   assert.deepEqual(secondPage.items.map(({ itemId }) => itemId), [consumer.itemId]);
   assert.deepEqual(secondPage.facts, [{
     itemId: consumer.itemId,
+    graphProgressDigest: indexWorkLedgerGraphProgress(durable.items).graphProgressDigest(consumer),
     graphBlocked: true,
     submittedChildren: 0,
     satisfiedChildren: 0,

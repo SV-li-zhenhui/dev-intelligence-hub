@@ -23,6 +23,7 @@ import { WorkGraphStore } from "../src/services/work-graph-store.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
 import { RoleDecisionEngine } from "../src/services/role-decision-engine.js";
 import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
+import { WorkContinuationScheduler } from "../src/services/work-continuation-scheduler.js";
 import { DeliveryEvidenceService } from "../src/services/delivery-evidence-service.js";
 import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
 import { currentWorkItemEvent, currentWorkItemExecutionBinding } from "../src/services/work-ledger-pr-source.js";
@@ -1581,6 +1582,63 @@ test("historical Review settlement checks the complete graph rather than its del
     });
     await assert.rejects(reader.assemble({ roleId: "orchestrator", item, trigger: "scheduled" }), error =>
       error.code === "ROLE_CONTEXT_PR_FACT_UNAVAILABLE" && error.cause?.code === "PR_FACTS_STALE");
+  });
+});
+
+test("child-only Review acceptance rearms the same durable root before its old no-progress backoff", async t => {
+  for (const origin of ["current wake", "between wakes"]) await t.test(origin, async () => {
+    const fixture = await publishedReviewSettlementFixture();
+    const { ledger, graphReader, assembler, root, item, host } = fixture;
+    let persisted, now = Date.parse("2026-10-15T18:34:00.000Z");
+    const operations = [];
+    const owner = operation => { const pending = operation(); operations.push(pending); return pending; };
+    const drain = async () => { await Promise.all(operations.splice(0)); };
+    const options = { ledger, clock: () => new Date(now),
+      store: { read: async (_key, fallback) => structuredClone(persisted ?? fallback), write: async (_key, value) => { persisted = structuredClone(value); } },
+      configurationReader: { readActive: async () => ({ configuration: { githubActions: { enabled: true, automaticReview: true } } }) },
+      roleStateReader: { read: async () => ({ enabled: true, paused: false }) },
+    };
+    let scheduler = new WorkContinuationScheduler(options);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await scheduler.runCycle({ dispatch: async () => {}, runOperation: owner }); await drain(); now += 90_000;
+    }
+    assert.equal(persisted.records.find(entry => entry.itemId === root.itemId).status, "stalled");
+    const parentBeforeAcceptance = (await ledger.listItems()).items.find(entry => entry.itemId === root.itemId);
+    const accept = async () => {
+      const current = (await ledger.listItems()).items.find(entry => entry.itemId === root.itemId);
+      const packet = await assembler.assemble({ roleId: "orchestrator", item: current, trigger: "scheduled" });
+      const view = await graphReader.getSnapshot();
+      const child = view.graph.tasks.find(entry => entry.taskId === item.itemId);
+      await host.execute({ worker: { roleId: "orchestrator", workerId: "employee-orchestrator" }, item: current, contextPacket: packet,
+        intent: orchestrate({ ...commonAction("accept_delivery", child, view), submittedDeliveryRevision: 1 }) });
+    };
+    if (origin === "current wake") {
+      now += 300_000;
+      await scheduler.runCycle({ dispatch: accept, runOperation: owner }); await drain();
+      const continuation = persisted.records.find(entry => entry.itemId === root.itemId);
+      assert.equal(continuation.receipts.at(-1).outcome, "progressed");
+      assert.equal(continuation.status, "pending");
+      assert.equal(continuation.attempt, 0);
+    } else await accept();
+    assert.equal((await ledger.listItems()).items.find(entry => entry.itemId === root.itemId).revision, parentBeforeAcceptance.revision,
+      "the actual acceptance changes only its child, not the root authority fingerprint");
+    let completionCalls = 0;
+    const loop = new ProactiveWorkLoop({ ledger, roleContextAssembler: assembler, orchestratorService: host,
+      clock: () => new Date("2026-10-15T18:34:00.000Z"), roleDirectory: { async resolve() { return {
+        roleId: "orchestrator", workerId: "employee-orchestrator", enabled: true, paused: false,
+        decide: async () => ({ schemaVersion: 1, confidence: 90, summary: "Complete accepted publication", intent: {
+          schemaVersion: 1, type: "complete", summary: "Original Review accepted", reason: "All required publication delivered", outcome: "done", evidence: [],
+        } }),
+      }; } } });
+    scheduler = new WorkContinuationScheduler(options);
+    await scheduler.runCycle({ runOperation: owner, dispatch: async ({ continuationTarget }) => {
+      completionCalls++;
+      assert.equal(continuationTarget.itemId, root.itemId);
+      return loop.runCycle({ roleId: "orchestrator", workLimit: 1, continuationTarget });
+    } });
+    await drain();
+    assert.equal(completionCalls, 1, "related progress must run the next step without advancing the retry clock");
+    assert.equal((await ledger.listItems()).items.find(entry => entry.itemId === root.itemId).status, "dispatch_pending");
   });
 });
 

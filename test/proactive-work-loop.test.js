@@ -4155,7 +4155,11 @@ test("changed root or hidden child revisions interrupt a partial blocked-root sw
       if (changed === "hidden child") {
         const candidates = await ledger.listClaimCandidates({ at: "2026-08-02T08:00:00.000Z" });
         assert.ok(candidates.items.every(({ itemId }) => itemId !== changedItem.itemId));
-        assert.deepEqual(candidates.facts.find(({ itemId }) => itemId === roots[0].itemId), factsBefore,
+        const { graphProgressDigest: beforeDigest, ...beforeCounts } = factsBefore;
+        const { graphProgressDigest: afterDigest, ...afterCounts } = candidates.facts
+          .find(({ itemId }) => itemId === roots[0].itemId);
+        assert.notEqual(afterDigest, beforeDigest, "hidden child revisions change the scheduling observation");
+        assert.deepEqual(afterCounts, beforeCounts,
           "same-count readiness changes must not depend on aggregate candidate facts");
       }
       const cycle = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });

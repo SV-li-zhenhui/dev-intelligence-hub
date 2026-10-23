@@ -3,6 +3,7 @@ import test from 'node:test';
 import { WorkContinuationScheduler } from '../src/services/work-continuation-scheduler.js';
 import { WORK_CONTINUATION_STATE_KEY, normalizeWorkContinuationState, migrateWorkContinuationState } from '../src/services/work-continuation-state.js';
 import { continuationFingerprint, normalizeContinuationTarget } from '../src/services/work-continuation-state.js';
+import { indexWorkLedgerGraphProgress } from '../src/services/work-ledger-graph-progress.js';
 
 const clone = value => structuredClone(value);
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
@@ -36,6 +37,72 @@ function fixture() {
     state: () => clone(persisted), seed: value => { persisted = clone(value); },
     advance: ms => { now += ms; }, async drain() { await Promise.all(operations.splice(0)); } };
 }
+
+function relatedProgressFixture() {
+  const f = fixture();
+  f.items[0].currentTarget.id = 'orchestrator';
+  f.items[0].graph = { parentItemId: null, dependsOnItemIds: [] };
+  f.items.push({ itemId: 'review-child', revision: 7, status: 'completed', currentTarget: { type: 'role', id: 'pr-engineer' },
+    graph: { parentItemId: f.items[0].itemId, dependsOnItemIds: [] } });
+  const project = item => ({ ...clone(item), graphProgressDigest: indexWorkLedgerGraphProgress(f.items).graphProgressDigest(item) });
+  f.ledger.listClaimCandidates = async () => ({ items: [clone(f.items[0])], nextCursor: null,
+    facts: [{ itemId: f.items[0].itemId, graphBlocked: false, graphProgressDigest: project(f.items[0]).graphProgressDigest }] });
+  f.ledger.readItemProgress = async ids => f.items.filter(item => ids.includes(item.itemId)).map(project);
+  return f;
+}
+
+test('unrelated graph churn keeps backoff while a related child or dependency change rearms once', async () => {
+  const f = relatedProgressFixture(), scheduler = new WorkContinuationScheduler(f.options);
+  f.items.push({ itemId: 'unrelated', revision: 1, status: 'completed', currentTarget: { type: 'role', id: 'tester' } });
+  let calls = 0;
+  const run = async () => { await scheduler.runCycle({ ...f, dispatch: async () => { calls++; } }); await f.drain(); };
+  for (let i = 0; i < 3; i++) { await run(); f.advance(90_000); }
+  const before = f.state().records.find(record => record.itemId === 'work-one');
+  f.items[2].revision++;
+  await run();
+  assert.equal(calls, 3);
+  assert.deepEqual(f.state().records.find(record => record.itemId === 'work-one'), before);
+  f.items[1].revision++;
+  await run();
+  assert.equal(calls, 4);
+  assert.equal(f.state().records[0].attempt, 1);
+  await run();
+  assert.equal(calls, 4);
+  f.items[0].graph.dependsOnItemIds = ['unrelated'];
+  await run();
+  assert.equal(calls, 5);
+  f.items[2].revision++;
+  await run();
+  assert.equal(calls, 6, 'the previously unrelated item now belongs to this dependency observation');
+});
+
+test('related progress during an active wake preserves the owner and survives its late acknowledgement', async () => {
+  const f = relatedProgressFixture(), scheduler = new WorkContinuationScheduler(f.options), held = deferred();
+  let calls = 0;
+  await scheduler.runCycle({ ...f, dispatch: async () => { calls++; await held.promise; } });
+  await new Promise(resolve => setImmediate(resolve));
+  const fingerprint = f.state().records[0].fingerprint;
+  f.items[1].revision++;
+  await scheduler.runCycle({ ...f, dispatch: async () => { calls++; } });
+  assert.equal(calls, 1, 'the actual running owner retains the role until settlement');
+  assert.equal(f.state().records[0].status, 'pending');
+  held.resolve(); await f.drain();
+  assert.equal(f.state().records[0].status, 'pending');
+  assert.equal(f.state().records[0].fingerprint, fingerprint);
+  assert.equal(f.state().records[0].receipts[0].outcome, 'progressed');
+  await scheduler.runCycle({ ...f, dispatch: async value => { calls++; await f.dispatch(value); } }); await f.drain();
+  assert.equal(calls, 2);
+  assert.equal(f.state().records[0].status, 'delivered');
+});
+
+test('unavailable related-progress telemetry cannot prevent an otherwise admitted role dispatch', async () => {
+  const f = relatedProgressFixture(), scheduler = new WorkContinuationScheduler(f.options);
+  f.ledger.readItemProgress = async () => { throw new Error('observation unavailable'); };
+  await scheduler.runCycle(f); await f.drain();
+  assert.equal(f.dispatched.length, 1);
+  assert.equal(f.state().records[0].receipts[0].outcome, 'progressed');
+  assert.equal(scheduler.readStatus().lastError, 'progress_observation_failed');
+});
 
 test('a durable wake survives restart and advances through the existing role dispatch', async () => {
   const f = fixture();

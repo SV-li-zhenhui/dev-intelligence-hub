@@ -140,6 +140,7 @@ import {
   WORK_LEDGER_STATUSES,
 } from "./work-ledger-values.js";
 import { projectWorkLedgerGraphView } from "./work-ledger-graph.js";
+import { indexWorkLedgerGraphProgress } from "./work-ledger-graph-progress.js";
 import { createLocalWorkLedgerCandidateProcessor } from
   "./work-ledger-candidate-processor.js";
 
@@ -475,23 +476,17 @@ function queryClaimCandidatePage(records, options = {}) {
         ? pageItems.at(-1).itemId
         : null,
   };
-  const statusById = new Map(records.map((item) => [item.itemId, item.status]));
-  const childrenByParent = new Map();
-  for (const item of records) {
-    const parentItemId = item.graph?.parentItemId;
-    if (typeof parentItemId !== "string") continue;
-    const children = childrenByParent.get(parentItemId) ?? [];
-    children.push(item);
-    childrenByParent.set(parentItemId, children);
-  }
+  const { byId, childrenByParent, graphProgressDigest } = indexWorkLedgerGraphProgress(records);
   const facts = page.items.map((item) => {
     const children = childrenByParent.get(item.itemId) ?? [];
     const dependencies = item.graph?.dependsOnItemIds ?? [];
+    const progress = graphProgressDigest(item);
     return {
       itemId: item.itemId,
+      ...(progress === null ? {} : { graphProgressDigest: progress }),
       graphBlocked:
         dependencies.some((dependencyId) =>
-          !CLAIM_DEPENDENCY_SATISFIED_STATUSES.has(statusById.get(dependencyId))
+          !CLAIM_DEPENDENCY_SATISFIED_STATUSES.has(byId.get(dependencyId)?.status)
         ) ||
         children.some((child) =>
           !CLAIM_CHILD_SETTLED_STATUSES.has(child.status)
@@ -799,12 +794,15 @@ export class WorkLedgerService {
       throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "工作项进度查询无效");
     }
     const requested = new Set(itemIds);
-    return this.state.items.filter((item) => requested.has(item.itemId)).map((item) =>
-      cloneLedgerValue({
+    const { graphProgressDigest } = indexWorkLedgerGraphProgress(this.state.items);
+    return this.state.items.filter((item) => requested.has(item.itemId)).map((item) => {
+      const progress = graphProgressDigest(item);
+      return cloneLedgerValue({
         itemId: item.itemId, status: item.status, statusReason: item.statusReason,
         currentTarget: item.currentTarget, updatedAt: item.updatedAt,
-      }),
-    );
+        ...(progress === null ? {} : { graphProgressDigest: progress }),
+      });
+    });
   }
 
   async listClaimCandidates(options = {}) {
