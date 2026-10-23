@@ -50,7 +50,7 @@ test("runtime exposes separate least-authority producer, browser, and consumer p
 
   assert.deepEqual(Object.keys(runtime).sort(), ["browser", "close", "consumer", "maintenance", "producer"]);
   assert.deepEqual(Object.keys(runtime.producer), ["create"]);
-  assert.deepEqual(Object.keys(runtime.browser).sort(), ["answer", "later", "listMaintenance", "next", "reject"]);
+  assert.deepEqual(Object.keys(runtime.browser).sort(), ["answer", "later", "listMaintenance", "next", "readStatus", "reject"]);
   assert.deepEqual(Object.keys(runtime.consumer), ["readOutbox"]);
   assert.deepEqual(Object.keys(runtime.maintenance), ["archiveRetired", "retrySystemQuestions"]);
   assert.equal(Object.isFrozen(runtime), true);
@@ -64,6 +64,7 @@ test("runtime exposes separate least-authority producer, browser, and consumer p
     question: "验收标准是什么？",
   });
   const next = await runtime.browser.next();
+  assert.deepEqual(await runtime.browser.readStatus({ requestId: next.requestId }), { requestId: next.requestId, status: "pending" });
   await runtime.browser.answer({
     requestId: next.requestId,
     expectedRevision: next.revision,

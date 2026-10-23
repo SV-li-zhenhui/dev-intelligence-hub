@@ -2837,7 +2837,7 @@ export async function createApplication({
       );
       attentionBrowser = frozenPort(
         attentionInboxRuntime.browser,
-        ["next", "answer", "reject", "later", "listMaintenance"],
+        ["next", "answer", "reject", "later", "listMaintenance", "readStatus"],
         "attentionInboxRuntime.browser",
       );
       attentionCoordinator = frozenPort(

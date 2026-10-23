@@ -23,19 +23,32 @@ export function shouldCloseExternalConfirmation(previous, current, automaticRevi
 }
 
 export function createExternalConfirmationReconciler({ readItem, getCurrent, onResolved }) {
+  return createConfirmationReconciler({ readItem, getCurrent, onResolved,
+    itemId: item => item.id,
+    shouldClose: (previous, current, captured) => shouldCloseExternalConfirmation(previous, current, captured.automaticReviewEnabled) });
+}
+
+export function createInternalConfirmationReconciler({ readItem, getCurrent, onResolved }) {
+  return createConfirmationReconciler({ readItem, getCurrent, onResolved,
+    itemId: item => item.requestId,
+    shouldClose: (previous, current) => Boolean(current && current.requestId === previous.requestId &&
+      ["answered", "rejected", "archived"].includes(current.status)) });
+}
+
+function createConfirmationReconciler({ readItem, getCurrent, onResolved, itemId, shouldClose }) {
   let latestRead = 0;
   return async function reconcile() {
     const captured = getCurrent();
     if (!captured || captured.submitting) return false;
     const read = ++latestRead;
     let item;
-    try { item = await readItem(captured.item.id); }
+    try { item = await readItem(itemId(captured.item)); }
     catch { return false; }
     const current = getCurrent();
     if (read !== latestRead || !current || current.submitting ||
         current.owner !== captured.owner || current.key !== captured.key ||
         current.requestSequence !== captured.requestSequence) return false;
-    if (!shouldCloseExternalConfirmation(captured.item, item, current.automaticReviewEnabled)) return false;
+    if (!shouldClose(captured.item, item, current)) return false;
     return onResolved(captured.owner);
   };
 }

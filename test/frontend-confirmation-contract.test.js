@@ -4,7 +4,44 @@ import path from "node:path";
 import test from "node:test";
 
 import { createConfirmationDialogOwnership, createExternalConfirmationReconciler,
-  shouldCloseExternalConfirmation } from "../public/confirmation-dialog-support.js";
+  createInternalConfirmationReconciler, shouldCloseExternalConfirmation } from "../public/confirmation-dialog-support.js";
+
+test("internal question reconciliation follows the exact archived question without posting an answer", async () => {
+  const state = { owner: 1, key: "internal-active", requestSequence: 2, submitting: false,
+    item: { requestId: "attention-active", status: "pending" } };
+  let result = { requestId: "attention-another", status: "archived" }, closes = 0;
+  const reconcile = createInternalConfirmationReconciler({ getCurrent: () => ({ ...state }),
+    readItem: async id => { assert.equal(id, state.item.requestId); return result; },
+    onResolved: owner => { assert.equal(owner, 1); closes++; return true; } });
+  for (result of [null, result, state.item, { ...state.item, status: "unknown" }]) {
+    assert.equal(await reconcile(), false);
+  }
+  for (const status of ["answered", "rejected", "archived"]) {
+    result = { ...state.item, status };
+    assert.equal(await reconcile(), true);
+  }
+  assert.equal(closes, 3);
+});
+
+for (const change of ["owner", "key", "requestSequence", "submitting", "closed", "readFailure", "newerRead"]) {
+  test(`internal question refresh preserves a changed ${change}`, async () => {
+    let state = { owner: 1, key: "internal", requestSequence: 2, submitting: false,
+      item: { requestId: "attention-active", status: "pending" } };
+    const reads = [];
+    let closes = 0;
+    const reconcile = createInternalConfirmationReconciler({ getCurrent: () => state ? { ...state } : null,
+      readItem: () => new Promise((resolve, reject) => reads.push({ resolve, reject })),
+      onResolved: () => { closes++; return true; } });
+    const pending = reconcile();
+    if (change === "closed") state = null;
+    else if (change === "readFailure") reads[0].reject(new Error("unavailable"));
+    else if (change === "newerRead") { const newer = reconcile(); reads[1].resolve(state.item); await newer; }
+    else state[change] = change === "submitting" ? true : "changed";
+    reads[0].resolve({ requestId: "attention-active", status: "archived" });
+    assert.equal(await pending, false);
+    assert.equal(closes, 0);
+  });
+}
 
 test("exact confirmation refresh closes settled or system-managed Reviews while preserving failures", () => {
   const item = { id: "review-1", approvalBindingDigest: "a".repeat(64), status: "pending",

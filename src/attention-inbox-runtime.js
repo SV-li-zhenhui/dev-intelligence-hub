@@ -49,6 +49,7 @@ export async function createAttentionInboxRuntime({
     return Object.freeze({
       producer: frozenPort({ create: (value) => inbox.create(value) }),
       browser: frozenPort({
+        readStatus: (options) => inbox.readStatus(options),
         next: (options) => inbox.next(options),
         listMaintenance: () => inbox.listMaintenance(),
         answer: (value) => inbox.answer(value),

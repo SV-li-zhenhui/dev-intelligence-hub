@@ -4183,6 +4183,22 @@ test("scheduled and manual employees wait for refresh without an external queue"
   }
 });
 
+test("exact internal question status is read-only and rejects query parameters", async () => {
+  const requestId = `attention-${"a".repeat(64)}`;
+  let reads = 0;
+  await withServer(async ({ server }) => {
+    const result = await request(server, { path: `/api/attention/internal/${requestId}` });
+    assert.equal(result.status, 200);
+    assert.deepEqual(JSON.parse(result.body), { item: { requestId, status: "archived" } });
+    assert.equal((await request(server, { path: `/api/attention/internal/${requestId}?answer=yes` })).status, 400);
+    assert.equal(reads, 1);
+  }, { attentionBrowser: { async readStatus(input) {
+    reads++;
+    assert.deepEqual(input, { requestId });
+    return { requestId, status: "archived" };
+  } } });
+});
+
 test("maintenance requests are a read-only separate endpoint", async () => {
   let reads = 0;
   const faults = { items: [{ requestId: `attention-${"a".repeat(64)}`, maintenanceCode: "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED" }], total: 1 };

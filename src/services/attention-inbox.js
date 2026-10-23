@@ -189,6 +189,16 @@ export class AttentionInbox {
     });
   }
 
+  readStatus(input) {
+    return this.#query(() => {
+      const error = inboxError("INVALID_ATTENTION_REQUEST", "内部请示状态查询无效");
+      assertAttentionAllowedKeys(input, ["requestId"], ["requestId"], error);
+      if (!/^attention-[a-f0-9]{64}$/.test(input.requestId)) throw error;
+      const item = this.state.items.find(entry => entry.requestId === input.requestId);
+      return item ? { requestId: item.requestId, status: item.status } : null;
+    });
+  }
+
   next(options) {
     return this.#query(async () => {
       const { deferred } = normalizeInternalDeferredOptions(options);

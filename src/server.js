@@ -3641,6 +3641,16 @@ export function createDashboardServer(
         sendJson(response, 200, result);
         return;
       }
+      const internalAttentionRead = url.pathname.match(/^\/api\/attention\/internal\/(attention-[a-f0-9]{64})$/);
+      if (request.method === "GET" && internalAttentionRead) {
+        requireNoQuery(url, "内部请示状态查询参数无效");
+        const browser = application.attentionBrowser;
+        if (typeof browser?.readStatus !== "function") throw httpError(503, "内部请示状态查询暂不可用");
+        const item = await runConfirmationRead(backgroundWork, () =>
+          browser.readStatus({ requestId: internalAttentionRead[1] }));
+        sendJson(response, 200, { item });
+        return;
+      }
       const internalAttentionAction = url.pathname.match(
         /^\/api\/attention\/internal\/(attention-[a-f0-9]{64})\/(answer|reject|later)$/,
       );

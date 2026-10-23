@@ -490,6 +490,7 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
     browser: {
       async next() {},
       async listMaintenance() { return { items: [], total: 0 }; },
+      async readStatus() { return null; },
       async answer() {},
       async reject() {},
       async later() {},
@@ -1568,6 +1569,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   const attentionConsumer = { async readOutbox() {} };
   const attentionBrowser = {
     async listMaintenance() { return { items: [], total: 0 }; },
+      async readStatus() { return null; },
     async next() {
       return { id: "attention-1" };
     },
@@ -1978,6 +1980,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     "later",
     "listMaintenance",
     "next",
+    "readStatus",
     "reject",
   ]);
   assert.deepEqual(Object.keys(application.attentionCoordinator), ["next"]);
@@ -2301,6 +2304,7 @@ test("composed intent dispatch honors configured leases and fences expired ackno
           browser: {
             async next() {}, async answer() {}, async reject() {}, async later() {},
             async listMaintenance() { return { items: [], total: 0 }; },
+      async readStatus() { return null; },
           },
           async close() {},
         }),
@@ -2610,6 +2614,7 @@ test("enabled unified memory exposes search only and projects the existing work 
       browser: {
         async next() {}, async answer() {}, async reject() {}, async later() {},
         async listMaintenance() { return { items: [], total: 0 }; },
+      async readStatus() { return null; },
       },
       async close() {},
     }),

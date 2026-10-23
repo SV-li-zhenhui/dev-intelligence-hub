@@ -8,6 +8,7 @@ import {
 import {
   createConfirmationDialogOwnership,
   createExternalConfirmationReconciler,
+  createInternalConfirmationReconciler,
   createSessionDeferredConfirmationStore,
 } from "./confirmation-dialog-support.js";
 import { postAttentionDuringFactRefresh } from "./attention-submission.js";
@@ -2801,6 +2802,7 @@ function applyConfirmationQueue(nextState, sequence = ++confirmationRequestSeque
   };
   confirmationQueueLoaded = true;
   void reconcileActiveExternalConfirmation();
+  void reconcileActiveInternalConfirmation();
   return true;
 }
 
@@ -3770,6 +3772,31 @@ const reconcileActiveExternalConfirmation = createExternalConfirmationReconciler
     invalidateConfirmationQueueSnapshot();
     statusBanner.hidden = false;
     statusBanner.textContent = "这项确认已由系统接管、处理或失效，旧弹窗已关闭。";
+    void refreshConfirmationQueue().catch(error => { statusBanner.textContent = error.message; });
+    return true;
+  },
+});
+
+const reconcileActiveInternalConfirmation = createInternalConfirmationReconciler({
+  getCurrent() {
+    const owner = confirmationDialogOwnership.current();
+    if (!confirmationDialog.open || !activeInternalAttention || owner === null) return null;
+    return { owner, key: activeConfirmationKey, item: activeInternalAttention,
+      requestSequence: lastAppliedConfirmationRequest,
+      submitting: confirmationDialogOwnership.ownsSubmission(owner) };
+  },
+  async readItem(id) {
+    const response = await fetch(`/api/attention/internal/${encodeURIComponent(id)}`, { cache: "no-store" });
+    if (!response.ok) return null;
+    return (await response.json()).item ?? null;
+  },
+  onResolved(owner) {
+    if (!closeConfirmationDialog(owner)) return false;
+    activeInternalAttention = null;
+    activeConfirmationKey = "";
+    invalidateConfirmationQueueSnapshot();
+    statusBanner.hidden = false;
+    statusBanner.textContent = "这项请示已处理或归档，旧弹窗已关闭。";
     void refreshConfirmationQueue().catch(error => { statusBanner.textContent = error.message; });
     return true;
   },

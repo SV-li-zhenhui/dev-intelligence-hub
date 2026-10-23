@@ -86,6 +86,38 @@ async function readyInbox({
   return { inbox, store, lease };
 }
 
+test("reading an exact question status never answers it or exposes its contents", async () => {
+  const { inbox, store } = await readyInbox();
+  const request = await inbox.create(attentionRequest());
+  const writes = store.writeCount;
+  assert.deepEqual(await inbox.readStatus({ requestId: request.requestId }), {
+    requestId: request.requestId, status: "pending",
+  });
+  assert.equal(await inbox.readStatus({ requestId: `attention-${"f".repeat(64)}` }), null);
+  assert.equal(store.writeCount, writes);
+  assert.equal((await inbox.readOutbox()).items.length, 0);
+  await inbox.answer({ requestId: request.requestId, expectedRevision: request.revision,
+    contentDigest: request.contentDigest, answer: { type: "choice", choiceId: "yes" } });
+  assert.deepEqual(await inbox.readStatus({ requestId: request.requestId }), {
+    requestId: request.requestId, status: "answered",
+  });
+  await assert.rejects(inbox.readStatus({ requestId: "invalid" }), { code: "INVALID_ATTENTION_REQUEST" });
+  await assert.rejects(inbox.readStatus({ requestId: request.requestId, extra: true }), { code: "INVALID_ATTENTION_REQUEST" });
+});
+
+test("exact status follows automatic retirement without producing an answer", async () => {
+  let retired = false;
+  const { inbox } = await readyInbox({ authority: { isCurrent: async () => !retired,
+    readAttentionRequestRetirement: async () => retired
+      ? { status: "cancelled", workItemRevision: 3, reason: "issue_source_left_scope" } : null } });
+  const request = await inbox.create(attentionRequest());
+  retired = true;
+  assert.equal((await inbox.readStatus({ requestId: request.requestId })).status, "pending");
+  await inbox.archiveRetired();
+  assert.deepEqual(await inbox.readStatus({ requestId: request.requestId }), { requestId: request.requestId, status: "archived" });
+  assert.equal((await inbox.readOutbox()).items.length, 0);
+});
+
 test("maintenance failures stay readable without blocking business questions or creating answers", async () => {
   const { inbox, store } = await readyInbox();
   const maintenance = await inbox.create(attentionRequest({
