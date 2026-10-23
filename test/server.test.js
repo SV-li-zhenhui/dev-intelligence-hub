@@ -1188,6 +1188,7 @@ async function withServer(
     changePackageApplicationRequester,
     changePackageApplicationStatusReader,
     codeJobEvidenceReader,
+    jenkinsConnection,
     runtimeSourceIdentity,
     onRecordConfirmationOutcome,
   } = {},
@@ -1429,6 +1430,7 @@ async function withServer(
   if (memoryImports) application.memoryImports = memoryImports;
   if (codeJobReader) application.codeJobReader = codeJobReader;
   if (codeJobControl) application.codeJobControl = codeJobControl;
+  if (jenkinsConnection) application.jenkinsConnection = jenkinsConnection;
   if (taskRuns) application.taskRuns = taskRuns;
   if (changePackageReader) application.changePackageReader = changePackageReader;
   if (changePackageApplicationRequester) {
@@ -1456,6 +1458,25 @@ async function withServer(
     await server.shutdown();
   }
 }
+
+test('Jenkins connection HTTP API enforces local action headers and returns no supplied secret', async () => {
+  const connected = [];
+  const input = { repository: 'acme/repo', buildUrl: 'http://ci.example/job/Test/1/', username: 'fixture-user', password: 'fixture-secret' };
+  await withServer(async ({ server }) => {
+    const status = await request(server, { path: '/api/ci/jenkins/connection' });
+    assert.deepEqual(JSON.parse(status.body), { configured: false });
+    for (const headers of [{ 'content-type': 'application/json' }, { ...trustedConfigurationHeaders(), origin: 'http://other.invalid' }]) {
+      const rejected = await request(server, { method: 'POST', path: '/api/ci/jenkins/connection', headers, body: JSON.stringify(input) });
+      assert.equal(rejected.status, 403);
+    }
+    assert.equal(connected.length, 0);
+    const accepted = await request(server, { method: 'POST', path: '/api/ci/jenkins/connection', headers: trustedConfigurationHeaders(), body: JSON.stringify(input) });
+    assert.equal(accepted.status, 200); assert.deepEqual(connected, [input]); assert.ok(!accepted.body.includes(input.password));
+    assert.equal(accepted.headers['cache-control'], 'no-store');
+    const expanded = await request(server, { method: 'POST', path: '/api/ci/jenkins/connection', headers: trustedConfigurationHeaders(), body: JSON.stringify({ ...input, allowAllJobs: true }) });
+    assert.equal(expanded.status, 400); assert.equal(connected.length, 1);
+  }, { jenkinsConnection: { async status() { return { configured: false }; }, async connect(value) { connected.push(value); return { configured: true, username: value.username, state: 'available' }; } } });
+});
 
 test('task-run HTTP controls enforce origin and CAS through the real registry',async()=>{
   let saved=null;const entered=deferred(),gate=deferred();let calls=0;

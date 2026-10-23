@@ -908,6 +908,7 @@ function projectedCheck(check, nameBytes) {
   return {
     kind: check.kind,
     name: name.value,
+    url: check.url,
     status: check.status,
     conclusion: check.conclusion,
     requirement: check.requirement,

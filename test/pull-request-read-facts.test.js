@@ -474,6 +474,7 @@ test("a bounded task context prioritizes actionable threads and checks", () => {
   assert.equal(context.comments.at(-1).bodyTruncated, true);
   assert.equal(context.reviewThreads[0].latestComment.body, "This can race.");
   assert.equal(context.checks[0].name, "required-failure");
+  assert.equal(context.checks[0].url, facts.checks[0].url, "roles retain the original CI details link");
   assert.equal(context.checks.length, 20);
   assert.equal(context.contextTruncated, true);
   assert.ok(Buffer.byteLength(JSON.stringify(context), "utf8") <= 64 * 1024);

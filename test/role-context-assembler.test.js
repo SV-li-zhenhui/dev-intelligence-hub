@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { canonicalJsonDigest } from "../src/lib/canonical-json-digest.js";
 
 import {
   RoleContextAssembler,
@@ -382,6 +383,7 @@ async function assemble(fixture, options = {}) {
       : {}),
     ...(options.internalReviewHandoffReader ? { internalReviewHandoffReader: options.internalReviewHandoffReader } : {}),
     ...(options.conflictInspectionReader ? { conflictInspectionReader: options.conflictInspectionReader } : {}),
+    ...(options.ciDiagnosticReader ? { ciDiagnosticReader: options.ciDiagnosticReader } : {}),
   });
   const roleId = options.roleId ?? "developer";
   return assembler.assemble({
@@ -813,7 +815,7 @@ test("conflict material readers are scoped to developer conflict tasks and failu
   assert.equal(calls, 1);
 });
 
-test("PR review material is checked against the atomic target reconstructed from the source event", async () => {
+function atomicPullRequestFixture() {
   const fixture = graphFixture({ pullRequest: true });
   const headRefOid = "b".repeat(40);
   const gitTarget = {
@@ -882,6 +884,87 @@ test("PR review material is checked against the atomic target reconstructed from
       patchTruncated: false,
     },
   };
+  return { fixture, gitTarget, pullRequestContext };
+}
+
+test("CI diagnostics retain the GitHub digest and bind the complete role context to the current Head", async () => {
+  const { fixture, gitTarget, pullRequestContext } = atomicPullRequestFixture();
+  const read = { async read() { return structuredClone(pullRequestContext); } };
+  const baseline = await assemble(fixture, { roleId: 'pr-engineer', pullRequestContextReader: read });
+  const packet = await assemble(fixture, { roleId: 'pr-engineer', pullRequestContextReader: read,
+    ciDiagnosticReader: { async read(request) {
+      assert.equal(request.repository, 'octo/repo'); assert.equal(request.headRefOid, gitTarget.headRefOid);
+      assert.equal(request.headRefName, gitTarget.headRefName); assert.ok(request.maximumBytes <= 12000);
+      const diagnostic = { schemaVersion: 1, repository: request.repository, headRefOid: request.headRefOid,
+        reports: [{ state: 'available', result: 'FAILURE', untrustedEvidence: true, failures: [{ name: 'Formatting', text: 'actual failure' }] }] };
+      return { ...diagnostic, contentDigest: canonicalJsonDigest(diagnostic) };
+    } } });
+  assert.deepEqual(packet.context.code.pullRequest, baseline.context.code.pullRequest);
+  assert.equal(packet.context.code.pullRequest.contentDigest, pullRequestContext.contentDigest);
+  assert.equal(packet.context.code.ciDiagnostics.reports[0].result, 'FAILURE');
+  assert.notEqual(packet.contextDigest, baseline.contextDigest);
+  assert.ok(Buffer.byteLength(JSON.stringify(packet)) <= 128 * 1024);
+});
+
+test("CI outages, stale evidence and oversized evidence do not block the role or leak adapter errors", async () => {
+  const { fixture, pullRequestContext } = atomicPullRequestFixture();
+  for (const read of [async () => { throw new Error('private fixture-password'); }, async () => ({ schemaVersion: 1, repository: 'other/repo', headRefOid: '9'.repeat(40), reports: [], contentDigest: '0'.repeat(64) }),
+    async () => ({ oversized: 'x'.repeat(200000) })]) {
+    const packet = await assemble(fixture, { roleId: 'pr-engineer', pullRequestContextReader: { async read() { return pullRequestContext; } }, ciDiagnosticReader: { read } });
+    assert.equal(packet.context.code.ciDiagnostics.state, 'unavailable');
+    assert.ok(!JSON.stringify(packet).includes('fixture-password'));
+  }
+});
+
+test("legacy PR contexts without an atomic Git target skip optional CI without blocking the role", async () => {
+  const { fixture, pullRequestContext } = atomicPullRequestFixture();
+  const { eventId, contentDigest, ...oldEvent } = fixture.item.event;
+  const { gitTarget, ...payload } = oldEvent.payload;
+  const event = normalizeWorkflowEvent({ ...oldEvent, payload: { ...payload, gitTargetAvailable: false } });
+  const source = createPullRequestWorkSource(pullRequestAssignment(1, event)).source;
+  fixture.item = { ...fixture.item, event, source, inputDigest: source.current.inputDigest };
+  let reads = 0;
+  delete pullRequestContext.reviewMaterial;
+  const packet = await assemble(fixture, { roleId: 'pr-engineer', pullRequestContextReader: { async read() { return pullRequestContext; } },
+    ciDiagnosticReader: { async read() { reads++; throw new Error('must not read legacy target'); } } });
+  assert.equal(reads, 0);
+  assert.equal(packet.context.code.ciDiagnostics.state, 'unavailable');
+});
+
+test("otherwise current CI material must keep its digest and fit the whole packet budget", async () => {
+  const { fixture, pullRequestContext } = atomicPullRequestFixture();
+  const reader = { async read() { return pullRequestContext; } };
+  for (const mode of ['changed-digest', 'too-large']) {
+    const packet = await assemble(fixture, { roleId: 'pr-engineer', pullRequestContextReader: reader,
+      ciDiagnosticReader: { async read(request) {
+        const material = { schemaVersion: 1, repository: request.repository, headRefOid: request.headRefOid,
+          reports: [{ state: 'available', text: mode === 'too-large' ? 'x'.repeat(request.maximumBytes) : 'original' }] };
+        const result = { ...material, contentDigest: canonicalJsonDigest(material) };
+        if (mode === 'changed-digest') result.reports[0].text = 'tampered';
+        return result;
+      } } });
+    assert.equal(packet.context.code.ciDiagnostics.state, 'unavailable');
+  }
+  for (const task of fixture.snapshot.graph.tasks.filter(task => ['task-requirements', 'task-implementation'].includes(task.taskId))) {
+    for (const delivery of task.deliveries.filter(delivery => ['submitted', 'accepted'].includes(delivery.status))) delivery.summary = 'x'.repeat(15000);
+  }
+  const baseline = await assemble(fixture, { roleId: 'pr-engineer', pullRequestContextReader: reader });
+  pullRequestContext.reviewMaterial.patch += 'x'.repeat(128 * 1024 - Buffer.byteLength(JSON.stringify(baseline)) - 2000);
+  let requestedBudget;
+  const packet = await assemble(fixture, { roleId: 'pr-engineer', pullRequestContextReader: reader,
+    ciDiagnosticReader: { async read(request) {
+      requestedBudget = request.maximumBytes;
+      const material = { schemaVersion: 1, repository: request.repository, headRefOid: request.headRefOid,
+        reports: [{ state: 'available', text: 'x'.repeat(request.maximumBytes - 350) }] };
+      return { ...material, contentDigest: canonicalJsonDigest(material) };
+    } } });
+  assert.ok(requestedBudget >= 256 && requestedBudget < 3000);
+  assert.equal(packet.context.code.ciDiagnostics.reports[0].state, 'available');
+  assert.ok(Buffer.byteLength(JSON.stringify(packet)) <= 128 * 1024);
+});
+
+test("PR review material is checked against the atomic target reconstructed from the source event", async () => {
+  const { fixture, gitTarget, pullRequestContext } = atomicPullRequestFixture();
 
   const packet = await assemble(fixture, {
     roleId: "pr-engineer",

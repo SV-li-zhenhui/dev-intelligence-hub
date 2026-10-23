@@ -1689,6 +1689,7 @@ function configurationView() {
         <div><dt>当前草稿</dt><dd>${draftId ? `${escapeHtml(draftId)} · r${draftRevision ?? "?"}` : "尚未保存"}</dd></div>
         <div><dt>运行时</dt><dd>${escapeHtml(runtime.label)}</dd></div>
       </dl>
+      <p><a href="/jenkins.html">连接 Jenkins 构建日志</a>：让岗位自动读取失败检查的具体原因。</p>
       ${migrationError ? `<p class="configuration-migration-error"><strong>启动配置未导入：</strong>${escapeHtml(migrationError)}</p>` : ""}
     </section>
     ${editor}

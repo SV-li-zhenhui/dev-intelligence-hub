@@ -2757,6 +2757,24 @@ export function createDashboardServer(
         );
         return;
       }
+      if (url.pathname === "/api/ci/jenkins/connection" && ["GET", "POST"].includes(request.method)) {
+        requireNoQuery(url, "Jenkins 连接参数无效");
+        const connection = requireApplicationPort(application, "jenkinsConnection", ["status", "connect"], "Jenkins 连接未启用");
+        if (request.method === "GET") {
+          await withClientAbortSignal(request, response, async signal => {
+            const result = await connection.status({ signal });
+            if (!signal.aborted && !response.destroyed) sendJson(response, 200, result);
+          });
+        } else {
+          assertTrustedMutation(request, expectedOrigin, { json: true });
+          const input = requireExactJsonFields(await readJsonBody(request, 8192), ["repository", "buildUrl", "username", "password"], "Jenkins 连接字段无效");
+          await withClientAbortSignal(request, response, async signal => {
+            const result = await connection.connect(input, { signal });
+            if (!signal.aborted && !response.destroyed) sendJson(response, 200, result);
+          });
+        }
+        return;
+      }
       if (request.method === "GET" && url.pathname === "/api/health") {
         const employees = await employeeRegistry.listRoles();
         const employee =

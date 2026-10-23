@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 
 import {
   normalizePullRequestGitTarget,
@@ -1258,6 +1259,7 @@ export class RoleContextAssembler {
   #internalReviewHandoffReader;
   #originalRepairFeedbackReader;
   #conflictInspectionReader;
+  #ciDiagnosticReader;
 
   constructor({
     graphReader,
@@ -1269,6 +1271,7 @@ export class RoleContextAssembler {
     internalReviewHandoffReader,
     originalRepairFeedbackReader,
     conflictInspectionReader,
+    ciDiagnosticReader,
   } = {}) {
     this.#graphReader = requireGraphReader(graphReader);
     this.#factSource = optionalFactSource(factSource);
@@ -1287,6 +1290,9 @@ export class RoleContextAssembler {
     });
     this.#conflictInspectionReader = conflictInspectionReader == null ? null : Object.freeze({
       read: bindPortMethod(conflictInspectionReader, "read", "conflictInspectionReader"),
+    });
+    this.#ciDiagnosticReader = ciDiagnosticReader == null ? null : Object.freeze({
+      read: bindPortMethod(ciDiagnosticReader, "read", "ciDiagnosticReader"),
     });
     this.#evidenceCatalogAdapter =
       createRoleContextEvidenceCatalogAdapter(evidenceCatalog);
@@ -1502,6 +1508,34 @@ export class RoleContextAssembler {
     }
     if (memoryQuery !== null) {
       context.memory = { agentQuery: memoryQuery };
+    }
+    if (isPullRequest && pullRequest !== null && context.code && this.#ciDiagnosticReader && item.sourceBinding !== null) {
+      const baselinePacket = { schemaVersion: 1, binding, context, acceptedInputs: dependencies.acceptedInputs, contextDigest: "0".repeat(64) };
+      const remaining = Math.min(12000, MAX_CONTEXT_BYTES - Buffer.byteLength(JSON.stringify(baselinePacket), "utf8") - 32);
+      if (remaining >= 256) {
+        let executionBinding;
+        try {
+          executionBinding = createPullRequestExecutionBinding({ sourceBinding: item.sourceBinding, event: item.event });
+          if (executionBinding.schemaVersion !== 2) throw invalid("CI diagnostic Git target is unavailable");
+          const value = await this.#ciDiagnosticReader.read({ repository: executionBinding.repository,
+            headRefOid: executionBinding.headRefOid, headRefName: executionBinding.gitTarget.headRefName,
+            checks: pullRequest.checks, maximumBytes: remaining }, signal === undefined ? {} : { signal });
+          signal?.throwIfAborted();
+          if (value !== null) {
+            const diagnostic = canonicalValue(value);
+            const { contentDigest, ...material } = diagnostic;
+            if (diagnostic.schemaVersion !== 1 || diagnostic.repository !== executionBinding.repository ||
+                diagnostic.headRefOid !== executionBinding.headRefOid || !Array.isArray(diagnostic.reports) || diagnostic.reports.length > 3 ||
+                canonicalJsonDigest(material) !== contentDigest || Buffer.byteLength(JSON.stringify(diagnostic), "utf8") > remaining) throw invalid("CI diagnostic binding is invalid");
+            context.code.ciDiagnostics = diagnostic;
+          }
+        } catch {
+          signal?.throwIfAborted();
+          context.code.ciDiagnostics = { schemaVersion: 1, repository: item.event.subject.repository,
+            headRefOid: item.sourceBinding.headRefOid, state: "unavailable", code: "CI_DIAGNOSTICS_UNAVAILABLE" };
+          if (Buffer.byteLength(JSON.stringify(context.code.ciDiagnostics)) > remaining) delete context.code.ciDiagnostics;
+        }
+      }
     }
     assertPacketSize(context);
 

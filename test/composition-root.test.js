@@ -4418,6 +4418,8 @@ test("automatic own PR repair composes internal push with ownership guards and c
       });
       const application = await createApplication({
         ...base,
+        privateRuntimeDirectory: path.join(tmpdir(), 'mydashboard-jenkins-composition', projectIdentityDigest({ projectRoot: path.resolve(import.meta.dirname, '..') })),
+        roleContextAssemblerFactory: options => { calls.contextAssembler = options; return { async assemble() {} }; },
         workLedgerRuntimeFactory: async (options) => ({
           ...await base.workLedgerRuntimeFactory(options),
           async readPullRequestExecutionContext() { throw new Error("unused in composition test"); },
@@ -4469,6 +4471,9 @@ test("automatic own PR repair composes internal push with ownership guards and c
       });
       try {
         assert.deepEqual(Object.keys(application.localCodeProposalRecovery), ["runCycle"]);
+        assert.deepEqual(Object.keys(application.jenkinsConnection), ['status', 'connect']);
+        assert.equal(Object.isFrozen(application.jenkinsConnection), true);
+        assert.equal(await calls.contextAssembler.ciDiagnosticReader.read({ repository: 'acme/repo', headRefOid: 'a'.repeat(40), headRefName: 'main', checks: [], maximumBytes: 1000 }), null);
         assert.equal(Object.isFrozen(calls.codeJobRuntime.automaticPauseRecovery), true);
         assert.equal(await calls.codeJobRuntime.automaticPauseRecovery.canRecover({}), false);
         assert.equal(Object.isFrozen(calls.coordination.codeJobPauseRecovery), true);

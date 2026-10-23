@@ -35,6 +35,7 @@ import { ActionAdmissionGate } from "./lib/action-admission-gate.js";
 import { loadConfigBootstrap, projectRoot } from "./lib/config.js";
 import { OperationQueue } from "./lib/operation-queue.js";
 import { PRODUCTION_PRIVATE_DIRECTORY_MANAGER } from "./lib/private-directory-manager.js";
+import { createJenkinsRuntime } from "./jenkins-runtime.js";
 import { ProcessExclusiveGuard } from "./lib/process-exclusive-guard.js";
 import {
   createProjectScopedGuardFactory,
@@ -1033,6 +1034,7 @@ export async function createApplication({
         bootstrapError: null,
       };
   let config = bootstrap.candidate ?? bootstrap.fallbackConfiguration;
+  const jenkinsRuntime = createJenkinsRuntime({ projectRoot, privateRuntimeDirectory });
   const store = suppliedStore || new StateStore(path.join(projectRoot, "data"));
   const configuredOperations =
     operationsOptions &&
@@ -2575,6 +2577,7 @@ export async function createApplication({
         ),
         factSource,
         pullRequestContextReader,
+        ...(jenkinsRuntime === null ? {} : { ciDiagnosticReader: jenkinsRuntime.diagnostics }),
         ...(automaticOwnPrRepair?.conflictRepair ? { conflictInspectionReader: Object.freeze({
           read: request => automaticOwnPrRepair.conflictRepair.readInspection(request),
         }) } : {}),
@@ -3018,6 +3021,7 @@ export async function createApplication({
       memoryImports,
       memoryProjector,
       brainProviderStatus,
+      jenkinsConnection: jenkinsRuntime?.connection ?? null,
       operations,
       close,
     };
