@@ -2054,6 +2054,22 @@ test("root coordination exposes a proven pre-dispatch conflict failure without r
   assert.equal(JSON.stringify(packet).includes("PRIVATE-HOST-TRACE"), false);
 });
 
+test("root coordination exposes an unbound policy failure without claiming its cause or recovery", async () => {
+  const fixture = rootOrchestratorFixture();
+  const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === "task-current");
+  state.ledgerStatus = "blocked";
+  state.statusReason = "intent_failed";
+  state.dispatchFailure = { intentId: "work-intent-policy", code: "policy-binding-invalid", downstreamCreated: false };
+  state.rawError = "PRIVATE-HOST-TRACE";
+  const packet = await assemble(fixture, { roleId: "orchestrator" });
+  const child = packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === state.taskId);
+  assert.equal(child.blockingCondition, "policy-binding-invalid");
+  assert.deepEqual(child.dispatchFailure, state.dispatchFailure);
+  assert.equal(JSON.stringify(packet).includes("PRIVATE-HOST-TRACE"), false);
+  state.dispatchFailure.downstreamCreated = true;
+  await assert.rejects(assemble(fixture, { roleId: "orchestrator" }), error => error.code === "ROLE_CONTEXT_INVALID");
+});
+
 test("root coordination explains a verification delivery mismatch while preserving the original package contract", async () => {
   const fixture = rootOrchestratorFixture();
   const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === "task-current");

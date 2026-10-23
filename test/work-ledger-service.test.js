@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import test from "node:test";
 import { automaticRoleHandoffCandidate } from "../src/services/work-ledger-role-handoff.js";
 import { indexWorkLedgerGraphProgress } from "../src/services/work-ledger-graph-progress.js";
-import { unstartedDeliveryContractFailure } from "../src/services/work-ledger-delivery-failure.js";
+import { unstartedDeliveryContractFailure, unstartedCodePolicyBindingFailure } from "../src/services/work-ledger-delivery-failure.js";
 import { hostContextRecoveryCandidate, planHostContextRecovery, hasPendingHostContextRecovery } from "../src/services/work-ledger-host-context-recovery.js";
 import { WorkContinuationScheduler } from "../src/services/work-continuation-scheduler.js";
 import { createWorkflowRoutingRuntime } from "../src/workflow-routing-runtime.js";
@@ -12822,6 +12822,54 @@ test("a historical unbound verification failure reaches its waiting orchestrator
     if (variant === "different-error") box.outcome.details.code = "policy-denied";
     if (variant === "duplicate") boxes.push(clone(box));
     assert.equal(unstartedDeliveryContractFailure(candidate, boxes), null, variant);
+  }
+});
+
+test("a compatible code proposal's unbound policy failure reaches its parent without replay", async () => {
+  const record = ownerRequestedPrAssignment(1);
+  record.assignment.target = { type: "role", id: "orchestrator" };
+  const fixture = await createFixture({ records: [record] });
+  await fixture.service.intake();
+  const [parent] = (await fixture.service.listItems()).items;
+  const command = prGraphChildCommand(parent, (await fixture.service.getSummary()).revision);
+  command.command.acceptanceContract.expectedDeliverables = [{ deliverableId: "ci-fix-package", kind: "change-package",
+    description: "Continue the controlled repair", required: true }];
+  const created = await fixture.service.createGraphChild(command);
+  let child = (await fixture.service.listItems()).items.find(item => item.itemId === created.taskId);
+  child = await fixture.service.claim({ itemId: child.itemId, expectedRevision: child.revision,
+    workerId: "employee-developer", leaseDurationMs: 30_000 });
+  const staged = await fixture.service.stageIntent({ itemId: child.itemId, expectedRevision: child.revision,
+    leaseId: child.leaseId, actorId: "employee-developer", roleId: "developer",
+    intent: { ...codeActionIntent({ operation: "modify" }), deliverableId: "ci-fix-package" } });
+  const outbox = await fixture.service.claimIntent({ intentId: staged.outbox.intentId, expectedRevision: staged.outbox.revision,
+    dispatcherId: "work-intent-dispatcher", leaseDurationMs: 30_000 });
+  await fixture.service.ackIntent({ intentId: outbox.intentId, expectedRevision: outbox.revision,
+    dispatchLeaseId: outbox.dispatchLeaseId, itemExpectedRevision: staged.item.revision,
+    actorId: "work-intent-dispatcher", outcome: "failed", nextStatus: "blocked", details: { code: "policy-binding-invalid" } });
+  const before = clone(fixture.store.stored());
+  const snapshot = await fixture.service.getGraphSnapshot();
+  assert.deepEqual(snapshot.taskStates.find(item => item.taskId === child.itemId).dispatchFailure,
+    { intentId: outbox.intentId, code: "policy-binding-invalid", downstreamCreated: false });
+  assert.deepEqual(fixture.store.stored(), before, "diagnosis never resumes a child or replays a failed intent");
+  const failedChild = before.items.find(item => item.itemId === child.itemId);
+  const failedBoxes = before.outbox.filter(item => item.itemId === child.itemId);
+  for (const variant of ["paused", "active-intent", "owner", "lease", "bound", "unknown", "changed-input",
+    "changed-source", "new-contract", "wrong-delivery", "different-error", "duplicate", "old-outcome"]) {
+    const candidate = clone(failedChild), boxes = clone(failedBoxes), box = boxes.at(-1);
+    if (variant === "paused") candidate.status = "paused";
+    if (variant === "active-intent") candidate.activeIntentId = box.intentId;
+    if (variant === "owner") candidate.ownerId = "employee-developer";
+    if (variant === "lease") candidate.leaseUntil = "2026-08-03T00:00:00.000Z";
+    if (variant === "bound") box.dispatchBinding = {};
+    if (variant === "unknown") box.status = "unknown";
+    if (variant === "changed-input") box.inputDigest = "f".repeat(64);
+    if (variant === "changed-source") box.sourceBinding = null;
+    if (variant === "new-contract") candidate.graph.acceptanceContracts.at(-1).recordedAt = "2026-08-03T00:00:00.000Z";
+    if (variant === "wrong-delivery") box.intent.deliverableId = "other-package";
+    if (variant === "different-error") box.outcome.details.code = "policy-denied";
+    if (variant === "duplicate") boxes.push(clone(box));
+    if (variant === "old-outcome") box.updatedAt = "2026-08-01T00:00:00.000Z";
+    assert.equal(unstartedCodePolicyBindingFailure(candidate, boxes), null, variant);
   }
 });
 

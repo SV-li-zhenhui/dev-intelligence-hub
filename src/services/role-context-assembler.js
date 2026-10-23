@@ -482,7 +482,7 @@ function normalizeDispatchFailure(value, task) {
   const code = ownData(value, "dispatch failure").get("code");
   if (code !== "delivery-evidence-incompatible") {
     const failure = exactData(value, ["intentId", "code", "downstreamCreated"], "dispatch failure");
-    if (code !== "conflict-source-stale" || failure.get("downstreamCreated") !== false) throw invalid("dispatch failure is invalid");
+    if (!["conflict-source-stale", "policy-binding-invalid"].includes(code) || failure.get("downstreamCreated") !== false) throw invalid("dispatch failure is invalid");
     return { intentId: identifier(failure.get("intentId"), "dispatchFailure.intentId"), code, downstreamCreated: false };
   }
   const failure = exactData(value, ["intentId", "code", "downstreamCreated", "operation", "contractRevision",

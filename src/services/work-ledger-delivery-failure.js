@@ -31,3 +31,26 @@ export function unstartedDeliveryContractFailure(item, outboxes) {
     compatibleEvidenceKinds: [...deliveryEvidenceKindsForProposal(proposal)],
     expectedDeliverables: contract.expectedDeliverables.map(({ deliverableId, kind }) => ({ deliverableId, kind })) };
 }
+
+// A compatible contract can still fail policy binding. Report only the retained
+// host outcome; it does not establish the underlying cause or authorize replay.
+export function unstartedCodePolicyBindingFailure(item, outboxes) {
+  if (item?.kind !== "graph_task" || item.status !== "blocked" || item.statusReason !== "intent_failed" ||
+      item.activeIntentId !== null || item.ownerId !== null || item.leaseId !== null || item.leaseUntil !== null ||
+      item.sourceQuarantine !== null || item.currentTarget?.type !== "role") return null;
+  const binding = currentWorkItemInputBinding(item), contract = item.graph.acceptanceContracts.at(-1);
+  if (binding === null || !contract) return null;
+  const matches = outboxes.filter(outbox => outbox.itemId === item.itemId && outbox.status === "failed" &&
+    outbox.updatedAt === item.updatedAt && outbox.dispatchBinding === null && outbox.inputDigest === item.inputDigest &&
+    isDeepStrictEqual(outbox.sourceBinding, binding) && outbox.requestedBy?.roleId === item.currentTarget.id &&
+    outbox.intent?.type === "propose_code_action" && ["verify", "modify"].includes(outbox.intent.operation) &&
+    outbox.outcome?.status === "failed" && isDeepStrictEqual(outbox.outcome.details, { code: "policy-binding-invalid" }) &&
+    Number.isFinite(Date.parse(contract.recordedAt)) && Date.parse(contract.recordedAt) <= Date.parse(outbox.createdAt));
+  if (matches.length !== 1) return null;
+  const [failed] = matches;
+  try {
+    createProposalDeliveryEvidenceTarget({ taskId: item.itemId, roleId: item.currentTarget.id, acceptanceContract: contract,
+      proposal: { kind: "code_action_proposal", operation: failed.intent.operation }, deliverableId: failed.intent.deliverableId });
+  } catch { return null; }
+  return { intentId: failed.intentId, code: "policy-binding-invalid", downstreamCreated: false };
+}
