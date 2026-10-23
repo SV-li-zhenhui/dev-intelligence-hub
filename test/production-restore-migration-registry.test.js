@@ -293,8 +293,8 @@ test("the archive owner supports immutable tombstones through verification outco
 
 test("the ledger owner upgrades schema 11 without changing an already current authority baseline", async (t) => {
   const owner = allPersistedSchemaOwners().find(({ ownerId }) => ownerId === "work-ledger-state");
-  assert.equal(owner.currentVersion, 12);
-  assert.deepEqual(owner.supportedVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  assert.equal(owner.currentVersion, 13);
+  assert.deepEqual(owner.supportedVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
   const current = emptyWorkLedgerState();
   const legacy = { ...structuredClone(current), schemaVersion: 11 };
   const fixture = await candidateDirectory(t, { "work-ledger-state.json": legacy });
@@ -309,7 +309,7 @@ test("the ledger owner upgrades schema 11 without changing an already current au
 
 test("a future ledger schema blocks the production restore before any writes", async (t) => {
   const fixture = await candidateDirectory(t, { "work-ledger-state.json": {
-    ...emptyWorkLedgerState(), schemaVersion: 13,
+    ...emptyWorkLedgerState(), schemaVersion: 14,
   } });
   const originalWrite = StateStore.prototype.write;
   let writes = 0;
@@ -975,7 +975,7 @@ test("the production registry plans every fixed owner before deterministic write
   );
   assert.equal(
     (await readJson(fixture.directory, "work-ledger-state")).schemaVersion,
-    12,
+    13,
   );
   assert.equal(
     (await readJson(fixture.directory, "code-job-state")).schemaVersion,

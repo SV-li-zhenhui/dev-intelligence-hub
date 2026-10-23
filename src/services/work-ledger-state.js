@@ -40,6 +40,7 @@ import {
   migrateWorkGraphMemoryProjection,
   normalizeWorkGraphMemoryProjection,
   migrateSchema11WorkGraphMemoryAuthority,
+  migrateSchema12WorkGraphMemoryAuthority,
   reconcileMigratedWorkGraphMemoryAuthority,
 } from "./work-ledger-graph-memory.js";
 import {
@@ -62,7 +63,7 @@ import {
 } from "./work-ledger-pr-source.js";
 
 export const WORK_LEDGER_STATE_KEY = "work-ledger-state";
-export const WORK_LEDGER_STATE_SCHEMA_VERSION = 12;
+export const WORK_LEDGER_STATE_SCHEMA_VERSION = 13;
 const GRAPH_MEMORY_STATE_SCHEMA_VERSION = 7;
 const DISPATCH_BINDING_STATE_SCHEMA_VERSION = 8;
 const PR_INPUT_BINDING_STATE_SCHEMA_VERSION = 9;
@@ -2170,7 +2171,7 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
     : null;
   if (
     !hasCurrentStateFields ||
-    ![11, WORK_LEDGER_STATE_SCHEMA_VERSION].includes(value.schemaVersion) ||
+    ![11, 12, WORK_LEDGER_STATE_SCHEMA_VERSION].includes(value.schemaVersion) ||
     !Number.isSafeInteger(value.revision) ||
     value.revision < 0 ||
     !Number.isSafeInteger(value.intakeCursor) ||
@@ -2249,6 +2250,8 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
       ...state,
       graphMemoryProjection: value.schemaVersion === 11
         ? migrateSchema11WorkGraphMemoryAuthority(graphMemoryProjection, state, limits)
+        : value.schemaVersion === 12
+          ? migrateSchema12WorkGraphMemoryAuthority(graphMemoryProjection, state, limits)
         : normalizeWorkGraphMemoryProjection(
             graphMemoryProjection,
             state.revision,

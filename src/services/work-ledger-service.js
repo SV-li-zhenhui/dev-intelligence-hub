@@ -6,7 +6,7 @@ import { hostContextRecoveryCandidate, planHostContextRecovery, hostContextRetir
 import { automaticRoleHandoffCandidate } from "./work-ledger-role-handoff.js";
 import { completedConflictInspectionRecoveryProof } from "./work-ledger-inspection-continuation.js";
 import { automaticReviewWorkAdmission } from "../domain/automatic-review-policy.js";
-import { inactivePullRequestTakeoverRecoveryProof } from "./work-ledger-pr-retirement-recovery.js";
+import { inactivePullRequestTakeoverRecoveryProof, sameHeadInternalReviewTakeoverRecoveryProof } from "./work-ledger-pr-retirement-recovery.js";
 import { createWorkIntentDispatchBinding } from "../domain/work-intent-dispatch-binding.js";
 import { planWorkItemRunControl } from './work-ledger-run-control.js';
 import {
@@ -96,6 +96,7 @@ import {
   currentWorkItemEvent,
   currentWorkItemInputBinding,
   currentWorkItemExecutionBinding,
+  pendingInternalReviewMatchesDiscovery,
   pullRequestHeadAdmission,
   pullRequestScopeLifecycleMatchesSource,
   pullRequestScopeLifecycleTargetRole,
@@ -285,7 +286,7 @@ function pullRequestRootsForLifecycle(itemsById, envelope) {
   );
 }
 
-function operationalPullRequestPredecessor(itemsById, root, authority) {
+function operationalPullRequestPredecessor(itemsById, root, authority, event) {
   // History from a source that left scope cannot take over live work.
   if (root.source.scope.active !== true) return null;
   const canonicalItemId = authority?.canonicalRootItemId ??
@@ -308,6 +309,7 @@ function operationalPullRequestPredecessor(itemsById, root, authority) {
     candidate = itemsById.get(pendingPredecessorItemId) ?? null;
   }
   if (candidate?.itemId === root.itemId) return null;
+  if (root.source.scope.kind === "automatic" && pendingInternalReviewMatchesDiscovery(candidate, event)) return null;
   if (
     candidate?.kind !== "source_root" ||
     !samePullRequestSubject(candidate, root)
@@ -2518,6 +2520,7 @@ export class WorkLedgerService {
           itemsById,
           root,
           predecessor,
+          envelope.event,
         );
         let appended = appendPullRequestWorkSource(
           root.source,
@@ -3098,7 +3101,8 @@ export class WorkLedgerService {
     const timelineEvents = [];
     const now = this.#now();
     for (const item of this.state.items) {
-      const proof = inactivePullRequestTakeoverRecoveryProof(this.state, item);
+      const proof = inactivePullRequestTakeoverRecoveryProof(this.state, item) ??
+        sameHeadInternalReviewTakeoverRecoveryProof({ ...this.state, items }, item);
       if (proof === null) continue;
       const transition = planWorkItemTransition({
         state: { ...this.state, items },
@@ -3108,8 +3112,8 @@ export class WorkLedgerService {
           leaseId: null,
           actorId: "work-ledger-system",
           toStatus: "queued",
-          reason: "pr_source_inactive_takeover_recovered",
-          details: { evidenceRefs: [proof.timelineId, proof.rootStateTimelineId, proof.inactiveRootItemId] },
+          reason: proof.reason ?? "pr_source_inactive_takeover_recovered",
+          details: { evidenceRefs: [proof.timelineId, proof.rootStateTimelineId, proof.replacementRootItemId ?? proof.inactiveRootItemId] },
         },
         clock: () => now,
       });

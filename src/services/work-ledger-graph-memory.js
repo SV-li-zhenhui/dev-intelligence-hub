@@ -19,6 +19,7 @@ import {
   pullRequestHeadAdmission,
   pullRequestHeadAdmissions,
   pullRequestHeadAdmissionForSchema11Migration,
+  pullRequestHeadAdmissionForSchema12Migration,
 } from "./work-ledger-pr-source.js";
 import {
   cloneLedgerValue,
@@ -179,6 +180,7 @@ function authorityStateDigestForAdmission(state, headAdmission) {
   const items = Array.isArray(state?.items) ? state.items : [];
   const admissions = pullRequestHeadAdmissions(state, items, {
     preserveInactiveHistory: headAdmission !== pullRequestHeadAdmissionForSchema11Migration,
+    preserveInternalReview: headAdmission === pullRequestHeadAdmission,
   });
   const admissionByItem = new Map(items.map((item, index) => [item, admissions[index]]));
   return ledgerDigest(
@@ -964,13 +966,21 @@ export function normalizeWorkGraphMemoryProjection(value, stateRevision, items, 
 }
 
 export function migrateSchema11WorkGraphMemoryAuthority(value, state, limits) {
+  return migratePreviousWorkGraphMemoryAuthority(value, state, limits, pullRequestHeadAdmissionForSchema11Migration);
+}
+
+export function migrateSchema12WorkGraphMemoryAuthority(value, state, limits) {
+  return migratePreviousWorkGraphMemoryAuthority(value, state, limits, pullRequestHeadAdmissionForSchema12Migration);
+}
+
+function migratePreviousWorkGraphMemoryAuthority(value, state, limits, previousAdmission) {
   try {
     return normalizeWorkGraphMemoryProjection(value, state.revision, state.items, limits);
   } catch {
     // A policy change is eligible only after every old projection invariant,
     // including its sealed high watermark and event chain, has been verified.
     const previous = normalizeProjection(value, state.revision, state.items, limits,
-      pullRequestHeadAdmissionForSchema11Migration);
+      previousAdmission);
     return normalizeWorkGraphMemoryProjection(
       reconcileMigratedWorkGraphMemoryAuthority(previous, state, {
         ...limits,

@@ -115,8 +115,8 @@ const OWNER_BASELINES = Object.freeze([
     ownerId: "work-ledger-state",
     key: "work-ledger-state",
     mode: "migrate-replace",
-    currentVersion: 12,
-    supportedVersions: frozenVersions(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12),
+    currentVersion: 13,
+    supportedVersions: frozenVersions(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13),
     optional: true,
   }),
   Object.freeze({

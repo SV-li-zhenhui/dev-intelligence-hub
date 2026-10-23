@@ -1474,6 +1474,21 @@ function samePullRequestSourceSubject(left, right) {
   );
 }
 
+export function pendingInternalReviewMatchesDiscovery(root, event) {
+  if (root?.source?.scope?.kind !== "internal_review" || root.source.scope.active !== true ||
+      root.sourceQuarantine !== null || root.source.pendingRevision !== null ||
+      ["completed", "cancelled", "superseded"].includes(root.status) ||
+      root.statusReason === "pr_source_cross_root_cutover_retired" ||
+      event?.source?.provider !== "github" || ["closed", "merged"].includes(event.payload.state) ||
+      root.source.identity.subjectId !== event.subject.id ||
+      root.source.identity.repository !== event.subject.repository ||
+      root.source.identity.pullRequestNumber !== event.subject.number) return false;
+  const current = root.source.current.event;
+  return current.eventType === "pull_request.internal_review_requested" &&
+    current.payload.gitTargetAvailable === true && event.payload.gitTargetAvailable === true &&
+    samePullRequestGitTarget(current.payload.gitTarget, event.payload.gitTarget);
+}
+
 function pointerForRevision(source, revision) {
   if (revision === source.activeRevision) return source.current;
   if (revision === source.pendingRevision) return source.pending;
@@ -1547,7 +1562,7 @@ function samePullRequestLifecycleObservation(left, right) {
       .every(key => left.revision[key] === right.revision[key]);
 }
 
-function evaluatePullRequestSubjectAuthority(state, root, preserveInactiveHistory = true) {
+function evaluatePullRequestSubjectAuthority(state, root, preserveInactiveHistory = true, preserveInternalReview = true) {
   if (
     root?.source?.kind !== "pull_request" ||
     !Array.isArray(state?.items)
@@ -1576,9 +1591,12 @@ function evaluatePullRequestSubjectAuthority(state, root, preserveInactiveHistor
   let predecessor = null;
   let canonical = null;
   const validAuthorities = new Map();
-  const selectLatestValidAuthority = () => [...validAuthorities.values()]
-    .sort((left, right) => right.sourceSequence - left.sourceSequence)[0] ??
-    null;
+  const selectLatestValidAuthority = () => {
+    const ordered = [...validAuthorities.values()].sort((left, right) => right.sourceSequence - left.sourceSequence);
+    const latest = ordered[0] ?? null;
+    if (!preserveInternalReview || latest?.source.scope.kind !== "automatic") return latest;
+    return ordered.find(entry => pendingInternalReviewMatchesDiscovery(entry.item, latest.pointer.event)) ?? latest;
+  };
   let trustedOccurredAtWatermark = Number.NEGATIVE_INFINITY;
   let trustedEvent = null;
   let trustedObservation = null;
@@ -1698,9 +1716,11 @@ function evaluatePullRequestSubjectAuthority(state, root, preserveInactiveHistor
       observation.pointer !== null &&
       targetAuthorityCurrent;
     if (executable) {
+      const retainInternalReview = preserveInternalReview && observation.source.scope.kind === "automatic" &&
+        pendingInternalReviewMatchesDiscovery(canonical?.item, observation.pointer.event);
       if (
         canonical !== null &&
-        canonical.item.itemId !== observation.item.itemId
+        canonical.item.itemId !== observation.item.itemId && !retainInternalReview
       ) {
         validAuthorities.clear();
       }
@@ -1717,9 +1737,9 @@ function evaluatePullRequestSubjectAuthority(state, root, preserveInactiveHistor
   };
 }
 
-function canonicalPullRequestSourceRoot(state, root, preserveInactiveHistory = true) {
+function canonicalPullRequestSourceRoot(state, root, preserveInactiveHistory = true, preserveInternalReview = true) {
   try {
-    return evaluatePullRequestSubjectAuthority(state, root, preserveInactiveHistory)?.canonical?.item ??
+    return evaluatePullRequestSubjectAuthority(state, root, preserveInactiveHistory, preserveInternalReview)?.canonical?.item ??
       null;
   } catch {
     return null;
@@ -1822,24 +1842,30 @@ export function pullRequestHeadAdmission(state, item) {
 
 // Share subject evaluation only within one synchronous snapshot read. No cache
 // survives a ledger mutation, including changes to another root for the PR.
-export function pullRequestHeadAdmissions(state, items, { preserveInactiveHistory = true } = {}) {
+export function pullRequestHeadAdmissions(state, items, { preserveInactiveHistory = true, preserveInternalReview = true } = {}) {
   const canonicalRoots = new Map();
   const canonicalRootFor = (snapshot, root, preserve) => {
     if (root?.source?.kind !== "pull_request") return null;
     const identity = root.source.identity;
     const key = JSON.stringify([identity.subjectId, identity.repository, identity.pullRequestNumber]);
     if (!canonicalRoots.has(key)) {
-      canonicalRoots.set(key, canonicalPullRequestSourceRoot(snapshot, root, preserve));
+      canonicalRoots.set(key, canonicalPullRequestSourceRoot(snapshot, root, preserve, preserveInternalReview));
     }
     return canonicalRoots.get(key);
   };
   return items.map(item => headAdmission(state, item, preserveInactiveHistory, canonicalRootFor));
 }
 
-// Only persisted schema 11 projection validation uses the former policy.
+// Only persisted schema 11/12 projection validation uses the former policies.
 // Execution and all newly persisted authority continue using the current one.
 export function pullRequestHeadAdmissionForSchema11Migration(state, item) {
-  return headAdmission(state, item, false);
+  return headAdmission(state, item, false, (snapshot, root, preserve) =>
+    canonicalPullRequestSourceRoot(snapshot, root, preserve, false));
+}
+
+export function pullRequestHeadAdmissionForSchema12Migration(state, item) {
+  return headAdmission(state, item, true, (snapshot, root, preserve) =>
+    canonicalPullRequestSourceRoot(snapshot, root, preserve, false));
 }
 
 export function verifyPullRequestExecutionBinding(state, value) {

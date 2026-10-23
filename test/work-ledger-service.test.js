@@ -107,6 +107,157 @@ test('internal review fact recovery assembles exact live context and the complet
   assert.equal(recovery.length, 1);
 });
 
+for (const existing of [false, true]) {
+test(`same-Head discovery refresh preserves an uncompleted internal repair review (${existing ? 'existing' : 'new'} discovery root)`, async () => {
+  const seed = await exhaustedInternalReviewFactsFixture({ attempts: 1 });
+  const internalRecord = { ...clone(seed.source.records[0]), sequence: existing ? 2 : 1 };
+  const fixture = await createFixture({ records: existing
+    ? [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) }), internalRecord] : [internalRecord] });
+  fixture.feedbackState = seed.feedbackState;
+  await fixture.service.intake();
+  const before = (await fixture.service.listItems()).items.find(item => item.source?.scope.kind === 'internal_review');
+  fixture.source.records.push(prAssignment(existing ? 3 : 2, { headRefOid: PR_HEAD_B, previousHeadRefOid: PR_HEAD_A,
+    occurredAt: '2026-08-02T01:02:00.000Z', gitFacts: prGitFacts(PR_HEAD_B) }));
+  fixture.source.highWatermark = existing ? 3 : 2;
+  await fixture.service.intake();
+  const secondarySequence = existing ? 4 : 3;
+  fixture.source.records.push(prAssignment(secondarySequence, { headRefOid: PR_HEAD_B,
+    occurredAt: '2026-08-02T01:03:00.000Z', sourceScopeId: 'secondary-view', gitFacts: prGitFacts(PR_HEAD_B) }));
+  fixture.source.highWatermark = secondarySequence;
+  await fixture.service.intake();
+  const exit = prAssignment(secondarySequence + 1, { eventType: 'pull_request.left_scope', headRefOid: PR_HEAD_B,
+    occurredAt: '2026-08-02T01:04:00.000Z', sourceScopeId: 'secondary-view', gitFacts: prGitFacts(PR_HEAD_B) });
+  fixture.source.records.push(prScopeLifecycleAssignment(secondarySequence + 1, exit.event));
+  fixture.source.highWatermark = secondarySequence + 1;
+  await fixture.service.intake();
+  const retained = await fixture.service.readItemForReconciliation({ itemId: before.itemId });
+  assert.equal(retained.status, 'queued', 'metadata refresh cannot retire the pending review of this exact Head');
+  await fixture.service.readPullRequestExecutionContext(prExecutionBinding(retained));
+  const assembler = internalReviewContextAssembler(fixture);
+  let reviewed = 0;
+  const cycle = await decisionBudgetLoop(fixture, { assemble: input => assembler.assemble(input), decide: async ({ context }) => {
+    reviewed += 1;
+    assert.equal(context.code.originalRepairFeedback.snapshotId, seed.snapshot.snapshotId);
+    return { schemaVersion: 1, confidence: 90, summary: 'Review repaired Head', intent: {
+      schemaVersion: 1, type: 'complete', summary: 'Review complete', reason: 'Assessed original feedback', outcome: 'done', evidence: [] } };
+  } }).runCycle();
+  assert.equal(cycle.staged, 1);
+  assert.equal(reviewed, 1);
+  const outbox = (await fixture.service.listOutbox()).items.find(entry => entry.itemId === before.itemId);
+  const staged = await fixture.service.readItemForReconciliation({ itemId: before.itemId });
+  const dispatch = await fixture.service.claimIntent({ intentId: outbox.intentId, expectedRevision: outbox.revision,
+    dispatcherId: 'review-dispatcher', leaseDurationMs: 30_000 });
+  await fixture.service.ackIntent({ intentId: dispatch.intentId, expectedRevision: dispatch.revision,
+    dispatchLeaseId: dispatch.dispatchLeaseId, itemExpectedRevision: staged.revision,
+    outcome: 'delivered', nextStatus: 'completed', actorId: 'review-dispatcher', details: {} });
+  const discovery = (await fixture.service.listItems()).items.find(item => item.source?.scope.kind === 'automatic');
+  await fixture.service.readPullRequestExecutionContext(prExecutionBinding(discovery));
+});
+}
+
+for (const change of ['Head', 'Base', 'account', 'closed']) {
+test(`internal review priority does not retain obsolete ${change} authority`, async () => {
+  const seed = await exhaustedInternalReviewFactsFixture({ attempts: 1 });
+  const fixture = await createFixture({ records: clone(seed.source.records) });
+  await fixture.service.intake();
+  const internal = (await fixture.service.listItems()).items[0];
+  const head = change === 'Head' ? PR_HEAD_C : PR_HEAD_B;
+  fixture.source.records.push(prAssignment(2, { headRefOid: head, previousHeadRefOid: PR_HEAD_B,
+    occurredAt: '2026-08-02T01:02:00.000Z', gitFacts: { ...prGitFacts(head,
+      change === 'Base' ? { baseRefOid: '9'.repeat(40) } : change === 'account' ? { sourceAccountId: 'another-account' } : {}),
+      ...(change === 'closed' ? { state: 'closed' } : {}) } }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  await assert.rejects(fixture.service.readPullRequestExecutionContext(prExecutionBinding(internal)),
+    { code: 'WORK_LEDGER_PR_EXECUTION_BINDING_STALE' });
+});
+}
+
+async function legacySameHeadInternalReviewTakeoverFixture({ existing = true } = {}) {
+  const seed = await exhaustedInternalReviewFactsFixture({ attempts: 1 });
+  const internalRecord = { ...clone(seed.source.records[0]), sequence: existing ? 2 : 1 };
+  const fixture = await createFixture({ records: existing
+    ? [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) }), internalRecord] : [internalRecord] });
+  await fixture.service.intake();
+  const internal = (await fixture.service.listItems()).items.find(item => item.source?.scope.kind === 'internal_review');
+  await decisionBudgetLoop(fixture, { assemble: async () => {
+    throw Object.assign(new Error('context timed out before model execution'), { code: 'ROLE_CONTEXT_TIMEOUT' });
+  } }).runCycle();
+  fixture.time.advance(1_000);
+  fixture.source.records.push(prAssignment(existing ? 3 : 2, { headRefOid: PR_HEAD_B, previousHeadRefOid: PR_HEAD_A,
+    occurredAt: '2026-08-02T01:02:00.000Z', gitFacts: prGitFacts(PR_HEAD_B) }));
+  fixture.source.highWatermark = existing ? 3 : 2;
+  await fixture.service.intake();
+  // Persist the exact legacy retirement shape: it erased the runnable status
+  // without adding a root timeline event or changing its sealed source.
+  const previous = fixture.store.stored();
+  const state = clone(previous);
+  const review = state.items.find(item => item.itemId === internal.itemId);
+  const discovery = state.items.find(item => item.source?.scope.kind === 'automatic');
+  Object.assign(review, { status: 'blocked', statusReason: 'pr_source_cross_root_cutover_retired',
+    revision: review.revision + 1, availableAt: null, updatedAt: discovery.updatedAt });
+  state.revision += 1;
+  fixture.store.replaceStored(appendWorkGraphMemoryEvents(previous, state, normalizeWorkLedgerLimits()));
+  return { ...fixture, internalId: internal.itemId, discoveryId: discovery.itemId };
+}
+
+for (const existing of [false, true]) {
+test(`normal recovery restores an internal review retired by same-Head metadata after context-only retries once (${existing ? 'existing' : 'new'} discovery root)`, async () => {
+  const fixture = await legacySameHeadInternalReviewTakeoverFixture({ existing });
+  const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  const restored = await restarted.service.readItemForReconciliation({ itemId: fixture.internalId });
+  assert.equal(restored.status, 'queued');
+  await restarted.service.readPullRequestExecutionContext(prExecutionBinding(restored));
+  const again = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
+  assert.deepEqual(await again.service.readItemForReconciliation({ itemId: fixture.internalId }), restored);
+  assert.equal((await again.service.listTimeline({ itemId: fixture.internalId, limit: 100 })).items.filter(entry =>
+    entry.details.reason === 'pr_source_internal_review_takeover_recovered').length, 1);
+});
+}
+
+test('schema 12 migrates the sealed automatic authority baseline to pending internal review without rewriting history', async () => {
+  const fixture = await legacySameHeadInternalReviewTakeoverFixture();
+  const legacy = fixture.store.stored();
+  legacy.schemaVersion = 12;
+  Object.assign(legacy.items.find(item => item.itemId === fixture.internalId), { status: 'queued', statusReason: null });
+  const before = clone(legacy);
+  const migrated = normalizeWorkLedgerPersistedState(legacy);
+  assert.equal(migrated.schemaVersion, WORK_LEDGER_STATE_SCHEMA_VERSION);
+  for (const key of ['items', 'timeline', 'outbox']) assert.deepEqual(migrated[key], before[key]);
+  assert.deepEqual(legacy, before);
+  assert.deepEqual(migrated.graphMemoryProjection.pending.slice(0, before.graphMemoryProjection.pending.length), before.graphMemoryProjection.pending);
+  assert.ok(migrated.graphMemoryProjection.pending.length > before.graphMemoryProjection.pending.length);
+  assert.deepEqual(normalizeWorkLedgerPersistedState(migrated), migrated);
+  const internal = migrated.items.find(item => item.itemId === fixture.internalId);
+  assert.equal(pullRequestHeadAdmission(migrated, internal).current, true);
+  for (const corruption of ['hash', 'current-schema']) {
+    const invalid = clone(before);
+    if (corruption === 'hash') invalid.graphMemoryProjection.pending.at(-1).eventDigest = 'f'.repeat(64);
+    else invalid.schemaVersion = WORK_LEDGER_STATE_SCHEMA_VERSION;
+    assert.throws(() => normalizeWorkLedgerPersistedState(invalid), { code: 'WORK_LEDGER_STATE_CORRUPTED' });
+  }
+});
+
+for (const scenario of ['paused', 'expired-history', 'missing-activation', 'model-work', 'unknown-effect', 'replacement-working', 'changed-Base']) {
+test(`same-Head internal review recovery preserves ${scenario}`, async () => {
+  const fixture = await legacySameHeadInternalReviewTakeoverFixture();
+  const state = fixture.store.stored();
+  const root = state.items.find(item => item.itemId === fixture.internalId);
+  const replacement = state.items.find(item => item.itemId === fixture.discoveryId);
+  if (scenario === 'paused') root.status = 'paused';
+  if (scenario === 'expired-history') state.timeline = state.timeline.filter(entry => entry.itemId !== root.itemId || entry.type !== 'pr_source_created');
+  if (scenario === 'missing-activation') state.timeline = state.timeline.filter(entry => entry.itemId !== replacement.itemId || entry.at !== root.updatedAt);
+  if (scenario === 'model-work') state.timeline.findLast(entry => entry.itemId === root.itemId).details.code = 'ROLE_DECISION_INVALID';
+  if (scenario === 'unknown-effect') state.outbox.push({ itemId: root.itemId, status: 'dispatching' });
+  if (scenario === 'replacement-working') replacement.status = 'working';
+  if (scenario === 'changed-Base') replacement.source.current.event.payload.gitTarget.baseRefOid = '9'.repeat(40);
+  const { sameHeadInternalReviewTakeoverRecoveryProof } = await import('../src/services/work-ledger-pr-retirement-recovery.js');
+  const before = clone(state);
+  assert.equal(sameHeadInternalReviewTakeoverRecoveryProof(state, root), null);
+  assert.deepEqual(state, before);
+});
+}
+
 test('internal review fact recovery cannot repeat after a real model failure and restart', async () => {
   const fixture = await exhaustedInternalReviewFactsFixture();
   const assembler = internalReviewContextAssembler(fixture);
@@ -2676,7 +2827,7 @@ test("schema v11 recovers a previous-policy authority baseline before appending 
   const fixture = await schema11SourceExitProjectionFixture();
   const before = clone(fixture.legacy);
   const normalized = normalizeWorkLedgerPersistedState(before);
-  assert.equal(normalized.schemaVersion, 12);
+  assert.equal(normalized.schemaVersion, WORK_LEDGER_STATE_SCHEMA_VERSION);
   assert.deepEqual(before, fixture.legacy);
   assert.deepEqual(normalized.items, before.items);
   assert.deepEqual(normalized.timeline, before.timeline);
@@ -2701,7 +2852,7 @@ test("schema v11 recovers a previous-policy authority baseline before appending 
   const receiver = (await restarted.service.listItems({ limit: 10 })).items.find(item => item.itemId === fixture.receiver.itemId);
   assert.equal((await restarted.service.claim({ itemId: receiver.itemId, expectedRevision: receiver.revision,
     workerId: "employee-pr-engineer", leaseDurationMs: 30_000 })).status, "working");
-  assert.equal(fixture.store.stored().schemaVersion, 12);
+  assert.equal(fixture.store.stored().schemaVersion, WORK_LEDGER_STATE_SCHEMA_VERSION);
   const second = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time });
   assert.deepEqual(await second.service.listItems({ limit: 10 }), await restarted.service.listItems({ limit: 10 }));
 });
@@ -2711,7 +2862,7 @@ test("schema v11 preserves an already current policy projection without appendin
   const state = fixture.store.stored();
   state.schemaVersion = 11;
   const normalized = normalizeWorkLedgerPersistedState(state);
-  assert.equal(normalized.schemaVersion, 12);
+  assert.equal(normalized.schemaVersion, WORK_LEDGER_STATE_SCHEMA_VERSION);
   assert.deepEqual(normalized.graphMemoryProjection, state.graphMemoryProjection);
 });
 
@@ -2767,7 +2918,7 @@ for (const schemaVersion of [10, 11]) {
     const drained = await second.service.readGraphMemoryProjectionBatch({ limit: 100 });
     assert.deepEqual(drained.items, []);
     assert.equal(drained.cursor, batch.highWatermark);
-    assert.equal(fixture.store.stored().schemaVersion, 12);
+    assert.equal(fixture.store.stored().schemaVersion, WORK_LEDGER_STATE_SCHEMA_VERSION);
   });
 }
 
@@ -2788,7 +2939,7 @@ test("schema v10 former-policy authority baseline passes the production restore 
   const registry = createProductionRestoreMigrationRegistry();
   await registry.migrate({ directory, manifest });
   const restored = JSON.parse(await readFile(path.join(directory, "work-ledger-state.json"), "utf8"));
-  assert.equal(restored.schemaVersion, 12);
+  assert.equal(restored.schemaVersion, WORK_LEDGER_STATE_SCHEMA_VERSION);
   assert.deepEqual(restored.items, state.items);
   assert.deepEqual(restored.graphMemoryProjection.pending.slice(0, 4), state.graphMemoryProjection.pending);
   const once = await readFile(path.join(directory, "work-ledger-state.json"));
