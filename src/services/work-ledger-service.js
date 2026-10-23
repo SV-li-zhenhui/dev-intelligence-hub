@@ -1,4 +1,5 @@
 import { scheduler } from "node:timers/promises";
+import { automaticRoleHandoffCandidate } from "./work-ledger-role-handoff.js";
 import { completedConflictInspectionRecoveryProof } from "./work-ledger-inspection-continuation.js";
 import { automaticReviewWorkAdmission } from "../domain/automatic-review-policy.js";
 import { inactivePullRequestTakeoverRecoveryProof } from "./work-ledger-pr-retirement-recovery.js";
@@ -769,6 +770,20 @@ export class WorkLedgerService {
   async listItems(options = {}) {
     this.#assertReady();
     return queryWorkItemPage(this.state.items, options);
+  }
+
+  async readAutomaticRoleHandoffCandidates({ events, afterSubjectId = null }) {
+    this.#assertReady();
+    return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
+      this.state = await this.#readDurableState();
+      const candidates = events.map(event => {
+        const candidate = automaticRoleHandoffCandidate(this.state, event);
+        return candidate === null ? null : { ...candidate, event };
+      }).filter(Boolean).sort((a, b) => a.event.subject.id.localeCompare(b.event.subject.id, "en"));
+      const after = afterSubjectId === null ? 0 : candidates.findIndex(candidate => candidate.event.subject.id.localeCompare(afterSubjectId, "en") > 0);
+      const start = after < 0 ? 0 : after;
+      return cloneLedgerValue([...candidates.slice(start), ...candidates.slice(0, start)].slice(0, 10));
+    }));
   }
 
   async readItemProgress(itemIds) {
@@ -1886,6 +1901,58 @@ export class WorkLedgerService {
       });
       return activation;
     };
+    const applyRoleHandoff = (envelope) => {
+      const candidate = automaticRoleHandoffCandidate({ items: [...itemsById.values()] }, envelope.event);
+      const skipped = { candidate, applied: false };
+      if (candidate === null || candidate.proofDigest !== envelope.event.payload.roleHandoffProof) return skipped;
+      let target = itemsById.get(candidate.targetItemId);
+      const predecessor = itemsById.get(candidate.predecessorItemId);
+      // A predecessor marker cannot represent two independent unknown-effect
+      // chains. Settle the target's own previous scope before activating it.
+      const ownCutover = applyCutoverProofPolicy(inspectPullRequestSourceCutover(target,
+        [...itemsById.values()], outboxById, { forceHeadChanged: true,
+          timelineIndex: currentCutoverTimelineIndex() }), `role-handoff-own:${envelope.assignment.assignmentId}:${target.itemId}`);
+      if (ownCutover.blockers.length !== 0) return skipped;
+      const activation = applyPullRequestScopeLifecycle(target.source, envelope, { attemptAtActivation: target.attempt });
+      if (!activation.authorityChanged || !activation.source.scope.active) return skipped;
+      target = applyReadyPullRequestSourceCutover({ root: target, activation: ownCutover,
+        itemsById, outboxById, nextInputRevision: activation.source.activeRevision,
+        nextHeadRevision: activation.source.headRevision, now, timelineEvents });
+      target = { ...target, source: activation.source, inputDigest: activation.source.current.inputDigest };
+      const cutover = applyCutoverProofPolicy(inspectPullRequestSourceCutover(predecessor,
+        [...itemsById.values()], outboxById, { forceHeadChanged: true, replacementRoot: target,
+          timelineIndex: currentCutoverTimelineIndex() }), `role-handoff:${envelope.assignment.assignmentId}:${predecessor.itemId}:${target.itemId}`);
+      if (cutover.blockers.length === 0) {
+        const settled = applyReadyPullRequestSourceCutover({ root: predecessor,
+          activation: crossRootPullRequestCutoverActivation(predecessor, cutover), itemsById, outboxById,
+          nextInputRevision: target.source.activeRevision, nextHeadRevision: target.source.headRevision, now, timelineEvents });
+        const retired = retirePredecessorInBatch(predecessor, settled);
+        itemsById.set(retired.itemId, retired);
+        rootByWorkKey.set(retired.source.workKey, retired);
+        target.status = "queued";
+        target.statusReason = "pr_source_role_handoff";
+      } else {
+        target.status = "blocked";
+        target.statusReason = crossRootPullRequestCutoverPendingReason(predecessor.itemId);
+        for (const blocker of cutover.blockers) {
+          if (blocker.status === "cancelled") continue;
+          const marked = { ...blocker, revision: initialItemIds.has(blocker.itemId) && !revisedItemIds.has(blocker.itemId)
+            ? blocker.revision + 1 : blocker.revision,
+            statusReason: crossRootPullRequestCutoverBlockerReason(target.itemId), updatedAt: now };
+          revisedItemIds.add(marked.itemId);
+          itemsById.set(marked.itemId, marked);
+          if (marked.source?.kind === "pull_request") rootByWorkKey.set(marked.source.workKey, marked);
+        }
+      }
+      target = { ...target, revision: initialItemIds.has(target.itemId) && !revisedItemIds.has(target.itemId)
+        ? target.revision + 1 : target.revision, ownerId: null, leaseId: null, leaseUntil: null,
+        activeIntentId: null, decisionContext: null, availableAt: null, updatedAt: now };
+      revisedItemIds.add(target.itemId);
+      itemsById.set(target.itemId, target);
+      rootByWorkKey.set(target.source.workKey, target);
+      touchedItemIds.add(target.itemId);
+      return { candidate, applied: true };
+    };
     let received = 0;
     let deduplicated = 0;
     const ignoreProtectedPullRequestReentry = (root, envelope, assignmentItem, disposition, recordAssignment = true) => {
@@ -1979,7 +2046,21 @@ export class WorkLedgerService {
           envelope.assignment,
           envelope.event,
         );
+      if (envelope.event.eventType === "pull_request.role_handoff" && !trustedScopeLifecycle) {
+        knownAssignments.set(assignmentItem.assignmentId, { inputDigest: assignmentItem.inputDigest, sourceSequence: assignmentItem.sourceSequence });
+        received += 1;
+        continue;
+      }
       if (trustedScopeLifecycle) {
+        if (envelope.event.eventType === "pull_request.role_handoff") {
+          const { candidate, applied } = applyRoleHandoff(envelope);
+          timelineEvents.push({ itemId: candidate?.targetItemId ?? null,
+            type: applied ? "pr_source_revised" : "pr_source_ignored", at: now, actorId: "work-ledger-system",
+            details: { sourceSequence: envelope.sequence, disposition: applied ? "role_handoff_applied" : "ignored_stale_role_handoff" } });
+          knownAssignments.set(assignmentItem.assignmentId, { inputDigest: assignmentItem.inputDigest, sourceSequence: assignmentItem.sourceSequence });
+          received += 1;
+          continue;
+        }
         const lifecycleActive = envelope.event.eventType === "pull_request.created";
         const lifecycleTargetRole = lifecycleActive ? pullRequestScopeLifecycleTargetRole(envelope) : null;
         const routedWorkKeys = new Set(batch.items

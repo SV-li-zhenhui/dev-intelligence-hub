@@ -185,6 +185,7 @@ test("runtime owns one named process guard and exposes least-authority graph por
     "listTimeline",
     "listOutbox",
     "readItemForReconciliation",
+    "readAutomaticRoleHandoffCandidates",
     "verifyPullRequestExecutionBindings",
     "reconcilePullRequestSourceBatch",
     "intake",
@@ -204,6 +205,7 @@ test("runtime owns one named process guard and exposes least-authority graph por
     assert.equal(typeof runtime[method], "function", method);
   }
   assert.equal(Object.isFrozen(runtime.graphReader), true);
+  assert.deepEqual(await runtime.readAutomaticRoleHandoffCandidates({ events: [] }), []);
   assert.equal(Object.isFrozen(runtime.graphBrowserReader), true);
   assert.equal(Object.isFrozen(runtime.graphPlanner), true);
   assert.equal(Object.isFrozen(runtime.scopedGraphPlannerFactory), true);

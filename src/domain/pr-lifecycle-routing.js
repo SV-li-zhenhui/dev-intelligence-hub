@@ -1,4 +1,5 @@
 const PULL_REQUEST_EVENTS = Object.freeze([
+  "pull_request.role_handoff",
   "pull_request.observed",
   "pull_request.created",
   "pull_request.updated",

@@ -56,6 +56,7 @@ test("supports every PR and Issue workflow event plus trusted owner intake", () 
     "owner_request.created",
     "pull_request.owner_requested",
     "pull_request.internal_review_requested",
+    "pull_request.role_handoff",
     "issue.owner_requested",
   ]);
   for (const eventType of expectedTypes) {

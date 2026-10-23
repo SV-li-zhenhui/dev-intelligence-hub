@@ -76,7 +76,7 @@ const AUTHORED_PR_SELF_FIX_ACTIONS = new Set([
   "continue_draft",
 ]);
 
-function trustedPrRoleForEvent(event) {
+export function trustedPrRoleForEvent(event) {
   if (
     event?.source?.provider !== "github" ||
     !["authored", "review_requested"].includes(event?.payload?.relation)
@@ -419,6 +419,7 @@ function normalizedEnvelope(value, lifecycleRoleId = "pr-engineer") {
   const event = storedEvent(rawEvent);
   const trustedLifecycle =
     isTrustedPullRequestScopeLifecycleAssignment(assignment, event);
+  if (event.eventType === "pull_request.role_handoff" && !trustedLifecycle) return null;
   if (
     !trustedLifecycle &&
     !ordinaryTarget &&
@@ -790,7 +791,7 @@ export function applyPullRequestScopeLifecycle(value, envelope, { attemptAtActiv
   if (!pullRequestScopeLifecycleMatchesSource(source, envelope)) {
     throw invalid("PR 范围生命周期工作键不一致");
   }
-  const active = input.event.eventType === "pull_request.created";
+  const active = ["pull_request.created", "pull_request.role_handoff"].includes(input.event.eventType);
   const authorityChanged = source.scope.active !== active;
   const appended = appendPullRequestWorkSource(source, envelope, {
     activate: true,
@@ -1216,11 +1217,11 @@ export function normalizePullRequestWorkSource(value) {
   );
   const currentLifecycleMatches =
     scope.lastLifecycleEventId === source.current.eventId &&
-    ["pull_request.created", "pull_request.left_scope"].includes(
+    ["pull_request.created", "pull_request.left_scope", "pull_request.role_handoff"].includes(
       source.current.event.eventType,
     ) &&
     scope.active ===
-      (source.current.event.eventType === "pull_request.created");
+      (["pull_request.created", "pull_request.role_handoff"].includes(source.current.event.eventType));
   const historicalLifecycleMatches =
     lastLifecycleRevision?.disposition === "accepted" &&
     lastLifecycleRevision.authorityEpochChanged === true &&
@@ -1964,7 +1965,7 @@ function validPullRequestScopeTransition(previousSource, nextSource) {
     (nextSource.current.eventId === nextScope.lastLifecycleEventId ||
       lastLifecycleRevision?.scopeRevocationApplied === true) &&
     (lastLifecycleRevision?.scopeRevocationApplied === true ||
-      ["pull_request.created", "pull_request.left_scope"].includes(
+      ["pull_request.created", "pull_request.left_scope", "pull_request.role_handoff"].includes(
         nextSource.current.event.eventType,
       ))
   );

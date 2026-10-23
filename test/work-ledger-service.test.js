@@ -2,6 +2,8 @@ import { digestValue } from "../src/domain/code-executor-contract.js";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
+import { automaticRoleHandoffCandidate } from "../src/services/work-ledger-role-handoff.js";
+import { createWorkflowRoutingRuntime } from "../src/workflow-routing-runtime.js";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -3599,6 +3601,172 @@ test("automatic scope lifecycle ignores a same-PR specialist root with a differe
   assert.equal(root.currentTarget.id, "developer");
   assert.equal(root.source.identity.targetRoleId, "developer");
   assert.equal(root.source.scope.active, true);
+});
+
+async function inactiveRoleHandoffFixture(nextHead = PR_HEAD_B) {
+  const fixture = await createFixture({ records: [specialistPrAssignment(1, "developer"), specialistPrAssignment(2, "tester")] });
+  await fixture.service.intake();
+  fixture.source.records.push(specialistScopeExit(3));
+  fixture.source.highWatermark = 3;
+  await fixture.service.intake();
+  const reentry = specialistPrAssignment(5, "developer", "authored", {
+    eventType: "pull_request.created", occurredAt: "2026-08-02T01:20:00.000Z" });
+  fixture.source.records.push(prScopeLifecycleAssignment(4, reentry.event), reentry);
+  fixture.source.highWatermark = 5;
+  await fixture.service.intake();
+  const moved = specialistPrAssignment(6, "tester", "authored", {
+    occurredAt: "2026-08-02T01:30:00.000Z", headRefOid: nextHead, previousHeadRefOid: PR_HEAD_A, changedFields: ["headRefOid"],
+    gitFacts: { ...prGitFacts(nextHead), relation: "authored", actionState: "waiting_other",
+      nextAction: "wait_merge", reviewDecision: "APPROVED", state: "open" } });
+  fixture.source.records.push(moved);
+  fixture.source.highWatermark = 6;
+  await fixture.service.intake();
+  return { ...fixture, moved };
+}
+
+for (const limit of [1, 100]) test(`host verified role handoff transfers inactive tester responsibility after developer reentry (limit=${limit})`, async () => {
+  const fixture = await inactiveRoleHandoffFixture();
+  const before = (await fixture.service.listItems()).items;
+  const old = before.find(item => item.currentTarget.id === "developer");
+  assert.equal(pullRequestHeadAdmission(fixture.store.stored(), old).current, true);
+  const candidates = await fixture.service.readAutomaticRoleHandoffCandidates({ events: [fixture.moved.event] });
+  assert.equal(candidates.length, 1);
+  const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.role_handoff",
+    occurredAt: "2026-08-02T01:40:00.000Z", source: fixture.moved.event.source, subject: fixture.moved.event.subject,
+    payload: { ...fixture.moved.event.payload, roleHandoffProof: candidates[0].proofDigest } });
+  fixture.source.records.push(prScopeLifecycleAssignment(7, event));
+  fixture.source.highWatermark = 7;
+  await fixture.service.intake({ limit });
+  const roots = (await fixture.service.listItems()).items;
+  const developer = roots.find(item => item.currentTarget.id === "developer");
+  const tester = roots.find(item => item.currentTarget.id === "tester");
+  assert.equal(developer.statusReason, "pr_source_cross_root_cutover_retired");
+  assert.equal(tester.source.scope.active, true);
+  assert.equal(tester.status, "queued");
+  assert.equal(tester.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(tester.attempt, before.find(item => item.itemId === tester.itemId).attempt);
+  assert.equal(pullRequestHeadAdmission(fixture.store.stored(), developer).current, false);
+  assert.equal(pullRequestHeadAdmission(fixture.store.stored(), tester).current, true);
+  const restarted = await createFixture({ store: fixture.store, source: fixture.source });
+  assert.deepEqual((await restarted.service.listItems()).items, roots);
+});
+
+test("role handoff also transfers responsibility when approval changes without a new Head", async () => {
+  const fixture = await inactiveRoleHandoffFixture(PR_HEAD_A);
+  assert.equal((await fixture.service.readAutomaticRoleHandoffCandidates({ events: [fixture.moved.event] })).length, 1);
+});
+
+test("snapshot delta cannot invalidate its own verified role handoff before ledger intake", async () => {
+  const fixture = await inactiveRoleHandoffFixture();
+  const values = new Map();
+  let recoverHandoff = false;
+  const runtime = await createWorkflowRoutingRuntime({ workflowRouting: { schemaVersion: 1, enabled: true, maxHops: 8, rules: [] } }, {
+    store: { async read(name, fallback) { return clone(values.get(name) ?? fallback); }, async write(name, value) { values.set(name, clone(value)); } },
+    clock: () => "2026-08-02T01:51:00.000Z",
+    createGuard: () => ({ async acquire() {}, run: operation => operation(), async close() {} }),
+    roleHandoffReader: { async read({ events }) {
+      if (!recoverHandoff) return [];
+      const candidates = await fixture.service.readAutomaticRoleHandoffCandidates({ events });
+      return candidates.map(({ event, proofDigest }) => normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.role_handoff",
+        occurredAt: "2026-08-02T01:51:00.000Z", source: event.source, subject: event.subject,
+        payload: { ...event.payload, roleHandoffProof: proofDigest } }));
+    } },
+  });
+  try {
+    const item = { ...fixture.moved.event.payload, kind: "pull_request", id: fixture.moved.event.subject.id,
+      repo: "acme/repo", number: 42 };
+    const snapshot = { refreshedAt: "2026-08-02T01:40:00.000Z", items: [item],
+      sourceStatus: { githubPullRequests: { ok: true, complete: true, stale: false }, githubIssues: { ok: true } } };
+    await runtime.ingestSnapshot({ snapshot });
+    const oldFeed = await runtime.readAssignmentBatch({ afterSequence: 0, limit: 100 });
+    recoverHandoff = true;
+    await runtime.ingestSnapshot({ snapshot: { ...snapshot, refreshedAt: "2026-08-02T01:50:00.000Z",
+      items: [{ ...item, title: "Approval with refreshed CI", ciStatus: "SUCCESS" }] } });
+    const feed = await runtime.readAssignmentBatch({ afterSequence: oldFeed.nextSequence, limit: 100 });
+    const records = feed.items.map((record, index) => ({ ...record, sequence: 7 + index }));
+    fixture.source.records.push(...records);
+    fixture.source.highWatermark = 6 + records.length;
+    await fixture.service.intake();
+    const roots = (await fixture.service.listItems()).items;
+    assert.equal(roots.find(item => item.currentTarget.id === "tester").source.scope.active, true);
+    assert.equal(roots.find(item => item.currentTarget.id === "developer").statusReason, "pr_source_cross_root_cutover_retired");
+  } finally { await runtime.close(); }
+});
+
+test("role handoff preserves owner controls, provenance, independent authority and retained Head proof", async () => {
+  const fixture = await inactiveRoleHandoffFixture();
+  const original = fixture.store.stored();
+  for (const variant of ["pause", "cancel", "rejected", "quarantine", "account", "branch", "unproven-head", "owner-authority"]) {
+    const state = clone(original), event = clone(fixture.moved.event);
+    const developer = state.items.find(item => item.currentTarget.id === "developer");
+    const tester = state.items.find(item => item.currentTarget.id === "tester");
+    if (variant === "pause") developer.status = "paused";
+    if (variant === "cancel") tester.status = "cancelled";
+    if (variant === "rejected") developer.statusReason = "proposal_rejected";
+    if (variant === "quarantine") tester.sourceQuarantine = {};
+    if (variant === "account") event.payload.gitTarget.sourceAccountId = "other-account";
+    if (variant === "branch") event.payload.gitTarget.headRefName = "other/branch";
+    if (variant === "unproven-head") event.payload.headRefOid = "c".repeat(40);
+    if (variant === "owner-authority") {
+      const ownerFixture = await createFixture({ records: [ownerRequestedPrAssignment(1, {
+        occurredAt: "2026-08-02T01:35:00.000Z", headRefOid: PR_HEAD_B, gitFacts: prGitFacts(PR_HEAD_B) })] });
+      await ownerFixture.service.intake();
+      const [owner] = (await ownerFixture.service.listItems()).items;
+      owner.source.bindings[0].sourceSequence = 20;
+      owner.source.current.sourceSequence = 20;
+      state.items.push(owner);
+    }
+    assert.equal(automaticRoleHandoffCandidate(state, event), null, variant);
+  }
+});
+
+test("a claim after host verification invalidates the role handoff proof without poisoning intake", async () => {
+  const fixture = await inactiveRoleHandoffFixture();
+  const [candidate] = await fixture.service.readAutomaticRoleHandoffCandidates({ events: [fixture.moved.event] });
+  const developer = (await fixture.service.listItems()).items.find(item => item.currentTarget.id === "developer");
+  await fixture.service.claim({ itemId: developer.itemId, expectedRevision: developer.revision,
+    workerId: "employee-developer", leaseDurationMs: 30_000 });
+  const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.role_handoff",
+    occurredAt: "2026-08-02T01:40:00.000Z", source: fixture.moved.event.source, subject: fixture.moved.event.subject,
+    payload: { ...fixture.moved.event.payload, roleHandoffProof: candidate.proofDigest } });
+  fixture.source.records.push(prScopeLifecycleAssignment(7, event));
+  fixture.source.highWatermark = 7;
+  await fixture.service.intake();
+  assert.equal((await fixture.service.listItems()).items.find(item => item.currentTarget.id === "tester").source.scope.active, false);
+  assert.equal((await fixture.service.getSummary()).intakeCursor, 7);
+});
+
+test("role handoff fences a sealed predecessor child and resumes through normal cutover reconciliation", async () => {
+  const fixture = await inactiveRoleHandoffFixture();
+  const developer = (await fixture.service.listItems()).items.find(item => item.currentTarget.id === "developer");
+  const sealed = await stageSealedPrChildReview(fixture);
+  const [candidate] = await fixture.service.readAutomaticRoleHandoffCandidates({ events: [fixture.moved.event] });
+  assert.ok(candidate);
+  const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.role_handoff",
+    occurredAt: "2026-08-02T01:40:00.000Z", source: fixture.moved.event.source, subject: fixture.moved.event.subject,
+    payload: { ...fixture.moved.event.payload, roleHandoffProof: candidate.proofDigest } });
+  fixture.source.records.push(prScopeLifecycleAssignment(7, event));
+  fixture.source.highWatermark = 7;
+  await fixture.service.intake();
+  let tester = (await fixture.service.listItems()).items.find(item => item.currentTarget.id === "tester");
+  assert.equal(tester.status, "blocked");
+  assert.equal(tester.statusReason, `pr_source_cross_root_cutover_pending:${developer.itemId}`);
+  assert.equal(tester.source.pendingRevision, null);
+  await assert.rejects(fixture.service.claim({ itemId: tester.itemId, expectedRevision: tester.revision,
+    workerId: "employee-tester", leaseDurationMs: 30_000 }));
+  const restarted = await createFixture({ store: fixture.store, source: fixture.source });
+  const child = (await restarted.service.listItems()).items.find(item => item.itemId === sealed.childItemId);
+  assert.equal(child.activeIntentId, sealed.outbox.intentId);
+  await restarted.service.ackIntent({ intentId: sealed.outbox.intentId, expectedRevision: sealed.outbox.revision,
+    dispatchLeaseId: sealed.outbox.dispatchLeaseId, itemExpectedRevision: child.revision,
+    actorId: "work-intent-dispatcher", outcome: "delivered", nextStatus: "completed",
+    details: { downstreamRef: "settled-child-review" } });
+  tester = (await restarted.service.listItems()).items.find(item => item.itemId === tester.itemId);
+  await restarted.service.reconcilePullRequestSource({ itemId: tester.itemId, expectedRevision: tester.revision,
+    expectedGraphRevision: (await restarted.service.getSummary()).revision, expectedPendingRevision: tester.source.activeRevision });
+  assert.equal((await restarted.service.listItems()).items.find(item => item.itemId === tester.itemId).status, "queued");
+  assert.equal((await restarted.service.listItems()).items.find(item => item.itemId === developer.itemId).statusReason,
+    "pr_source_cross_root_cutover_retired");
 });
 
 function specialistPrAssignment(sequence, roleId, relation = "authored", overrides = {}) {

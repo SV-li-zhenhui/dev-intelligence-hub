@@ -111,6 +111,7 @@ import { createPrTriageWorkRequest } from "./domain/owner-work-request.js";
 import { DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS } from "./domain/prioritizer.js";
 import { createPullRequestExecutionBinding, samePullRequestExecutionBinding } from "./domain/pull-request-execution-binding.js";
 import { AutomaticReviewScopeExitReader } from "./services/automatic-review-scope-exit-reader.js";
+import { AutomaticRoleHandoffReader } from "./services/automatic-role-handoff-reader.js";
 
 const GITHUB_REVIEW_PROPOSAL_RUNNER_ID = "github-review-runner";
 const GITHUB_PULL_REQUEST_ACTION_RUNNER_ID = "github-pr-action-runner";
@@ -1071,6 +1072,7 @@ export async function createApplication({
   let localCodeProposalRecovery = null;
   let codeAuthorizationRoleRegistry = null;
   let automaticReviewScopeExitReader = null;
+  let automaticRoleHandoffReader = null;
   let workflowRouting = null;
   let workLedgerRuntime = null;
   let workContinuationScheduler = null;
@@ -1297,6 +1299,15 @@ export async function createApplication({
               account: config.githubActions.actorAccountId,
               ...(workCoordinationDependencies.clock ? { clock: workCoordinationDependencies.clock } : {}) });
             return automaticReviewScopeExitReader.read(options);
+          } }),
+        } : {}),
+        ...(config.githubActions?.enabled === true && config.githubActions.automaticOwnPrRepair === true && config.workCoordination?.enabled === true ? {
+          roleHandoffReader: Object.freeze({ async read(options) {
+            if (!workLedgerRuntime) return [];
+            automaticRoleHandoffReader ??= new AutomaticRoleHandoffReader({ ledger: workLedgerRuntime, github,
+              account: config.githubActions.actorAccountId,
+              ...(workCoordinationDependencies.clock ? { clock: workCoordinationDependencies.clock } : {}) });
+            return automaticRoleHandoffReader.read(options);
           } }),
         } : {}),
         ...(ordinaryActionAdmissionGate === null

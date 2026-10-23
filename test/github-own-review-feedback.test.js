@@ -1,11 +1,48 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { GitHubAdapter } from "../src/adapters/github-adapter.js";
+import { AutomaticRoleHandoffReader } from "../src/services/automatic-role-handoff-reader.js";
+import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { readOwnReviewFeedback, readOwnPullRequestHandoff, summarizeOwnReviewFeedback } from "../src/adapters/github-own-review-feedback.js";
 
 const ACCOUNT = "local-owner";
 const HEAD = "a".repeat(40);
 const AT = "2026-10-10T01:00:00Z";
+
+for (const drift of [null, "head", "base", "approval", "assignees", "incomplete-assignees", "account", "author"]) {
+  test(`automatic role handoff fresh GitHub observation preserves exact authority (${drift})`, async () => {
+    let accountReads = 0;
+    const target = { schemaVersion: 1, provider: "github", sourceAccountId: ACCOUNT,
+      baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "b".repeat(40),
+      headRepository: "acme/repo", headRefName: "fix/handoff", headRefOid: HEAD };
+    const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.observed",
+      occurredAt: "2026-10-10T01:00:00.000Z", source: { provider: "github", scopeId: "github-dashboard" },
+      subject: { id: "github:pr:acme/repo#42", repository: "acme/repo", number: 42 },
+      payload: { author: ACCOUNT, assignees: ["qa"], relation: "authored", state: "open",
+        actionState: "waiting_other", nextAction: "wait_merge", reviewDecision: "APPROVED",
+        headRefOid: HEAD, gitTargetAvailable: true, gitTarget: target } });
+    const adapter = new GitHubAdapter({ run: async (_command, args) => {
+      if (args.at(-1) === "user") return { login: drift === "account" && ++accountReads > 1 ? "other-account" : ACCOUNT };
+      assert.match(args.find(x => x.startsWith("query=")), /PullRequestRoleHandoff/);
+      const head = drift === "head" ? "c".repeat(40) : HEAD;
+      return { data: { repository: { pullRequest: pullRequest({ isDraft: false,
+        author: { login: drift === "author" ? "other-author" : ACCOUNT },
+        reviewDecision: drift === "approval" ? "CHANGES_REQUESTED" : "APPROVED",
+        assignees: page([{ login: drift === "assignees" ? "other-qa" : "qa" }], drift === "incomplete-assignees"),
+        baseRefOid: "e".repeat(40), baseRefName: "main",
+        baseRef: { name: "main", repository: { nameWithOwner: "acme/repo" }, target: { oid: drift === "base" ? "d".repeat(40) : target.baseRefOid } },
+        headRefName: target.headRefName, headRepository: { nameWithOwner: "acme/repo" }, headRefOid: head,
+        headRef: { name: target.headRefName, repository: { nameWithOwner: "acme/repo" }, target: { oid: head } } }) } } };
+    } });
+    const reader = new AutomaticRoleHandoffReader({ account: ACCOUNT, github: adapter,
+      clock: () => "2026-10-10T01:01:00.000Z", ledger: { async readAutomaticRoleHandoffCandidates() {
+        return [{ event, proofDigest: "f".repeat(64) }];
+      } } });
+    const results = await reader.read({ events: [event] });
+    assert.equal(results.length, drift === null ? 1 : 0);
+    if (results.length) assert.equal(results[0].eventType, "pull_request.role_handoff");
+  });
+}
 
 function review(overrides = {}) {
   return { id: "review-1", author: { login: "reviewer" }, state: "CHANGES_REQUESTED", submittedAt: AT, commit: { oid: HEAD }, body: "Fix the null dereference", ...overrides };

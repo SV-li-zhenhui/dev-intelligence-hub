@@ -1,5 +1,6 @@
 import { normalizeStoredWorkflowEvent, normalizeWorkflowEvent } from "../domain/workflow-events.js";
 import { DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS } from "../domain/prioritizer.js";
+import { AUTHORED_PR_APPROVED_RULE_ID } from "../domain/pr-lifecycle-routing.js";
 import { normalizeWorkflowRoutingConfig } from "../domain/workflow-router.js";
 import {
   projectWorkflowSnapshot,
@@ -107,6 +108,7 @@ export class WorkflowRoutingService {
     bundleByteBudget = MAX_WORKFLOW_BUNDLE_BYTES,
     issueActiveWindowDays = DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS,
     scopeExitRecoveryReader = null,
+    roleHandoffReader = null,
   } = {}) {
     if (
       !store ||
@@ -133,6 +135,8 @@ export class WorkflowRoutingService {
       throw new TypeError("scopeExitRecoveryReader is invalid");
     }
     this.scopeExitRecoveryReader = scopeExitRecoveryReader;
+    if (roleHandoffReader !== null && typeof roleHandoffReader?.read !== "function") throw new TypeError("roleHandoffReader is invalid");
+    this.roleHandoffReader = roleHandoffReader;
     this.operationQueue = operationQueue || new OperationQueue();
     this.exclusiveLease = exclusiveLease;
     this.runNewWorkAdmission = newWorkAdmissionRun(actionAdmissionGate);
@@ -276,6 +280,9 @@ export class WorkflowRoutingService {
   }
 
   async ingest({ event } = {}) {
+    if (event?.eventType === "pull_request.role_handoff") {
+      throw workflowServiceError("WORKFLOW_EVENT_HOST_ONLY", "岗位责任交接只能由系统事实核验生成", 400);
+    }
     this.#assertReady();
     const normalizedEvent = normalizeWorkflowEvent(event);
     return this.#admitNewWork(() => this.#writeTransaction(async () => {
@@ -328,6 +335,11 @@ export class WorkflowRoutingService {
     const recoveredExits = this.scopeExitRecoveryReader !== null &&
       snapshot.sourceStatus?.githubPullRequests?.ok === true && snapshot.sourceStatus.githubPullRequests.complete === true
       ? await this.scopeExitRecoveryReader.read({ sourceScopeId }) : [];
+    const roleHandoffs = this.roleHandoffReader !== null &&
+      snapshot.sourceStatus?.githubPullRequests?.ok === true && snapshot.sourceStatus.githubPullRequests.complete === true &&
+      snapshot.sourceStatus.githubPullRequests.stale !== true
+      ? await this.roleHandoffReader.read({ events: workflowEventsFromSnapshots(null, currentCheckpoint,
+        { sourceScopeId, ...projectionOptions }).filter(event => event.eventType.startsWith("pull_request.")) }) : [];
     return this.#admitNewWork(() => this.#writeTransaction(async () => {
       const replay = this.#snapshotReplay(currentCheckpoint);
       const existingEventIds = new Set(
@@ -339,14 +351,23 @@ export class WorkflowRoutingService {
         }
         return !existingEventIds.has(event.eventId);
       });
+      for (const value of roleHandoffs) {
+        const event = normalizeStoredWorkflowEvent(value);
+        if (event.eventType !== "pull_request.role_handoff" || event.source.provider !== "github" || event.source.scopeId !== sourceScopeId) {
+          throw new TypeError("role handoff reader may only transfer its GitHub scope");
+        }
+        if (!existingEventIds.has(event.eventId)) extraEvents.push(event);
+      }
       if (replay && extraEvents.length === 0) return replay;
       const config = this.#requireConfig();
       const emittedEventIds = new Set(existingEventIds);
-      const events = [...(replay ? [] : workflowEventsFromSnapshots(
+      // The proof seals pre-intake root revisions. Apply it before this same
+      // snapshot's ordinary metadata can advance those revisions.
+      const events = [...extraEvents.filter(event => event.eventType === "pull_request.role_handoff"), ...(replay ? [] : workflowEventsFromSnapshots(
         this.state.checkpoint,
         currentCheckpoint,
         { sourceScopeId, ...projectionOptions },
-      )), ...extraEvents].filter(event => {
+      )), ...extraEvents.filter(event => event.eventType !== "pull_request.role_handoff")].filter(event => {
         if (emittedEventIds.has(event.eventId)) return false;
         emittedEventIds.add(event.eventId);
         return true;
@@ -471,7 +492,9 @@ export class WorkflowRoutingService {
     const assignments = [];
     if (
       includeTrustedScopeLifecycle &&
-      isPullRequestScopeLifecycleEventType(routed.event.eventType)
+      isPullRequestScopeLifecycleEventType(routed.event.eventType) &&
+      (routed.event.eventType !== "pull_request.role_handoff" || routed.result.assignments.some(assignment =>
+        assignment.ruleId === AUTHORED_PR_APPROVED_RULE_ID && assignment.target?.type === "role" && assignment.target.id === "tester"))
     ) {
       assignments.push(
         identifiedWorkflowRecord("assignmentId", "workflow-assignment", {

@@ -21,6 +21,7 @@ const EVENT_TYPES = new Set(
 EVENT_TYPES.add("owner_request.created");
 EVENT_TYPES.add("pull_request.owner_requested");
 EVENT_TYPES.add("pull_request.internal_review_requested");
+EVENT_TYPES.add("pull_request.role_handoff");
 EVENT_TYPES.add("issue.owner_requested");
 const BASE_KEYS = Object.freeze([
   "schemaVersion",
@@ -62,6 +63,7 @@ const INVALID_CONTROL = /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const IDENTIFIER_CONTROL = /\p{Cc}/u;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const PAYLOAD_FIELDS = new Set([
+  "roleHandoffProof",
   "actionState",
   "acceptanceCriteria",
   "assignee",
@@ -132,6 +134,7 @@ const FILE_FACT_FIELDS = new Set([
   "status",
 ]);
 const STRING_PAYLOAD_FIELDS = new Set([
+  "roleHandoffProof",
   "actionState",
   "assignee",
   "assignmentSource",

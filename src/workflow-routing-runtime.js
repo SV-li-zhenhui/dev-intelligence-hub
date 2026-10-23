@@ -30,6 +30,7 @@ export async function createWorkflowRoutingRuntime(
     operationQueue,
     actionAdmissionGate,
     scopeExitRecoveryReader,
+    roleHandoffReader,
     createGuard = (options) => new ProcessExclusiveGuard(options),
   } = {},
 ) {
@@ -70,6 +71,7 @@ export async function createWorkflowRoutingRuntime(
         DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS,
       ...(actionAdmissionGate === undefined ? {} : { actionAdmissionGate }),
       ...(scopeExitRecoveryReader === undefined ? {} : { scopeExitRecoveryReader }),
+      ...(roleHandoffReader === undefined ? {} : { roleHandoffReader }),
       ...(clock ? { clock } : {}),
       ...(operationQueue ? { operationQueue } : {}),
     });

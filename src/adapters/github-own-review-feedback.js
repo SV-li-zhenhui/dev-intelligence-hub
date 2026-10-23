@@ -48,6 +48,24 @@ const CONFLICT_QUERY = `query OwnPullRequestConflict($owner: String!, $name: Str
     ${GITHUB_CURRENT_PULL_REQUEST_FIELDS} isDraft mergeStateStatus
   } }
 }`;
+const ROLE_HANDOFF_QUERY = `query PullRequestRoleHandoff($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    ${GITHUB_CURRENT_PULL_REQUEST_FIELDS} isDraft reviewDecision
+    assignees(first: 100) { nodes { login } pageInfo { hasNextPage } }
+  } }
+}`;
+
+export async function readPullRequestRoleHandoffFacts(run, identity, options = {}) {
+  const [owner, name] = identity.repository.split("/");
+  const result = await graphql(run, ROLE_HANDOFF_QUERY, { owner, name, number: identity.number }, options);
+  const pr = assertPullRequest(result.repository?.pullRequest, identity);
+  if (typeof pr.isDraft !== "boolean" || pr.assignees?.pageInfo?.hasNextPage !== false ||
+      !Array.isArray(pr.assignees.nodes)) throw invalid("role handoff facts are incomplete");
+  return { state: pr.state.toLowerCase(), isDraft: pr.isDraft, author: pr.author.login,
+    reviewDecision: pr.reviewDecision, assignees: pr.assignees.nodes.map(user => user.login),
+    gitTarget: pr.state === "OPEN" ? githubCurrentPullRequestGitTarget(pr, {
+      baseRepository: identity.repository, sourceAccountId: identity.account }) : null };
+}
 
 function invalid(message) {
   return new Error(`GitHub own PR feedback ${message}`);

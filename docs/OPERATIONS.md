@@ -962,6 +962,17 @@ The cycle can then admit another ready task, even with `workLimit: 1`. Availabil
 checks and claims remain bounded; an error after the model started or an untyped
 lookalike still consumes its normal work slot.
 
+With automatic own-PR repair and coordination enabled, a complete fresh GitHub
+snapshot also checks authored PR responsibility changes from developer to tester.
+An inactive tester root requires its retained trusted Head lineage, the current
+approved route, a fresh account/author/assignee/Head/Base observation, and a proof
+sealed to all subject-root revisions. Intake applies this host-only handoff before
+ordinary metadata from the same snapshot. It settles the target's old scope and
+uses the existing cross-root cutover to retire the old developer; sealed unknown
+effects keep the handoff blocked until normal reconciliation can settle them.
+Public events cannot create a handoff, stale proofs are ignored, and explicit
+owner controls and independent owner/internal-review authority remain in force.
+
 ## Automatic work continuations
 
 In automatic mode, schema 2 of `work-continuations.json` records the source task,
