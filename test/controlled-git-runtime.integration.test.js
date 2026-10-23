@@ -354,11 +354,17 @@ test("controlled conflict repair preserves a bounded full repository with non-co
   const config = { enabled: true, gitCommand, preparationRoot: setup.preparationRoot,
     baseMirrorsByRepository: { "acme/runtime-test": setup.baseMirrorRoot },
     headMirrorsByRepository: { "contributor/runtime-test": setup.headMirrorRoot } };
-  const dependencies = { limits: { maxBlobBytes: 10_000_000, maxTotalBytes: 12_000_000 } };
+  const processRunner = new RecordingProcessRunner();
+  const dependencies = { processRunner, limits: { maxBlobBytes: 10_000_000, maxTotalBytes: 12_000_000 } };
   const bundle = await createControlledGitRuntimeBundle(config, dependencies);
   const source = await bundle.preparer.prepare(inputBinding(setup));
   assert.deepEqual(source.writeScope.paths, ["src/conflict.txt"]);
+  const blobBatches = () => processRunner.calls.filter(({ args }) =>
+    args.includes("cat-file") && args.includes("--batch")).length;
+  const batchesBeforeInspection = blobBatches();
   const inspection = await bundle.inspectionReader.read(inputBinding(setup));
+  assert.ok(batchesBeforeInspection > 0);
+  assert.equal(blobBatches(), batchesBeforeInspection);
   assert.deepEqual(inspection.inputBinding, inputBinding(setup));
   assert.deepEqual(inspection.conflicts.map(entry => entry.path), ["src/conflict.txt"]);
   assert.deepEqual(inspection.conflicts[0].versions.slice(0, 3).map(entry => entry.excerpt),
@@ -407,6 +413,8 @@ test("controlled conflict repair preserves a bounded full repository with non-co
   const sealedResource = path.join(setup.preparationRoot, "preparations",
     source.preparationBinding.preparationId, "blobs", `${sha256(resource)}.blob`);
   await writeFile(sealedResource, Buffer.alloc(resource.length));
+  await assert.rejects(bundle.preparer.prepare(inputBinding(setup)),
+    error => error.code === "CONTROLLED_GIT_PREPARATION_TAMPERED");
   await assert.rejects(restarted.preparer.prepare(inputBinding(setup)),
     error => error.code === "CONTROLLED_GIT_PREPARATION_TAMPERED");
 });

@@ -516,6 +516,20 @@ function lookupMirror(mirrors, repository, role) {
   return mirrorRoot;
 }
 
+function assertPreparationInputUnchanged(value, expected) {
+  let current;
+  try {
+    current = normalizePullRequestExecutionBinding(value);
+  } catch (cause) {
+    throw runtimeError("CONFLICT_PREPARATION_INPUT_CHANGED",
+      "PR 执行绑定在 conflict preparation 期间发生变化", cause);
+  }
+  if (!samePullRequestExecutionBinding(expected, current)) {
+    throw runtimeError("CONFLICT_PREPARATION_INPUT_CHANGED",
+      "PR 执行绑定在 conflict preparation 期间发生变化");
+  }
+}
+
 function createPorts(service, { baseMirrors, headMirrors }) {
   const createControlledCommit = method(
     service,
@@ -565,6 +579,8 @@ function createPorts(service, { baseMirrors, headMirrors }) {
   const verifier = Object.freeze({
     verify: (binding) => verifyConflictPreparation({ binding }),
   });
+  // Reuse material across inspection and dispatch; verification remains fresh.
+  const preparationBindings = new Map();
   const preparer = Object.freeze({
     async prepare(inputBindingValue) {
       let inputBinding;
@@ -585,65 +601,37 @@ function createPorts(service, { baseMirrors, headMirrors }) {
         );
       }
       const gitTarget = inputBinding.gitTarget;
-      const preparation = await inspectConflict({
-        gitTarget,
-        baseMirrorRoot: lookupMirror(
-          baseMirrors,
-          gitTarget.baseRepository,
-          "Base",
-        ),
-        headMirrorRoot: lookupMirror(
-          headMirrors,
-          gitTarget.headRepository,
-          "Head",
-        ),
-      });
-      let currentInputBinding;
-      try {
-        currentInputBinding = normalizePullRequestExecutionBinding(
-          inputBindingValue,
-        );
-      } catch (cause) {
-        throw runtimeError(
-          "CONFLICT_PREPARATION_INPUT_CHANGED",
-          "PR 执行绑定在 conflict preparation 期间发生变化",
-          cause,
-        );
-      }
-      if (!samePullRequestExecutionBinding(inputBinding, currentInputBinding)) {
-        throw runtimeError(
-          "CONFLICT_PREPARATION_INPUT_CHANGED",
-          "PR 执行绑定在 conflict preparation 期间发生变化",
-        );
-      }
-      if (preparation?.status !== "conflicted") {
-        throw runtimeError(
-          "CONFLICT_PREPARATION_NOT_CONFLICTED",
-          "PR 当前镜像不再产生受支持的冲突",
-        );
-      }
-      let preparationBinding;
-      try {
-        preparationBinding = createConflictPreparationBinding({
-          preparation,
+      const cacheKey = JSON.stringify(inputBinding);
+      let preparationBinding = preparationBindings.get(cacheKey);
+      if (preparationBinding === undefined) {
+        const preparation = await inspectConflict({
           gitTarget,
+          baseMirrorRoot: lookupMirror(baseMirrors, gitTarget.baseRepository, "Base"),
+          headMirrorRoot: lookupMirror(headMirrors, gitTarget.headRepository, "Head"),
         });
-      } catch (cause) {
-        throw runtimeError(
-          "INVALID_CONFLICT_PREPARATION_RESULT",
-          "Controlled Git preparation 结果无效",
-          cause,
-        );
+        assertPreparationInputUnchanged(inputBindingValue, inputBinding);
+        if (preparation?.status !== "conflicted") {
+          throw runtimeError("CONFLICT_PREPARATION_NOT_CONFLICTED",
+            "PR 当前镜像不再产生受支持的冲突");
+        }
+        try {
+          preparationBinding = deepFreeze(createConflictPreparationBinding({ preparation, gitTarget }));
+        } catch (cause) {
+          throw runtimeError("INVALID_CONFLICT_PREPARATION_RESULT",
+            "Controlled Git preparation 结果无效", cause);
+        }
       }
-      const verified = await verifyConflictPreparation({
-        binding: preparationBinding,
-      });
-      if (!sameConflictPreparationBinding(verified, preparationBinding)) {
-        throw runtimeError(
-          "CONFLICT_PREPARATION_VERIFICATION_MISMATCH",
-          "Controlled Git preparation 校验结果不一致",
-        );
+      try {
+        const verified = await verifyConflictPreparation({ binding: preparationBinding });
+        if (!sameConflictPreparationBinding(verified, preparationBinding)) {
+          throw runtimeError("CONFLICT_PREPARATION_VERIFICATION_MISMATCH",
+            "Controlled Git preparation 校验结果不一致");
+        }
+      } catch (error) {
+        preparationBindings.delete(cacheKey);
+        throw error;
       }
+      assertPreparationInputUnchanged(inputBindingValue, inputBinding);
       const executionSource = createConflictCodeExecutionSource({
         inputBinding,
         preparationBinding,
@@ -660,6 +648,10 @@ function createPorts(service, { baseMirrors, headMirrors }) {
           "INVALID_CONFLICT_PREPARATION_RESULT",
           "Conflict execution source 构造失败",
         );
+      }
+      preparationBindings.set(cacheKey, preparationBinding);
+      if (preparationBindings.size > 32) {
+        preparationBindings.delete(preparationBindings.keys().next().value);
       }
       return deepFreeze(normalizedSource);
     },

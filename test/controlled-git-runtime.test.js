@@ -444,6 +444,114 @@ test("startup preflight does not create preparation roots through linked ancesto
   );
 });
 
+test("inspection and dispatch reuse exact-binding sealed material with fresh verification", async (t) => {
+  const setup = await fixture(t);
+  const inputBinding = pullRequestBinding();
+  const service = fakeService(preparationFor(inputBinding));
+  const bundle = await createControlledGitRuntimeBundle(setup.config, {
+    controlledGitServiceFactory: () => service,
+  });
+  const inspection = await bundle.inspectionReader.read(inputBinding);
+  const source = await bundle.preparer.prepare(structuredClone(inputBinding));
+  assert.equal(service.calls.inspect.length, 1);
+  assert.equal(service.calls.verify.length, 2);
+  assert.deepEqual(source.preparationBinding, inspection.preparationBinding);
+  assert.deepEqual(source.inputBinding, inputBinding);
+  assert.equal(Object.isFrozen(source), true);
+});
+
+test("material reuse does not cross input, root, event, Head or Base bindings", async (t) => {
+  const setup = await fixture(t);
+  const input = pullRequestBinding();
+  const service = fakeService(preparationFor(input));
+  service.inspectConflict = async (request) => {
+    service.calls.inspect.push(request);
+    return preparationFor(pullRequestBinding({ gitTarget: request.gitTarget }));
+  };
+  const bundle = await createControlledGitRuntimeBundle(setup.config, {
+    controlledGitServiceFactory: () => service,
+  });
+  await bundle.preparer.prepare(input);
+  for (const change of [
+    { inputRevision: 4 }, { rootItemId: "another-root" }, { eventId: "another-event" },
+    { gitTarget: { headRefOid: "b".repeat(40) } },
+    { gitTarget: { baseRefOid: "c".repeat(40) } },
+  ]) await bundle.preparer.prepare(pullRequestBinding(change));
+  assert.equal(service.calls.inspect.length, 6);
+  assert.equal(service.calls.verify.length, 6);
+});
+
+for (const failure of ["throw", "mismatch"]) {
+  test(`cached material verification ${failure} rejects without rebuilding and evicts the binding`, async (t) => {
+    const setup = await fixture(t);
+    const input = pullRequestBinding();
+    const service = fakeService(preparationFor(input));
+    let broken = false;
+    service.verifyConflictPreparation = async ({ binding }) => {
+      if (broken && failure === "throw") throw Object.assign(new Error("damaged evidence"), {
+        code: "CONTROLLED_GIT_PREPARATION_TAMPERED",
+      });
+      return broken ? { ...binding, evidenceDigest: "f".repeat(64) } : structuredClone(binding);
+    };
+    const bundle = await createControlledGitRuntimeBundle(setup.config, {
+      controlledGitServiceFactory: () => service,
+    });
+    await bundle.preparer.prepare(input);
+    broken = true;
+    await assert.rejects(bundle.preparer.prepare(input), { code: failure === "throw"
+      ? "CONTROLLED_GIT_PREPARATION_TAMPERED" : "CONFLICT_PREPARATION_VERIFICATION_MISMATCH" });
+    assert.equal(service.calls.inspect.length, 1);
+    broken = false;
+    await bundle.preparer.prepare(input);
+    assert.equal(service.calls.inspect.length, 2);
+  });
+}
+
+test("cached material still fences input changes during asynchronous verification", async (t) => {
+  const setup = await fixture(t);
+  const input = pullRequestBinding();
+  const service = fakeService(preparationFor(input));
+  let started, release, blocked = false;
+  const verifying = new Promise(resolve => { started = resolve; });
+  const resume = new Promise(resolve => { release = resolve; });
+  service.verifyConflictPreparation = async ({ binding }) => {
+    if (blocked) {
+      started();
+      await resume;
+    }
+    return binding;
+  };
+  const bundle = await createControlledGitRuntimeBundle(setup.config, {
+    controlledGitServiceFactory: () => service,
+  });
+  await bundle.preparer.prepare(input);
+  blocked = true;
+  const pending = bundle.preparer.prepare(input);
+  await verifying;
+  input.headRevision += 1;
+  release();
+  await assert.rejects(pending, { code: "CONFLICT_PREPARATION_INPUT_CHANGED" });
+  assert.equal(service.calls.inspect.length, 1);
+});
+
+test("sealed material reuse is bounded and cold after runtime restart", async (t) => {
+  const setup = await fixture(t);
+  const input = pullRequestBinding();
+  const service = fakeService(preparationFor(input));
+  const createBundle = () => createControlledGitRuntimeBundle(setup.config, {
+    controlledGitServiceFactory: () => service,
+  });
+  const bundle = await createBundle();
+  for (let inputRevision = 1; inputRevision <= 33; inputRevision += 1) {
+    await bundle.preparer.prepare(pullRequestBinding({ inputRevision }));
+  }
+  await bundle.preparer.prepare(pullRequestBinding({ inputRevision: 1 }));
+  assert.equal(service.calls.inspect.length, 34);
+  const restarted = await createBundle();
+  await restarted.preparer.prepare(pullRequestBinding({ inputRevision: 1 }));
+  assert.equal(service.calls.inspect.length, 35);
+});
+
 test("preparer rejects v1, unknown mirrors and clean results without fallback", async (t) => {
   const setup = await fixture(t);
   const inputBinding = pullRequestBinding();
