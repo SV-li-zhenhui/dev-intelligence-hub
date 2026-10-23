@@ -9089,6 +9089,87 @@ test("shutdown closes browser preconnections that have not sent an HTTP request"
   }
 });
 
+test("shutdown closes a reused browser connection whose next HTTP headers are incomplete", { timeout: 2000 }, async (t) => {
+  const events = [];
+  const application = startupApplication({ async close() { events.push('application-close'); } });
+  application.config.port = 4173;
+  const server = createDashboardServer(application, {
+    backgroundWork: { async stop() { events.push('background-stop'); } },
+    writerLease: { async acquire() {}, async close() { events.push('lease-close'); } },
+    shutdownDrainTimeoutMs: 250,
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const accepted = deferred(), finished = deferred();
+  server.once('connection', socket => accepted.resolve(socket));
+  server.once('request', (_request, response) => response.once('finish', finished.resolve));
+  const client = net.createConnection({ host: '127.0.0.1', port: server.address().port });
+  let response = '';
+  client.on('data', chunk => { response += chunk.toString(); });
+  t.after(async () => { client.destroy(); await server.shutdown().catch(() => {}); });
+  try {
+    const socket = await accepted.promise;
+    client.write('GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:4173\r\nConnection: keep-alive\r\n\r\n');
+    await finished.promise;
+    const nextHeaders = new Promise(resolve => socket.once('data', resolve));
+    client.write('GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:4173\r\nX-Pending:');
+    await nextHeaders;
+    const closed = new Promise(resolve => client.once('close', resolve));
+    await server.shutdown();
+    await closed;
+    assert.match(response, /^HTTP\/1\.1 200 /);
+    assert.match(response, /\r\n0\r\n\r\n$/);
+    assert.deepEqual(events, ['background-stop', 'application-close', 'lease-close']);
+  } finally {
+    client.destroy();
+    await server.shutdown().catch(() => {});
+  }
+});
+
+test("shutdown preserves an accepted pipelined POST after an earlier response finishes", { timeout: 2000 }, async (t) => {
+  const started = deferred(), release = deferred(), firstFinished = deferred(), accepted = deferred();
+  const events = [];
+  const application = startupApplication({
+    async refresh() { started.resolve(); return release.promise; },
+    async close() { events.push('application-close'); },
+  });
+  application.config.port = 4173;
+  const server = createDashboardServer(application, { shutdownDrainTimeoutMs: 1000,
+    writerLease: { async acquire() {}, async close() { events.push('lease-close'); } } });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  server.once('connection', socket => accepted.resolve(socket));
+  server.on('request', (incoming, response) => {
+    if (incoming.method === 'GET') response.once('finish', firstFinished.resolve);
+  });
+  const client = net.createConnection({ host: '127.0.0.1', port: server.address().port });
+  const closed = new Promise(resolve => client.once('close', resolve));
+  let response = '', clientError = null, stopping;
+  client.on('data', chunk => { response += chunk.toString(); });
+  client.on('error', error => { clientError = error; });
+  t.after(async () => { release.resolve(healthyRefreshResult()); client.destroy(); await server.shutdown().catch(() => {}); });
+  try {
+    const socket = await accepted.promise;
+    client.write('GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:4173\r\nConnection: keep-alive\r\n\r\n' +
+      'POST /api/refresh HTTP/1.1\r\nHost: 127.0.0.1:4173\r\nOrigin: http://127.0.0.1:4173\r\nX-MyDashboard-Action: 1\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n');
+    await Promise.all([started.promise, firstFinished.promise]);
+    stopping = server.shutdown();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(socket.destroyed, false);
+    assert.deepEqual(events, []);
+    release.resolve(healthyRefreshResult());
+    await stopping;
+    await closed;
+    assert.equal(clientError, null);
+    assert.equal((response.match(/HTTP\/1\.1 200 /g) ?? []).length, 2);
+    assert.equal((response.match(/\r\n0\r\n\r\n/g) ?? []).length, 2);
+    assert.deepEqual(events, ['application-close', 'lease-close']);
+  } finally {
+    release.resolve(healthyRefreshResult());
+    client.destroy();
+    await stopping?.catch(() => {});
+    await server.shutdown().catch(() => {});
+  }
+});
+
 test("shutdown waits for an accepted POST instead of treating it as a browser preconnection", async () => {
   const started = deferred();
   const release = deferred();

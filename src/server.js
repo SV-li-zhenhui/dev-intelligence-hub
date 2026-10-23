@@ -2495,17 +2495,34 @@ function attachServerLifecycle(
   const closeServer = server.close.bind(server);
   let shutdownPromise = null;
   let httpClosing = false;
-  const unusedConnections = new Set();
+  const idleConnections = new Set();
+  const activeRequests = new WeakMap();
   server.on("connection", (socket) => {
     if (httpClosing) {
       socket.destroy();
       return;
     }
-    unusedConnections.add(socket);
-    socket.once("close", () => unusedConnections.delete(socket));
+    idleConnections.add(socket);
+    socket.once("close", () => {
+      idleConnections.delete(socket);
+      activeRequests.delete(socket);
+    });
   });
-  server.prependListener("request", (request) => {
-    unusedConnections.delete(request.socket);
+  server.prependListener("request", (request, response) => {
+    const socket = request.socket;
+    idleConnections.delete(socket);
+    activeRequests.set(socket, (activeRequests.get(socket) ?? 0) + 1);
+    response.once("finish", () => {
+      const remaining = (activeRequests.get(socket) ?? 1) - 1;
+      if (remaining > 0) {
+        activeRequests.set(socket, remaining);
+        return;
+      }
+      activeRequests.delete(socket);
+      if (socket.destroyed) return;
+      idleConnections.add(socket);
+      if (httpClosing) socket.destroySoon();
+    });
   });
 
   async function performShutdown() {
@@ -2516,10 +2533,10 @@ function attachServerLifecycle(
       : Promise.resolve();
     httpClosing = true;
     const closingHttp = closeHttpServer(closeServer);
-    // Browser preconnections never enter an HTTP handler, so server.close()
-    // cannot drain them. Connections that have served a request retain the
-    // normal drain and failure barrier, including unfinished write actions.
-    for (const socket of unusedConnections) socket.destroy();
+    // Incomplete headers on either a new or reused connection have no accepted
+    // handler to drain. Flush earlier responses before closing these sockets;
+    // accepted requests, including pipelined writes, retain their drain barrier.
+    for (const socket of idleConnections) socket.destroySoon();
     const serviceResults = await settleBeforeDeadline(
       [stoppingBackground, closingHttp],
       deadline,
