@@ -9,6 +9,7 @@ import { currentWorkItemEvent, currentWorkItemInputBinding, currentWorkItemExecu
   verifyPullRequestExecutionBinding } from "./work-ledger-pr-source.js";
 import { hasExactLedgerKeys, ledgerDigest } from "./work-ledger-values.js";
 import { moveWorkItem } from "./work-ledger-transitions.js";
+import { reviewDiagnosticState, normalizeRecoveredReviewFailure, recoveredReviewFailureMatches, recoverReviewDiagnostic } from "./work-ledger-review-diagnostic.js";
 
 export const HOST_CONTEXT_RECOVERED = "host_context_facts_recovered";
 
@@ -35,6 +36,16 @@ function requestedDeliveryChild(intent) {
     ? { itemId: question[1], revision: Number(reason[1]), deliveryContext: true } : null;
 }
 
+function requestedReviewChild(intent) {
+  if (intent?.type !== "ask_user" || intent.summary !== "升级复审提案失效的具体诊断缺口" ||
+      intent.reason !== "直属子任务为 blocked/proposal-stale，github-rereview 尚无交付。当前材料的 Head/Base 未变，也未提供提案失效的具体校验原因，无法安全确定恢复方式；已有 APPROVED Review 不能替代本契约权威交付，根任务不能完成。" ||
+      !isDeepStrictEqual(intent.choices, [
+        { id: "provide-stale-diagnostics", label: "补充宿主失效诊断", description: "提供失效校验项与当前有效绑定，保留原子任务及尝试历史，再确定恢复方式。" },
+        { id: "suspend-intentionally", label: "有意暂缓本轮工作", description: "仅在确需停止推进时明确暂缓；不视为 Review 已交付或根任务已完成。" }])) return null;
+  const match = /^请补充子任务 (work-item-[a-f0-9]{64}) 的 proposal-stale 宿主校验原因及当前有效绑定，以确定原任务的恢复路径。这是缺失的执行诊断，不是请求再次授权常规 Review；目前没有本轮发布成功的证据。$/.exec(intent.question);
+  return match ? { itemId: match[1], reviewContext: true } : null;
+}
+
 function settledCodeProposalResult(box) {
   if (box.intent.type !== "propose_code_action" || box.dispatchBinding === null) return null;
   try {
@@ -47,12 +58,13 @@ function settledCodeProposalResult(box) {
 export function hostContextRetirement(outbox) {
   const proof = outbox?.outcome?.details?.hostContextRetirement;
   const delivery = normalizeRecordedDeliveryFailure(proof?.failure, proof?.childRevision);
+  const review = normalizeRecoveredReviewFailure(proof?.failure, proof?.childRevision);
   if (!hasExactLedgerKeys(proof, ["schemaVersion", "intentId", "questionRef", "workItemRevision", "reason",
     "inputBinding", "childId", "childRevision", "childInputBinding", "failure", "recoveryKey", "digest"]) ||
       proof.schemaVersion !== 1 || proof.reason !== HOST_CONTEXT_RECOVERED || proof.intentId !== outbox.intentId ||
       proof.questionRef !== outbox.outcome.details.questionRef || outbox.status !== "delivered" || outbox.outcome.status !== "delivered" ||
       !Number.isSafeInteger(proof.workItemRevision) || proof.workItemRevision < 1 ||
-      !((delivery?.code === "ORCHESTRATOR_EVIDENCE_REJECTED") ||
+      !(review || (delivery?.code === "ORCHESTRATOR_EVIDENCE_REJECTED") ||
         (["delivery-evidence-incompatible", "policy-binding-invalid"].includes(proof.failure?.code) &&
           proof.failure.stage === undefined && proof.failure.downstreamCreated === false)) ||
       !isDeepStrictEqual(proof.childInputBinding, outbox.sourceBinding)) return null;
@@ -65,23 +77,28 @@ export function hostContextRecoveryCandidate(state, item) {
   if (item?.kind === "graph_task") return childPolicyContextCandidate(state, item);
   if (state.attentionCursor < state.attentionHighWatermark || item?.kind !== "source_root" || item.status !== "waiting_user" ||
       item.currentTarget?.id !== "orchestrator" || item.sourceQuarantine !== null || item.ownerId !== null ||
-      item.leaseId !== null || item.leaseUntil !== null || !isOwnerRequestedCiRepairEvent(currentWorkItemEvent(item))) return null;
+      item.leaseId !== null || item.leaseUntil !== null) return null;
+  const event = currentWorkItemEvent(item);
+  const reviewEvent = event?.eventType === "pull_request.owner_requested" && event.source.provider === "local-owner" &&
+      item.source?.scope.kind === "owner_requested" && event.payload.workType === "general" && event.payload.suggestedCapability === "pr-review" &&
+      ["review", "rereview"].includes(event.payload.nextAction) && event.payload.expectedHeadRefOid === event.payload.headRefOid;
+  const ciEvent = isOwnerRequestedCiRepairEvent(event);
+  if (!reviewEvent && !ciEvent) return null;
   const ask = state.outbox.find(entry => entry.intentId === item.activeIntentId);
-  const wanted = requestedChild(ask?.intent);
+  const wanted = (reviewEvent ? requestedReviewChild(ask?.intent) : null) ?? (ciEvent ? requestedChild(ask?.intent) : null);
   if (!wanted || ask.itemId !== item.itemId || ask.inputDigest !== item.inputDigest || ask.requestedBy.roleId !== "orchestrator" ||
       ask.requestedBy.workerId !== "employee-orchestrator" || ask.status !== "delivered" || ask.outcome?.status !== "delivered" ||
       ask.outcome.details?.resultAttestation || !/^attention-[a-f0-9]{64}$/.test(ask.outcome.details?.questionRef ?? "") ||
       ask.dispatchBinding?.boundIntent?.kind !== "attention_request" ||
       !isDeepStrictEqual(ask.sourceBinding, currentWorkItemInputBinding(item))) return null;
   const child = state.items.find(entry => entry.itemId === wanted.itemId);
-  if (child?.revision !== wanted.revision || child.graph?.parentItemId !== item.itemId ||
+  if (!child || (!wanted.reviewContext && child.revision !== wanted.revision) || child.graph?.parentItemId !== item.itemId ||
       child.leaseUntil !== null ||
       !isDeepStrictEqual(currentWorkItemInputBinding(child), currentWorkItemInputBinding(item))) return null;
   if (state.outbox.some(entry => [item.itemId, child.itemId].includes(entry.itemId) &&
       ["pending", "dispatching", "unknown"].includes(entry.status))) return null;
-  const failure = wanted.deliveryContext
-    ? recordedDeliveryFailure(child, state.timeline.findLast(entry => entry.itemId === child.itemId))
-    : unstartedDeliveryContractFailure(child, state.outbox);
+  const failure = wanted.reviewContext ? reviewDiagnosticState(state, child) : wanted.deliveryContext
+    ? recordedDeliveryFailure(child, state.timeline.findLast(entry => entry.itemId === child.itemId)) : unstartedDeliveryContractFailure(child, state.outbox);
   if (wanted.deliveryContext && (child.currentTarget?.id !== "developer" || failure?.code !== "ORCHESTRATOR_EVIDENCE_REJECTED" ||
       child.graph.deliveries.at(-1)?.status === "submitted" ||
       !child.graph.deliveries.some(entry => entry.status === "accepted" && child.graph.acceptanceContracts
@@ -95,14 +112,17 @@ export function hostContextRecoveryCandidate(state, item) {
   // Outboxes are retained with their root (capacity rejects instead of evicting
   // active history). Exclude question/failed-intent IDs from the durable one-shot key.
   const { intentId: _failedIntentId, ...retainedCause } = failure;
-  const cause = wanted.deliveryContext ? { code: failure.code, stage: failure.stage,
+  const cause = wanted.reviewContext ? { code: failure.code, stage: failure.stage, proposalId: failure.proposalId, resultDigest: failure.resultDigest,
+    contractDigest: deliveryAcceptanceContractDigest(child.graph.acceptanceContracts.at(-1)) } : wanted.deliveryContext ? { code: failure.code, stage: failure.stage,
     contractDigest: deliveryAcceptanceContractDigest(child.graph.acceptanceContracts.at(-1)) } : retainedCause;
   const recoveryKey = ledgerDigest({ rootItemId: item.itemId, inputBinding, childId: child.itemId,
     childInputBinding: currentWorkItemInputBinding(child), cause });
   if (state.outbox.some(entry => hostContextRetirement(entry)?.recoveryKey === recoveryKey)) return null;
   return { item, child, ask, inputBinding, failure, recoveryKey,
-    ...(wanted.deliveryContext ? { guardedChildItemId: child.itemId } : {}),
-    snapshotDigest: canonicalJsonDigest({ item, child, ask, failure }) };
+    ...(wanted.deliveryContext || wanted.reviewContext ? { guardedChildItemId: child.itemId } : {}),
+    ...(wanted.reviewContext ? { reviewDiagnostics: true, confirmationIds: failure.confirmationIds } : {}),
+    snapshotDigest: canonicalJsonDigest({ item, child, ask, failure,
+      ...(wanted.reviewContext ? { boxes: state.outbox.filter(box => [item.itemId, child.itemId].includes(box.itemId)) } : {}) }) };
 }
 
 function childPolicyContextCandidate(state, item) {
@@ -176,9 +196,10 @@ export function hasPendingHostContextRecovery(state, item) {
   const child = state.items.find(entry => entry.itemId === proof.childId);
   if (child?.revision !== proof.childRevision || child.graph?.parentItemId !== item.itemId ||
       !isDeepStrictEqual(currentWorkItemInputBinding(child), proof.childInputBinding) ||
-      !isDeepStrictEqual(proof.failure.stage === "delivery"
+      !(proof.failure.stage === "review" ? recoveredReviewFailureMatches(state, child, proof.failure) && item.decisionContext?.contentDigest === proof.failure.diagnosticDigest
+        : isDeepStrictEqual(proof.failure.stage === "delivery"
         ? recordedDeliveryFailure(child, state.timeline.findLast(entry => entry.itemId === child.itemId))
-        : unstartedDeliveryContractFailure(child, state.outbox), proof.failure)) return false;
+        : unstartedDeliveryContractFailure(child, state.outbox), proof.failure))) return false;
   try { verifyPullRequestExecutionBinding(state, binding); } catch { return false; }
   return true;
 }
@@ -215,7 +236,8 @@ function hasStoppedDecision(candidate, control, now) {
     Date.parse(receipt.registeredAt) <= Date.parse(receipt.modelStartedAt) && Date.parse(receipt.modelStartedAt) <= Date.parse(receipt.finishedAt) &&
     Date.parse(receipt.finishedAt) <= Date.parse(ask.createdAt) && Date.parse(ask.createdAt) <= Date.parse(ask.updatedAt);
   return rootStopped && (!candidate.guardedChildItemId ||
-    (stoppedDecisionRun(control.childRun, candidate.child.itemId, "developer", candidate.child.revision - 1, now) &&
+    (stoppedDecisionRun(control.childRun, candidate.child.itemId, candidate.reviewDiagnostics ? "pr-engineer" : "developer",
+      candidate.child.revision - (candidate.reviewDiagnostics ? 3 : 1), now) &&
       Date.parse(control.childRun.receipt.finishedAt) <= Date.parse(candidate.failure.recordedAt)));
 }
 
@@ -225,11 +247,16 @@ export function planHostContextRecovery({ state, captured, control, clock }) {
   if (!candidate || candidate.snapshotDigest !== captured.snapshotDigest || !hasStoppedDecision(candidate, control, now)) {
     return { write: false, result: { retried: 0 } };
   }
-  const { item, child, ask, inputBinding, failure, recoveryKey } = candidate;
+  const { item, child, ask, inputBinding, recoveryKey } = candidate;
+  let failure = candidate.failure;
+  const recoveredReview = candidate.reviewDiagnostics ? recoverReviewDiagnostic(state, candidate, control, now) : null;
+  if (candidate.reviewDiagnostics && !recoveredReview) return { write: false, result: { retried: 0 } };
+  if (recoveredReview) failure = recoveredReview.failure;
   const readyForOrchestration = Boolean(candidate.guardedChildItemId);
   const updated = moveWorkItem(item, { status: readyForOrchestration ? "queued" : "retry_wait", now,
     ...(readyForOrchestration ? {} : { availableAt: now }),
-    reason: HOST_CONTEXT_RECOVERED, activeIntentId: null });
+    reason: HOST_CONTEXT_RECOVERED, activeIntentId: null,
+    ...(recoveredReview ? { decisionContext: recoveredReview.decisionContext } : {}) });
   const core = { schemaVersion: 1, intentId: ask.intentId, questionRef: ask.outcome.details.questionRef,
     workItemRevision: updated.revision, reason: HOST_CONTEXT_RECOVERED, inputBinding,
     childId: child.itemId, childRevision: child.revision, childInputBinding: currentWorkItemInputBinding(child), failure, recoveryKey };

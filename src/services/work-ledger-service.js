@@ -1192,7 +1192,7 @@ export class WorkLedgerService {
     const hostRetirement = hostContextRetirement(intent);
     const maintenance = systemMaintenanceRetirement(intent) ?? hostRetirement ?? ciRetirement;
     if (item && intent?.itemId === item.itemId && intent.requestedBy.roleId === input.producer.roleId && maintenance !== null) {
-      return { status: ciRetirement || hostRetirement?.failure.stage === "delivery" ? "queued" : "retry_wait",
+      return { status: ciRetirement || ["delivery", "review"].includes(hostRetirement?.failure.stage) ? "queued" : "retry_wait",
         workItemRevision: maintenance.workItemRevision, reason: maintenance.reason };
     }
     if (
@@ -1694,6 +1694,7 @@ export class WorkLedgerService {
         const candidate = ci ?? hostContextRecoveryCandidate(this.state, item);
         if (candidate) candidates.push({ itemId: item.itemId, snapshotDigest: candidate.snapshotDigest,
           ...(ci ? { ciMaterials: true, inputBinding: ci.readBinding, event: ci.readEvent } : {}),
+          ...(candidate.reviewDiagnostics ? { reviewDiagnostics: true, confirmationIds: candidate.confirmationIds } : {}),
           ...(candidate.decisionOwner ? { controlItemId: candidate.decisionOwner.itemId, childItemId: item.itemId }
             : candidate.guardedChildItemId ? { childItemId: candidate.guardedChildItemId } : {}) });
         if (candidates.length >= input.limit - result.retried) break;
@@ -1701,7 +1702,9 @@ export class WorkLedgerService {
       return candidates;
     });
     for (const candidate of captured) {
-      const control = candidate.ciMaterials
+      const control = candidate.reviewDiagnostics
+        ? await this.hostContextRecoveryReader.readReviewDiagnostics?.({ itemId: candidate.itemId, childItemId: candidate.childItemId,
+          confirmationIds: candidate.confirmationIds }) : candidate.ciMaterials
         ? await this.hostContextRecoveryReader.readCiMaterials?.({ itemId: candidate.itemId, inputBinding: candidate.inputBinding, event: candidate.event })
         : await this.hostContextRecoveryReader.read({ itemId: candidate.controlItemId ?? candidate.itemId,
           ...(candidate.childItemId ? { childItemId: candidate.childItemId } : {}) });

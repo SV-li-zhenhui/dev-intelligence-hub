@@ -12,10 +12,18 @@ import { ledgerDigest } from "./work-ledger-values.js";
 const settlements = new WeakMap();
 const digest = (value) => ledgerDigest(value, { maximumEntries: 30_000 });
 
+function legacyStaleConfirmation(decision) {
+  const value = decision?.value;
+  const match = value?.summary === "GitHub Review 提案已失效" && Array.isArray(value.evidence) && value.evidence.length === 1 && typeof value.evidence[0] === "string" &&
+    /^confirmation:(confirmation-github-review-[a-f0-9]{64})$/.exec(value.evidence[0]);
+  return match && (value.downstreamRef === null || value.downstreamRef === match[1]) ? match[1] : null;
+}
+
 export function isChangedReviewConfirmationDecision(decision) {
   const value = decision?.value;
   if (decision?.source !== "proposal" || decision.outcome !== "stale" ||
       typeof decision.referenceId !== "string" || value?.kind !== "github_review_proposal" || !Array.isArray(value.evidence)) return false;
+  if (legacyStaleConfirmation(decision)) return true;
   if (value.downstreamRef === null) return value.evidence.length === 2 &&
     value.evidence[0] === "authorization_changed" && value.evidence[1] === `proposal:${decision.referenceId}`;
   return typeof value.downstreamRef === "string" && value.downstreamRef.startsWith("confirmation-github-review-") &&
@@ -27,7 +35,8 @@ export function isChangedReviewConfirmationDecision(decision) {
 function deliveredProposalBinding(item, outbox, proposal) {
   const sourceBinding = normalizePullRequestInputBinding(outbox.sourceBinding);
   const binding = normalizePullRequestExecutionBinding(proposal.binding.inputBinding);
-  if (binding.schemaVersion !== 2 || outbox.inputDigest !== sourceBinding.inputDigest ||
+  const expectedInputDigest = item.kind === "graph_task" ? item.inputDigest : sourceBinding.inputDigest;
+  if (binding.schemaVersion !== 2 || outbox.inputDigest !== expectedInputDigest ||
       !Object.entries(sourceBinding).every(([key, value]) => binding[key] === value)) return null;
   if (digest(sourceBinding) === digest(currentWorkItemInputBinding(item))) {
     return samePullRequestExecutionBinding(binding, currentWorkItemExecutionBinding(item)) ? binding : null;
@@ -91,6 +100,8 @@ export function reviewConfirmationSettlementIds(item, outboxById) {
     const delivered = matchingDeliveredProposal(item, outboxById);
     if (!delivered) return [];
     const ids = [...new Set(historicalPlans(delivered).map((plan) => plan.id))];
+    const legacy = legacyStaleConfirmation(item.decisionContext);
+    if (legacy && !ids.includes(legacy)) return [];
     return item.decisionContext.value.downstreamRef === null || ids.includes(item.decisionContext.value.downstreamRef) ? ids : [];
   } catch { return []; }
 }
@@ -100,6 +111,8 @@ export function createCompletedReviewConfirmationSettlement(item, outboxById, sn
     const delivered = matchingDeliveredProposal(item, outboxById);
     if (!delivered || !Array.isArray(snapshots)) return null;
     const plans = historicalPlans(delivered);
+    const legacy = legacyStaleConfirmation(item.decisionContext);
+    if (legacy && !plans.some(plan => plan.id === legacy)) return null;
     if (item.decisionContext.value.downstreamRef !== null &&
         !plans.some((plan) => plan.id === item.decisionContext.value.downstreamRef)) return null;
     const completed = [];

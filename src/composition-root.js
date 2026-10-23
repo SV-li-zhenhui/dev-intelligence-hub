@@ -1431,6 +1431,21 @@ export async function createApplication({
             return observed?.ciEvidence && control ? { ...control, ciEvidence: observed.ciEvidence } : null;
           } catch (error) { if (error?.code === "CODE_CI_REPAIR_CONTEXT_UNAVAILABLE") return null; throw error; }
         },
+        async readReviewDiagnostics({ itemId, childItemId, confirmationIds }) {
+          if (!Array.isArray(confirmationIds) || confirmationIds.length < 1 || confirmationIds.length > 4 ||
+              new Set(confirmationIds).size !== confirmationIds.length ||
+              !confirmationIds.every(id => typeof id === "string" && /^confirmation-github-review-[a-f0-9]{64}$/.test(id)) ||
+              typeof confirmationRuntime?.confirmationSettlementReader?.read !== "function") return null;
+          const confirmations = await Promise.all(confirmationIds.map(confirmationId =>
+            confirmationRuntime.confirmationSettlementReader.read({ confirmationId })));
+          const config = (await configurationRuntime?.reader?.readActive())?.configuration;
+          const roles = await Promise.all(["orchestrator", "pr-engineer"].map(id => codeAuthorizationRoleRegistry?.get(id)?.roleView()));
+          if (config?.githubActions?.enabled !== true || config.githubActions.automaticReview !== true ||
+              config.workCoordination?.enabled !== true || roles.some(role => role?.enabled !== true || role.paused === true)) return null;
+          try { return { actorAccountId: config.githubActions.actorAccountId, confirmations,
+            run: await taskRuns.get("work-item", itemId), childRun: await taskRuns.get("work-item", childItemId) }; }
+          catch (error) { if (error?.code === "TASK_RUN_NOT_FOUND") return null; throw error; }
+        },
       });
       workLedgerRuntime = trackRuntime(
         await workLedgerRuntimeFactory({

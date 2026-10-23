@@ -1330,6 +1330,9 @@ import { WorkLedgerService } from "../src/services/work-ledger-service.js";
 import { createCodeJobGrant, CODE_JOB_ACTIONS_BY_OPERATION } from "../src/domain/code-job-contract.js";
 import { createCodeActionProposalConfirmationPlan } from "../src/domain/code-action-proposal-confirmation.js";
 import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
+import { createGitHubReviewProposalConfirmationPlan } from "../src/domain/github-review-proposal-confirmation.js";
+import { reviewDiagnosticState } from "../src/services/work-ledger-review-diagnostic.js";
+import { isChangedReviewConfirmationDecision, reviewConfirmationSettlementIds } from "../src/services/work-ledger-review-confirmation-settlement.js";
 import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
 import { CodeJobStore } from "../src/services/code-job-store.js";
 import { CodeJobApprovalExecutor } from "../src/services/code-job-approval-executor.js";
@@ -18476,4 +18479,172 @@ test('the same delivery failure and contract cannot consume another host recover
   const proof = f.store.stored().outbox.find(box => box.intentId === f.askId).outcome.details.hostContextRetirement;
   before.outbox.find(box => box.intentId === f.askId).outcome.details.hostContextRetirement = clone(proof);
   assert.equal(hostContextRecoveryCandidate(before, before.items.find(item => item.itemId === f.rootId)), null);
+});
+
+async function pendingReviewDiagnosticFixture() {
+  let control, queue;
+  const reads = [];
+  const reader = {
+    async read() { assert.fail('Review recovery must use its own automatic mode and role checks'); },
+    async readReviewDiagnostics(input) {
+      reads.push(clone(input));
+      return { ...clone(control), confirmations: await Promise.all(input.confirmationIds.map(confirmationId => queue.readSettlement({ confirmationId }))) };
+    },
+    async withStoppedRuns(_control, operation) { return { executed: true, result: await operation() }; },
+  };
+  const record = ownerRequestedPrAssignment(1, { gitFacts: { ...prGitFacts(PR_HEAD_A), workType: 'general',
+    state: 'open', nextAction: 'rereview', suggestedCapability: 'pr-review', expectedHeadRefOid: PR_HEAD_A } });
+  record.assignment.target = { type: 'role', id: 'orchestrator' };
+  const f = await createFixture({ records: [record], hostContextRecoveryReader: reader });
+  await f.service.intake();
+  let root = (await f.service.listItems()).items[0];
+  const command = prGraphChildCommand(root, (await f.service.getSummary()).revision, 'review-existing-head');
+  command.command.target.id = 'pr-engineer';
+  command.command.acceptanceContract.expectedDeliverables = [{ deliverableId: 'github-rereview', kind: 'github-review', description: 'Published review', required: true }];
+  const created = await f.service.createGraphChild(command);
+  let child = await f.service.readItemForReconciliation({ itemId: created.taskId });
+  child = await f.service.claim({ itemId: child.itemId, expectedRevision: child.revision, workerId: 'employee-pr-engineer', leaseDurationMs: 30000 });
+  const decisionRevision = child.revision;
+  await f.service.stageIntent({ itemId: child.itemId, expectedRevision: child.revision, leaseId: child.leaseId,
+    actorId: 'employee-pr-engineer', roleId: 'pr-engineer', intent: reviewIntent() });
+  let proposal;
+  const dispatcher = new WorkIntentDispatcher({ ledger: f.service, clock: f.time.clock,
+    policy: createWorkIntentPolicy({ githubReviewRoles: ['pr-engineer'] }),
+    attentionProducer: { async create() { assert.fail('unexpected attention dispatch'); } },
+    proposalProducer: { async create(value) { proposal = normalizeBoundWorkProposal(value);
+      return { proposalId: proposal.proposalId, contentDigest: proposal.contentDigest, kind: proposal.kind,
+        status: 'pending_delivery', revision: 1, createdAt: f.time.clock() }; } } });
+  const dispatched = await dispatcher.dispatchPending();
+  assert.equal(dispatched.delivered, 1, JSON.stringify((await f.service.listOutbox()).items.map(box => box.outcome)));
+  const actorAccountId = prExecutionBinding(root).gitTarget.sourceAccountId;
+  queue = new ConfirmationQueue({ store: new MemoryStore(), exclusiveLease: new ExclusiveLease(),
+    clock: () => new Date(f.time.clock()), executor: { async execute() { assert.fail('no Review publication'); }, async reconcile() { assert.fail('no Review replay'); } } });
+  await queue.recover();
+  const plan = createGitHubReviewProposalConfirmationPlan(proposal, { actorAccountId, legacyRecovery: true });
+  const queued = await queue.enqueue(plan);
+  await queue.invalidate(queued.id, { requestedBy: proposal.requestedBy, approvalBindingDigest: queued.approvalBindingDigest, reason: 'authorization_changed' });
+  const result = createWorkProposalResult({ proposal, sequence: 1, transition: { status: 'stale', summary: 'GitHub Review 提案已失效',
+    evidence: [`confirmation:${queued.id}`] }, downstreamRef: null, at: f.time.clock() });
+  await f.service.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+  root = await f.service.readItemForReconciliation({ itemId: root.itemId });
+  child = await f.service.readItemForReconciliation({ itemId: child.itemId });
+  const stopped = (item, roleId, taskRevision) => ({ kind: 'work-item', taskId: item.itemId, roleId, active: false, mode: 'active', pendingCommand: null,
+    stopUnconfirmed: false, phase: 'completed', receipt: { kind: 'work-item', taskId: item.itemId, roleId, taskRevision,
+      registeredAt: f.time.clock(), modelStartedAt: f.time.clock(), finishedAt: f.time.clock(), phase: 'completed', stopConfirmed: true } });
+  control = { actorAccountId, run: stopped(root, 'orchestrator', root.revision), childRun: stopped(child, 'pr-engineer', decisionRevision) };
+  const question = `请补充子任务 ${child.itemId} 的 proposal-stale 宿主校验原因及当前有效绑定，以确定原任务的恢复路径。这是缺失的执行诊断，不是请求再次授权常规 Review；目前没有本轮发布成功的证据。`;
+  const choices = [{ id: 'provide-stale-diagnostics', label: '补充宿主失效诊断', description: '提供失效校验项与当前有效绑定，保留原子任务及尝试历史，再确定恢复方式。' },
+    { id: 'suspend-intentionally', label: '有意暂缓本轮工作', description: '仅在确需停止推进时明确暂缓；不视为 Review 已交付或根任务已完成。' }];
+  const staged = await f.service.stageGraphEscalation({ authority: { actorId: 'employee-orchestrator', scopeRootTaskId: root.itemId }, command: {
+    taskId: root.itemId, expectedTaskRevision: root.revision, expectedGraphRevision: (await f.service.getSummary()).revision,
+    summary: '升级复审提案失效的具体诊断缺口',
+    reason: '直属子任务为 blocked/proposal-stale，github-rereview 尚无交付。当前材料的 Head/Base 未变，也未提供提案失效的具体校验原因，无法安全确定恢复方式；已有 APPROVED Review 不能替代本契约权威交付，根任务不能完成。', question, choices } });
+  let ask = await f.service.claimIntent({ intentId: staged.outbox.intentId, expectedRevision: staged.outbox.revision, dispatcherId: 'work-intent-dispatcher', leaseDurationMs: 30000 });
+  ask = await f.service.bindIntent({ intentId: ask.intentId, expectedRevision: ask.revision, dispatchLeaseId: ask.dispatchLeaseId,
+    dispatcherId: 'work-intent-dispatcher', itemExpectedRevision: staged.item.revision, boundIntent: boundAttentionIntent(staged.item, ask) });
+  const request = normalizeAttentionRequest({ requestKey: ask.intentId, type: 'ask_user', producer: { roleId: 'orchestrator', workItemId: root.itemId }, question, choices, context: [] });
+  const attention = createAttentionItem(request, 1, f.time.clock());
+  await f.service.ackIntent({ intentId: ask.intentId, expectedRevision: ask.revision, dispatchLeaseId: ask.dispatchLeaseId,
+    itemExpectedRevision: staged.item.revision, actorId: 'work-intent-dispatcher', outcome: 'delivered', nextStatus: 'waiting_user', details: { questionRef: attention.requestId } });
+  return { ...f, rootId: root.itemId, childId: child.itemId, askId: ask.intentId, request, attention, queue, control, reads };
+}
+
+test('recorded Review revocation supplies host diagnostics and archives the old question without publishing or accepting a Review', async () => {
+  const f = await pendingReviewDiagnosticFixture();
+  const child = await f.service.readItemForReconciliation({ itemId: f.childId });
+  const reviewBox = f.store.stored().outbox.find(box => box.itemId === child.itemId);
+  assert.deepEqual(reviewBox.sourceBinding, currentWorkItemInputBinding(child));
+  assert.deepEqual(reviewBox.dispatchBinding.boundIntent.binding.inputBinding, prExecutionBinding(child));
+  assert.equal(isChangedReviewConfirmationDecision(child.decisionContext), true);
+  assert.ok(reviewConfirmationSettlementIds(child, new Map(f.store.stored().outbox.map(box => [box.intentId, box]))).length, 'matching historical confirmation plans');
+  assert.ok(reviewDiagnosticState(f.store.stored(), child));
+  const before = await f.service.readItemForReconciliation({ itemId: f.rootId });
+  const candidate = hostContextRecoveryCandidate(f.store.stored(), before);
+  assert.ok(candidate);
+  const inbox = new AttentionInbox({ store: new MemoryStore(), exclusiveLease: new ExclusiveLease(), authority: f.service, clock: f.time.clock });
+  await inbox.recover(); await inbox.create(f.request);
+  assert.deepEqual(await inbox.retrySystemQuestions(), { retried: 1 }, JSON.stringify(f.reads));
+  const parent = await f.service.readItemForReconciliation({ itemId: f.rootId });
+  assert.equal(parent.status, 'queued');
+  assert.equal(parent.decisionContext.value.kind, 'host_review_diagnostic');
+  assert.equal(parent.decisionContext.value.invalidationReason, 'authorization_changed');
+  assert.equal(parent.decisionContext.value.publicationExecuted, false);
+  assert.equal(parent.decisionContext.value.contractSatisfied, false);
+  assert.deepEqual(await f.service.readItemForReconciliation({ itemId: f.childId }), child);
+  assert.deepEqual(await inbox.archiveRetired(), { archived: 1 });
+  assert.equal((await inbox.readOutbox()).items.length, 0);
+  const ready = await f.service.listClaimCandidates({ at: f.time.clock(), roleId: 'orchestrator' });
+  assert.equal(ready.facts.find(row => row.itemId === f.rootId).orchestrationReady, true);
+  const late = resolveAttentionItem(f.attention, { type: 'choice', choiceId: 'suspend-intentionally' }, 2, f.time.clock(), 1).outbox;
+  await f.service.applyAttentionBatch({ items: [late], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+  assert.deepEqual(await f.service.readItemForReconciliation({ itemId: f.rootId }), parent);
+  // Exercise the normal coordinator's cleanup path, without a replacement Review.
+  await f.service.cancelGraphTask({ authority: { actorId: 'employee-orchestrator', scopeRootTaskId: parent.itemId }, command: {
+    taskId: child.itemId, expectedTaskRevision: child.revision, expectedGraphRevision: (await f.service.getSummary()).revision,
+    reason: 'Already-reviewed Head has left this automatic assignment' } });
+  const claimed = await f.service.claim({ itemId: parent.itemId, expectedRevision: parent.revision,
+    workerId: 'employee-orchestrator', leaseDurationMs: 30000 });
+  await f.service.complete({ itemId: claimed.itemId, expectedRevision: claimed.revision, leaseId: claimed.leaseId,
+    actorId: 'employee-orchestrator', result: { outcome: 'obsolete-review-request-retired' } });
+  assert.equal((await f.service.readItemForReconciliation({ itemId: parent.itemId })).status, 'completed');
+});
+
+test('Review diagnostic recovery preserves paused owners, user decisions, effects and exact confirmation authority', async t => {
+  const f = await pendingReviewDiagnosticFixture();
+  const saved = clone(f.store.stored()), root = saved.items.find(item => item.itemId === f.rootId);
+  const captured = { itemId: root.itemId, snapshotDigest: hostContextRecoveryCandidate(saved, root).snapshotDigest };
+  const ids = hostContextRecoveryCandidate(saved, root).confirmationIds;
+  const control = { ...clone(f.control), confirmations: await Promise.all(ids.map(confirmationId => f.queue.readSettlement({ confirmationId }))) };
+  for (const variant of ['root-paused', 'child-paused', 'root-active', 'child-active', 'root-command', 'child-command', 'unknown-stop',
+    'root-revision', 'child-revision', 'child-receipt-role', 'account', 'business-question', 'selected-choice', 'source-left', 'source-pending',
+    'pending-effect', 'unknown-effect', 'changed-child-input', 'unbound-result', 'wrong-reference', 'missing-confirmation',
+    'pending-confirmation', 'executing-confirmation', 'completed-confirmation', 'rejected-confirmation', 'unknown-confirmation-effect',
+    'different-invalidation', 'confirmation-binding', 'duplicate-snapshot', 'changed-history']) await t.test(variant, () => {
+    const state = clone(saved), observed = clone(control), parent = state.items.find(item => item.itemId === f.rootId);
+    const child = state.items.find(item => item.itemId === f.childId), ask = state.outbox.find(box => box.intentId === f.askId);
+    const box = state.outbox.find(box => box.itemId === child.itemId), confirmation = observed.confirmations.find(value => value !== null);
+    if (variant === 'root-paused') observed.run.mode = 'paused';
+    if (variant === 'child-paused') observed.childRun.mode = 'paused';
+    if (variant === 'root-active') observed.run.active = true;
+    if (variant === 'child-active') observed.childRun.active = true;
+    if (variant === 'root-command') observed.run.pendingCommand = { type: 'pause' };
+    if (variant === 'child-command') observed.childRun.pendingCommand = { type: 'pause' };
+    if (variant === 'unknown-stop') observed.childRun.receipt.stopConfirmed = false;
+    if (variant === 'root-revision') parent.revision++;
+    if (variant === 'child-revision') child.revision++;
+    if (variant === 'child-receipt-role') observed.childRun.receipt.roleId = 'developer';
+    if (variant === 'account') observed.actorAccountId = 'other-user';
+    if (variant === 'business-question') ask.intent.question = 'Should we change the requirements?';
+    if (variant === 'selected-choice') ask.outcome.details.resultAttestation = {};
+    if (variant === 'source-left') parent.source.scope.active = false;
+    if (variant === 'source-pending') parent.source.pendingRevision = 2;
+    if (variant === 'pending-effect') box.status = 'pending';
+    if (variant === 'unknown-effect') box.status = 'unknown';
+    if (variant === 'changed-child-input') box.inputDigest = box.sourceBinding.inputDigest;
+    if (variant === 'unbound-result') box.dispatchBinding = null;
+    if (variant === 'wrong-reference') child.decisionContext.value.evidence[0] = `confirmation:confirmation-github-review-${'f'.repeat(64)}`;
+    if (variant === 'missing-confirmation') observed.confirmations = observed.confirmations.map(() => null);
+    if (variant === 'pending-confirmation') confirmation.item.status = 'pending';
+    if (variant === 'executing-confirmation') confirmation.item.status = 'executing';
+    if (variant === 'completed-confirmation') confirmation.item.status = 'completed';
+    if (variant === 'rejected-confirmation') confirmation.item.status = 'rejected';
+    if (variant === 'unknown-confirmation-effect') confirmation.item.execution = {};
+    if (variant === 'different-invalidation') confirmation.item.invalidation.reason = 'head_changed';
+    if (variant === 'confirmation-binding') confirmation.item.approvalBindingDigest = 'f'.repeat(64);
+    if (variant === 'duplicate-snapshot') observed.confirmations.push(clone(confirmation));
+    if (variant === 'changed-history') box.revision++;
+    assert.equal(planHostContextRecovery({ state, captured, control: observed, clock: f.time.clock }).result.retried, 0);
+  });
+});
+
+test('the same Review diagnostic cannot repeatedly retire questions and malformed legacy evidence stays untrusted', async () => {
+  const f = await pendingReviewDiagnosticFixture();
+  const original = clone(f.store.stored());
+  assert.deepEqual(await f.service.retrySystemMaintenanceQuestions({ limit: 10, requestKeys: [f.askId] }), { retried: 1 });
+  const proof = f.store.stored().outbox.find(box => box.intentId === f.askId).outcome.details.hostContextRetirement;
+  original.outbox.find(box => box.intentId === f.askId).outcome.details.hostContextRetirement = clone(proof);
+  assert.equal(hostContextRecoveryCandidate(original, original.items.find(item => item.itemId === f.rootId)), null);
+  const child = original.items.find(item => item.itemId === f.childId);
+  child.decisionContext.value.evidence = [{ toString: null }];
+  assert.equal(isChangedReviewConfirmationDecision(child.decisionContext), false);
 });

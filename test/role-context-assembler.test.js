@@ -1859,6 +1859,16 @@ test("does not project specialist rejection feedback from a root task", async ()
   assert.equal(JSON.stringify(packet).includes("SECRET-ROOT-REJECTION"), false);
 });
 
+test("a root orchestrator receives recovered Review diagnostics without a synthetic Review delivery", async () => {
+  const fixture = rootOrchestratorFixture();
+  fixture.item.decisionContext = { source: "proposal", referenceId: `work-intent-${DIGEST_A}`, outcome: "stale",
+    value: { kind: "host_review_diagnostic", code: "REVIEW_AUTHORIZATION_CHANGED", invalidationReason: "authorization_changed",
+      publicationExecuted: false, contractSatisfied: false }, observedAt: "2026-08-03T05:00:00.000Z", contentDigest: DIGEST_B };
+  const packet = await assemble(fixture, { roleId: "orchestrator" });
+  assert.deepEqual(packet.context.code.decisionContext, fixture.item.decisionContext);
+  assert.equal(packet.context.requirements.decisionContext, undefined);
+});
+
 test("a configured root orchestrator receives exact direct-child coordination by data class", async () => {
   const fixture = rootOrchestratorFixture();
   const packet = await assemble(fixture, { roleId: "orchestrator" });
