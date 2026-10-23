@@ -2773,7 +2773,18 @@ export class WorkLedgerService {
       const items = batch.items.slice(0, Math.floor(batch.items.length / 2));
       return this.#recordBatch({ ...batch, items, nextSequence: items.at(-1).sequence }, now);
     }
-    await this.#persist(nextState);
+    const stateBeforeCommit = this.state;
+    try {
+      await this.#persist(nextState);
+    } catch (error) {
+      if (error?.code !== "WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID" ||
+          scopeRecoveryRoots !== null || batch.items.length < 2 || this.state !== stateBeforeCommit) throw error;
+      // The source validator rejected preparation before any write. Commit a
+      // valid prefix; retain all remaining feed entries for subsequent intake.
+      const items = batch.items.slice(0, Math.floor(batch.items.length / 2));
+      return this.#recordBatch({ ...batch, items, nextSequence: items.at(-1).sequence },
+        now, deniedCutoverProofs, scopeRecoveryRoots);
+    }
     return cloneLedgerValue({
       received,
       deduplicated,

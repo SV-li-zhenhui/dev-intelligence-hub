@@ -436,9 +436,10 @@ for (const corruption of [3, 4, 5, 6, 'missing activation proof', 'wrong activat
 test('prepared Head activation cannot hide an intermediate Head behind a later metadata budget', async () => {
   let captured;
   const fixture = await batchedHeadActivationFixture({ candidateProcessor: {
-    async prepare(request) { captured = clone(request); return prepareWorkLedgerCandidate(request); },
+    async prepare(request) { captured ??= clone(request); return prepareWorkLedgerCandidate(request); },
     async commit() {}, async discard() {},
   } });
+  captured = null;
   fixture.source.records.push(
     prAssignment(7, { headRefOid: PR_HEAD_C, previousHeadRefOid: PR_HEAD_B,
       changedFields: ['headRefOid'], occurredAt: '2026-08-02T01:00:07.000Z' }),
@@ -446,7 +447,9 @@ test('prepared Head activation cannot hide an intermediate Head behind a later m
       changedFields: ['headRefOid'], occurredAt: '2026-08-02T01:00:08.000Z' }),
   );
   fixture.source.highWatermark = 8;
-  await assert.rejects(fixture.service.intake(), error => error.code === 'WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID');
+  const intake = await fixture.service.intake();
+  assert.ok(intake.cursor > 1 && intake.cursor < 8, 'commit only a strictly valid prefix');
+  const committed = fixture.store.stored();
   const { previousState, limits } = captured;
   const candidate = normalizeWorkLedgerPersistedState(
     appendWorkGraphMemoryEvents(previousState, captured.candidate, limits), limits);
@@ -455,7 +458,7 @@ test('prepared Head activation cannot hide an intermediate Head behind a later m
   assert.doesNotThrow(() => normalizeWorkLedgerPersistedState(candidate, limits));
   assert.throws(() => prepareWorkLedgerCandidate({ previousState, candidate, limits,
     appendGraphMemory: false }), error => error.code === 'WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID');
-  assert.deepEqual(fixture.store.stored(), fixture.previous);
+  assert.deepEqual(fixture.store.stored(), committed);
 });
 
 test('Head activation uses the committed pointer after old source timeline entries are trimmed', async () => {
@@ -17327,3 +17330,60 @@ for (const eventType of ["issue.left_scope", "issue.completed"]) {
     assert.deepEqual((await recovered.service.readItemForReconciliation({ itemId: child.itemId })).graph.deliveries, retired.graph.deliveries);
   });
 }
+
+
+for (const [processorName, createProcessor] of [["local", createLocalWorkLedgerCandidateProcessor],
+  ["worker", createWorkerWorkLedgerCandidateProcessor]]) {
+  test(`${processorName} intake automatically splits scope reentry followed by metadata and preserves later PRs`, async t => {
+    const processor = createProcessor(); t.after(() => processor.close());
+    let f = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })], candidateProcessor: processor });
+    await f.service.intake();
+    const initial = (await f.service.listItems()).items[0];
+    const left = prAssignment(2, { eventType: "pull_request.left_scope", occurredAt: "2026-08-02T01:10:00.000Z",
+      gitFacts: prGitFacts(PR_HEAD_A) });
+    const created = prAssignment(4, { eventType: "pull_request.created", occurredAt: "2026-08-02T01:15:00.000Z",
+      gitFacts: prGitFacts(PR_HEAD_A) });
+    f.source.records.push(prScopeLifecycleAssignment(2, left.event), prScopeLifecycleAssignment(3, created.event), created,
+      prAssignment(5, { occurredAt: "2026-08-02T01:20:00.000Z", title: "Metadata after reentry", gitFacts: prGitFacts(PR_HEAD_A) }),
+      prAssignment(6, { occurredAt: "2026-08-02T01:25:00.000Z", pullRequestNumber: 43 }));
+    f.source.highWatermark = 6;
+    let cursor = 1;
+    for (let turn = 0; cursor < 6 && turn < 8; turn++) {
+      const page = await f.service.intake({ limit: 100 });
+      assert.ok(page.cursor > cursor);
+      assert.equal(page.highWatermark, 6);
+      cursor = page.cursor;
+      f = await createFixture({ store: f.store, source: f.source, time: f.time, candidateProcessor: processor });
+    }
+    assert.equal(cursor, 6);
+    const current = await f.service.readItemForReconciliation({ itemId: initial.itemId });
+    assert.equal(current.source.scope.active, true);
+    assert.equal(current.source.scope.revision, initial.source.scope.revision + 2);
+    assert.equal(current.source.current.event.payload.title, "Metadata after reentry");
+    assert.equal(current.attempt, initial.attempt);
+    assert.ok((await f.service.listItems()).items.some(i => i.source?.identity.pullRequestNumber === 43));
+  });
+}
+
+
+test("an invalid single PR source event remains rejected without skipping its sequence", async () => {
+  const processor = createLocalWorkLedgerCandidateProcessor();
+  let reject = false, preparations = 0;
+  const f = await createFixture({ records: [prAssignment(1)], candidateProcessor: {
+    prepare: q => { if (reject) { preparations++; throw Object.assign(new Error("invalid source"), { code: "WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID" }); } return processor.prepare(q); },
+    commit: () => processor.commit(), discard: () => processor.discard(),
+  } });
+  await f.service.intake();
+  f.source.records.push(prAssignment(2, { title: "New metadata" })); f.source.highWatermark = 2; reject = true;
+  await assert.rejects(f.service.intake(), e => e.code === "WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID");
+  assert.equal(preparations, 1); assert.equal(f.store.stored().intakeCursor, 1);
+});
+
+test("an intake storage failure never starts source-prefix retries", async () => {
+  const f = await createFixture({ records: [prAssignment(1)] }); await f.service.intake();
+  f.source.records.push(prAssignment(2, { title: "First metadata" }), prAssignment(3, { title: "Second metadata" }));
+  f.source.highWatermark = 3; let writes = 0;
+  f.store.write = async () => { writes++; throw new Error("storage unavailable"); };
+  await assert.rejects(f.service.intake(), e => e.code === "WORK_LEDGER_STATE_WRITE_FAILED");
+  assert.equal(writes, 1); assert.equal(f.store.stored().intakeCursor, 1);
+});
