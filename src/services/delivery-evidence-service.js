@@ -2,6 +2,7 @@ import {
   deliveryEvidenceKindsForProposal,
   normalizeDeliveryEvidenceTarget,
 } from "../domain/delivery-evidence-contract.js";
+import { normalizePullRequestExecutionBinding, samePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const SAFE_TASK_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._:/#-]{0,190}[A-Za-z0-9])?$/;
@@ -183,6 +184,11 @@ function proposalSupportsEvidenceKind(proposal, evidenceKind) {
 }
 
 function proposalTarget(proposal, expected, kind, deliverable = null) {
+  if (expected.inputBinding !== undefined) {
+    try {
+      if (!samePullRequestExecutionBinding(proposal?.binding?.inputBinding, expected.inputBinding)) return null;
+    } catch { return null; }
+  }
   if (
     proposal?.requestedBy?.workItemId !== expected.taskId ||
     proposal.requestedBy.roleId !== expected.roleId ||
@@ -483,7 +489,8 @@ export class DeliveryEvidenceService {
 
   async verify(value) {
     const input = ownObject(value, "verify input");
-    const expected = authority(input, { requireDeliverable: true });
+    const expected = { ...authority(input, { requireDeliverable: true }),
+      ...(input.inputBinding === undefined ? {} : { inputBinding: normalizePullRequestExecutionBinding(input.inputBinding) }) };
     const evidence = evidenceRecord(input.evidence);
     const signal = optionalSignal(input.signal);
     checkAbort(signal);

@@ -1,4 +1,6 @@
 import { normalizeWorkDecision } from "../domain/work-intent.js";
+import { isDeepStrictEqual } from "node:util";
+import { permitsReviewPublicationSettlementIntent } from "./review-publication-settlement.js";
 import { samePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { TaskRunControlError } from './task-run-registry.js';
 import { automaticReviewEligibility, automaticReviewContinuationEligibility, automaticReviewWorkAdmission } from "../domain/automatic-review-policy.js";
@@ -1541,11 +1543,14 @@ export class ProactiveWorkLoop {
         ),
       );
       signal.throwIfAborted();
+      if (!permitsReviewPublicationSettlementIntent(context, decision.intent)) throw Object.assign(
+        new Error("Historical Review settlement cannot create new work or ask for renewed authority"),
+        { code: "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION" });
       return decision;
     };
     const first = await decide(packet.context);
     if (first.intent.type !== "query_memory") {
-      await this.#verifyDecisionAuthority(item, worker, packet, signal);
+      await this.#verifyDecisionAuthority(item, worker, packet, signal, first.intent);
       return { decision: first, packet };
     }
     if (this.memoryQueryService === null) {
@@ -1592,11 +1597,12 @@ export class ProactiveWorkLoop {
       worker,
       refreshedPacket,
       signal,
+      second.intent,
     );
     return { decision: second, packet: refreshedPacket };
   }
 
-  async #verifyDecisionAuthority(item, worker, packet, signal) {
+  async #verifyDecisionAuthority(item, worker, packet, signal, intent = null) {
     const current = await withinAbortable(
       (verificationSignal) =>
         this.#readCurrentDecisionItem(item.itemId, verificationSignal),
@@ -1610,6 +1616,14 @@ export class ProactiveWorkLoop {
         new Error("Role decision input changed while the provider was running"),
         { code: "ROLE_DECISION_INPUT_STALE" },
       );
+    }
+    if (intent?.type === "complete" && packet.context.code?.reviewPublicationSettlement !== undefined) {
+      const fresh = await withinAbortable(verificationSignal => this.roleContextAssembler.assemble({
+        roleId: worker.roleId, item, trigger: packet.context.requirements.trigger, signal: verificationSignal,
+      }), this.resolveTimeoutMs, "ROLE_CONTEXT_TIMEOUT", signal);
+      if (!isDeepStrictEqual(fresh.context.code?.reviewPublicationSettlement, packet.context.code.reviewPublicationSettlement) ||
+          !permitsReviewPublicationSettlementIntent(fresh.context, intent)) throw Object.assign(
+        new Error("Historical Review settlement changed before completion"), { code: "ROLE_DECISION_INPUT_STALE" });
     }
     const memoryContext = packet?.context?.memory?.agentQuery;
     if (memoryContext === undefined) return;

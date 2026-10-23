@@ -22,6 +22,7 @@ import { RoleContextAssembler } from "../src/services/role-context-assembler.js"
 import { WorkGraphStore } from "../src/services/work-graph-store.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
 import { RoleDecisionEngine } from "../src/services/role-decision-engine.js";
+import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
 import { DeliveryEvidenceService } from "../src/services/delivery-evidence-service.js";
 import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
 import { currentWorkItemEvent, currentWorkItemExecutionBinding } from "../src/services/work-ledger-pr-source.js";
@@ -1365,7 +1366,7 @@ test("scoped rebase rejects changed inputs, forged digests and intent revisions"
 });
 
 async function refreshedPrDeliveryFixture({ workerId = "employee-pr-engineer", evidenceCatalog,
-  ciDiagnosticReader, checks = [] } = {}) {
+  ciDiagnosticReader, checks = [], deliveryKind = "text-report", settlement = false } = {}) {
   const originalAt = "2026-10-15T18:23:34.401Z";
   const refreshedAt = "2026-10-15T18:39:53.208Z";
   const state = { observedAt: originalAt, factObservedAt: originalAt, facts: { checks }, mutatePacket: null };
@@ -1408,7 +1409,7 @@ async function refreshedPrDeliveryFixture({ workerId = "employee-pr-engineer", e
     return planner.createChild({ parentTaskId: root.itemId, childKey,
       work: { title: childKey, description: "Assess every request against the pinned code" },
       target: { type: "role", id: "pr-engineer" }, dependsOnTaskIds: [], leaseId: null,
-      acceptanceContract: contract({ deliverableId: "rereview-report", kind: "text-report" }),
+      acceptanceContract: contract({ deliverableId: "rereview-report", kind: deliveryKind }),
       expectedGraphRevision: (await graphReader.getSnapshot()).graph.revision,
       expectedTaskRevisions: [{ taskId: parent.itemId, revision: parent.revision }] });
   }
@@ -1417,9 +1418,12 @@ async function refreshedPrDeliveryFixture({ workerId = "employee-pr-engineer", e
   item = await ledger.claim({ itemId: item.itemId, expectedRevision: item.revision,
     workerId, leaseDurationMs: 600_000 });
   const assembler = new RoleContextAssembler({ graphReader, evidenceCatalog, ciDiagnosticReader,
+    ...(settlement ? { settlementInputAuthorityVerifier: { verify: binding => ledger.verifyPullRequestExecutionBinding(binding) },
+      settlementEvidenceVerifier: evidenceCatalog } : {}),
     factSource: { async read({ fact }) { return { healthy: true, fresh: true,
       value: fact === "state" ? "open" : null, observedAt: state.factObservedAt }; } },
     pullRequestContextReader: { async read(input) {
+      if (state.staleFacts) throw Object.assign(new Error("Canonical Base advanced"), { name: "GitHubReadError", code: "PR_FACTS_STALE", statusCode: 409 });
       const executionBinding = createPullRequestExecutionBinding(input);
       const identity = createPullRequestReadIdentity({ executionBinding, event: input.event });
       state.lastFacts = createPullRequestReadFacts({ identity,
@@ -1456,6 +1460,129 @@ async function refreshedPrDeliveryFixture({ workerId = "employee-pr-engineer", e
       item: claimed, contextPacket: packet, intent }),
   };
 }
+
+async function publishedReviewSettlementFixture() {
+  let proposal = null, result = null;
+  const evidence = new DeliveryEvidenceService({ proposalResultReader: {
+    async getResult() { return result; }, async getProposalForEvidence() { return proposal; },
+    async getResultForProposal() { return result; },
+    async listEvidenceCandidates() { return { items: result ? [{ proposal, result }] : [], nextBeforeSequence: null }; },
+  } });
+  const fixture = await refreshedPrDeliveryFixture({ evidenceCatalog: evidence, deliveryKind: "github-review", settlement: true });
+  const { ledger, graph, graphReader, assembler, root, item } = fixture;
+  const acceptance = fixture.original.context.requirements.currentTask.acceptanceContract;
+  const reviewIntent = { schemaVersion: 1, type: "propose_github_review", summary: "Published original input Review",
+    reason: "Complete bound diff assessed", verdict: "comment", body: "Original Head and Base reviewed.",
+    deliverableId: "rereview-report", evidence: [`head:${"b".repeat(40)}`] };
+  const bound = createWorkIntentPolicy({ githubReviewRoles: ["pr-engineer"] }).bind({
+    context: { assignmentId: item.assignmentId, workItemId: item.itemId, roleId: "pr-engineer",
+      event: currentWorkItemEvent(item), inputBinding: currentWorkItemExecutionBinding(item),
+      evidenceTarget: { schemaVersion: 1, taskId: item.itemId, roleId: "pr-engineer", contractRevision: acceptance.revision,
+        contractDigest: deliveryAcceptanceContractDigest(acceptance), deliverables: [{ deliverableId: "rereview-report", kind: "github-review" }] } },
+    intent: reviewIntent,
+  });
+  const { intentId, ...content } = bound;
+  proposal = normalizeBoundWorkProposal({ proposalId: intentId, ...content });
+  result = createWorkProposalResult({ proposal, sequence: 1, transition: { status: "succeeded", summary: "GitHub Review published",
+    evidence: ["confirmation:historical-published-review"] }, downstreamRef: null, at: "2026-10-15T18:34:00.000Z" });
+  const host = new OrchestratorService({ contextAssembler: assembler, graphReader, evidenceVerifier: evidence,
+    clock: () => new Date("2026-10-15T18:34:00.000Z"),
+    scopedGraphPlannerFactory: { forRoot({ scopeRootTaskId }) { return graph.planner({ principalId: "employee-orchestrator", scopeRootTaskId }); } },
+    graphDelivererFactory: { forClaim({ workerId, ...authority }) { return graph.deliverer({ principalId: workerId, ...authority }); } },
+  });
+  const packet = await assembler.assemble({ roleId: "pr-engineer", item, trigger: "scheduled" });
+  await host.execute({ worker: { roleId: "pr-engineer", workerId: "employee-pr-engineer" }, item, contextPacket: packet,
+    intent: { ...fixture.intent, expectedGraphRevision: packet.binding.graphRevision, evidence: [packet.context.code.authoritativeEvidence[0].evidence] } });
+  fixture.state.staleFacts = true;
+  return { ...fixture, host, evidence, publication: structuredClone(result), readPublication: () => structuredClone(result),
+    removePublication: () => { result = null; },
+    changePublicationInput: () => { proposal = structuredClone(proposal); proposal.binding.inputBinding.gitTarget.baseRefOid = "c".repeat(40); } };
+}
+
+test("published Review settles its original input after Base movement without fresh review authority", async () => {
+  const fixture = await publishedReviewSettlementFixture();
+  const { ledger, graphReader, assembler, root, item, host } = fixture;
+  const currentRoot = (await ledger.listItems()).items.find(entry => entry.itemId === root.itemId);
+  const historical = await assembler.assemble({ roleId: "orchestrator", item: currentRoot, trigger: "scheduled" });
+  assert.equal(historical.context.code.pullRequest, undefined);
+  assert.equal(historical.context.code.reviewPublicationSettlement.inputBinding.gitTarget.baseRefOid, "a".repeat(40));
+  const before = await graphReader.getSnapshot();
+  const child = before.graph.tasks.find(entry => entry.taskId === item.itemId);
+  await assert.rejects(host.execute({ worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+    item: currentRoot, contextPacket: historical,
+    intent: orchestrate({ ...commonAction("return_delivery", child, before), submittedDeliveryRevision: 1 }) }),
+    { code: "ORCHESTRATOR_AUTHORITY_DENIED" });
+  assert.deepEqual(await graphReader.getSnapshot(), before);
+  await host.execute({ worker: { roleId: "orchestrator", workerId: "employee-orchestrator" }, item: currentRoot, contextPacket: historical,
+    intent: orchestrate({ ...commonAction("accept_delivery", child, before), submittedDeliveryRevision: 1 }) });
+  assert.equal((await ledger.listItems()).items.find(entry => entry.itemId === item.itemId).status, "completed");
+  assert.deepEqual(fixture.readPublication(), fixture.publication);
+  const finalRoot = (await ledger.listItems()).items.find(entry => entry.itemId === root.itemId);
+  const finalPacket = await assembler.assemble({ roleId: "orchestrator", item: finalRoot, trigger: "scheduled" });
+  assert.equal(finalPacket.context.code.reviewPublicationSettlement.allAccepted, true);
+  let nextIntent = orchestrate(commonAction("pause", child, before));
+  const engine = new RoleDecisionEngine({ definition: { id: "orchestrator", name: "orchestrator", mission: "Settle the original published Review", enabled: true },
+    permissions: { allowedIntents: ["complete", "orchestrate"] },
+    brain: { provider: "local-fixture", model: "fixture", remoteData: { code: false, requirements: false, memory: false } },
+    brainRouter: { describe: () => ({ singleAttempt: true }), generate: async () => JSON.stringify({ schemaVersion: 1, confidence: 90, summary: "Settle publication", intent: nextIntent }) },
+  });
+  await assert.rejects(engine.decide({ item: finalRoot, context: finalPacket.context }), { code: "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION" });
+  nextIntent = { schemaVersion: 1, type: "complete", summary: "Original Review published and accepted", reason: "Bound delivery accepted",
+    outcome: "done", evidence: [] };
+  const loop = new ProactiveWorkLoop({ ledger, roleContextAssembler: assembler, orchestratorService: host,
+    clock: () => new Date("2026-10-15T18:34:00.000Z"),
+    roleDirectory: { async resolve() { return { roleId: "orchestrator", workerId: "employee-orchestrator", enabled: true, paused: false,
+      decide: input => engine.decide(input) }; } },
+  });
+  const completed = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+  assert.equal(completed.staged, 1);
+  assert.equal((await ledger.listItems()).items.find(entry => entry.itemId === root.itemId).status, "dispatch_pending");
+  assert.equal((await ledger.listOutbox({ itemId: root.itemId, limit: 10 })).items.at(-1).intent.type, "complete");
+});
+
+test("historical Review settlement requires real publication and original input authority", async t => {
+  for (const boundary of ["missing-publication", "wrong-input", "revoked-source"]) await t.test(boundary, async () => {
+    const fixture = await publishedReviewSettlementFixture();
+    const item = (await fixture.ledger.listItems()).items.find(entry => entry.itemId === fixture.root.itemId);
+    if (boundary === "missing-publication") fixture.removePublication();
+    if (boundary === "wrong-input") fixture.changePublicationInput();
+    if (boundary === "revoked-source") fixture.ledger.verifyPullRequestExecutionBinding = async () => {
+      throw Object.assign(new Error("Source no longer active"), { code: "WORK_LEDGER_PR_EXECUTION_BINDING_STALE" });
+    };
+    const before = await fixture.graphReader.getSnapshot();
+    await assert.rejects(fixture.assembler.assemble({ roleId: "orchestrator", item, trigger: "scheduled" }), error =>
+      boundary === "revoked-source" ? error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE" :
+        error.code === "ROLE_CONTEXT_PR_FACT_UNAVAILABLE" && error.cause?.code === "PR_FACTS_STALE");
+    assert.deepEqual(await fixture.graphReader.getSnapshot(), before);
+  });
+});
+
+test("historical Review settlement checks the complete graph rather than its delivery preview", async t => {
+  for (const boundary of ["paused-child", "extra-child", "missing-required-slot", "local-report", "paused-root"]) await t.test(boundary, async () => {
+    const fixture = await publishedReviewSettlementFixture();
+    const view = structuredClone(await fixture.graphReader.getSnapshot());
+    const child = view.graph.tasks.find(entry => entry.taskId === fixture.item.itemId);
+    const childState = view.taskStates.find(entry => entry.taskId === child.taskId);
+    const item = (await fixture.ledger.listItems()).items.find(entry => entry.itemId === fixture.root.itemId);
+    if (boundary === "paused-child") { child.status = "paused"; childState.ledgerStatus = "paused"; }
+    if (boundary === "extra-child") {
+      const extra = structuredClone(child); extra.taskId += "/new"; extra.responsibility.id = "developer";
+      view.graph.tasks.push(extra); view.taskStates.push({ ...structuredClone(childState), taskId: extra.taskId });
+    }
+    if (boundary === "missing-required-slot") child.acceptanceContracts.at(-1).expectedDeliverables.push({
+      deliverableId: "zz-required-review", kind: "github-review", required: true, description: "Another required publication" });
+    if (boundary === "local-report") child.acceptanceContracts.at(-1).expectedDeliverables[0].kind = "text-report";
+    if (boundary === "paused-root") view.taskStates.find(entry => entry.taskId === item.itemId).ledgerStatus = "paused";
+    view.graph = createWorkGraphSnapshot({ graphId: view.graph.graphId, revision: view.graph.revision, tasks: view.graph.tasks });
+    const reader = new RoleContextAssembler({ graphReader: { getSnapshot: async () => view },
+      settlementInputAuthorityVerifier: { verify: binding => fixture.ledger.verifyPullRequestExecutionBinding(binding) },
+      settlementEvidenceVerifier: fixture.evidence,
+      pullRequestContextReader: { read: async () => { throw Object.assign(new Error("Canonical Base advanced"), { code: "PR_FACTS_STALE" }); } },
+    });
+    await assert.rejects(reader.assemble({ roleId: "orchestrator", item, trigger: "scheduled" }), error =>
+      error.code === "ROLE_CONTEXT_PR_FACT_UNAVAILABLE" && error.cause?.code === "PR_FACTS_STALE");
+  });
+});
 
 test("legacy external rereview returns its local report, cancels it, and publishes one authoritative replacement", async () => {
   let proposal = null;

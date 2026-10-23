@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { permitsReviewPublicationSettlementIntent } from "./review-publication-settlement.js";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 
 import { deliveryAcceptanceContractDigest } from "../domain/delivery-evidence-contract.js";
@@ -1614,6 +1615,9 @@ export class OrchestratorService {
     bindingTask,
   }) {
     assertOrchestrator(worker, bindingTask);
+    if (!permitsReviewPublicationSettlementIntent(packet.context, intent)) {
+      throw denied("Historical Review settlement only permits accepting its exact published delivery");
+    }
     const children = directChildIds(packet);
     const action = intent.action;
     assertStructuredPrTriageAction(packet, children, action, tasksById, this.#automaticMode, this.#capabilityRoles);

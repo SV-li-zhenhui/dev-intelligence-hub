@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { permitsReviewPublicationSettlementIntent } from "./review-publication-settlement.js";
 import { NATIVE_REVIEW_SKILL_NAME } from "../lib/native-review-skill.js";
 import { taskInstructionMessages } from '../lib/task-execution-context.js';
 import {
@@ -615,6 +616,8 @@ export class RoleDecisionEngine {
           decision,
         );
         assertExternalRereviewDecision(context, this.#definition.id, decision);
+        if (!permitsReviewPublicationSettlementIntent(context, decision.intent)) throw engineError(
+          "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION", "Historical Review settlement only permits exact acceptance or completion after acceptance", 409);
         assertPullRequestReviewDecision(this.#definition.id, item, context, decision, reviewTarget);
         break;
       } catch (error) {

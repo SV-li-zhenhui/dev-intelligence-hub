@@ -2605,6 +2605,8 @@ export async function createApplication({
         ["listForTask", "verify"],
         "deliveryEvidenceService",
       );
+      const automaticMode = config.githubActions?.enabled === true &&
+        (config.githubActions.automaticReview === true || config.githubActions.automaticOwnPrRepair === true);
       const roleContextAssembler = roleContextAssemblerFactory({
         graphReader: frozenPort(
           workLedgerRuntime.graphReader,
@@ -2630,6 +2632,10 @@ export async function createApplication({
           failedCodeJobContextReader: new FailedCodeJobContextReader({ codeJobReader, ledger: workLedgerRuntime }),
         }),
         evidenceCatalog: deliveryEvidence,
+        ...(automaticMode ? {
+          settlementInputAuthorityVerifier: inputAuthorityVerifier,
+          settlementEvidenceVerifier: deliveryEvidence,
+        } : {}),
         ...(agentMemoryQueries === null
           ? {}
           : {
@@ -2641,8 +2647,7 @@ export async function createApplication({
             }),
       });
       const orchestratorService = orchestratorServiceFactory({
-        automaticMode: config.githubActions?.enabled === true &&
-          (config.githubActions.automaticReview === true || config.githubActions.automaticOwnPrRepair === true),
+        automaticMode,
         contextAssembler: roleContextAssembler,
         graphReader: workLedgerRuntime.graphReader,
         scopedGraphPlannerFactory:

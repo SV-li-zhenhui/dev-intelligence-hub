@@ -1284,6 +1284,8 @@ export class RoleContextAssembler {
   #originalRepairFeedbackReader;
   #conflictInspectionReader;
   #ciDiagnosticReader;
+  #settlementInputAuthorityVerifier;
+  #settlementEvidenceVerifier;
 
   constructor({
     graphReader,
@@ -1296,8 +1298,14 @@ export class RoleContextAssembler {
     originalRepairFeedbackReader,
     conflictInspectionReader,
     ciDiagnosticReader,
+    settlementInputAuthorityVerifier,
+    settlementEvidenceVerifier,
   } = {}) {
     this.#graphReader = requireGraphReader(graphReader);
+    this.#settlementInputAuthorityVerifier = settlementInputAuthorityVerifier == null ? null :
+      bindPortMethod(settlementInputAuthorityVerifier, "verify", "settlementInputAuthorityVerifier");
+    this.#settlementEvidenceVerifier = settlementEvidenceVerifier == null ? null :
+      bindPortMethod(settlementEvidenceVerifier, "verify", "settlementEvidenceVerifier");
     this.#factSource = optionalFactSource(factSource);
     this.#pullRequestContextReader = optionalPullRequestContextReader(
       pullRequestContextReader,
@@ -1392,6 +1400,7 @@ export class RoleContextAssembler {
       currentTask,
       deliveryState,
     );
+    const reviewPublicationSettlement = await this.#readReviewPublicationSettlement(roleId, item, currentTask, snapshot, signal);
     const [facts, authoritativeEvidence, pullRequest, memoryQuery, failedExecution, internalReview] = await Promise.all([
       readFacts(this.#factSource, item.event, signal),
       this.#evidenceCatalogAdapter.read({
@@ -1400,7 +1409,7 @@ export class RoleContextAssembler {
         acceptanceContract: currentAcceptanceContract,
         signal,
       }),
-      readPullRequestContext(this.#pullRequestContextReader, item, signal),
+      reviewPublicationSettlement === null ? readPullRequestContext(this.#pullRequestContextReader, item, signal) : null,
       readMemoryQueryContext(this.#memoryQueryReader, roleId, item, signal),
       readFailedCodeJobContext(this.#failedCodeJobContextReader, item, signal),
       roleId === "pr-engineer" && this.#internalReviewHandoffReader !== null
@@ -1510,6 +1519,7 @@ export class RoleContextAssembler {
       context.code = {
         ...(isPullRequest ? { sourceEvent: item.event } : {}),
         ...(pullRequest === null ? {} : { pullRequest }),
+        ...(reviewPublicationSettlement === null ? {} : { reviewPublicationSettlement }),
         acceptedDependencies: dependencies.code,
         facts: isPullRequest ? facts : [],
         ...(proposalDecisionContext === null
@@ -1579,5 +1589,53 @@ export class RoleContextAssembler {
     assertPacketSize(packet);
     signal?.throwIfAborted();
     return deepFreeze(packet);
+  }
+
+  async #readReviewPublicationSettlement(roleId, item, currentTask, snapshot, signal) {
+    const event = item.event, payload = event.payload;
+    if (this.#settlementInputAuthorityVerifier === null || this.#settlementEvidenceVerifier === null ||
+        !isConfiguredRootOrchestrator(roleId, currentTask) || currentTask.acceptanceContracts.at(-1).expectedDeliverables.length !== 0 ||
+        !["queued", "working"].includes(snapshot.statesById.get(currentTask.taskId)?.ledgerStatus) ||
+        event.eventType !== "pull_request.owner_requested" || event.source?.provider !== "local-owner" ||
+        payload?.workType !== "general" || payload.nextAction !== "rereview" || payload.suggestedCapability !== "pr-review" ||
+        item.sourceBinding === null) return null;
+    const children = [...snapshot.tasksById.values()].filter(task => task.parentTaskId === currentTask.taskId && task.status !== "superseded");
+    if (children.length === 0) return null;
+    const entries = [];
+    for (const child of children) {
+      const state = snapshot.statesById.get(child.taskId);
+      if (child.responsibility.type !== "role" || child.responsibility.id !== "pr-engineer" || child.dependsOn.length !== 0 ||
+          state?.taskRevision !== child.revision || !["waiting_external", "completed"].includes(state.ledgerStatus)) return null;
+      const { currentContract, deliveries, latestByDeliverable } = currentDeliveryState(child);
+      if (!currentContract.expectedDeliverables.some(slot => slot.required) ||
+          currentContract.expectedDeliverables.some(slot => slot.kind !== "github-review")) return null;
+      const contractDigest = deliveryAcceptanceContractDigest(publicContract(currentContract));
+      for (const slot of currentContract.expectedDeliverables) {
+        const latest = latestByDeliverable.get(slot.deliverableId);
+        if (!["submitted", "accepted"].includes(latest?.status)) return null;
+        const submitted = latest.status === "submitted" ? latest : matchingSubmission(deliveries, latest,
+          "ROLE_CONTEXT_CHILD_DELIVERY_INVALID", "Published Review acceptance has no exact submission");
+        const records = submitted.evidence.filter(record => record.kind === "github-review");
+        if (records.length !== 1) return null;
+        entries.push({ taskId: child.taskId, taskRevision: child.revision, contractRevision: currentContract.revision,
+          contractDigest, deliverableId: slot.deliverableId,
+          submittedDeliveryRevision: submitted.revision, state: latest.status, completed: state.ledgerStatus === "completed",
+          evidence: records[0] });
+      }
+    }
+    const inputBinding = createPullRequestExecutionBinding({ sourceBinding: item.sourceBinding, event });
+    if (inputBinding.schemaVersion !== 2) return null;
+    const verifiedInput = await this.#settlementInputAuthorityVerifier(inputBinding);
+    signal?.throwIfAborted();
+    if (!samePullRequestExecutionBinding(verifiedInput, inputBinding)) throw invalid("Historical Review input authority changed");
+    for (const entry of entries) {
+      const verified = await this.#settlementEvidenceVerifier({ taskId: entry.taskId, roleId: "pr-engineer",
+        contractRevision: entry.contractRevision, contractDigest: entry.contractDigest, deliverableId: entry.deliverableId,
+        inputBinding, evidence: entry.evidence, ...(signal === undefined ? {} : { signal }) });
+      signal?.throwIfAborted();
+      if (verified !== true && !sameEvidence(verified, entry.evidence)) return null;
+    }
+    return { schemaVersion: 1, scope: "historical_publication_only", inputBinding,
+      allAccepted: entries.every(entry => entry.state === "accepted" && entry.completed), entries };
   }
 }

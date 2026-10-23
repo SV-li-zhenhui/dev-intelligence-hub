@@ -2283,6 +2283,49 @@ function contextPacket(item, roleId) {
   };
 }
 
+test("historical Review settlement fences direct decisions and rechecks proof before normal completion", async t => {
+  for (const scenario of ["complete", "ask-user", "pause", "complete-early", "proof-withdrawn", "owner-paused"]) await t.test(scenario, async () => {
+    const time = controlledClock();
+    const source = workItem(81, { type: "role", id: "orchestrator" });
+    const ledger = new FakeLedger({ source: [source], time });
+    let reads = 0;
+    const assembler = { async assemble({ item, roleId }) {
+      reads++;
+      const packet = contextPacket(item, roleId);
+      packet.context.requirements.currentTask = { taskId: item.itemId };
+      packet.context.requirements.trigger = "scheduled";
+      if (scenario !== "proof-withdrawn" || reads === 1) packet.context.code = { reviewPublicationSettlement: {
+        schemaVersion: 1, scope: "historical_publication_only", inputBinding: { rootItemId: item.itemId },
+        allAccepted: scenario !== "complete-early", entries: [{ taskId: "review-child", taskRevision: 7,
+          submittedDeliveryRevision: 1, state: scenario === "complete-early" ? "submitted" : "accepted", completed: scenario !== "complete-early" }],
+      } };
+      return packet;
+    } };
+    const directory = new FakeRoleDirectory({ orchestrator: worker({ roleId: "orchestrator", paused: scenario === "owner-paused",
+      decide: async ({ item }) => {
+        if (scenario === "pause") return orchestrationDecision(item, "pause");
+        if (scenario === "ask-user") return { schemaVersion: 1, confidence: 90, summary: "Ask again", intent: {
+          schemaVersion: 1, type: "ask_user", summary: "Ask again", reason: "Renew authority", question: "Continue?",
+          choices: [{ id: "continue", label: "Continue", description: "Confirm again" }],
+        } };
+        return completeDecision();
+      } }) });
+    const loop = createLoop({ ledger, directory, time, roleContextAssembler: assembler,
+      orchestratorService: { async execute() { assert.fail("Historical closeout cannot run this graph action"); } } });
+    const result = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+    if (scenario === "complete") {
+      assert.equal(reads, 2, "completion verifies publication authority again after the model");
+      assert.equal(result.staged, 1);
+      assert.equal(ledger.calls.stageIntent[0].intent.type, "complete");
+    } else {
+      assert.equal(ledger.calls.claim.length, 0);
+      assert.equal(ledger.calls.stageIntent.length, 0);
+      assert.equal(ledger.items[0].status, "queued");
+      assert.ok(result.outcomes.some(entry => entry.status === (scenario === "owner-paused" ? "paused" : "decision_deferred")));
+    }
+  });
+});
+
 function deliveryDecision(item) {
   return {
     schemaVersion: 1,

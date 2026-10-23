@@ -657,6 +657,7 @@ test("automatic Review publication and final execution share the trusted ledger 
     return { inputBinding, admission: { kind: "owner_requested", admittedAt: "2026-10-09T09:50:00Z" } };
   };
   const application = await createApplication({ config, store: memoryStore(), ...stubs,
+    roleContextAssemblerFactory: options => { calls.settlementContext = options; return { async assemble() {} }; },
     workLedgerRuntimeFactory: async () => ledger,
     workCoordinationDependencies: { clock: () => "2026-10-09T10:00:00.000Z" },
     confirmationRuntimeFactory: async (_config, dependencies) => {
@@ -670,6 +671,8 @@ test("automatic Review publication and final execution share the trusted ledger 
     workProposalRunnerGroupFactory: () => ({ async runCycle() {} }),
   });
   try {
+    assert.strictEqual(calls.settlementContext.settlementEvidenceVerifier, application.deliveryEvidence);
+    assert.equal(typeof calls.settlementContext.settlementInputAuthorityVerifier.verify, "function");
     const head = "a".repeat(40);
     const binding = { schemaVersion: 2, repository: "acme/repo", pullRequestNumber: 42,
       headRefOid: head, gitTarget: { sourceAccountId: "review-account" } };
