@@ -416,6 +416,26 @@ export class ProactivePrEmployeeService {
       (policy.enabled && automaticReviewEligibility(item, policy.account, this.clock()) === null));
   }
 
+  async #stillNeedsReviewTriage(item, signal) {
+    const policy = this.config.automaticReviewPolicy;
+    if (this.config.triageOnly !== true || policy?.enabled !== true || item.relation !== "review_requested") return true;
+    const unavailable = () => Object.assign(new Error("无法读取 PR 当前审核与分配状态"), { code: "PR_LIVE_REVIEW_FACTS_UNAVAILABLE" });
+    if (typeof this.github.readIncomingReviewRequest !== "function") throw unavailable();
+    const facts = await this.github.readIncomingReviewRequest({ repository: item.repo, number: item.number, account: policy.account },
+      signal === null ? undefined : { signal });
+    signal?.throwIfAborted();
+    if (facts?.kind !== "pull_request" || facts.incomingReviewFactsAvailable !== true ||
+        typeof facts.repo !== "string" || facts.repo.toLowerCase() !== item.repo.toLowerCase() ||
+        typeof facts.currentUser !== "string" || facts.currentUser.toLowerCase() !== policy.account.toLowerCase() ||
+        !["open", "closed", "merged"].includes(facts.state?.toLowerCase()) || typeof facts.isDraft !== "boolean" ||
+        typeof facts.author !== "string" || !facts.author || !Array.isArray(facts.assignees) ||
+        !facts.assignees.every(login => typeof login === "string" && login.length > 0) ||
+        !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(facts.headRefOid || "")) throw unavailable();
+    const reason = automaticReviewEligibility(facts, policy.account, this.clock());
+    if (reason === "INVALID_TARGET" || (reason === "SELF_AUTHORED" && facts.author.toLowerCase() !== policy.account.toLowerCase())) throw unavailable();
+    return facts.headRefOid === item.headRefOid && reason === null;
+  }
+
   constructor({
     store,
     github,
@@ -1547,6 +1567,11 @@ export class ProactivePrEmployeeService {
       index = state.jobs.findIndex((job) => job.id === claimed.id);
       const completedAt = this.clock().toISOString();
       failurePhase = "handoff";
+      // Analysis may outlive a publication or QA handoff while the dashboard
+      // snapshot still has the same Head. Re-read live scope before creating work.
+      if (policy.targetRoleId === "pr-engineer" && !await this.#stillNeedsReviewTriage(current, signal)) {
+        return this.#finishAsSuperseded(state, claimed.id);
+      }
       const handoff = policy.targetRoleId
         ? await this.triageHandoff.submit({
             requestKey: claimed.id,

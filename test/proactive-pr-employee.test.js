@@ -1313,6 +1313,71 @@ test("triage-only PR promoter classifies work without reading patches or draftin
   assert.equal(result.confirmationQueue.length, 0);
 });
 
+test("automatic Review triage checks live completion and assignment before creating another root", async (t) => {
+  for (const change of ['published', 'unassigned', 'head-changed', 'unchanged']) await t.test(change, async () => {
+    const item = pullRequest({ isDraft: false, assignees: ['runtime-user'], incomingReviewFactsAvailable: true });
+    const store = new MemoryStore({ snapshot: snapshot([item]) });
+    const facts = { ...item, currentUser: 'runtime-user' };
+    let reads = 0, handoffs = 0;
+    const service = createService({
+      store,
+      config: { triageOnly: true, automaticReviewPolicy: { enabled: true, account: 'runtime-user' } },
+      triageHandoff: durableTriageHandoff(() => { handoffs++; }),
+      github: {
+        async loadReviewContext() { return { ...item, patch: '', files: [] }; },
+        async readIncomingReviewRequest(input) {
+          assert.deepEqual(input, { repository: item.repo, number: item.number, account: 'runtime-user' });
+          reads++;
+          return structuredClone(facts);
+        },
+      },
+      reviewer: { async analyze() {
+        if (change === 'published') facts.myLatestPublishedReviewCommitOid = item.headRefOid;
+        if (change === 'unassigned') facts.assignees = ['qa-user'];
+        if (change === 'head-changed') facts.headRefOid = HEAD_43;
+        return reviewResult({ workType: 'triage_plan', reviewVerdict: 'none', reviewBody: '', requiresApproval: false });
+      } },
+    });
+    const result = await service.tick();
+    assert.equal(handoffs, change === 'unchanged' ? 1 : 0);
+    assert.equal(reads, 1);
+    assert.equal(result.jobs[0].status, change === 'unchanged' ? 'ready' : 'superseded');
+    // The dashboard snapshot deliberately remains unchanged throughout analysis.
+    assert.deepEqual((await store.read('snapshot')).items[0], item);
+  });
+});
+
+test("unavailable live Review facts retry triage without creating or retiring work", async (t) => {
+  const invalid = {
+    unavailable: () => ({ incomingReviewFactsAvailable: false }),
+    'wrong-target': facts => ({ ...facts, repo: 'other/repo' }),
+    'wrong-account': facts => ({ ...facts, currentUser: 'other-user' }),
+    'unknown-state': facts => ({ ...facts, state: 'unknown' }),
+    'missing-assignees': facts => ({ ...facts, assignees: undefined }),
+    'malformed-author': facts => ({ ...facts, author: '?' }),
+    'malformed-head': facts => ({ ...facts, headRefOid: 'unknown' }),
+  };
+  for (const [name, change] of Object.entries(invalid)) await t.test(name, async () => {
+    const item = pullRequest({ isDraft: false, assignees: ['runtime-user'], incomingReviewFactsAvailable: true });
+    let handoffs = 0;
+    const service = createService({
+      store: new MemoryStore({ snapshot: snapshot([item]) }),
+      config: { triageOnly: true, automaticReviewPolicy: { enabled: true, account: 'runtime-user' } },
+      triageHandoff: durableTriageHandoff(() => { handoffs++; }),
+      github: {
+        async loadReviewContext() { return { ...item, patch: '', files: [] }; },
+        async readIncomingReviewRequest() { return change({ ...item, currentUser: 'runtime-user' }); },
+      },
+      reviewer: { async analyze() { return reviewResult({ workType: 'triage_plan' }); } },
+    });
+    const result = await service.tick();
+    assert.equal(handoffs, 0);
+    assert.equal(result.jobs[0].status, 'retry_wait');
+    assert.equal(result.jobs[0].analysisFailure.phase, 'handoff');
+    assert.equal(result.jobs[0].analysisFailure.code, 'PR_LIVE_REVIEW_FACTS_UNAVAILABLE');
+  });
+});
+
 test("triage-only PR promoter durably routes authored fixes to developer", async () => {
   const owned = pullRequest({
     relation: "authored",
