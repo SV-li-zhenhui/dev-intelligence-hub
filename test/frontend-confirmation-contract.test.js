@@ -3,7 +3,77 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 
-import { createConfirmationDialogOwnership } from "../public/confirmation-dialog-support.js";
+import { createConfirmationDialogOwnership, createExternalConfirmationReconciler,
+  shouldCloseExternalConfirmation } from "../public/confirmation-dialog-support.js";
+
+test("exact confirmation refresh closes settled or system-managed Reviews while preserving failures", () => {
+  const item = { id: "review-1", approvalBindingDigest: "a".repeat(64), status: "pending",
+    kind: "github.work-proposal-review", display: { payload: { action: { type: "pull_request_review" } } } };
+  for (const status of ["completed", "stale", "rejected", "executing"]) {
+    assert.equal(shouldCloseExternalConfirmation(item, { ...item, status }), true);
+  }
+  assert.equal(shouldCloseExternalConfirmation(item, item), false);
+  assert.equal(shouldCloseExternalConfirmation(item, item, true), true);
+  assert.equal(shouldCloseExternalConfirmation(item, { ...item, status: "failed", resolutionRequired: true }, true), false);
+  assert.equal(shouldCloseExternalConfirmation(item, { ...item, kind: "github.pull-request-comment" }, true), false);
+  assert.equal(shouldCloseExternalConfirmation(item, { ...item, id: "another", status: "stale" }), false);
+  assert.equal(shouldCloseExternalConfirmation(item, null), false);
+});
+
+for (const change of ["owner", "key", "requestSequence", "submitting", "closed"]) {
+  test(`a late confirmation read cannot close a changed ${change}`, async () => {
+    let release;
+    let current = { owner: 1, key: "external-1", requestSequence: 1, submitting: false,
+      item: { id: "review-1", status: "pending" } };
+    let closes = 0;
+    const reconcile = createExternalConfirmationReconciler({
+      getCurrent: () => current ? { ...current } : null,
+      readItem: id => { assert.equal(id, "review-1"); return new Promise(resolve => { release = resolve; }); },
+      onResolved: () => { closes += 1; return true; },
+    });
+    const pending = reconcile();
+    if (change === "closed") current = null;
+    else current[change] = change === "submitting" ? true : "changed";
+    release({ id: "review-1", status: "stale" });
+    assert.equal(await pending, false);
+    assert.equal(closes, 0);
+  });
+}
+
+test("confirmation reconciliation uses the active id and leaves pending items open despite another next item", async () => {
+  const state = { owner: 1, key: "active", requestSequence: 2, submitting: false,
+    nextItemId: "another", item: { id: "review-1", status: "pending" } };
+  let refreshed = state.item;
+  let closedOwner = null;
+  const reconcile = createExternalConfirmationReconciler({ getCurrent: () => ({ ...state }),
+    readItem: async id => { assert.equal(id, state.item.id); return refreshed; },
+    onResolved: owner => { closedOwner = owner; return true; },
+  });
+  assert.equal(await reconcile(), false);
+  refreshed = { ...state.item, status: "stale" };
+  assert.equal(await reconcile(), true);
+  assert.equal(closedOwner, 1);
+});
+
+test("failed and out-of-order confirmation reads never dismiss the current decision", async () => {
+  const state = { owner: 1, key: "active", requestSequence: 1, submitting: false,
+    item: { id: "review-1", status: "pending" } };
+  const releases = [];
+  let closes = 0;
+  const reconcile = createExternalConfirmationReconciler({ getCurrent: () => ({ ...state }),
+    readItem: () => new Promise((resolve, reject) => releases.push({ resolve, reject })),
+    onResolved: () => { closes += 1; },
+  });
+  const older = reconcile(), newer = reconcile();
+  releases[1].resolve(state.item);
+  assert.equal(await newer, false);
+  releases[0].resolve({ ...state.item, status: "stale" });
+  assert.equal(await older, false);
+  const failed = reconcile();
+  releases[2].reject(new Error("unavailable"));
+  assert.equal(await failed, false);
+  assert.equal(closes, 0);
+});
 
 const root = path.resolve(import.meta.dirname, "..");
 

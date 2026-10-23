@@ -5,13 +5,15 @@ import { automaticReviewEligibility, automaticReviewContinuationEligibility, aut
 // Only the composition root receives this port. Model output cannot grant
 // automatic publication, choose arbitrary assignees, or execute other actions.
 export class AutomaticReviewPublisher {
-  constructor({ enabled = false, assignAfterReview = true, queue, github, reviewAdmissionReader = null, testingOwnersByProduct = {}, clock = () => new Date() }) {
+  constructor({ enabled = false, assignAfterReview = true, queue, github, confirmationInvalidator = null, reviewAdmissionReader = null, testingOwnersByProduct = {}, clock = () => new Date() }) {
     this.enabled = enabled === true;
     this.assignAfterReview = assignAfterReview !== false;
     this.queue = queue;
     this.github = github;
     this.testingOwners = structuredClone(testingOwnersByProduct);
     this.clock = clock;
+    if (confirmationInvalidator !== null && typeof confirmationInvalidator.invalidate !== "function") throw new TypeError("confirmationInvalidator is invalid");
+    this.invalidate = confirmationInvalidator?.invalidate.bind(confirmationInvalidator) ?? null;
     if (reviewAdmissionReader !== null && typeof reviewAdmissionReader?.read !== "function") throw new TypeError("reviewAdmissionReader is invalid");
     this.readAdmission = reviewAdmissionReader?.read.bind(reviewAdmissionReader) ?? null;
   }
@@ -37,6 +39,24 @@ export class AutomaticReviewPublisher {
     const match = /^([^#]+)#([1-9]\d*)$/.exec(item.target.resourceId);
     if (!match) return item;
     const facts = await this.github.readIncomingReviewRequest({ repository: match[1], number: Number(match[2]), account: item.actor.accountId });
+    const reason = automaticReviewEligibility(facts, item.actor.accountId, this.clock());
+    const headChanged = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(facts?.headRefOid || "") &&
+      facts.headRefOid !== item.target.version;
+    const revoked = facts?.kind === "pull_request" && facts.incomingReviewFactsAvailable === true &&
+      (headChanged || reason === "HEAD_ALREADY_REVIEWED" ||
+      (reason === "SELF_AUTHORED" && typeof facts.author === "string" &&
+        facts.author.toLowerCase() === item.actor.accountId.toLowerCase()) ||
+      (reason === "NO_CURRENT_INCOMING_REQUEST" && Array.isArray(facts.assignees)) ||
+      (reason === "PR_NOT_READY" && (["closed", "merged"].includes(facts.state?.toLowerCase()) || facts.isDraft === true)));
+    if (this.invalidate !== null && revoked) {
+      try {
+        return await this.invalidate(item.id, { requestedBy: item.requestedBy,
+          approvalBindingDigest: item.approvalBindingDigest, reason: "authorization_changed" });
+      } catch (error) {
+        if (error?.code === "CONFIRMATION_NOT_INVALIDATABLE") return item;
+        throw error;
+      }
+    }
     if (!await this.eligible(facts, item)) return item;
     let reviewHandoff;
     if (this.assignAfterReview) {

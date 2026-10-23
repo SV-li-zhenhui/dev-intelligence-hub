@@ -7,6 +7,7 @@ import {
 } from "./configuration-view-support.js";
 import {
   createConfirmationDialogOwnership,
+  createExternalConfirmationReconciler,
   createSessionDeferredConfirmationStore,
 } from "./confirmation-dialog-support.js";
 import { postAttentionDuringFactRefresh } from "./attention-submission.js";
@@ -768,8 +769,11 @@ function confirmationPendingMarkup() {
     return '<div class="empty">正在读取下一项确认…</div>';
   }
   const [entry] = pendingConfirmations();
+  const managed = confirmationQueueState.systemManagedCount || 0;
+  const automaticStatus = managed > 0
+    ? `<p class="confirmation-note">系统正在自动处理 ${managed} 项 Review，无需你确认。进展可在岗位任务和确认历史查看。</p>` : "";
   if (!entry) {
-    return '<div class="empty">当前没有需要你处理的确认。</div>';
+    return automaticStatus || '<div class="empty">当前没有需要你处理的确认。</div>';
   }
   const item = entry.item || entry.job;
   const title = item.display?.title || item.title || "待确认事项";
@@ -790,7 +794,7 @@ function confirmationPendingMarkup() {
     : entry.kind === "review_draft"
       ? "接受或驳回只处理这份本地 Review 草稿，不会直接写入 GitHub；如果存在受控发布动作，它会作为另一项授权单独确认。"
     : "确认或驳回后，结果会进入下方“只读确认历史”；选择“稍后”仍保留在待确认队列。";
-  return `<article class="confirmation-pending-item">
+  return `${automaticStatus}<article class="confirmation-pending-item">
     <div class="confirmation-history-row-heading">
       <strong>${escapeHtml(title)}</strong>
       <span class="status-pill status-waiting_user">下一项</span>
@@ -2790,9 +2794,12 @@ function applyConfirmationQueue(nextState, sequence = ++confirmationRequestSeque
     queueRevision:
       nextState.externalQueueRevision || nextState.queueRevision || 0,
     pendingCount: nextState.pendingCount || 0,
+    automaticReviewEnabled: nextState.automaticReviewEnabled === true,
+    systemManagedCount: nextState.systemManagedCount || 0,
     item: nextState.item || null,
   };
   confirmationQueueLoaded = true;
+  void reconcileActiveExternalConfirmation();
   return true;
 }
 
@@ -3739,6 +3746,33 @@ function closeExternalConfirmation(owner) {
   activeExternalConfirmation = null;
   return true;
 }
+
+const reconcileActiveExternalConfirmation = createExternalConfirmationReconciler({
+  getCurrent() {
+    const owner = confirmationDialogOwnership.current();
+    if (!confirmationDialog.open || !activeExternalConfirmation || owner === null) return null;
+    return { owner, key: activeConfirmationKey, item: activeExternalConfirmation,
+      requestSequence: lastAppliedConfirmationRequest,
+      submitting: confirmationDialogOwnership.ownsSubmission(owner),
+      automaticReviewEnabled: confirmationQueueState.automaticReviewEnabled };
+  },
+  async readItem(id) {
+    const response = await fetch(`/api/confirmations/${encodeURIComponent(id)}`, { cache: "no-store" });
+    if (!response.ok) return null;
+    const result = await response.json();
+    return result.available === true ? result.item : null;
+  },
+  onResolved(owner) {
+    if (!closeConfirmationDialog(owner)) return false;
+    activeExternalConfirmation = null;
+    activeConfirmationKey = "";
+    invalidateConfirmationQueueSnapshot();
+    statusBanner.hidden = false;
+    statusBanner.textContent = "这项确认已由系统接管、处理或失效，旧弹窗已关闭。";
+    void refreshConfirmationQueue().catch(error => { statusBanner.textContent = error.message; });
+    return true;
+  },
+});
 
 function pendingConfirmations() {
   if (!confirmationQueueLoaded) return [];

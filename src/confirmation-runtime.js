@@ -529,6 +529,10 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
   );
 
   try {
+    const coordination = dataProperty(config, "workCoordination");
+    const automaticReviewEnabled = enabledConfig?.reviewEnabled === true &&
+      isPlainRecord(coordination) && dataProperty(coordination, "enabled") === true &&
+      dataProperty(dataProperty(config, "githubActions"), "automaticReview") === true;
     const queueOptions = {
       store,
       executor,
@@ -550,6 +554,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
           ...RECOVERY_STATUS_READER_METHODS,
           ...REVIEW_HANDOFF_METHODS,
           "readSettlement",
+          ...(automaticReviewEnabled ? ["nextForHuman"] : []),
         ]),
       ],
       "queue",
@@ -560,6 +565,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
     return Object.freeze({
       queue: Object.freeze({
         ...createQueueFacade(queue, USER_QUEUE_METHODS),
+        ...(automaticReviewEnabled ? { next: options => queue.nextForHuman(options) } : {}),
         historyReader,
       }),
       historyReader,

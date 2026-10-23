@@ -769,6 +769,12 @@ export class ConfirmationQueue {
     return this.#projectNext(deferred);
   }
 
+  async nextForHuman(options) {
+    this.#assertReady();
+    const { deferred } = normalizeExternalDeferredOptions(options);
+    return this.#projectNext(deferred, null, true);
+  }
+
   async nextForAction(kind, actionType, options) {
     this.#assertReady();
     const selector = normalizeActionSelector(kind, actionType);
@@ -1348,7 +1354,7 @@ export class ConfirmationQueue {
     }
   }
 
-  #projectNext(deferred = [], selector = null) {
+  #projectNext(deferred = [], selector = null, automaticReviewEnabled = false) {
     const deferredBindings = new Set(
       deferred.map(
         (entry) => `${entry.id}\u0000${entry.approvalBindingDigest}`,
@@ -1384,11 +1390,15 @@ export class ConfirmationQueue {
           isVisible(item),
       )
       .sort(byCreation);
-    const actionable = [...pending, ...retryable, ...unresolved];
+    const systemManaged = automaticReviewEnabled ? pending.filter(item =>
+      item.kind === "github.work-proposal-review" && item.action.type === "pull_request_review") : [];
+    const managedIds = new Set(systemManaged.map(item => item.id));
+    const actionable = [...pending.filter(item => !managedIds.has(item.id)), ...retryable, ...unresolved];
     return {
       queueRevision: this.state.revision,
       pendingCount: actionable.length,
       item: actionable.length ? this.#projectItem(actionable[0]) : null,
+      ...(automaticReviewEnabled ? { automaticReviewEnabled: true, systemManagedCount: systemManaged.length } : {}),
     };
   }
 

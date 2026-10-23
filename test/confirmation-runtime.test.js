@@ -102,6 +102,28 @@ function runtimeDependencies(overrides = {}) {
   };
 }
 
+test("automatic mode exposes human selection without changing publisher and producer access", async () => {
+  const port = queuePort();
+  port.nextForHuman = options => ["human", options];
+  const runtime = await createConfirmationRuntime({ ...enabledConfig({ automaticReview: true }),
+    workCoordination: { enabled: true } },
+    runtimeDependencies({ createQueue: () => port }));
+  assert.deepEqual(runtime.queue.next(), ["human", undefined]);
+  assert.deepEqual(runtime.queue.nextForAction("kind", "action"), ["nextForAction", "kind", "action"]);
+  assert.deepEqual(runtime.producerQueue.get("review-id"), ["get", "review-id"]);
+  assert.deepEqual(runtime.queue.approve("review-id", {}), ["approve", "review-id", {}]);
+  await runtime.close();
+});
+
+test("automatic Review settings cannot hide manual work while coordination is disabled", async () => {
+  for (const coordination of [undefined, { enabled: false }]) {
+    const runtime = await createConfirmationRuntime({ ...enabledConfig({ automaticReview: true }),
+      ...(coordination ? { workCoordination: coordination } : {}) }, runtimeDependencies());
+    assert.equal(runtime.queue.next(), "next");
+    await runtime.close();
+  }
+});
+
 function memoryStore() {
   let value = null;
   return {

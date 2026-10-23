@@ -2183,6 +2183,7 @@ export async function createApplication({
             enabled: config.githubActions.automaticReview === true,
             assignAfterReview: config.githubActions.assignAfterAutomaticReview !== false,
             queue: confirmationRuntime.queue,
+            confirmationInvalidator: confirmationRuntime.producerQueue,
             github,
             reviewAdmissionReader: {
               read: binding => workLedgerRuntime.readAutomaticReviewAdmission(binding),

@@ -1201,6 +1201,9 @@ async function readUnifiedAttention(application, options) {
         ? external.queueRevision
         : 0,
       item: external.item || null,
+      ...(external.automaticReviewEnabled === true ? {
+        automaticReviewEnabled: true, systemManagedCount: external.systemManagedCount,
+      } : {}),
     };
   }
   return {

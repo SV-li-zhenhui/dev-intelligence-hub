@@ -329,6 +329,42 @@ async function readyQueue({
   return queue;
 }
 
+test("automatic Reviews stay available to the publisher while human selection advances past them", async () => {
+  const queue = await readyQueue();
+  for (let index = 0; index < 40; index += 1) {
+    await queue.enqueue(actionPlan({ id: `managed-review-${index}`, kind: "github.work-proposal-review" }));
+  }
+  await queue.enqueue(actionPlan({ id: "manual-review", kind: "github.pull-request-review" }));
+  const human = await queue.nextForHuman();
+  assert.equal(human.item.id, "manual-review");
+  assert.equal(human.pendingCount, 1);
+  assert.equal(human.systemManagedCount, 40);
+  assert.equal(human.automaticReviewEnabled, true);
+  const raw = await queue.next();
+  assert.equal(raw.item.id, "managed-review-0");
+  assert.equal(raw.pendingCount, 41);
+  assert.equal((await queue.nextForAction("github.work-proposal-review", "pull_request_review")).item.id, raw.item.id);
+  assert.equal((await queue.get(raw.item.id)).status, "pending");
+  assert.equal((await queue.approve(raw.item.id, approvalRequest(raw))).status, "completed");
+});
+
+test("human selection retains converted comments and failed automatic Reviews", async () => {
+  const actionExecutor = executor({ async execute() {
+    throw new ConfirmationExecutionError("TEMPORARY", "retry", { outcome: "absent", retryable: true });
+  } });
+  const queue = await readyQueue({ actionExecutor });
+  await queue.enqueue(actionPlan({ id: "failed-review", kind: "github.work-proposal-review" }));
+  const raw = await queue.next();
+  await queue.approve(raw.item.id, approvalRequest(raw));
+  const human = await queue.nextForHuman();
+  assert.equal(human.item.id, "failed-review");
+  assert.equal(human.item.status, "failed");
+  assert.equal(human.systemManagedCount, 0);
+  await queue.enqueue(actionPlan({ id: "converted-comment", kind: "github.work-proposal-review",
+    action: { type: "pull_request_comment", body: "self authored note" } }));
+  assert.equal((await queue.nextForHuman()).item.id, "converted-comment");
+});
+
 function approvalRequest(next, requestId = "request-approve-0001") {
   return {
     requestId,

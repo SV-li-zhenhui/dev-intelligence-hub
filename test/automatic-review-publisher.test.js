@@ -3,23 +3,52 @@ import test from "node:test";
 import { AutomaticReviewPublisher } from "../src/services/automatic-review-publisher.js";
 const now = "2026-10-09T10:00:00.000Z";
 const head = "a".repeat(40);
-function fixture({ enabled = true, event = "APPROVE", facts = {}, owners = { qt: ["tester"] }, admission = null } = {}) {
+function fixture({ enabled = true, event = "APPROVE", facts = {}, owners = { qt: ["tester"] }, admission = null, invalidator = false } = {}) {
   const calls = [];
+  const invalidations = [];
   const current = { kind: "pull_request", state: "open", author: "dev", currentUser: "me", headRefOid: head, isDraft: false,
     title: "Qt fix", incomingReviewFactsAvailable: true, reviewRecipient: "me", reviewReceivedFrom: "dev",
     reviewReceivedAt: "2026-10-09T09:00:00Z", reviewReceivedVia: "assignee", reviewRequestEventId: "AE_1", ...facts };
   const queue = { approve: async (...args) => { calls.push(args); return { ...item, status: "completed" }; } };
   const item = { id: "confirmation-1", kind: "github.work-proposal-review", status: "pending", actor: { accountId: "me" },
+    requestedBy: { roleId: "pr-engineer", workItemId: "review-work-1" },
     target: { resourceId: "acme/repo#1", version: head }, queueRevision: 1, itemRevision: 1,
     displayedPayloadDigest: "b".repeat(64), approvalBindingDigest: "c".repeat(64), display: { payload: { action: { type: "pull_request_review", reviewEvent: event } } } };
   const inputBinding = { schemaVersion: 2, repository: "acme/repo", pullRequestNumber: 1, headRefOid: head,
     gitTarget: { sourceAccountId: "me" } };
   if (admission) item.display.payload.action.inputBinding = inputBinding;
   const publisher = new AutomaticReviewPublisher({ enabled, assignAfterReview: true, queue,
+    ...(invalidator ? { confirmationInvalidator: { async invalidate(...args) {
+      invalidations.push(args); return { ...item, status: "stale" };
+    } } } : {}),
     github: { readIncomingReviewRequest: async () => current }, testingOwnersByProduct: owners, clock: () => now,
     ...(admission ? { reviewAdmissionReader: { async read() { return { inputBinding, admission }; } } } : {}) });
-  return { publisher, item, calls };
+  return { publisher, item, calls, invalidations };
 }
+
+test("automatic publication retires duplicate same-Head reviews and positively revoked targets", async () => {
+  for (const facts of [
+    { assignees: ["me"], myLatestPublishedReviewCommitOid: head },
+    { headRefOid: "d".repeat(40) }, { state: "closed" }, { state: "merged" },
+    { isDraft: true }, { assignees: ["other"] }, { author: "me" },
+  ]) {
+    const { publisher, item, calls, invalidations } = fixture({ facts, invalidator: true });
+    assert.equal((await publisher.publish(item)).status, "stale");
+    assert.equal(calls.length, 0);
+    assert.deepEqual(invalidations, [[item.id, { requestedBy: item.requestedBy,
+      approvalBindingDigest: item.approvalBindingDigest, reason: "authorization_changed" }]]);
+  }
+});
+
+test("unavailable assignment evidence and an expired legacy intake window do not revoke a Review", async () => {
+  for (const facts of [{ headRefOid: "", incomingReviewFactsAvailable: false },
+    { author: "" }, { assignees: [], incomingReviewFactsAvailable: false },
+    { reviewReceivedAt: "2026-10-01T09:00:00Z" }]) {
+    const { publisher, item, invalidations } = fixture({ facts, invalidator: true });
+    assert.equal(await publisher.publish(item), item);
+    assert.equal(invalidations.length, 0);
+  }
+});
 test("eligible proposals publish using durable approval and configured testing handoff", async () => {
   const { publisher, item, calls } = fixture();
   assert.equal((await publisher.publish(item)).status, "completed");
