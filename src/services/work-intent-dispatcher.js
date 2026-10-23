@@ -4,7 +4,7 @@ import {
   normalizeBoundWorkIntent,
   normalizeWorkIntentDispatchBinding,
 } from "../domain/work-intent-dispatch-binding.js";
-import { createProposalDeliveryEvidenceTarget } from "../domain/delivery-evidence-contract.js";
+import { createProposalDeliveryEvidenceTarget, DELIVERY_EVIDENCE_ACTION_INCOMPATIBLE } from "../domain/delivery-evidence-contract.js";
 import {
   createPullRequestExecutionBinding,
   normalizePullRequestExecutionBinding,
@@ -1413,11 +1413,13 @@ export class WorkIntentDispatcher {
           );
         } catch (error) {
           const code = ownErrorCode(error);
+          let failureCode = POLICY_BLOCK_CODES.has(code) ? "policy-denied" : "policy-binding-invalid";
+          const incompatibleDelivery = code === DELIVERY_EVIDENCE_ACTION_INCOMPATIBLE && claimed.intent.type === "propose_code_action" &&
+            ["verify", "modify"].includes(claimed.intent.operation) && claimed.intent.deliverableId === undefined;
+          if (incompatibleDelivery) failureCode = "delivery-evidence-incompatible";
           return {
             status: "failed",
-            code: POLICY_BLOCK_CODES.has(code)
-              ? "policy-denied"
-              : "policy-binding-invalid",
+            code: failureCode,
           };
         }
         try {

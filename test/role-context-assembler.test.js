@@ -2054,6 +2054,31 @@ test("root coordination exposes a proven pre-dispatch conflict failure without r
   assert.equal(JSON.stringify(packet).includes("PRIVATE-HOST-TRACE"), false);
 });
 
+test("root coordination explains a verification delivery mismatch while preserving the original package contract", async () => {
+  const fixture = rootOrchestratorFixture();
+  const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === "task-current");
+  state.ledgerStatus = "blocked";
+  state.statusReason = "intent_failed";
+  const contract = fixture.snapshot.graph.tasks.find(({ taskId }) => taskId === state.taskId).acceptanceContracts.at(-1);
+  state.dispatchFailure = { intentId: "work-intent-verification", code: "delivery-evidence-incompatible", downstreamCreated: false,
+    operation: "verify", contractRevision: contract.revision, contractDigest: deliveryAcceptanceContractDigest(contract),
+    compatibleEvidenceKinds: ["test-report"], expectedDeliverables: contract.expectedDeliverables.map(({ deliverableId, kind }) => ({ deliverableId, kind })) };
+  const packet = await assemble(fixture, { roleId: "orchestrator" });
+  const child = packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === state.taskId);
+  assert.equal(child.blockingCondition, "delivery-evidence-incompatible");
+  assert.deepEqual(child.dispatchFailure, state.dispatchFailure);
+  for (const variant of ["contract", "operation", "output-kinds", "expected-kind", "downstream"]) {
+    const previous = structuredClone(state.dispatchFailure);
+    if (variant === "contract") state.dispatchFailure.contractRevision++;
+    if (variant === "operation") state.dispatchFailure.operation = "inspect";
+    if (variant === "output-kinds") state.dispatchFailure.compatibleEvidenceKinds = ["change-package"];
+    if (variant === "expected-kind") state.dispatchFailure.expectedDeliverables[0].kind = "test-report";
+    if (variant === "downstream") state.dispatchFailure.downstreamCreated = true;
+    await assert.rejects(assemble(fixture, { roleId: "orchestrator" }), error => error.code === "ROLE_CONTEXT_INVALID", variant);
+    state.dispatchFailure = previous;
+  }
+});
+
 test("root coordination distinguishes settled ledger work from coarse graph progress", async (t) => {
   for (const ledgerStatus of ["queued", "retry_wait", "blocked", "working", "waiting_external"]) {
     await t.test(ledgerStatus, async () => {

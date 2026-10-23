@@ -1063,6 +1063,20 @@ test("proposal authority auto-selects the sole action-compatible deliverable", a
   ]);
 });
 
+test("incompatible verification contract reports a precise unstarted failure without invoking policy or producer", async () => {
+  const pair = workPair(6, codeIntent({ operation: "verify" }), { target: { type: "role", id: "developer" } });
+  attachChildContract(pair, { revision: 1, acceptanceCriteria: [], expectedDeliverables: [
+    { deliverableId: "ci-fix-package", kind: "change-package", description: "保留原修复包", required: true },
+  ] });
+  const { dispatcher, ledger, proposals } = fixture([pair]);
+  const result = await dispatcher.dispatchPending();
+  assert.equal(result.blocked, 1);
+  assert.equal(result.items[0].code, "delivery-evidence-incompatible");
+  assert.equal(ledger.ackCalls[0].details.code, "delivery-evidence-incompatible");
+  assert.equal(proposals.calls.length, 0);
+  assert.equal(ledger.bindCalls.length, 0);
+});
+
 test("a contracted PR child can inspect without claiming its final delivery", async () => {
   const pair = workPair(6, codeIntent({ operation: "inspect" }), {
     target: { type: "role", id: "developer" },

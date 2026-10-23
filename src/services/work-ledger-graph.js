@@ -15,6 +15,7 @@ import {
 import { currentWorkItemInputBinding } from "./work-ledger-pr-source.js";
 import { isRecoveredConflictInspection } from "./work-ledger-inspection-continuation.js";
 import { unstartedConflictDispatchFailure } from "./work-ledger-conflict-failure.js";
+import { unstartedDeliveryContractFailure } from "./work-ledger-delivery-failure.js";
 
 export const WORK_LEDGER_GRAPH_ID = "work-ledger";
 
@@ -408,8 +409,11 @@ export function projectWorkLedgerGraphView(state, options) {
       );
     }
     workLedgerStatusToGraphStatus(item.get("status"));
-    const dispatchFailure = item.get("statusReason") === "intent_failed"
-      ? unstartedConflictDispatchFailure(Object.fromEntries(item), outboxesByItemId.get(task.taskId) ?? []) : null;
+    let dispatchFailure = null;
+    if (item.get("statusReason") === "intent_failed") {
+      const failedItem = Object.fromEntries(item), outboxes = outboxesByItemId.get(task.taskId) ?? [];
+      dispatchFailure = unstartedConflictDispatchFailure(failedItem, outboxes) ?? unstartedDeliveryContractFailure(failedItem, outboxes);
+    }
     return {
       taskId: task.taskId,
       taskRevision: task.revision,

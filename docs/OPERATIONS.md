@@ -973,6 +973,15 @@ effects keep the handoff blocked until normal reconciliation can settle them.
 Public events cannot create a handoff, stale proofs are ignored, and explicit
 owner controls and independent owner/internal-review authority remain in force.
 
+An unbound code proposal whose operation cannot produce any contracted
+deliverable now reports `delivery-evidence-incompatible`. The graph can also
+explain an exact historical `policy-binding-invalid` failure after recomputing
+the same incompatibility from its current input and unchanged contract. This
+read-only diagnostic reaches the queued parent orchestrator; it does not replay
+the proposal, reset the child, replace a change-package with a test-report, or
+discard prior successful package evidence. The parent must arrange compatible
+work and require the actual repaired snapshot for verification.
+
 ## Automatic work continuations
 
 In automatic mode, schema 2 of `work-continuations.json` records the source task,

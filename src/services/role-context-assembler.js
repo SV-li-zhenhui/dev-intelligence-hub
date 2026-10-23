@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
+import { deliveryAcceptanceContractDigest, deliveryEvidenceKindsForProposal } from "../domain/delivery-evidence-contract.js";
 
 import {
   normalizePullRequestGitTarget,
@@ -477,6 +478,32 @@ function publicContract(contract) {
   };
 }
 
+function normalizeDispatchFailure(value, task) {
+  const code = ownData(value, "dispatch failure").get("code");
+  if (code !== "delivery-evidence-incompatible") {
+    const failure = exactData(value, ["intentId", "code", "downstreamCreated"], "dispatch failure");
+    if (code !== "conflict-source-stale" || failure.get("downstreamCreated") !== false) throw invalid("dispatch failure is invalid");
+    return { intentId: identifier(failure.get("intentId"), "dispatchFailure.intentId"), code, downstreamCreated: false };
+  }
+  const failure = exactData(value, ["intentId", "code", "downstreamCreated", "operation", "contractRevision",
+    "contractDigest", "compatibleEvidenceKinds", "expectedDeliverables"], "dispatch failure");
+  const operation = failure.get("operation"), contract = task?.acceptanceContracts.at(-1);
+  if (failure.get("downstreamCreated") !== false || !["verify", "modify"].includes(operation) || !contract ||
+      failure.get("contractRevision") !== contract.revision ||
+      digest(failure.get("contractDigest"), "dispatchFailure.contractDigest") !== deliveryAcceptanceContractDigest(contract)) throw invalid("dispatch failure contract is stale");
+  const kinds = denseArray(failure.get("compatibleEvidenceKinds"), "dispatch failure evidence kinds", 2).map(value => identifier(value, "evidence kind"));
+  const expected = denseArray(failure.get("expectedDeliverables"), "dispatch failure deliverables", 100).map(value => {
+    const entry = exactData(value, ["deliverableId", "kind"], "dispatch failure deliverable");
+    return { deliverableId: identifier(entry.get("deliverableId"), "deliverableId"), kind: identifier(entry.get("kind"), "kind") };
+  });
+  if (JSON.stringify(kinds) !== JSON.stringify(deliveryEvidenceKindsForProposal({ kind: "code_action_proposal", operation })) ||
+      JSON.stringify(expected) !== JSON.stringify(contract.expectedDeliverables.map(({ deliverableId, kind }) => ({ deliverableId, kind }))) ||
+      expected.some(({ kind }) => kinds.includes(kind))) throw invalid("dispatch failure action is compatible");
+  return { intentId: identifier(failure.get("intentId"), "dispatchFailure.intentId"), code, downstreamCreated: false,
+    operation, contractRevision: contract.revision, contractDigest: failure.get("contractDigest"),
+    compatibleEvidenceKinds: kinds, expectedDeliverables: expected };
+}
+
 function normalizeSnapshot(value) {
   const snapshot = exactData(
     value,
@@ -511,10 +538,7 @@ function normalizeSnapshot(value) {
     const work = exactData(fields.get("work"), ["title", "description"], "task work");
     let dispatchFailure = null;
     if (ledgerStatus === "blocked" && fields.get("statusReason") === "intent_failed" && fields.get("dispatchFailure") != null) {
-      const failure = exactData(fields.get("dispatchFailure"), ["intentId", "code", "downstreamCreated"], "dispatch failure");
-      if (failure.get("code") !== "conflict-source-stale" || failure.get("downstreamCreated") !== false) throw invalid("dispatch failure is invalid");
-      dispatchFailure = { intentId: identifier(failure.get("intentId"), "dispatchFailure.intentId"),
-        code: "conflict-source-stale", downstreamCreated: false };
+      dispatchFailure = normalizeDispatchFailure(fields.get("dispatchFailure"), tasksById.get(taskId));
     }
     if (statesById.has(taskId)) throw invalid("task state IDs are duplicated");
     statesById.set(taskId, {

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import { automaticRoleHandoffCandidate } from "../src/services/work-ledger-role-handoff.js";
+import { unstartedDeliveryContractFailure } from "../src/services/work-ledger-delivery-failure.js";
 import { createWorkflowRoutingRuntime } from "../src/workflow-routing-runtime.js";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -12752,6 +12753,52 @@ function codeActionIntent(overrides = {}) {
     ...overrides,
   };
 }
+
+test("a historical unbound verification failure reaches its waiting orchestrator without changing child history", async () => {
+  const record = ownerRequestedPrAssignment(1);
+  record.assignment.target = { type: "role", id: "orchestrator" };
+  const fixture = await createFixture({ records: [record] });
+  await fixture.service.intake();
+  const [parent] = (await fixture.service.listItems()).items;
+  const command = prGraphChildCommand(parent, (await fixture.service.getSummary()).revision);
+  command.command.acceptanceContract.expectedDeliverables = [{ deliverableId: "ci-fix-package", kind: "change-package",
+    description: "保留原修复包", required: true }];
+  const created = await fixture.service.createGraphChild(command);
+  let child = (await fixture.service.listItems()).items.find(item => item.itemId === created.taskId);
+  child = await fixture.service.claim({ itemId: child.itemId, expectedRevision: child.revision,
+    workerId: "employee-developer", leaseDurationMs: 30_000 });
+  const staged = await fixture.service.stageIntent({ itemId: child.itemId, expectedRevision: child.revision,
+    leaseId: child.leaseId, actorId: "employee-developer", roleId: "developer", intent: codeActionIntent({ operation: "verify" }) });
+  const outbox = await fixture.service.claimIntent({ intentId: staged.outbox.intentId, expectedRevision: staged.outbox.revision,
+    dispatcherId: "work-intent-dispatcher", leaseDurationMs: 30_000 });
+  await fixture.service.ackIntent({ intentId: outbox.intentId, expectedRevision: outbox.revision,
+    dispatchLeaseId: outbox.dispatchLeaseId, itemExpectedRevision: staged.item.revision,
+    actorId: "work-intent-dispatcher", outcome: "failed", nextStatus: "blocked", details: { code: "policy-binding-invalid" } });
+  const before = clone(fixture.store.stored());
+  const snapshot = await fixture.service.getGraphSnapshot();
+  const diagnostic = snapshot.taskStates.find(item => item.taskId === child.itemId).dispatchFailure;
+  assert.equal(diagnostic?.code, "delivery-evidence-incompatible");
+  assert.equal(diagnostic.downstreamCreated, false);
+  assert.deepEqual(diagnostic.compatibleEvidenceKinds, ["test-report"]);
+  assert.deepEqual(diagnostic.expectedDeliverables, [{ deliverableId: "ci-fix-package", kind: "change-package" }]);
+  assert.equal((await fixture.service.listItems()).items.find(item => item.itemId === parent.itemId).status, "queued");
+  assert.deepEqual(fixture.store.stored(), before, "diagnostic projection never resets or replays work");
+  const failedChild = before.items.find(item => item.itemId === child.itemId);
+  const failedBoxes = before.outbox.filter(item => item.itemId === child.itemId);
+  for (const variant of ["paused", "active-intent", "bound", "unknown", "changed-input", "new-contract", "compatible-contract", "different-error", "duplicate"]) {
+    const candidate = clone(failedChild), boxes = clone(failedBoxes), box = boxes.at(-1);
+    if (variant === "paused") candidate.status = "paused";
+    if (variant === "active-intent") candidate.activeIntentId = box.intentId;
+    if (variant === "bound") box.dispatchBinding = {};
+    if (variant === "unknown") box.status = "unknown";
+    if (variant === "changed-input") box.inputDigest = "f".repeat(64);
+    if (variant === "new-contract") candidate.graph.acceptanceContracts.at(-1).recordedAt = "2026-08-03T00:00:00.000Z";
+    if (variant === "compatible-contract") candidate.graph.acceptanceContracts.at(-1).expectedDeliverables[0].kind = "test-report";
+    if (variant === "different-error") box.outcome.details.code = "policy-denied";
+    if (variant === "duplicate") boxes.push(clone(box));
+    assert.equal(unstartedDeliveryContractFailure(candidate, boxes), null, variant);
+  }
+});
 
 function handoffIntent(overrides = {}) {
   return {
