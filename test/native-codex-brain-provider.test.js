@@ -883,6 +883,35 @@ test("native cancellation waits for supervised cleanup beyond ten seconds withou
   assert.deepEqual(await readdir(f.runtime), ["sessions"]);
 });
 
+test("native inner result preserves literal string whitespace while the outer envelope stays strict", async (t) => {
+  const f = await fixture(t);
+  const expected = { text: "line one\nline two\tindent\r\nend", literal: "\\n" };
+  const provider = f.create(async call => {
+    const finished = await result(call);
+    const inner = JSON.stringify(expected).replace('one\\nline', 'one\nline').replace('two\\tindent', 'two\tindent').replace('indent\\r\\nend', 'indent\r\nend');
+    await writeFile(call.args[call.args.indexOf("--output-last-message") + 1], JSON.stringify({ result: inner }));
+    return finished;
+  });
+  try {
+    assert.deepEqual(JSON.parse(await provider.generate(request({ schema: { type: "object" } }))), expected);
+  } finally { await provider.close(); }
+});
+
+for (const [label, serialized] of [
+  ['duplicate decoded keys', JSON.stringify({ result: '{"text":"line\nbreak","text":"duplicate"}' })],
+  ['dangerous keys', JSON.stringify({ result: '{"text":"line\nbreak","__proto__":{}}' })],
+  ['raw whitespace in the outer envelope', '{"result":"{\n}"}'],
+]) test(`native string normalization still rejects ${label}`, async t => {
+  const f = await fixture(t);
+  const provider = f.create(async call => {
+    const finished = await result(call);
+    await writeFile(call.args[call.args.indexOf("--output-last-message") + 1], serialized);
+    return finished;
+  });
+  try { await assert.rejects(provider.generate(request()), { code: "STRUCTURED_PROVIDER_RESPONSE_INVALID" }); }
+  finally { await provider.close(); }
+});
+
 test("malformed output keeps native session progress and does not fence later work", async (t) => {
   const f = await fixture(t);
   const bad = f.create(async (call) => {

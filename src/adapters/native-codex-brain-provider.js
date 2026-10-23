@@ -12,6 +12,7 @@ import { CodexAppServerRunner, didAppServerNotStart, didAppServerNotStartModel, 
 import { normalizeStructuredBrainRequest, readStructuredBrainGenerateInput } from "../lib/structured-brain-request.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { parseJsonWithUniqueKeys } from "../lib/strict-json.js";
+import { parseNativeResultJson } from "../lib/native-result-json.js";
 import { GitHubReviewReader } from "./github-review-reader.js";
 import { createCodeJobArtifactReader } from "./code-job-artifact-reader.js";
 import { describeCodeReadContext, revokeCodeReadContext } from "../lib/code-read-context.js";
@@ -161,7 +162,7 @@ async function readResult(file, maximum) {
     if (bytes.length > maximum) throw failure("STRUCTURED_PROVIDER_RESPONSE_TOO_LARGE");
     const envelope = parseJsonWithUniqueKeys(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
     if (!envelope || Object.keys(envelope).length !== 1 || typeof envelope.result !== "string") throw failure("STRUCTURED_PROVIDER_RESPONSE_INVALID");
-    const value = parseJsonWithUniqueKeys(envelope.result);
+    const value = parseNativeResultJson(envelope.result);
     if (!value || typeof value !== "object" || Array.isArray(value)) throw failure("STRUCTURED_PROVIDER_RESPONSE_INVALID");
     const rejectDangerousKeys = (item) => {
       if (!item || typeof item !== "object") return;

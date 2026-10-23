@@ -613,6 +613,81 @@ test("a conflict decision blocked without materials receives one bounded retry o
   }
 });
 
+test("automatic graph decisions get one fresh format retry only for the exact completed native turn", async () => {
+  for (const variant of ["current", "paged", "manual", "owner-paused", "active", "unknown-stop", "running-turn", "old-receipt", "wrong-lease", "wrong-failure", "trimmed", "already-retried", "paged-already-retried", "repeated-cursor", "stale-binding"]) {
+    const time = controlledClock();
+    const item = workItem(42, { type: "role", id: "developer" });
+    const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "runtime-user",
+      baseRepository: "acme/repo", headRepository: "acme/repo", baseRefName: "main", headRefName: "feature",
+      baseRefOid: "1".repeat(40), headRefOid: "2".repeat(40) };
+    item.event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.updated", occurredAt: item.createdAt,
+      source: { provider: "github", scopeId: "test" }, subject: { id: "github:pr:acme/repo#42", repository: "acme/repo", number: 42 },
+      payload: { title: "Repair feedback", relation: "authored", nextAction: "address_review", headRefOid: gitTarget.headRefOid,
+        gitTargetAvailable: true, gitTarget } });
+    Object.assign(item, { kind: "graph_task", sourceQuarantine: null, revision: 20, attempt: 4,
+      status: "blocked", statusReason: "decision_attempts_exhausted",
+      decisionContext: { source: "proposal", referenceId: "inspect-proposal", outcome: "succeeded", value: { kind: "code_action_proposal" } } });
+    item.assignment.graphTask = { sourceBinding: { kind: "pull_request", rootItemId: "pr-root", workKey: "pr-key",
+      inputRevision: 1, headRevision: 1, headRefOid: gitTarget.headRefOid, eventId: item.event.eventId,
+      eventDigest: item.event.contentDigest, inputDigest: "a".repeat(64) } };
+    const timeline = [
+      { sequence: 1, type: "graph_child_created", at: item.createdAt, details: { childTaskId: item.itemId, inputDigest: item.inputDigest } },
+      { sequence: 2, type: "proposal_result_applied", details: { proposalId: "inspect-proposal", outcome: "succeeded" } },
+      { sequence: 3, type: "claimed", at: item.updatedAt, details: { leaseId: "failed-lease", attempt: item.attempt, inputDigest: item.inputDigest } },
+      { sequence: 4, type: "transitioned", at: item.updatedAt, details: { fromStatus: "working", toStatus: "blocked", reason: "decision_attempts_exhausted",
+        context: { code: variant === "wrong-failure" ? "OTHER_FAILURE" : "STRUCTURED_PROVIDER_RESPONSE_INVALID" } } },
+    ];
+    if (variant === "trimmed") timeline.shift();
+    if (["already-retried", "paged-already-retried"].includes(variant)) timeline.splice(1, 0, { sequence: 1.5, type: "transitioned", details: { reason: "native_result_string_format_retried" } });
+    const ledger = new FakeLedger({ source: [item], time });
+    ledger.listTimeline = async ({ cursor }) => {
+      const newest = clone(timeline).reverse();
+      if (["paged", "paged-already-retried", "repeated-cursor"].includes(variant)) {
+        return cursor === undefined || variant === "repeated-cursor"
+          ? { items: newest.slice(0, 2), nextCursor: "older-history" }
+          : { items: newest.slice(2), nextCursor: null };
+      }
+      return { items: newest, nextCursor: null };
+    };
+    ledger.verifyPullRequestExecutionBinding = async binding => {
+      if (variant === "stale-binding") throw Object.assign(new Error("changed target"), { code: "WORK_LEDGER_PR_EXECUTION_BINDING_STALE" });
+      return binding;
+    };
+    const transition = ledger.transition.bind(ledger);
+    ledger.transition = async input => {
+      if (input.toStatus !== "queued") return transition(input);
+      assert.equal(input.expectedRevision, ledger.items[0].revision);
+      Object.assign(ledger.items[0], { status: "queued", statusReason: input.reason, revision: item.revision + 1 });
+      timeline.push({ sequence: 5, type: "transitioned", at: item.updatedAt, details: { reason: input.reason } });
+      return clone(ledger.items[0]);
+    };
+    const loop = createLoop({ ledger, time,
+      ...(variant === "manual" ? {} : { automaticOwnPrRepair: { shouldRun: async () => true } }),
+      taskRuns: {
+        order: async items => items,
+        run: async (_task, operation) => operation(),
+        get: async () => ({ active: variant === "active", mode: variant === "owner-paused" ? "paused" : "active",
+          phase: "failed", pendingCommand: null, stopUnconfirmed: variant === "unknown-stop", receipt: {
+            runId: "failed-native-run", kind: "work-item", taskId: item.itemId, roleId: "developer", phase: "failed",
+            taskRevision: variant === "old-receipt" ? 18 : 19, leaseId: variant === "wrong-lease" ? "other" : "failed-lease",
+            registeredAt: item.updatedAt, modelStartedAt: item.updatedAt, finishedAt: item.updatedAt,
+            outcomeCode: "STRUCTURED_PROVIDER_RESPONSE_INVALID", session: { transport: "app-server", status: variant === "running-turn" ? "running" : "completed" },
+          } }),
+      },
+      directory: new FakeRoleDirectory({ developer: worker({ roleId: "developer", decide: async () => {
+        throw Object.assign(new Error("model failed again"), { code: "STRUCTURED_PROVIDER_RESPONSE_INVALID" });
+      } }) }),
+    });
+    const eligible = ["current", "paged"].includes(variant);
+    assert.equal((await loop.runCycle({ roleId: "developer" })).claimed, eligible ? 1 : 0, variant);
+    assert.equal(ledger.items[0].attempt, eligible ? 5 : 4, variant);
+    if (eligible) {
+      assert.equal((await loop.runCycle({ roleId: "developer" })).claimed, 0);
+      assert.equal(timeline.filter(entry => entry.details.reason === "native_result_string_format_retried").length, 1);
+    }
+  }
+});
+
 test("a cycle reliably intakes, claims, decides, and only stages an intent", async () => {
   const time = controlledClock();
   const ledger = new FakeLedger({ source: [workItem(1)], time });

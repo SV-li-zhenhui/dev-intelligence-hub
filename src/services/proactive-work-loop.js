@@ -2082,6 +2082,10 @@ export class ProactiveWorkLoop {
     for (const item of blocked) {
       if (recovered >= options.workLimit) break;
       const event = currentWorkItemEvent(item);
+      if (await this.#recoverNativeResultStringBlock(item, options)) {
+        recovered += 1;
+        continue;
+      }
       if (item.kind === "graph_task" && item.currentTarget?.id === "developer" && event?.payload?.nextAction === "resolve_conflict" &&
           (item.graph?.deliveries ?? []).length === 0 &&
           item.activeIntentId === null && item.ownerId === null && item.leaseId === null && item.leaseUntil === null &&
@@ -2117,6 +2121,66 @@ export class ProactiveWorkLoop {
       }
     }
     return outcomes;
+  }
+
+  async #recoverNativeResultStringBlock(item, options) {
+    const event = currentWorkItemEvent(item);
+    if (this.automaticOwnPrRepair === null || typeof this.taskRuns?.get !== "function" ||
+        item.kind !== "graph_task" || item.currentTarget?.type !== "role" || item.currentTarget.id !== "developer" ||
+        event?.payload?.relation !== "authored" || item.activeIntentId !== null || item.sourceQuarantine !== null ||
+        item.ownerId !== null || item.leaseId !== null || item.leaseUntil !== null ||
+        item.decisionContext?.source !== "proposal" || item.decisionContext.outcome !== "succeeded" ||
+        item.decisionContext.value?.kind !== "code_action_proposal") return false;
+    try {
+      const timeline = [];
+      let cursor = null;
+      for (let page = 0; page < MAX_PAGE_COUNT; page += 1) {
+        throwIfLoopAborted(options.signal);
+        const result = await this.listTimeline({ itemId: item.itemId, order: "newest", limit: PAGE_SIZE,
+          ...(cursor === null ? {} : { cursor }) });
+        timeline.push(...result.items);
+        if (!result.nextCursor) break;
+        if (result.nextCursor === cursor || page === MAX_PAGE_COUNT - 1) return false;
+        cursor = result.nextCursor;
+      }
+      timeline.sort((left, right) => left.sequence - right.sequence);
+      const creation = timeline[0], latest = timeline.at(-1), claim = timeline.at(-2);
+      if (creation?.type !== "graph_child_created" || creation.at !== item.createdAt ||
+          creation.details?.childTaskId !== item.itemId || creation.details.inputDigest !== item.inputDigest ||
+          latest?.at !== item.updatedAt || latest.type !== "transitioned" || claim?.type !== "claimed" ||
+          claim.details?.attempt !== item.attempt || claim.details?.inputDigest !== item.inputDigest ||
+          latest.details?.fromStatus !== "working" || latest.details?.toStatus !== "blocked" ||
+          latest.details?.reason !== "decision_attempts_exhausted" ||
+          latest.details?.context?.code !== "STRUCTURED_PROVIDER_RESPONSE_INVALID" ||
+          timeline.some(entry => entry.details?.reason === "native_result_string_format_retried") ||
+          !timeline.some(entry => entry.type === "proposal_result_applied" &&
+            entry.details.proposalId === item.decisionContext.referenceId && entry.details.outcome === "succeeded")) return false;
+      const run = await this.taskRuns.get("work-item", item.itemId);
+      const receipt = run.receipt;
+      const times = [claim.at, receipt?.registeredAt, receipt?.modelStartedAt, receipt?.finishedAt, latest.at].map(Date.parse);
+      // A completed native turn proves quiescence without confusing its shared
+      // app-server process with a stopped per-task process. Owner holds win.
+      if (run.active !== false || run.mode !== "active" || run.pendingCommand !== null || run.phase !== "failed" || run.stopUnconfirmed === true ||
+          receipt?.kind !== "work-item" || receipt.taskId !== item.itemId || receipt.roleId !== "developer" ||
+          receipt.phase !== "failed" || receipt.taskRevision !== item.revision - 1 || receipt.leaseId !== claim.details.leaseId ||
+          receipt.outcomeCode !== "STRUCTURED_PROVIDER_RESPONSE_INVALID" || receipt.session?.transport !== "app-server" ||
+          receipt.session.status !== "completed" || times.some(time => !Number.isFinite(time)) ||
+          times.some((time, index) => index > 0 && time < times[index - 1])) return false;
+      const binding = currentWorkItemExecutionBinding(item);
+      if (binding?.schemaVersion !== 2) return false;
+      await this.verifyPullRequestExecutionBinding(binding);
+      throwIfLoopAborted(options.signal);
+      // The native string parser now preserves literal line breaks. Permit one
+      // fresh normal decision; never replay the failed output or reset attempts.
+      await this.ledger.transition({ itemId: item.itemId, expectedRevision: item.revision,
+        leaseId: null, actorId: "work-ledger-system", toStatus: "queued", reason: "native_result_string_format_retried",
+        details: { evidenceRefs: [`run:${receipt.runId}`, "native-result-string-parser:1"] } });
+      return true;
+    } catch (error) {
+      throwIfLoopAborted(options.signal);
+      if (RUNTIME_ADMISSION_ERROR_CODES.has(stableFailureCode(error))) throw error;
+      return false;
+    }
   }
 
   async #recoverConflictInspectionBlock(item, options) {

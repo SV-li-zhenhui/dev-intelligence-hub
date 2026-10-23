@@ -703,6 +703,18 @@ native thread and publish its reference using `CodexNativeSessionStore.save`
 with the exact router-bound session key. Do not remove a pending journal merely
 to make retry succeed: that could silently start a new conversation.
 
+Native structured results normalize literal LF, CR and TAB characters only
+inside the inner JSON's strings. The outer envelope, duplicate decoded
+keys, other syntax, dangerous keys and resource limits remain strict. This
+preserves multiline text without inferring missing JSON structure.
+
+Automatic own-PR graph tasks whose post-code decision exhausted on an invalid
+native result may receive one fresh decision after this parser upgrade. The
+system requires matching failed-attempt history, a completed app-server turn,
+the exact task revision and lease, current PR authority and no owner hold. It
+records `native_result_string_format_retried`, retains lifetime attempts, and
+does not replay the old response or mark any deliverable complete.
+
 Codex PR review JSON traces can contain tool-read output. Their stdout transport
 budget is 64 MiB, separate from the configured structured final-response limit
 (at most 1 MiB). This is not a per-source-file or total-diff truncation rule;
