@@ -1,7 +1,7 @@
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import { createCiRepairEvidence } from "../src/domain/ci-repair-evidence.js";
 import { isDeepStrictEqual } from "node:util";
-import { ciMaterialRecoveryCandidate, planCiMaterialRecovery } from "../src/services/work-ledger-ci-material-recovery.js";
+import { ciMaterialRecoveryCandidate, planCiMaterialRecovery, hasPendingCiMaterialRecovery } from "../src/services/work-ledger-ci-material-recovery.js";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
@@ -18138,7 +18138,7 @@ test('available bound CI material retires its obsolete question before ordinary 
   assert.equal(before.items.find(item => item.itemId === f.rootId).status, 'waiting_user');
   assert.deepEqual(await f.retry(), { retried: 1 });
   let root = await f.service.readItemForReconciliation({ itemId: f.rootId });
-  assert.equal(root.status, 'retry_wait');
+  assert.equal(root.status, 'queued');
   assert.equal(root.activeIntentId, null);
   const retirement = await f.service.readAttentionRequestRetirement({ requestKey: f.askId, producer: f.request.producer });
   assert.equal(retirement.reason, 'ci_materials_recovered');
@@ -18167,6 +18167,10 @@ test('CI material recovery without a Base change makes the orchestrator ready an
   assert.deepEqual(await inbox.archiveRetired(), { archived: 1 });
   assert.equal(inboxStore.stored('attention-inbox').items[0].result, null);
   assert.equal((await inbox.readOutbox()).items.length, 0);
+  const ready = await f.service.readItemForReconciliation({ itemId: f.rootId });
+  const created = await f.service.createGraphChild(prGraphChildCommand(ready, (await f.service.getSummary()).revision, 'repair-after-materials'));
+  assert.equal((await f.service.readItemForReconciliation({ itemId: created.taskId })).status, 'queued');
+  assert.equal((await f.service.readItemForReconciliation({ itemId: f.rootId })).status, 'queued');
 });
 
 test('CI material recovery preserves holds, real questions, source bindings and unknown effects', async t => {
@@ -18251,4 +18255,52 @@ test('CI material recovery fingerprints complete legal histories beyond the defa
   changed.items.find(item => item.itemId === f.childId).graph.acceptanceContracts[20].acceptanceCriteria[40].description = 'Changed historical evidence';
   assert.deepEqual(planCiMaterialRecovery({ state: changed, captured: { itemId: root.itemId, snapshotDigest: candidate.snapshotDigest },
     control: f.control, clock: f.time.clock }), { write: false, result: { retried: 0 } });
+});
+
+async function persistedRetryCiMaterialFixture() {
+  const f = await pendingCiMaterialFixture({ changedBase: false });
+  await f.retry();
+  const legacy = clone(f.store.stored()), root = legacy.items.find(item => item.itemId === f.rootId);
+  root.status = 'retry_wait'; root.availableAt = root.updatedAt;
+  const transition = legacy.timeline.findLast(entry => entry.itemId === f.rootId && entry.type === 'transitioned');
+  transition.type = 'retry_scheduled';
+  transition.details = { fromStatus: 'waiting_user', availableAt: root.availableAt, reason: 'ci_materials_recovered', restoredAttempts: 0 };
+  const { timelineId, contentDigest, ...content } = transition;
+  transition.contentDigest = ledgerDigest(content); transition.timelineId = `work-timeline-${transition.contentDigest}`;
+  legacy.graphMemoryProjection = migrateWorkGraphMemoryProjection(legacy.items, legacy.revision, normalizeWorkLedgerLimits());
+  const durable = normalizeWorkLedgerPersistedState(legacy);
+  return { f, durable, rootId: f.rootId };
+}
+
+test('a persisted retry_wait CI recovery can create its next child after restart', async () => {
+  const { f, durable, rootId } = await persistedRetryCiMaterialFixture();
+  await f.store.write(STATE_KEY, durable);
+  const recovered = await createFixture({ store: f.store, source: f.source, time: f.time });
+  const root = await recovered.service.readItemForReconciliation({ itemId: rootId });
+  assert.equal(root.status, 'retry_wait');
+  assert.equal(hasPendingCiMaterialRecovery(durable, root), true);
+  const created = await recovered.service.createGraphChild(prGraphChildCommand(root,
+    (await recovered.service.getSummary()).revision, 'repair-after-restored-materials'));
+  assert.equal((await recovered.service.readItemForReconciliation({ itemId: created.taskId })).status, 'queued');
+  assert.equal((await recovered.service.readItemForReconciliation({ itemId: rootId })).status, 'queued');
+  assert.equal((await recovered.service.readItemForReconciliation({ itemId: rootId })).activeIntentId, null);
+});
+
+test('legacy CI parent admission still requires its unchanged retirement proof and source', async t => {
+  const { durable, rootId } = await persistedRetryCiMaterialFixture();
+  for (const variant of ['owner-paused', 'no-proof', 'bad-proof', 'changed-child', 'extra-outbox', 'changed-root', 'source-left', 'source-pending']) {
+    await t.test(variant, () => {
+      const state = clone(durable), root = state.items.find(item => item.itemId === rootId);
+      const ask = state.outbox.find(box => box.itemId === rootId);
+      if (variant === 'owner-paused') root.status = 'paused';
+      if (variant === 'no-proof') delete ask.outcome.details.ciMaterialRetirement;
+      if (variant === 'bad-proof') ask.outcome.details.ciMaterialRetirement.digest = 'f'.repeat(64);
+      if (variant === 'changed-child') state.items.find(item => item.graph.parentItemId === rootId).revision++;
+      if (variant === 'extra-outbox') state.outbox.push({ ...clone(ask), intentId: `work-intent-${'f'.repeat(64)}`, status: 'unknown' });
+      if (variant === 'changed-root') root.revision++;
+      if (variant === 'source-left') root.source.scope.active = false;
+      if (variant === 'source-pending') root.source.pendingRevision = 2;
+      assert.equal(hasPendingCiMaterialRecovery(state, root), false);
+    });
+  }
 });

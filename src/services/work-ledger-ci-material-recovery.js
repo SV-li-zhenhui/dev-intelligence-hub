@@ -130,7 +130,7 @@ export function planCiMaterialRecovery({ state, captured, control, clock }) {
   if (material.repository !== readBinding.repository || material.number !== readBinding.pullRequestNumber ||
       material.headRefOid !== readBinding.headRefOid || material.headRefName !== readBinding.gitTarget.headRefName ||
       !material.diagnostics.some(report => report.check === "QuickTest.cn" && report.state === "available" && Array.isArray(report.failures) && report.failures.length > 0)) return noChange;
-  const now = clock(), updated = moveWorkItem(item, { status: "retry_wait", now, availableAt: now,
+  const now = clock(), updated = moveWorkItem(item, { status: "queued", now,
     reason: CI_MATERIALS_RECOVERED, activeIntentId: null });
   const core = { schemaVersion: 1, intentId: ask.intentId, questionRef: ask.outcome.details.questionRef,
     workItemRevision: updated.revision, reason: CI_MATERIALS_RECOVERED, inputBinding, readBinding, materialDigest: material.contentDigest, childrenDigest };
@@ -139,7 +139,25 @@ export function planCiMaterialRecovery({ state, captured, control, clock }) {
       outcome: { ...ask.outcome, details: { ...ask.outcome.details, ciMaterialRetirement: { ...core, digest: ledgerDigest(core) } } } } : entry) },
     timelineEvents: [{ itemId: item.itemId, type: "intent_superseded", at: now, actorId: "work-ledger-system",
       details: { intentId: ask.intentId, reason: CI_MATERIALS_RECOVERED, workItemRevision: updated.revision, materialDigest: material.contentDigest } },
-    { itemId: item.itemId, type: "retry_scheduled", at: now, actorId: "work-ledger-system",
-      details: { fromStatus: item.status, availableAt: now, reason: CI_MATERIALS_RECOVERED, restoredAttempts: 0 } }], result: { retried: 1 } };
+    { itemId: item.itemId, type: "transitioned", at: now, actorId: "work-ledger-system",
+      details: { fromStatus: item.status, toStatus: "queued", reason: CI_MATERIALS_RECOVERED } }], result: { retried: 1 } };
+}
+
+// Previously persisted CI recoveries used retry_wait. Only their unchanged
+// proof-bearing parent can continue; creating its child restores queued state.
+export function hasPendingCiMaterialRecovery(state, item) {
+  if (item?.kind !== "source_root" || item.currentTarget?.id !== "orchestrator" || item.status !== "retry_wait" ||
+      item.statusReason !== CI_MATERIALS_RECOVERED || item.activeIntentId !== null || item.ownerId !== null ||
+      item.leaseId !== null || item.sourceQuarantine !== null || item.source?.pendingRevision !== null) return false;
+  const binding = currentWorkItemExecutionBinding(item);
+  for (const ask of state.outbox) {
+    if (ask.itemId !== item.itemId) continue;
+    const proof = ciMaterialRetirement(ask);
+    if (proof?.workItemRevision !== item.revision || !isDeepStrictEqual(proof.readBinding, binding)) continue;
+    const children = limitationChildren(state, item, ask);
+    if (children === null || proof.childrenDigest !== childHistoryDigest(children)) continue;
+    try { verifyPullRequestExecutionBinding(state, binding); return true; } catch { return false; }
+  }
+  return false;
 }
 

@@ -1188,9 +1188,10 @@ export class WorkLedgerService {
     const state = await this.#readAttentionAuthorityState();
     const item = state.items.find((candidate) => candidate.itemId === input.producer.workItemId);
     const intent = state.outbox.find((candidate) => candidate.intentId === input.requestKey);
-    const maintenance = systemMaintenanceRetirement(intent) ?? hostContextRetirement(intent) ?? ciMaterialRetirement(intent);
+    const ciRetirement = ciMaterialRetirement(intent);
+    const maintenance = systemMaintenanceRetirement(intent) ?? hostContextRetirement(intent) ?? ciRetirement;
     if (item && intent?.itemId === item.itemId && intent.requestedBy.roleId === input.producer.roleId && maintenance !== null) {
-      return { status: "retry_wait", workItemRevision: maintenance.workItemRevision, reason: maintenance.reason };
+      return { status: ciRetirement ? "queued" : "retry_wait", workItemRevision: maintenance.workItemRevision, reason: maintenance.reason };
     }
     if (
       !item || !["cancelled", "completed", "superseded"].includes(item.status) ||

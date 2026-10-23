@@ -1,5 +1,6 @@
 import { normalizeWorkGraphAcceptanceContract } from "../domain/work-graph-contract.js";
 import { hasPendingHostContextRecovery } from "./work-ledger-host-context-recovery.js";
+import { hasPendingCiMaterialRecovery } from "./work-ledger-ci-material-recovery.js";
 import {
   normalizeStoredWorkflowEvent,
   normalizeWorkflowEvent,
@@ -347,7 +348,7 @@ export function planWorkGraphChildCreation({ state, input, clock }) {
   assertTaskRevisionBindings(state, command.expectedTaskRevisions);
   if (
     !["assignment", "graph_task", "source_root"].includes(parent.kind) ||
-    (!CHILD_PARENT_STATUSES.has(parent.status) && !hasPendingHostContextRecovery(state, parent))
+    (!CHILD_PARENT_STATUSES.has(parent.status) && !hasPendingHostContextRecovery(state, parent) && !hasPendingCiMaterialRecovery(state, parent))
   ) {
     throw workLedgerError(
       "WORK_LEDGER_GRAPH_PARENT_CONFLICT",
