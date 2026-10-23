@@ -1061,19 +1061,6 @@ export class ProactiveWorkLoop {
         options.roleId !== ORCHESTRATOR_ROLE_ID &&
         (item.currentTarget.type !== "role" || item.currentTarget.id !== options.roleId)
       ) continue;
-      if (this.automaticOwnPrRepair !== null) {
-        try {
-          if (!(await this.automaticOwnPrRepair.shouldRun(item))) continue;
-        } catch (error) {
-          throwIfLoopAborted(options.signal);
-          const code = stableFailureCode(error);
-          if (!PR_PREPARATION_DEFERRED_CODES.has(code)) throw error;
-          availabilityBudgetUsed += 1;
-          preparationSweep.set(item.itemId, item.revision);
-          outcomes.push({ itemId: item.itemId, status: "conflict_material_deferred", code });
-          continue;
-        }
-      }
       if (this.automaticReviewPolicy !== null && item.currentTarget?.id === "pr-engineer") {
         const event = currentWorkItemEvent(item);
         if (event.source?.provider === "github" && event.payload?.relation === "review_requested") {
@@ -1124,6 +1111,21 @@ export class ProactiveWorkLoop {
       if (resolution.status === "paused") {
         outcomes.push({ itemId: item.itemId, status: "paused" });
         continue;
+      }
+      // Preparation can fetch Git objects and inspect conflicts. Resolve the
+      // owner first so a scoped orchestrator cycle cannot prepare another role's work.
+      if (this.automaticOwnPrRepair !== null) {
+        try {
+          if (!(await this.automaticOwnPrRepair.shouldRun(item))) continue;
+        } catch (error) {
+          throwIfLoopAborted(options.signal);
+          const code = stableFailureCode(error);
+          if (!PR_PREPARATION_DEFERRED_CODES.has(code)) throw error;
+          availabilityBudgetUsed += 1;
+          preparationSweep.set(item.itemId, item.revision);
+          outcomes.push({ itemId: item.itemId, status: "conflict_material_deferred", code });
+          continue;
+        }
       }
       const isGraphBlocked = graphBlocked.has(item.itemId);
       const configuredRoot = isConfiguredRootItem(item, resolution);

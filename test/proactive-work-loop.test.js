@@ -530,6 +530,42 @@ test("PR preparation deferrals respect the scan budget and role scope", async ()
   assert.deepEqual(ledger.calls.claim.map(call => call.itemId), [healthy.itemId]);
 });
 
+test("orchestrator scans do not prepare work owned by another available role", async () => {
+  const time = controlledClock();
+  const developer = workItem(1, { type: "role", id: "developer" });
+  const root = workItem(2, { type: "role", id: "orchestrator" });
+  const ledger = new FakeLedger({ source: [developer, root], time });
+  const prepared = [];
+  const loop = createLoop({ ledger, time,
+    directory: new FakeRoleDirectory({ developer: worker({ roleId: "developer" }),
+      orchestrator: worker({ roleId: "orchestrator" }) }),
+    automaticOwnPrRepair: { async shouldRun(item) {
+      prepared.push(item.itemId);
+      if (item.itemId === developer.itemId) throw new Error("another role's preparation must not occupy the orchestrator");
+      return true;
+    } },
+  });
+  const result = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+  assert.equal(result.claimed, 1);
+  assert.deepEqual(prepared, [root.itemId]);
+  assert.deepEqual(ledger.calls.claim.map(call => call.itemId), [root.itemId]);
+  assert.equal(ledger.items.find(item => item.itemId === developer.itemId).attempt, 0);
+});
+
+test("orchestrator fallback retains PR suppression for a missing role", async () => {
+  const time = controlledClock();
+  const item = workItem(1, { type: "role", id: "developer" });
+  const ledger = new FakeLedger({ source: [item], time });
+  const prepared = [];
+  const loop = createLoop({ ledger, time, directory: new FakeRoleDirectory(),
+    automaticOwnPrRepair: { async shouldRun(candidate) { prepared.push(candidate.itemId); return false; } },
+  });
+  const result = await loop.runCycle({ roleId: "orchestrator" });
+  assert.deepEqual(prepared, [item.itemId]);
+  assert.equal(result.claimed, 0);
+  assert.equal(ledger.calls.claim.length, 0);
+});
+
 test("PR preparation still propagates unknown failures, runtime fences and cancellation", async () => {
   for (const code of ["UNEXPECTED_FAILURE", "RUNTIME_RESTART_REQUIRED", "aborted"]) {
     const time = controlledClock(), controller = new AbortController();
