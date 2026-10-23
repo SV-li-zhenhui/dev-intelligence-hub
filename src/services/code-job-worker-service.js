@@ -1834,7 +1834,7 @@ export class CodeJobWorkerService {
     }
     // A failed brain request between executor actions can retry from the same
     // checkpoint. An admitted or uncertain action still follows reconciliation.
-    if (brainFailureOwnerAttention(code) !== null && current?.status === "active" &&
+    if ((brainFailureOwnerAttention(code) !== null || code === "STRUCTURED_PROVIDER_RESPONSE_INVALID") && current?.status === "active" &&
         current.execution.pendingAction === null && current.execution.actionAdmission === null) {
       const now = new Date(this.#clock()).getTime();
       if (!Number.isFinite(now)) throw workerError("CODE_JOB_CLOCK_INVALID", "Code job worker clock is invalid");

@@ -42,6 +42,11 @@ function normalizeState(value) {
         typeof record.largeActionRecovery.runId !== "string" || !record.largeActionRecovery.runId || record.largeActionRecovery.runId.length > 256)) {
       throw new Error("自动冲突修复大文件恢复记录无效");
     }
+    if (record.providerResponseRecovery !== undefined && (record.providerResponseRecovery?.capability !== "provider-response-retry-v1" ||
+        !Number.isSafeInteger(record.providerResponseRecovery.pausedRevision) || record.providerResponseRecovery.pausedRevision < 1 ||
+        typeof record.providerResponseRecovery.runId !== "string" || !record.providerResponseRecovery.runId || record.providerResponseRecovery.runId.length > 256)) {
+      throw new Error("自动冲突修复模型响应恢复记录无效");
+    }
   }
   return structuredClone(value);
 }
@@ -289,7 +294,7 @@ export class AutomaticOwnPrConflict {
       return "waiting";
     }
     if (detail.job.status === "paused") {
-      return await this.#recoverCapabilityBlock(record, codeItem, detail.job) ? "working" : "waiting";
+      return await this.#recoverSystemBlock(record, codeItem, detail.job) ? "working" : "waiting";
     }
     if (["failed", "cancelled", "fenced"].includes(detail.job.status)) { await this.#update(record, "failed"); return "failed"; }
     const receipt = detail.changePackage?.receipt?.controlledCommit;
@@ -320,14 +325,18 @@ export class AutomaticOwnPrConflict {
     await this.#save({ ...this.#state, records: this.#state.records.map(row => row.jobId === record.jobId ? { ...row, status } : row) });
   }
 
-  async #recoverCapabilityBlock(record, codeItem, job) {
+  async #recoverSystemBlock(record, codeItem, job) {
+    const responseFailure = job.pause?.reason === "等待人工处理（STRUCTURED_PROVIDER_RESPONSE_INVALID）";
+    const code = responseFailure ? "STRUCTURED_PROVIDER_RESPONSE_INVALID" : "CODE_BRAIN_COMPLETION_NOT_READY";
+    const recoveryKey = responseFailure ? "providerResponseRecovery" : "largeActionRecovery";
+    const recovery = record[recoveryKey];
     if (!this.codeJobControl?.resume || !this.taskRuns?.get || record.status !== "working" ||
         codeItem.status !== "completed" ||
         codeItem.receipt?.id !== record.jobId || job.jobId !== record.jobId || job.operation !== "modify" ||
         job.pendingActionType !== null || job.uncertainty !== null ||
-        job.pause?.reason !== "等待人工处理（CODE_BRAIN_COMPLETION_NOT_READY）" ||
+        job.pause?.reason !== `等待人工处理（${code}）` ||
         !samePullRequestExecutionBinding(job.inputBinding, record.inputBinding) ||
-        (record.largeActionRecovery && record.largeActionRecovery.pausedRevision !== job.revision)) return false;
+        (recovery && recovery.pausedRevision !== job.revision)) return false;
     const grant = codeItem.display.payload.action.grant;
     if (job.grantDigest !== grant.grantDigest || grant.executionSource?.kind !== "conflict_preparation" ||
         !await this.#current(record.inputBinding) || !await this.#grantCurrent(grant)) return false;
@@ -339,13 +348,14 @@ export class AutomaticOwnPrConflict {
     if (proof?.mode !== "active" || proof.active !== false || proof.pendingCommand !== null || proof.stopUnconfirmed === true ||
         proof.runId !== receipt?.runId || receipt?.session?.transport !== "app-server" ||
         receipt?.kind !== "code-job" || receipt.taskId !== record.jobId || receipt.roleId !== "developer" ||
-        receipt.phase !== "failed" || receipt.outcomeCode !== "CODE_BRAIN_COMPLETION_NOT_READY" || receipt.stopConfirmed !== true ||
+        receipt.phase !== "failed" || receipt.outcomeCode !== code || receipt.stopConfirmed !== true ||
         typeof receipt.runId !== "string" || !receipt.runId || !Number.isFinite(finished) || !Number.isFinite(started) || !Number.isFinite(paused) ||
         started < Date.parse(job.createdAt) || started > finished || finished > paused ||
-        (record.largeActionRecovery && record.largeActionRecovery.runId !== receipt.runId)) return false;
-    if (!record.largeActionRecovery) {
+        (recovery && recovery.runId !== receipt.runId)) return false;
+    if (!recovery) {
       await this.#save({ ...this.#state, records: this.#state.records.map(row => row.jobId === record.jobId ? {
-        ...row, largeActionRecovery: { capability: "conflict-large-action-v1", pausedRevision: job.revision, runId: receipt.runId },
+        ...row, [recoveryKey]: { capability: responseFailure ? "provider-response-retry-v1" : "conflict-large-action-v1",
+          pausedRevision: job.revision, runId: receipt.runId },
       } : row) });
     }
     // CAS protects concurrent controls. A durable owner pause in TaskRuns is

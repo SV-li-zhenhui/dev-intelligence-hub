@@ -516,51 +516,59 @@ test("conflict checks and verification start automatically for orchestrator-assi
   }
 });
 
-test("automatic conflict capability recovery resumes one settled system block across restart and preserves owner controls", async () => {
-  for (const changed of [null, "owner", "unsettled", "unknown", "drift", "revoked", "disabled", "other-run"]) {
-    let f, resumes = 0;
-    const proof = { runId: "stopped-run", mode: "active", active: false, pendingCommand: null, stopUnconfirmed: false,
-      receipt: { runId: "stopped-run", kind: "code-job", roleId: "developer", phase: "failed", stopConfirmed: true,
-        outcomeCode: "CODE_BRAIN_COMPLETION_NOT_READY", session: { transport: "app-server" },
-        modelStartedAt: "2026-10-10T03:00:30.000Z", finishedAt: "2026-10-10T03:01:00.000Z" } };
-    f = await fixture({ conflict: true, taskRuns: { async get() { return clone(proof); } },
-      codeJobControl: { async resume({ jobId, expectedRevision }) {
-        const job = f.details.get(jobId).job;
-        assert.equal(job.revision, expectedRevision);
-        resumes++; job.status = "active"; job.revision++; job.pause = null;
-      } } });
-    await f.deliver();
-    const job = clone([...f.jobs.values()][0]);
-    Object.assign(job, { status: "paused", revision: 12, pause: {
-      reason: "等待人工处理（CODE_BRAIN_COMPLETION_NOT_READY）", at: "2026-10-10T03:01:01.000Z" } });
-    proof.receipt.taskId = job.jobId;
-    f.details.set(job.jobId, { job });
-    if (changed === "owner") proof.mode = "paused";
-    if (changed === "unsettled") proof.receipt.stopConfirmed = false;
-    if (changed === "unknown") job.uncertainty = { code: "unknown" };
-    if (changed === "drift") f.facts.headRefOid = "9".repeat(40);
-    if (changed === "revoked") f.revokeGrant();
-    if (changed === "disabled") f.config.githubActions.automaticOwnPrRepair = false;
-    if (changed === "other-run") proof.runId = "different-run";
-    if (changed === null) {
-      const state = await f.store.read("automatic-own-pr-conflict-state");
-      state.records[0].capabilityRecovery = { capability: "conflict-edit-and-source-v1", pausedRevision: 8, runId: "earlier-stopped-run" };
-      await f.store.write("automatic-own-pr-conflict-state", state);
-    }
-    await f.restart();
-    await f.service.runCycle();
-    assert.equal(resumes, changed === null ? 1 : 0, String(changed));
-    if (changed === null) {
-      await f.restart(); await f.service.runCycle();
-      assert.equal(resumes, 1);
-      job.status = "paused"; job.revision++; job.pause = { reason: "等待人工处理（CODE_BRAIN_COMPLETION_NOT_READY）", at: "2026-10-10T03:01:01.000Z" };
+test("automatic conflict recovery resumes settled capability and provider blocks while preserving owner controls", async () => {
+  for (const code of ["CODE_BRAIN_COMPLETION_NOT_READY", "STRUCTURED_PROVIDER_RESPONSE_INVALID"]) {
+    const recoveryKey = code === "STRUCTURED_PROVIDER_RESPONSE_INVALID" ? "providerResponseRecovery" : "largeActionRecovery";
+    for (const changed of [null, "owner", "owner-reason", "unsettled", "unknown", "pending-action", "wrong-code", "active", "pending-command", "drift", "revoked", "disabled", "other-run"]) {
+      let f, resumes = 0;
+      const proof = { runId: "stopped-run", mode: "active", active: false, pendingCommand: null, stopUnconfirmed: false,
+        receipt: { runId: "stopped-run", kind: "code-job", roleId: "developer", phase: "failed", stopConfirmed: true,
+          outcomeCode: code, session: { transport: "app-server" },
+          modelStartedAt: "2026-10-10T03:00:30.000Z", finishedAt: "2026-10-10T03:01:00.000Z" } };
+      f = await fixture({ conflict: true, taskRuns: { async get() { return clone(proof); } },
+        codeJobControl: { async resume({ jobId, expectedRevision }) {
+          const job = f.details.get(jobId).job;
+          assert.equal(job.revision, expectedRevision);
+          resumes++; job.status = "active"; job.revision++; job.pause = null;
+        } } });
+      await f.deliver();
+      const job = clone([...f.jobs.values()][0]);
+      Object.assign(job, { status: "paused", revision: 12, pause: {
+        reason: `等待人工处理（${code}）`, at: "2026-10-10T03:01:01.000Z" } });
+      proof.receipt.taskId = job.jobId;
+      f.details.set(job.jobId, { job });
+      if (changed === "owner") proof.mode = "paused";
+      if (changed === "owner-reason") job.pause.reason = "用户从本地指挥中枢暂停代码任务";
+      if (changed === "unsettled") proof.receipt.stopConfirmed = false;
+      if (changed === "unknown") job.uncertainty = { code: "unknown" };
+      if (changed === "pending-action") job.pendingActionType = "write_text";
+      if (changed === "wrong-code") proof.receipt.outcomeCode = "STRUCTURED_PROVIDER_TIMEOUT";
+      if (changed === "active") proof.active = true;
+      if (changed === "pending-command") proof.pendingCommand = "pause";
+      if (changed === "drift") f.facts.headRefOid = "9".repeat(40);
+      if (changed === "revoked") f.revokeGrant();
+      if (changed === "disabled") f.config.githubActions.automaticOwnPrRepair = false;
+      if (changed === "other-run") proof.runId = "different-run";
+      if (changed === null) {
+        const state = await f.store.read("automatic-own-pr-conflict-state");
+        state.records[0].capabilityRecovery = { capability: "conflict-edit-and-source-v1", pausedRevision: 8, runId: "earlier-stopped-run" };
+        await f.store.write("automatic-own-pr-conflict-state", state);
+      }
+      await f.restart();
       await f.service.runCycle();
-      assert.equal(resumes, 1, "a second block cannot replay the one-time capability recovery");
-      const state = await f.store.read("automatic-own-pr-conflict-state");
-      assert.equal(state.records[0].largeActionRecovery.pausedRevision, 12);
-      assert.equal(state.records[0].capabilityRecovery.runId, "earlier-stopped-run", "retain the earlier recovery audit");
+      assert.equal(resumes, changed === null ? 1 : 0, String(changed));
+      if (changed === null) {
+        await f.restart(); await f.service.runCycle();
+        assert.equal(resumes, 1);
+        job.status = "paused"; job.revision++; job.pause = { reason: `等待人工处理（${code}）`, at: "2026-10-10T03:01:01.000Z" };
+        await f.service.runCycle();
+        assert.equal(resumes, 1, "a second block cannot replay the one-time capability recovery");
+        const state = await f.store.read("automatic-own-pr-conflict-state");
+        assert.equal(state.records[0][recoveryKey].pausedRevision, 12);
+        assert.equal(state.records[0].capabilityRecovery.runId, "earlier-stopped-run", "retain the earlier recovery audit");
+      }
+      assert.equal(f.pushes.length, 0);
     }
-    assert.equal(f.pushes.length, 0);
   }
 });
 
