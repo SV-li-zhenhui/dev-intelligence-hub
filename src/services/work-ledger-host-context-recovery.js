@@ -1,6 +1,8 @@
 import { isDeepStrictEqual } from "node:util";
+import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 import { isOwnerRequestedCiRepairEvent } from "./ci-repair-context-reader.js";
-import { unstartedDeliveryContractFailure, unstartedCodePolicyBindingFailure } from "./work-ledger-delivery-failure.js";
+import { unstartedDeliveryContractFailure, unstartedCodePolicyBindingFailure, recordedDeliveryFailure,
+  normalizeRecordedDeliveryFailure } from "./work-ledger-delivery-failure.js";
 import { deliveryAcceptanceContractDigest } from "../domain/delivery-evidence-contract.js";
 import { normalizeWorkResultAttestation } from "./work-ledger-result-attestation.js";
 import { currentWorkItemEvent, currentWorkItemInputBinding, currentWorkItemExecutionBinding,
@@ -13,6 +15,8 @@ export const HOST_CONTEXT_RECOVERED = "host_context_facts_recovered";
 // Restricted adapter for the old untyped host-status question. Product decisions
 // and renewed authorization questions must never be inferred from a choice label.
 function requestedChild(intent) {
+  const delivery = requestedDeliveryChild(intent);
+  if (delivery) return delivery;
   if (intent?.type !== "ask_user" || intent.summary !== "补齐未知阻塞的宿主上下文" ||
       !isDeepStrictEqual(intent.choices, [{ id: "supply-blocking-context", label: "补齐阻塞上下文",
         description: "提供宿主记录的阻塞原因和验证提案状态，保留原修复包及任务历史，再按证据继续。" }])) return null;
@@ -21,14 +25,36 @@ function requestedChild(intent) {
   return match && question && Number.isSafeInteger(Number(match[1])) ? { itemId: question[1], revision: Number(match[1]) } : null;
 }
 
+function requestedDeliveryChild(intent) {
+  if (intent?.type !== "ask_user" || intent.summary !== "请求补充阻塞证据，不请求重复修复授权。" ||
+      !isDeepStrictEqual(intent.choices, [{ id: "provide-blocker-evidence", label: "补充阻塞诊断",
+        description: "提供宿主失败码、对应意图处理结果或可读取的诊断引用；保留原任务与历史，再据证据决定恢复。" }])) return null;
+  const reason = /^多个调度周期中，开发子任务始终停留在 revision ([1-9][0-9]*)、blocked、blockingCondition=null；必需总结未登记且无待验收交付。现有输入及可用只读工具不能确定阻塞原因，无法安全选择恢复措施。需补充宿主诊断信息，不能盲目取消、替换或重复执行；已验收验证报告不代表 QuickTest.cn 已解决，根任务保持未完成。$/.exec(intent.reason);
+  const question = /^请补充开发子任务 (work-item-[a-f0-9]{64}) 在 revision ([1-9][0-9]*) 被标记为 blocked 的宿主原因或失败记录，尤其是 ci-resolution-summary 未登记的处理结果。这是缺失诊断信息请求，不是检查、修改或更新 PR 的授权请求。$/.exec(intent.question);
+  return reason && question && reason[1] === question[2] && Number.isSafeInteger(Number(reason[1]))
+    ? { itemId: question[1], revision: Number(reason[1]), deliveryContext: true } : null;
+}
+
+function settledCodeProposalResult(box) {
+  if (box.intent.type !== "propose_code_action" || box.dispatchBinding === null) return null;
+  try {
+    const result = normalizeWorkResultAttestation(box.outcome?.details?.resultAttestation);
+    return result.kind === "proposal_result" && result.intentId === box.intentId && result.payload.outcome !== "unknown" &&
+      result.payload.proposalId === box.outcome.details.downstreamRef && result.payload.proposalContentDigest === box.outcome.details.proposalDigest ? result : null;
+  } catch { return null; }
+}
+
 export function hostContextRetirement(outbox) {
   const proof = outbox?.outcome?.details?.hostContextRetirement;
+  const delivery = normalizeRecordedDeliveryFailure(proof?.failure, proof?.childRevision);
   if (!hasExactLedgerKeys(proof, ["schemaVersion", "intentId", "questionRef", "workItemRevision", "reason",
     "inputBinding", "childId", "childRevision", "childInputBinding", "failure", "recoveryKey", "digest"]) ||
       proof.schemaVersion !== 1 || proof.reason !== HOST_CONTEXT_RECOVERED || proof.intentId !== outbox.intentId ||
       proof.questionRef !== outbox.outcome.details.questionRef || outbox.status !== "delivered" || outbox.outcome.status !== "delivered" ||
       !Number.isSafeInteger(proof.workItemRevision) || proof.workItemRevision < 1 ||
-      !["delivery-evidence-incompatible", "policy-binding-invalid"].includes(proof.failure?.code) || proof.failure.downstreamCreated !== false ||
+      !((delivery?.code === "ORCHESTRATOR_EVIDENCE_REJECTED") ||
+        (["delivery-evidence-incompatible", "policy-binding-invalid"].includes(proof.failure?.code) &&
+          proof.failure.stage === undefined && proof.failure.downstreamCreated === false)) ||
       !isDeepStrictEqual(proof.childInputBinding, outbox.sourceBinding)) return null;
   const { digest, ...core } = proof;
   const pointer = proof.inputBinding && Object.fromEntries(Object.keys(outbox.sourceBinding ?? {}).map(key => [key, proof.inputBinding[key]]));
@@ -53,18 +79,30 @@ export function hostContextRecoveryCandidate(state, item) {
       !isDeepStrictEqual(currentWorkItemInputBinding(child), currentWorkItemInputBinding(item))) return null;
   if (state.outbox.some(entry => [item.itemId, child.itemId].includes(entry.itemId) &&
       ["pending", "dispatching", "unknown"].includes(entry.status))) return null;
-  const failure = unstartedDeliveryContractFailure(child, state.outbox);
+  const failure = wanted.deliveryContext
+    ? recordedDeliveryFailure(child, state.timeline.findLast(entry => entry.itemId === child.itemId))
+    : unstartedDeliveryContractFailure(child, state.outbox);
+  if (wanted.deliveryContext && (child.currentTarget?.id !== "developer" || failure?.code !== "ORCHESTRATOR_EVIDENCE_REJECTED" ||
+      child.graph.deliveries.at(-1)?.status === "submitted" ||
+      !child.graph.deliveries.some(entry => entry.status === "accepted" && child.graph.acceptanceContracts
+        .find(contract => contract.revision === entry.contractRevision)?.expectedDeliverables
+        .find(expected => expected.deliverableId === entry.deliverableId)?.kind === "test-report") ||
+      state.outbox.some(box => [item.itemId, child.itemId].includes(box.itemId) && box.intent.type !== "ask_user" &&
+        settledCodeProposalResult(box)?.payload.outcome !== "succeeded"))) return null;
   const inputBinding = currentWorkItemExecutionBinding(item);
   if (!failure || !inputBinding) return null;
   try { verifyPullRequestExecutionBinding(state, inputBinding); } catch { return null; }
   // Outboxes are retained with their root (capacity rejects instead of evicting
   // active history). Exclude question/failed-intent IDs from the durable one-shot key.
-  const { intentId: _failedIntentId, ...cause } = failure;
+  const { intentId: _failedIntentId, ...retainedCause } = failure;
+  const cause = wanted.deliveryContext ? { code: failure.code, stage: failure.stage,
+    contractDigest: deliveryAcceptanceContractDigest(child.graph.acceptanceContracts.at(-1)) } : retainedCause;
   const recoveryKey = ledgerDigest({ rootItemId: item.itemId, inputBinding, childId: child.itemId,
     childInputBinding: currentWorkItemInputBinding(child), cause });
   if (state.outbox.some(entry => hostContextRetirement(entry)?.recoveryKey === recoveryKey)) return null;
   return { item, child, ask, inputBinding, failure, recoveryKey,
-    snapshotDigest: ledgerDigest({ item, child, ask, failure }) };
+    ...(wanted.deliveryContext ? { guardedChildItemId: child.itemId } : {}),
+    snapshotDigest: canonicalJsonDigest({ item, child, ask, failure }) };
 }
 
 function childPolicyContextCandidate(state, item) {
@@ -103,12 +141,7 @@ function childPolicyContextCandidate(state, item) {
   if (!failure || failure.intentId !== failed.intentId || failed.intent.operation !== "modify") return null;
   for (const box of boxes) {
     if (box.intent.type !== "propose_code_action" || box.dispatchBinding === null) continue;
-    try {
-      const result = normalizeWorkResultAttestation(box.outcome?.details?.resultAttestation);
-      if (result.kind !== "proposal_result" || result.intentId !== box.intentId || result.payload.outcome === "unknown" ||
-          result.payload.proposalId !== box.outcome.details.downstreamRef ||
-          result.payload.proposalContentDigest !== box.outcome.details.proposalDigest) return null;
-    } catch { return null; }
+    if (!settledCodeProposalResult(box)) return null;
   }
   const inputBinding = currentWorkItemExecutionBinding(item);
   if (!inputBinding) return null;
@@ -125,7 +158,7 @@ function childPolicyContextCandidate(state, item) {
 // recovery instead needs the configured root orchestrator's unleased decision.
 export function hasPendingHostContextRecovery(state, item) {
   if (item?.kind !== "source_root" || item.currentTarget?.id !== "orchestrator" ||
-      item.status !== "retry_wait" || item.statusReason !== HOST_CONTEXT_RECOVERED ||
+      !["retry_wait", "queued"].includes(item.status) || item.statusReason !== HOST_CONTEXT_RECOVERED ||
       item.activeIntentId !== null || item.sourceQuarantine !== null || item.ownerId !== null ||
       item.leaseId !== null || item.leaseUntil !== null) return false;
   const binding = currentWorkItemExecutionBinding(item);
@@ -143,32 +176,36 @@ export function hasPendingHostContextRecovery(state, item) {
   const child = state.items.find(entry => entry.itemId === proof.childId);
   if (child?.revision !== proof.childRevision || child.graph?.parentItemId !== item.itemId ||
       !isDeepStrictEqual(currentWorkItemInputBinding(child), proof.childInputBinding) ||
-      !isDeepStrictEqual(unstartedDeliveryContractFailure(child, state.outbox), proof.failure)) return false;
+      !isDeepStrictEqual(proof.failure.stage === "delivery"
+        ? recordedDeliveryFailure(child, state.timeline.findLast(entry => entry.itemId === child.itemId))
+        : unstartedDeliveryContractFailure(child, state.outbox), proof.failure)) return false;
   try { verifyPullRequestExecutionBinding(state, binding); } catch { return false; }
   return true;
+}
+
+function stoppedDecisionRun(run, target, roleId, revision, now) {
+  return run?.kind === "work-item" && run.taskId === target && run.roleId === roleId && run.active === false &&
+    run.mode === "active" && run.pendingCommand === null && run.stopUnconfirmed !== true && run.phase === "completed" &&
+    run.receipt?.kind === "work-item" && run.receipt.taskId === target && run.receipt.roleId === roleId &&
+    run.receipt.taskRevision === revision && run.receipt.phase === "completed" && run.receipt.stopConfirmed === true &&
+    [run.receipt.registeredAt, run.receipt.modelStartedAt, run.receipt.finishedAt].every(value => Number.isFinite(Date.parse(value))) &&
+    Date.parse(run.receipt.registeredAt) <= Date.parse(run.receipt.modelStartedAt) &&
+    Date.parse(run.receipt.modelStartedAt) <= Date.parse(run.receipt.finishedAt) && Date.parse(run.receipt.finishedAt) <= Date.parse(now);
 }
 
 function hasStoppedDecision(candidate, control, now) {
   if (candidate.decisionOwner) {
     const { item, decisionOwner: root, failed, inputBinding } = candidate;
-    const stopped = (run, target, roleId, revision) => run?.kind === "work-item" && run.taskId === target &&
-      run.roleId === roleId && run.active === false && run.mode === "active" && run.pendingCommand === null &&
-      run.stopUnconfirmed !== true && run.phase === "completed" && run.receipt?.kind === "work-item" &&
-      run.receipt.taskId === target && run.receipt.roleId === roleId && run.receipt.taskRevision === revision &&
-      run.receipt.phase === "completed" && run.receipt.stopConfirmed === true &&
-      [run.receipt.registeredAt, run.receipt.modelStartedAt, run.receipt.finishedAt].every(value => Number.isFinite(Date.parse(value))) &&
-      Date.parse(run.receipt.registeredAt) <= Date.parse(run.receipt.modelStartedAt) &&
-      Date.parse(run.receipt.modelStartedAt) <= Date.parse(run.receipt.finishedAt) && Date.parse(run.receipt.finishedAt) <= Date.parse(now);
     return typeof control?.actorAccountId === "string" && control.actorAccountId.toLowerCase() === inputBinding.gitTarget.sourceAccountId.toLowerCase() &&
-      stopped(control.run, root.itemId, "orchestrator", root.revision) &&
-      stopped(control.childRun, item.itemId, "developer", item.revision - 4) &&
+      stoppedDecisionRun(control.run, root.itemId, "orchestrator", root.revision, now) &&
+      stoppedDecisionRun(control.childRun, item.itemId, "developer", item.revision - 4, now) &&
       Date.parse(control.childRun.receipt.finishedAt) <= Date.parse(failed.createdAt);
   }
   const { item, ask, inputBinding } = candidate;
   const run = control?.run, receipt = run?.receipt;
   // The decision's revision is followed by exactly two parent revisions:
   // staging its ask_user escalation and acknowledging the question's delivery.
-  return typeof control?.actorAccountId === "string" && control.actorAccountId.toLowerCase() === inputBinding.gitTarget.sourceAccountId.toLowerCase() &&
+  const rootStopped = typeof control?.actorAccountId === "string" && control.actorAccountId.toLowerCase() === inputBinding.gitTarget.sourceAccountId.toLowerCase() &&
     run?.kind === "work-item" && run.taskId === item.itemId &&
     run.roleId === "orchestrator" && run.active === false && run.mode === "active" && run.pendingCommand === null &&
     run.stopUnconfirmed !== true && run.phase === "completed" && receipt?.kind === "work-item" && receipt.taskId === item.itemId &&
@@ -177,6 +214,9 @@ function hasStoppedDecision(candidate, control, now) {
     [receipt.registeredAt, receipt.modelStartedAt, receipt.finishedAt, ask.createdAt, ask.updatedAt].every(value => Number.isFinite(Date.parse(value))) &&
     Date.parse(receipt.registeredAt) <= Date.parse(receipt.modelStartedAt) && Date.parse(receipt.modelStartedAt) <= Date.parse(receipt.finishedAt) &&
     Date.parse(receipt.finishedAt) <= Date.parse(ask.createdAt) && Date.parse(ask.createdAt) <= Date.parse(ask.updatedAt);
+  return rootStopped && (!candidate.guardedChildItemId ||
+    (stoppedDecisionRun(control.childRun, candidate.child.itemId, "developer", candidate.child.revision - 1, now) &&
+      Date.parse(control.childRun.receipt.finishedAt) <= Date.parse(candidate.failure.recordedAt)));
 }
 
 export function planHostContextRecovery({ state, captured, control, clock }) {
@@ -186,7 +226,9 @@ export function planHostContextRecovery({ state, captured, control, clock }) {
     return { write: false, result: { retried: 0 } };
   }
   const { item, child, ask, inputBinding, failure, recoveryKey } = candidate;
-  const updated = moveWorkItem(item, { status: "retry_wait", now, availableAt: now,
+  const readyForOrchestration = Boolean(candidate.guardedChildItemId);
+  const updated = moveWorkItem(item, { status: readyForOrchestration ? "queued" : "retry_wait", now,
+    ...(readyForOrchestration ? {} : { availableAt: now }),
     reason: HOST_CONTEXT_RECOVERED, activeIntentId: null });
   const core = { schemaVersion: 1, intentId: ask.intentId, questionRef: ask.outcome.details.questionRef,
     workItemRevision: updated.revision, reason: HOST_CONTEXT_RECOVERED, inputBinding,
@@ -197,7 +239,8 @@ export function planHostContextRecovery({ state, captured, control, clock }) {
     timelineEvents: [{ itemId: item.itemId, type: "intent_superseded", at: now, actorId: "work-ledger-system",
       details: { intentId: ask.intentId, reason: HOST_CONTEXT_RECOVERED, inputBinding, inputDigest: ask.inputDigest,
         workItemRevision: updated.revision, code: failure.code } },
-    { itemId: item.itemId, type: "retry_scheduled", at: now, actorId: "work-ledger-system",
-      details: { fromStatus: item.status, availableAt: now, reason: HOST_CONTEXT_RECOVERED, restoredAttempts: 0 } }],
+    { itemId: item.itemId, type: readyForOrchestration ? "transitioned" : "retry_scheduled", at: now, actorId: "work-ledger-system",
+      details: readyForOrchestration ? { fromStatus: item.status, toStatus: "queued", reason: HOST_CONTEXT_RECOVERED }
+        : { fromStatus: item.status, availableAt: now, reason: HOST_CONTEXT_RECOVERED, restoredAttempts: 0 } }],
     result: { retried: 1 } };
 }

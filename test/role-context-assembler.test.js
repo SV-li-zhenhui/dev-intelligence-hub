@@ -2479,3 +2479,44 @@ test("constructor rejects accessor ports without invoking them", () => {
     assert.equal(getterCalls, 0);
   }
 });
+
+test('root coordination exposes the retained delivery failure without presenting it as an unstarted proposal', async () => {
+  const fixture = rootOrchestratorFixture();
+  const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === 'task-current');
+  state.ledgerStatus = 'blocked'; state.statusReason = 'delivery_attempts_exhausted';
+  state.deliveryFailure = { code: 'ORCHESTRATOR_EVIDENCE_REJECTED', stage: 'delivery', taskRevision: state.taskRevision,
+    timelineId: `work-timeline-${'a'.repeat(64)}`, timelineDigest: 'a'.repeat(64), recordedAt: '2026-08-03T07:00:00.000Z' };
+  state.rawError = 'PRIVATE-HOST-TRACE';
+  const packet = await assemble(fixture, { roleId: 'orchestrator' });
+  const visible = packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === state.taskId);
+  assert.equal(visible.blockingCondition, 'ORCHESTRATOR_EVIDENCE_REJECTED');
+  assert.deepEqual(visible.deliveryFailure, state.deliveryFailure);
+  assert.equal(Object.hasOwn(visible.deliveryFailure, 'downstreamCreated'), false);
+  assert.equal(JSON.stringify(packet).includes('PRIVATE-HOST-TRACE'), false);
+});
+
+for (const variant of ['revision', 'stage', 'code', 'timeline', 'timestamp', 'extra-field', 'accessor']) {
+  test(`delivery diagnostic context rejects an invalid ${variant}`, async () => {
+    const fixture = rootOrchestratorFixture();
+    const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === 'task-current');
+    state.ledgerStatus = 'blocked'; state.statusReason = 'delivery_attempts_exhausted';
+    const failure = { code: 'ORCHESTRATOR_EVIDENCE_REJECTED', stage: 'delivery', taskRevision: state.taskRevision,
+      timelineId: `work-timeline-${'a'.repeat(64)}`, timelineDigest: 'a'.repeat(64), recordedAt: '2026-08-03T07:00:00.000Z' };
+    let reads = 0;
+    if (variant === 'revision') failure.taskRevision++;
+    if (variant === 'stage') failure.stage = 'dispatch';
+    if (variant === 'code') failure.code = { toString: 'not-code' };
+    if (variant === 'timeline') failure.timelineId = `work-timeline-${'b'.repeat(64)}`;
+    if (variant === 'timestamp') failure.recordedAt = 'not-a-timestamp';
+    if (variant === 'extra-field') failure.downstreamCreated = false;
+    if (variant === 'accessor') Object.defineProperty(failure, 'code', { enumerable: true, get() { reads++; return 'ORCHESTRATOR_EVIDENCE_REJECTED'; } });
+    state.deliveryFailure = failure;
+    const run = variant === 'accessor' ? new RoleContextAssembler({ graphReader: { async getSnapshot() {
+      return { ...fixture.snapshot, graph: createWorkGraphSnapshot({ graphId: fixture.snapshot.graph.graphId,
+        revision: fixture.snapshot.graph.revision, tasks: fixture.snapshot.graph.tasks }) };
+    } } }).assemble({ roleId: 'orchestrator', item: fixture.item, trigger: 'employee:orchestrator' })
+      : assemble(fixture, { roleId: 'orchestrator' });
+    await assert.rejects(run, error => error.code === 'ROLE_CONTEXT_INVALID');
+    assert.equal(reads, 0);
+  });
+}

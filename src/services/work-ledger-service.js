@@ -1189,9 +1189,11 @@ export class WorkLedgerService {
     const item = state.items.find((candidate) => candidate.itemId === input.producer.workItemId);
     const intent = state.outbox.find((candidate) => candidate.intentId === input.requestKey);
     const ciRetirement = ciMaterialRetirement(intent);
-    const maintenance = systemMaintenanceRetirement(intent) ?? hostContextRetirement(intent) ?? ciRetirement;
+    const hostRetirement = hostContextRetirement(intent);
+    const maintenance = systemMaintenanceRetirement(intent) ?? hostRetirement ?? ciRetirement;
     if (item && intent?.itemId === item.itemId && intent.requestedBy.roleId === input.producer.roleId && maintenance !== null) {
-      return { status: ciRetirement ? "queued" : "retry_wait", workItemRevision: maintenance.workItemRevision, reason: maintenance.reason };
+      return { status: ciRetirement || hostRetirement?.failure.stage === "delivery" ? "queued" : "retry_wait",
+        workItemRevision: maintenance.workItemRevision, reason: maintenance.reason };
     }
     if (
       !item || !["cancelled", "completed", "superseded"].includes(item.status) ||
@@ -1692,7 +1694,8 @@ export class WorkLedgerService {
         const candidate = ci ?? hostContextRecoveryCandidate(this.state, item);
         if (candidate) candidates.push({ itemId: item.itemId, snapshotDigest: candidate.snapshotDigest,
           ...(ci ? { ciMaterials: true, inputBinding: ci.readBinding, event: ci.readEvent } : {}),
-          ...(candidate.decisionOwner ? { controlItemId: candidate.decisionOwner.itemId, childItemId: item.itemId } : {}) });
+          ...(candidate.decisionOwner ? { controlItemId: candidate.decisionOwner.itemId, childItemId: item.itemId }
+            : candidate.guardedChildItemId ? { childItemId: candidate.guardedChildItemId } : {}) });
         if (candidates.length >= input.limit - result.retried) break;
       }
       return candidates;

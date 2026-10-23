@@ -16249,10 +16249,12 @@ async function prepareProposalResult(
     intentOverrides = {},
     roleId: configuredRoleId,
     workerId: configuredWorkerId,
+    itemId: selectedItemId,
   } = {},
 ) {
   await fixture.service.intake();
-  let item = (await fixture.service.listItems()).items[0];
+  let item = selectedItemId === undefined ? (await fixture.service.listItems()).items[0]
+    : await fixture.service.readItemForReconciliation({ itemId: selectedItemId });
   const codeProposal = kind === "code_action_proposal";
   const externalActionProposal =
     kind === "github_pull_request_action_proposal";
@@ -18303,4 +18305,175 @@ test('legacy CI parent admission still requires its unchanged retirement proof a
       assert.equal(hasPendingCiMaterialRecovery(state, root), false);
     });
   }
+});
+
+async function blockedDeliveryDiagnosticFixture({ hostContextRecoveryReader } = {}) {
+  const record = ownerRequestedPrAssignment(1, { gitFacts: { ...prGitFacts(PR_HEAD_A), workType: 'general',
+    nextAction: 'fix_ci', suggestedCapability: 'development', expectedHeadRefOid: PR_HEAD_A } });
+  record.assignment.target = { type: 'role', id: 'orchestrator' };
+  const f = await createFixture({ records: [record], hostContextRecoveryReader });
+  await f.service.intake();
+  let root = (await f.service.listItems()).items[0];
+  const command = prGraphChildCommand(root, (await f.service.getSummary()).revision, 'ci-diagnostic-summary');
+  command.command.acceptanceContract.expectedDeliverables = [
+    { deliverableId: 'ci-resolution-summary', kind: 'text-report', description: 'Bound CI diagnosis and limitations', required: true },
+    { deliverableId: 'ci-fix-verification', kind: 'test-report', description: 'Actual verification evidence only', required: false }];
+  const created = await f.service.createGraphChild(command);
+  const inspected = await prepareProposalResult(f, { kind: 'code_action_proposal', itemId: created.taskId,
+    intentOverrides: { operation: 'inspect' }, sealSource: true });
+  await f.service.applyProposalBatch({ items: [inspected], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+  let child = await f.service.readItemForReconciliation({ itemId: created.taskId });
+  child = await f.service.claim({ itemId: child.itemId, expectedRevision: child.revision, workerId: 'employee-developer', leaseDurationMs: 30000 });
+  await f.service.submitGraphDelivery({ authority: { actorId: 'employee-developer', scopeRootTaskId: root.itemId,
+    taskId: child.itemId, leaseId: child.leaseId }, command: { deliveryRevision: 1, contractRevision: 1,
+      deliverableId: 'ci-fix-verification', summary: 'A completed preflight does not establish remote CI success',
+      evidence: [{ kind: 'test-report', referenceId: 'fixture-previous-verification', contentDigest: 'a'.repeat(64) }],
+      expectedGraphRevision: (await f.service.getSummary()).revision, expectedTaskRevision: child.revision } });
+  child = await f.service.readItemForReconciliation({ itemId: child.itemId });
+  await f.service.decideGraphDelivery({ authority: { actorId: 'employee-orchestrator', scopeRootTaskId: root.itemId }, command: {
+    taskId: child.itemId, submittedDeliveryRevision: 1, decision: 'accept', reason: 'Accept the reported check only, not CI success',
+    expectedGraphRevision: (await f.service.getSummary()).revision, expectedTaskRevision: child.revision } });
+  child = await f.service.readItemForReconciliation({ itemId: child.itemId });
+  child = await f.service.claim({ itemId: child.itemId, expectedRevision: child.revision, workerId: 'employee-developer', leaseDurationMs: 30000 });
+  child = await f.service.transition({ itemId: child.itemId, expectedRevision: child.revision, leaseId: child.leaseId,
+    actorId: 'employee-developer', toStatus: 'blocked', reason: 'delivery_attempts_exhausted', details: { code: 'ORCHESTRATOR_EVIDENCE_REJECTED' } });
+  root = await f.service.readItemForReconciliation({ itemId: root.itemId });
+  return { ...f, rootId: root.itemId, childId: child.itemId };
+}
+
+test('a blocked delivery retains its host failure beside accepted verification history', async () => {
+  const f = await blockedDeliveryDiagnosticFixture();
+  const before = await f.service.readItemForReconciliation({ itemId: f.childId });
+  const state = (await f.service.getGraphSnapshot()).taskStates.find(task => task.taskId === f.childId);
+  assert.equal(state.deliveryFailure.code, 'ORCHESTRATOR_EVIDENCE_REJECTED');
+  assert.equal(state.deliveryFailure.stage, 'delivery');
+  assert.equal(state.deliveryFailure.taskRevision, before.revision);
+  assert.equal(Object.hasOwn(state.deliveryFailure, 'downstreamCreated'), false);
+  assert.equal(before.graph.deliveries.at(-1).status, 'accepted');
+  assert.deepEqual(await f.service.readItemForReconciliation({ itemId: f.childId }), before);
+});
+
+async function pendingDeliveryDiagnosticQuestionFixture({ duringRead = () => {} } = {}) {
+  let control;
+  const reads = [];
+  const f = await blockedDeliveryDiagnosticFixture({ hostContextRecoveryReader: {
+    async read(input) { reads.push(input); const captured = clone(control); duringRead(control); return captured; },
+    async withStoppedRuns(expected, operation) {
+      return isDeepStrictEqual(expected, control) ? { executed: true, result: await operation() } : { executed: false };
+    },
+  } });
+  const root = await f.service.readItemForReconciliation({ itemId: f.rootId });
+  const child = await f.service.readItemForReconciliation({ itemId: f.childId });
+  const receipt = (item, roleId, taskRevision) => ({ kind: 'work-item', taskId: item.itemId, roleId, active: false,
+    mode: 'active', pendingCommand: null, phase: 'completed', receipt: { kind: 'work-item', taskId: item.itemId, roleId,
+      taskRevision, phase: 'completed', stopConfirmed: true, registeredAt: f.time.clock(), modelStartedAt: f.time.clock(), finishedAt: f.time.clock() } });
+  control = { actorAccountId: 'runtime-user', run: receipt(root, 'orchestrator', root.revision), childRun: receipt(child, 'developer', child.revision - 1) };
+  const question = `请补充开发子任务 ${child.itemId} 在 revision ${child.revision} 被标记为 blocked 的宿主原因或失败记录，尤其是 ci-resolution-summary 未登记的处理结果。这是缺失诊断信息请求，不是检查、修改或更新 PR 的授权请求。`;
+  const choices = [{ id: 'provide-blocker-evidence', label: '补充阻塞诊断', description: '提供宿主失败码、对应意图处理结果或可读取的诊断引用；保留原任务与历史，再据证据决定恢复。' }];
+  const staged = await f.service.stageGraphEscalation({ authority: { actorId: 'employee-orchestrator', scopeRootTaskId: root.itemId }, command: {
+    taskId: root.itemId, expectedTaskRevision: root.revision, expectedGraphRevision: (await f.service.getSummary()).revision,
+    summary: '请求补充阻塞证据，不请求重复修复授权。',
+    reason: `多个调度周期中，开发子任务始终停留在 revision ${child.revision}、blocked、blockingCondition=null；必需总结未登记且无待验收交付。现有输入及可用只读工具不能确定阻塞原因，无法安全选择恢复措施。需补充宿主诊断信息，不能盲目取消、替换或重复执行；已验收验证报告不代表 QuickTest.cn 已解决，根任务保持未完成。`, question, choices } });
+  let ask = await f.service.claimIntent({ intentId: staged.outbox.intentId, expectedRevision: staged.outbox.revision,
+    dispatcherId: 'work-intent-dispatcher', leaseDurationMs: 30000 });
+  ask = await f.service.bindIntent({ intentId: ask.intentId, expectedRevision: ask.revision, dispatchLeaseId: ask.dispatchLeaseId,
+    dispatcherId: 'work-intent-dispatcher', itemExpectedRevision: staged.item.revision, boundIntent: boundAttentionIntent(staged.item, ask) });
+  const request = normalizeAttentionRequest({ requestKey: ask.intentId, type: 'ask_user', producer: { roleId: 'orchestrator', workItemId: root.itemId },
+    question, choices, context: [] });
+  const attention = createAttentionItem(request, 1, f.time.clock());
+  await f.service.ackIntent({ intentId: ask.intentId, expectedRevision: ask.revision, dispatchLeaseId: ask.dispatchLeaseId,
+    itemExpectedRevision: staged.item.revision, actorId: 'work-intent-dispatcher', outcome: 'delivered', nextStatus: 'waiting_user', details: { questionRef: attention.requestId } });
+  return { ...f, control, reads, request, attention, askId: ask.intentId,
+    retry: () => f.service.retrySystemMaintenanceQuestions({ limit: 10, requestKeys: [ask.intentId] }) };
+}
+
+test('recorded delivery diagnostics retire a host-only question while retaining accepted reports and allowing follow-up work', async () => {
+  const f = await pendingDeliveryDiagnosticQuestionFixture();
+  const child = await f.service.readItemForReconciliation({ itemId: f.childId });
+  const inboxStore = new MemoryStore();
+  const inbox = new AttentionInbox({ store: inboxStore, exclusiveLease: new ExclusiveLease(), authority: f.service, clock: f.time.clock });
+  await inbox.recover(); await inbox.create(f.request);
+  assert.deepEqual(await inbox.retrySystemQuestions(), { retried: 1 });
+  assert.deepEqual(f.reads, [{ itemId: f.rootId, childItemId: f.childId }]);
+  assert.deepEqual(await f.service.readItemForReconciliation({ itemId: f.childId }), child);
+  assert.deepEqual(await inbox.archiveRetired(), { archived: 1 });
+  assert.equal((await inbox.readOutbox()).items.length, 0);
+  const parent = await f.service.readItemForReconciliation({ itemId: f.rootId });
+  assert.equal(parent.status, 'queued');
+  const page = await f.service.listClaimCandidates({ at: f.time.clock(), roleId: 'orchestrator' });
+  assert.equal(page.facts.find(fact => fact.itemId === f.rootId).orchestrationReady, true);
+  const next = await f.service.createGraphChild(prGraphChildCommand(parent, (await f.service.getSummary()).revision, 'resolve-recorded-delivery-failure'));
+  assert.equal((await f.service.readItemForReconciliation({ itemId: next.taskId })).status, 'queued');
+  const late = resolveAttentionItem(f.attention, { type: 'choice', choiceId: 'provide-blocker-evidence' }, 2, f.time.clock(), 1).outbox;
+  const saved = await f.service.readItemForReconciliation({ itemId: f.rootId });
+  await f.service.applyAttentionBatch({ items: [late], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+  assert.deepEqual(await f.service.readItemForReconciliation({ itemId: f.rootId }), saved);
+});
+
+test('delivery diagnostic recovery preserves real questions, pending effects and both stopped owners', async t => {
+  const f = await pendingDeliveryDiagnosticQuestionFixture();
+  for (const variant of ['root-pause', 'child-pause', 'root-active', 'child-active', 'root-control', 'child-control', 'child-stop-unknown',
+    'child-revision', 'actor', 'business-question', 'extra-choice', 'answered', 'backlog', 'submitted-report', 'missing-acceptance',
+    'failure-code', 'failure-missing', 'failure-not-latest', 'pending-effect', 'failed-effect', 'stale-effect', 'unknown-effect', 'child-history', 'root-revision']) {
+    await t.test(variant, () => {
+      const state = clone(f.store.stored()), control = clone(f.control), root = state.items.find(item => item.itemId === f.rootId);
+      const candidate = hostContextRecoveryCandidate(state, root); assert.ok(candidate);
+      const captured = { itemId: root.itemId, snapshotDigest: candidate.snapshotDigest };
+      const child = state.items.find(item => item.itemId === f.childId), ask = state.outbox.find(box => box.intentId === f.askId);
+      const failed = state.timeline.findLast(entry => entry.itemId === child.itemId);
+      if (variant === 'root-pause') root.status = 'paused';
+      if (variant === 'child-pause') child.status = 'paused';
+      if (variant === 'root-active') control.run.active = true;
+      if (variant === 'child-active') control.childRun.active = true;
+      if (variant === 'root-control') control.run.pendingCommand = { type: 'pause' };
+      if (variant === 'child-control') control.childRun.pendingCommand = { type: 'pause' };
+      if (variant === 'child-stop-unknown') control.childRun.receipt.stopConfirmed = false;
+      if (variant === 'child-revision') control.childRun.receipt.taskRevision++;
+      if (variant === 'actor') control.actorAccountId = 'another-user';
+      if (variant === 'business-question') ask.intent.question = 'Change the acceptance scope?';
+      if (variant === 'extra-choice') ask.intent.choices.push({ id: 'pause', label: 'Pause' });
+      if (variant === 'answered') ask.outcome.details.resultAttestation = {};
+      if (variant === 'backlog') state.attentionHighWatermark++;
+      if (variant === 'submitted-report') child.graph.deliveries.at(-1).status = 'submitted';
+      if (variant === 'missing-acceptance') child.graph.deliveries.pop();
+      if (variant === 'failure-code') failed.details.context.code = 'SOME_OTHER_ERROR';
+      if (variant === 'failure-missing') delete failed.details.context.code;
+      if (variant === 'failure-not-latest') state.timeline.push({ ...clone(failed), type: 'graph_acceptance_contract_revised' });
+      if (variant === 'pending-effect') state.outbox.find(box => box.itemId === child.itemId).status = 'unknown';
+      if (['failed-effect', 'stale-effect', 'unknown-effect'].includes(variant)) {
+        const box = state.outbox.find(box => box.itemId === child.itemId), attestation = box.outcome.details.resultAttestation;
+        const { resultId, contentDigest, ...body } = attestation.payload;
+        body.outcome = variant.split('-')[0];
+        const hash = workProposalDigest(body);
+        attestation.payload = { ...body, contentDigest: hash, resultId: `work-proposal-result-${hash}` };
+        const { attestationDigest, ...core } = attestation;
+        attestation.attestationDigest = ledgerDigest(core);
+      }
+      if (variant === 'child-history') child.graph.deliveries[0].summary += ' changed';
+      if (variant === 'root-revision') root.revision++;
+      const before = clone(state);
+      assert.deepEqual(planHostContextRecovery({ state, captured, control, clock: f.time.clock }), { write: false, result: { retried: 0 } });
+      assert.deepEqual(state, before);
+    });
+  }
+});
+
+for (const owner of ['root', 'child']) {
+  test(`a ${owner} owner change after diagnostic reading cannot retire its question`, async () => {
+    const f = await pendingDeliveryDiagnosticQuestionFixture({ duringRead(control) {
+      if (owner === 'root') control.run.pendingCommand = { type: 'pause' };
+      else control.childRun.active = true;
+    } });
+    assert.deepEqual(await f.retry(), { retried: 0 });
+    assert.equal((await f.service.readItemForReconciliation({ itemId: f.rootId })).status, 'waiting_user');
+  });
+}
+
+test('the same delivery failure and contract cannot consume another host recovery', async () => {
+  const f = await pendingDeliveryDiagnosticQuestionFixture();
+  const before = clone(f.store.stored());
+  assert.deepEqual(await f.retry(), { retried: 1 });
+  const proof = f.store.stored().outbox.find(box => box.intentId === f.askId).outcome.details.hostContextRetirement;
+  before.outbox.find(box => box.intentId === f.askId).outcome.details.hostContextRetirement = clone(proof);
+  assert.equal(hostContextRecoveryCandidate(before, before.items.find(item => item.itemId === f.rootId)), null);
 });

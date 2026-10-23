@@ -2,6 +2,29 @@ import { isDeepStrictEqual } from "node:util";
 import { createProposalDeliveryEvidenceTarget, deliveryAcceptanceContractDigest,
   deliveryEvidenceKindsForProposal, DELIVERY_EVIDENCE_ACTION_INCOMPATIBLE } from "../domain/delivery-evidence-contract.js";
 import { currentWorkItemInputBinding } from "./work-ledger-pr-source.js";
+import { hasExactLedgerKeys } from "./work-ledger-values.js";
+
+export function normalizeRecordedDeliveryFailure(value, taskRevision) {
+  if (!hasExactLedgerKeys(value, ["code", "stage", "taskRevision", "timelineId", "timelineDigest", "recordedAt"]) ||
+      typeof value.code !== "string" || !/^[A-Z][A-Z0-9_]{1,127}$/.test(value.code) || value.stage !== "delivery" ||
+      !Number.isSafeInteger(taskRevision) || taskRevision < 1 || value.taskRevision !== taskRevision ||
+      typeof value.timelineDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.timelineDigest) ||
+      value.timelineId !== `work-timeline-${value.timelineDigest}` || typeof value.recordedAt !== "string" ||
+      !Number.isFinite(Date.parse(value.recordedAt)) || new Date(value.recordedAt).toISOString() !== value.recordedAt) return null;
+  return { code: value.code, stage: "delivery", taskRevision, timelineId: value.timelineId,
+    timelineDigest: value.timelineDigest, recordedAt: value.recordedAt };
+}
+
+// Retained worker outcome only; it does not diagnose the product's CI failure
+// or say that earlier proposals were never executed.
+export function recordedDeliveryFailure(item, latest) {
+  if (item?.kind !== "graph_task" || item.status !== "blocked" || item.statusReason !== "delivery_attempts_exhausted" ||
+      item.activeIntentId !== null || item.ownerId !== null || item.leaseId !== null || item.leaseUntil !== null ||
+      item.sourceQuarantine !== null || latest?.itemId !== item.itemId || latest.type !== "transitioned" ||
+      latest.at !== item.updatedAt || latest.details?.toStatus !== "blocked" || latest.details.reason !== "delivery_attempts_exhausted") return null;
+  return normalizeRecordedDeliveryFailure({ code: latest.details.context?.code, stage: "delivery", taskRevision: item.revision,
+    timelineId: latest.timelineId, timelineDigest: latest.contentDigest, recordedAt: latest.at }, item.revision);
+}
 
 // This explains a failed pre-binding decision to the parent. It does not
 // authorize retry, alter the delivery contract, or replay a downstream action.

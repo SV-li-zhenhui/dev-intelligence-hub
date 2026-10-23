@@ -15,7 +15,7 @@ import {
 import { currentWorkItemInputBinding } from "./work-ledger-pr-source.js";
 import { isRecoveredConflictInspection } from "./work-ledger-inspection-continuation.js";
 import { unstartedConflictDispatchFailure } from "./work-ledger-conflict-failure.js";
-import { unstartedDeliveryContractFailure, unstartedCodePolicyBindingFailure } from "./work-ledger-delivery-failure.js";
+import { unstartedDeliveryContractFailure, unstartedCodePolicyBindingFailure, recordedDeliveryFailure } from "./work-ledger-delivery-failure.js";
 
 export const WORK_LEDGER_GRAPH_ID = "work-ledger";
 
@@ -381,6 +381,8 @@ export function projectWorkLedgerGraphView(state, options) {
   const graph = projectWorkLedgerGraphSnapshot(state, options);
   const stateEntries = ledgerDataEntries(state);
   const fields = new Map(stateEntries);
+  const latestTimelineByItem = new Map();
+  const deliveryFailureIds = new Set();
   const outboxesByItemId = new Map();
   for (const outbox of fields.get("outbox") ?? []) {
     const siblings = outboxesByItemId.get(outbox.itemId) ?? [];
@@ -397,9 +399,19 @@ export function projectWorkLedgerGraphView(state, options) {
         );
       }
       const itemFields = new Map(entries);
+      if (itemFields.get("status") === "blocked" && itemFields.get("statusReason") === "delivery_attempts_exhausted") {
+        deliveryFailureIds.add(itemFields.get("itemId"));
+      }
       return [itemFields.get("itemId"), itemFields];
     }),
   );
+  const timeline = fields.get("timeline") ?? [];
+  for (let index = timeline.length - 1; index >= 0 && latestTimelineByItem.size < deliveryFailureIds.size; index--) {
+    const entry = timeline[index];
+    if (deliveryFailureIds.has(entry.itemId) && !latestTimelineByItem.has(entry.itemId)) {
+      latestTimelineByItem.set(entry.itemId, entry);
+    }
+  }
   const taskStates = graph.tasks.map((task) => {
     const item = itemsById.get(task.taskId);
     if (!item || item.get("revision") !== task.revision) {
@@ -410,6 +422,8 @@ export function projectWorkLedgerGraphView(state, options) {
     }
     workLedgerStatusToGraphStatus(item.get("status"));
     let dispatchFailure = null;
+    const deliveryFailure = deliveryFailureIds.has(task.taskId)
+      ? recordedDeliveryFailure(Object.fromEntries(item), latestTimelineByItem.get(task.taskId)) : null;
     if (item.get("statusReason") === "intent_failed") {
       const failedItem = Object.fromEntries(item), outboxes = outboxesByItemId.get(task.taskId) ?? [];
       dispatchFailure = unstartedConflictDispatchFailure(failedItem, outboxes) ?? unstartedDeliveryContractFailure(failedItem, outboxes) ??
@@ -424,6 +438,7 @@ export function projectWorkLedgerGraphView(state, options) {
       availableAt: item.get("availableAt"),
       statusReason: item.get("statusReason"),
       ...(dispatchFailure === null ? {} : { dispatchFailure }),
+      ...(deliveryFailure === null ? {} : { deliveryFailure }),
       updatedAt: item.get("updatedAt"),
       work: projectedItemWork(item),
     };
