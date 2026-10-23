@@ -577,18 +577,28 @@ export function migrateWorkGraphMemoryProjection(items, ledgerRevision, limits) 
   };
 }
 
+function batchedSourceAuthorityReader(state) {
+  const admissions = pullRequestHeadAdmissions(state, state.items);
+  const admissionByItem = new Map(state.items.map((item, index) => [item, admissions[index]]));
+  return item => sourceAuthorityFor(state, item, {
+    headAdmission: (_state, candidate) => admissionByItem.get(candidate),
+  });
+}
+
 function authorityInvalidations(previousState, candidateState) {
+  const previousAuthorityFor = batchedSourceAuthorityReader(previousState);
+  const candidateAuthorityFor = batchedSourceAuthorityReader(candidateState);
   const candidateById = new Map(
     candidateState.items.map((item) => [item.itemId, item]),
   );
   const result = [];
   for (const item of previousState.items) {
-    const previousAuthority = sourceAuthorityFor(previousState, item);
+    const previousAuthority = previousAuthorityFor(item);
     if (!previousAuthority.applies) continue;
     const candidate = candidateById.get(item.itemId);
     const nextAuthority = candidate === undefined
       ? null
-      : sourceAuthorityFor(candidateState, candidate);
+      : candidateAuthorityFor(candidate);
     const bindingChanged =
       nextAuthority === null ||
       nextAuthority.bindingDigest !== previousAuthority.bindingDigest;
