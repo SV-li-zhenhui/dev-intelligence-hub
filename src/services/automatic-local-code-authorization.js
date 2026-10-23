@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { OperationQueue } from '../lib/operation-queue.js';
 import { samePullRequestExecutionBinding } from '../domain/pull-request-execution-binding.js';
 import { approveOwnPrAction } from './automatic-own-pr-repair-authorization.js';
+import { pendingOverwriteRecoveryCandidate, stoppedCodeJobRun } from './code-job-read-recovery.js';
 
 const sameLogin = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
 const STALE_TARGET = Symbol('stale local code target');
@@ -13,8 +14,9 @@ const OPERATIONS = { developer: new Set(['inspect', 'modify', 'verify']), tester
 export class AutomaticLocalCodeAuthorization {
   #operations = new OperationQueue();
 
-  constructor({ specialized, configurationReader, ledger, github, confirmations, grantVerifier, objectSync, roleStateReader }) {
-    Object.assign(this, { specialized, configurationReader, ledger, github, confirmations, grantVerifier, objectSync, roleStateReader });
+  constructor({ specialized, configurationReader, ledger, github, confirmations, grantVerifier, objectSync, roleStateReader,
+    taskRuns = null, clock = () => new Date() }) {
+    Object.assign(this, { specialized, configurationReader, ledger, github, confirmations, grantVerifier, objectSync, roleStateReader, taskRuns, clock });
   }
 
   approveCodeJob(item) {
@@ -46,6 +48,46 @@ export class AutomaticLocalCodeAuthorization {
     if (!grant?.inputBinding || Object.hasOwn(grant, 'executionSource') || !OPERATIONS[role]?.has(grant.operation)) return false;
     const current = await this.#current({ requestedBy: grant.requestedBy }, grant);
     return current !== null && current !== STALE_TARGET;
+  }
+
+  async canReplanUnstartedWrite(job) {
+    const grant = job?.grant, binding = grant?.inputBinding, role = grant?.requestedBy?.roleId;
+    if (!pendingOverwriteRecoveryCandidate(job) || !binding || role !== 'developer' || !this.taskRuns?.get) return false;
+    if (!Object.hasOwn(grant, 'executionSource')) {
+      const current = await this.#current({ requestedBy: grant.requestedBy }, grant);
+      if (current === null || current === STALE_TARGET) return false;
+    } else {
+      // Source-bearing work keeps its dedicated record and authority checks;
+      // a generic task-status whitelist cannot replace that provenance.
+      if (!['conflict_preparation', 'review_repair', 'ci_repair'].includes(grant.executionSource?.kind)) return false;
+      const config = (await this.configurationReader.readActive())?.configuration;
+      if (config?.githubActions?.enabled !== true || config.githubActions.automaticOwnPrRepair !== true ||
+          !config.trackedRepositories?.includes(binding.repository) ||
+          !sameLogin(binding.gitTarget?.sourceAccountId, config.githubActions.actorAccountId)) return false;
+      const roleState = await this.roleStateReader.read(role);
+      const root = await this.ledger.readItemForReconciliation({ itemId: binding.rootItemId });
+      const task = grant.requestedBy.workItemId === binding.rootItemId ? root :
+        await this.ledger.readItemForReconciliation({ itemId: grant.requestedBy.workItemId });
+      if (roleState?.enabled !== true || roleState.paused !== false || !root || !task ||
+          root.source?.scope?.active !== true || [root, task].some(item =>
+            ['paused', 'cancelled', 'superseded', 'completed'].includes(item.status) ||
+            (item.status === 'blocked' && ['attention_rejected', 'proposal_rejected'].includes(item.statusReason))) ||
+          task.currentTarget?.type !== 'role' || task.currentTarget.id !== role ||
+          typeof this.specialized.canReplanUnstartedWrite !== 'function' ||
+          !await this.specialized.canReplanUnstartedWrite(job)) return false;
+    }
+    const getRun = async (kind, taskId) => {
+      try { return await this.taskRuns.get(kind, taskId); }
+      catch (error) { if (error?.code === 'TASK_RUN_NOT_FOUND') return null; throw error; }
+    };
+    const proof = await getRun('code-job', job.jobId);
+    const before = job.status === 'paused' ? job.execution.pause?.at : new Date(this.clock()).toISOString();
+    if (!stoppedCodeJobRun(proof, job, before)) return false;
+    for (const taskId of new Set([grant.requestedBy.workItemId, binding.rootItemId])) {
+      const run = await getRun('work-item', taskId);
+      if (run && (run.mode !== 'active' || run.pendingCommand !== null || run.stopUnconfirmed === true)) return false;
+    }
+    return true;
   }
 
   async #current(item, grant) {

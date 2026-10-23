@@ -12,6 +12,7 @@ import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.j
 import { createChangePackage } from "../src/domain/change-package-contract.js";
 import { createCodeJobRuntime } from "../src/code-job-runtime.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
+import { incompleteReadPauseReason } from '../src/services/code-job-read-recovery.js';
 
 class MemoryStore {
   constructor({ events = [], value = null } = {}) {
@@ -131,8 +132,7 @@ function grant() {
   });
 }
 
-function envelope({ requestId = "approval-request-0001" } = {}) {
-  const sealedGrant = grant();
+function envelope({ requestId = "approval-request-0001", grant: sealedGrant = grant() } = {}) {
   const actor = {
     provider: "local-code",
     accountId: "controlled-code-executor",
@@ -890,6 +890,43 @@ test("automatic paused-job recovery remains available while the code worker is b
     assert.equal(Object.isFrozen(runtime.pauseRecovery), true);
     assert.equal((await runtime.pauseRecovery.runCycle()).scanned, 0);
   } finally { releaseWorker(); await working; await runtime.close(); }
+});
+
+test('runtime resumes an authorized host read pause and supplies the same live recovery policy to its worker', async () => {
+  let jobs, selected, recoveryPort, enabled = true;
+  const policy = { async canRecover() { return false; }, async canReplanUnstartedWrite(job) {
+    assert.equal(job.jobId, selected.jobId); return enabled;
+  } };
+  const { runtime } = await runtimeFixture({ executor: {}, brainDirectory: {}, automaticPauseRecovery: policy,
+    taskRuns: { async get() { return { runId: 'older-stopped', mode: 'active', active: false, pendingCommand: null, stopUnconfirmed: false,
+      receipt: { runId: 'older-stopped', kind: 'code-job', taskId: selected.jobId, roleId: 'developer', phase: 'failed',
+        outcomeCode: 'STRUCTURED_PROVIDER_CANCELLED', stopConfirmed: true, registeredAt: selected.createdAt,
+        modelStartedAt: selected.createdAt, finishedAt: selected.createdAt } }; } },
+    workerFactory(options) { jobs = options.jobStore; recoveryPort = options.unstartedWriteRecovery;
+      return { async runCycle() { return {}; }, requestCancellation() {} }; },
+  });
+  try {
+    const { grantDigest, ...base } = grant();
+    const sealed = createCodeJobGrant({ ...base, operation: 'modify', writablePaths: ['src'],
+      allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify] });
+    const created = await runtime.confirmationExecutor.execute(envelope({ grant: sealed }));
+    selected = await jobs.getForWorker(created.receipt.id);
+    selected = (await jobs.claimStarting({ jobId: selected.jobId, expectedRevision: selected.revision })).job;
+    selected = (await jobs.activate({ jobId: selected.jobId, expectedRevision: selected.revision, workspaceRevision: '4'.repeat(64) })).job;
+    selected = (await jobs.prepareAction({ jobId: selected.jobId, expectedRevision: selected.revision,
+      action: { type: 'write_text', actionId: 'old-unstarted', path: 'src/app.js', content: 'old candidate',
+        expectedWorkspaceRevision: '4'.repeat(64), expectedSha256: '5'.repeat(64) } })).job;
+    selected = (await jobs.pause({ jobId: selected.jobId, expectedRevision: selected.revision,
+      reason: incompleteReadPauseReason('src/app.js') })).job;
+    assert.equal((await runtime.pauseRecovery.runCycle()).resumed, 1);
+    const active = await jobs.getForWorker(selected.jobId);
+    assert.equal(active.status, 'active');
+    assert.equal(active.execution.pendingAction.actionId, 'old-unstarted');
+    assert.equal(await recoveryPort.canRecover(active), true);
+    enabled = false;
+    assert.equal(await recoveryPort.canRecover(active), false, 'worker eligibility is current, not captured at construction');
+    assert.deepEqual(Object.keys(runtime.pauseRecovery), ['runCycle']);
+  } finally { await runtime.close(); }
 });
 
 test("cancel persists before best-effort worker interruption and keeps it private", async () => {

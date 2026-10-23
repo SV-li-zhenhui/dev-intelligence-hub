@@ -105,6 +105,20 @@ export class AutomaticOwnPrConflict {
     return this.#state.records.some(record => active(record) && samePr(record.inputBinding, binding));
   }
 
+  async canReplanUnstartedWrite(job) {
+    const grant = job?.grant;
+    if (grant?.operation !== 'modify' || grant.executionSource?.kind !== 'conflict_preparation' ||
+        !samePullRequestExecutionBinding(grant.executionSource.inputBinding, grant.inputBinding)) return false;
+    const record = this.#state.records.find(row => row.jobId === job.jobId && row.status === 'working' &&
+      samePullRequestExecutionBinding(row.inputBinding, grant.inputBinding));
+    if (!record) return false;
+    const item = await this.confirmations.get(record.confirmationId);
+    if (item.kind !== 'local.code-job-create' || item.status !== 'completed' || item.receipt?.id !== job.jobId ||
+        !isDeepStrictEqual(item.display?.payload?.action?.grant, grant) ||
+        !await this.#current(record.inputBinding) || !await this.#grantCurrent(grant)) return false;
+    return this.#state.records.some(row => row.jobId === record.jobId && row.confirmationId === record.confirmationId && row.status === 'working');
+  }
+
   async readInspection({ itemId, itemRevision, inputDigest }) {
     const cached = this.#inspections.get(itemId);
     if (!cached) return null;

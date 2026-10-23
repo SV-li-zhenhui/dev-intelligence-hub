@@ -359,6 +359,46 @@ test('CI failure repairs automatically publish a controlled commit and hand off 
   assert.equal(await f.service.shouldRun(f.item), false);
 });
 
+test('unstarted write replanning requires the exact still-working conflict, review or CI repair receipt', async (t) => {
+  for (const kind of ['conflict', 'review', 'ci']) await t.test(kind, async () => {
+    const f = await fixture({ conflict: kind === 'conflict', ci: kind === 'ci' });
+    await f.deliver();
+    const job = { jobId: codeJobIdForGrant(f.grant), grant: clone(f.grant) };
+    assert.equal(await f.service.canReplanUnstartedWrite(job), true);
+    assert.equal(f.pushes.length, 0, 'eligibility cannot publish');
+    await f.restart();
+    assert.equal(await f.service.canReplanUnstartedWrite(job), true);
+    assert.equal(await f.service.canReplanUnstartedWrite({ ...job, jobId: 'foreign-job' }), false);
+    const changed = clone(job);
+    changed.grant.objective = 'unrelated authority';
+    assert.equal(await f.service.canReplanUnstartedWrite(changed), false);
+    f.revokeGrant();
+    assert.equal(await f.service.canReplanUnstartedWrite(job), false);
+  });
+});
+
+test('repair-origin recovery rejects changed remote identity and settled source records', async (t) => {
+  for (const kind of ['conflict', 'review', 'ci']) for (const change of ['head', 'base', 'author', 'disabled', 'settled']) {
+    await t.test(`${kind}: ${change}`, async () => {
+      const f = await fixture({ conflict: kind === 'conflict', ci: kind === 'ci' });
+      await f.deliver();
+      const job = { jobId: codeJobIdForGrant(f.grant), grant: clone(f.grant) };
+      if (change === 'head') f.facts.headRefOid = '9'.repeat(40);
+      if (change === 'base') f.facts.baseRefOid = '9'.repeat(40);
+      if (change === 'author') f.facts.author = 'other';
+      if (change === 'disabled') f.config.githubActions.automaticOwnPrRepair = false;
+      if (change === 'settled') {
+        const key = kind === 'conflict' ? 'automatic-own-pr-conflict-state' : STATE_KEY;
+        const value = await f.store.read(key);
+        (kind === 'conflict' ? value.records : value.repairs)[0].status = 'failed';
+        await f.store.write(key, value); await f.restart();
+      }
+      assert.equal(await f.service.canReplanUnstartedWrite(job), false);
+      assert.equal(f.pushes.length, 0);
+    });
+  }
+});
+
 test("owner-requested CI repair seals fresh ownership and uses controlled commit, auto publication and internal review", async () => {
   const f = await fixture({ ci: true, ownerRequestedCi: true });
   const original = clone(f.item.event);

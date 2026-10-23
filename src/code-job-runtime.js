@@ -307,6 +307,9 @@ export async function createCodeJobRuntime({
           executor,
           brainDirectory,
           taskRuns,
+          ...(typeof automaticPauseRecovery?.canReplanUnstartedWrite !== 'function' ? {} : {
+            unstartedWriteRecovery: { canRecover: job => automaticPauseRecovery.canReplanUnstartedWrite(job) },
+          }),
           ...(reviewRepairContextReader === undefined ? {} : { reviewRepairContextReader }),
           ...(conflictSourceReader == null ? {} : { conflictSourceReader }),
           grantVerifier,

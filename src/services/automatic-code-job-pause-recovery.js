@@ -1,4 +1,5 @@
 import { OperationQueue } from '../lib/operation-queue.js';
+import { hasIncompleteReadPause, stoppedCodeJobRun } from './code-job-read-recovery.js';
 
 const CODE = 'STRUCTURED_PROVIDER_RESPONSE_INVALID';
 const REASON = `等待人工处理（${CODE}）`;
@@ -50,12 +51,15 @@ export class AutomaticCodeJobPauseRecovery {
         try {
           const job = await this.jobs.getForWorker(candidate.jobId);
           let status = 'waiting';
-          if (recoverable(job)) {
+          const hostReadPause = hasIncompleteReadPause(job) && typeof this.eligibility.canReplanUnstartedWrite === 'function';
+          if (recoverable(job) || hostReadPause) {
+            const stopped = value => hostReadPause ? stoppedCodeJobRun(value, job, job.execution.pause.at) : stoppedRun(value, job);
+            const eligible = () => hostReadPause ? this.eligibility.canReplanUnstartedWrite(job) : this.eligibility.canRecover(job);
             const proof = await this.taskRuns.get('code-job', job.jobId);
-            if (stoppedRun(proof, job) && await this.eligibility.canRecover(job) === true) {
+            if (stopped(proof) && await eligible() === true) {
               const latestProof = await this.taskRuns.get('code-job', job.jobId);
               signal?.throwIfAborted();
-              if (stoppedRun(latestProof, job) && latestProof.runId === proof.runId) {
+              if (stopped(latestProof) && latestProof.runId === proof.runId) {
                 await this.jobs.resume({ jobId: job.jobId, expectedRevision: job.revision });
                 status = 'resumed';
               }

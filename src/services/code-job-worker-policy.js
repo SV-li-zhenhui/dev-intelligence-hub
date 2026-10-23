@@ -342,6 +342,8 @@ export function modelObservation(observation) {
       path: action.path,
       bytes: result.bytes ?? 0,
       error: result.error ?? null,
+      ...(observation.detail.origin === 'host_pre_execution_rejection' && observation.detail.notExecuted === true
+        ? { notExecuted: true } : {}),
     };
   } else if (action.type === "run_profile") {
     detail = {
@@ -459,10 +461,14 @@ export function verificationFailure(job) {
   };
 }
 
+export function incompleteReadMessage(path) {
+  return `无法覆盖 ${cleanText(path, 1_024)}：当前模型上下文未包含该文件的完整读取结果，请完整读取文件或调整任务范围后重试`;
+}
+
 function incompleteReadError(path) {
   return workerError(
     "CODE_BRAIN_INCOMPLETE_READ",
-    `无法覆盖 ${cleanText(path, 1_024)}：当前模型上下文未包含该文件的完整读取结果，请完整读取文件或调整任务范围后重试`,
+    incompleteReadMessage(path),
   );
 }
 

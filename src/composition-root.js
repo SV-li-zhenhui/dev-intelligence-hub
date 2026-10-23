@@ -1777,6 +1777,7 @@ export async function createApplication({
           taskRuns,
           ...(ownPrRepairEnabled ? { automaticPauseRecovery: Object.freeze({
             canRecover: job => automaticLocalCodeAuthorization?.canRecoverPausedCodeJob(job) ?? false,
+            canReplanUnstartedWrite: job => automaticLocalCodeAuthorization?.canReplanUnstartedWrite(job) ?? false,
           }) } : {}),
           ...runtimeDependencies(codeJobRuntimeDependencies),
           store,
@@ -2103,6 +2104,7 @@ export async function createApplication({
       automaticLocalCodeAuthorization = new AutomaticLocalCodeAuthorization({
         ...ownPrRepairDependencies,
         specialized: automaticOwnPrRepair,
+        taskRuns,
         roleStateReader: { async read(roleId) {
           return codeAuthorizationRoleRegistry?.get(roleId)?.roleView() ?? null;
         } },

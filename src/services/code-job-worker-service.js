@@ -15,6 +15,7 @@ import { packCodeJobBrainContext } from "./code-job-context-packer.js";
 import { normalizeReviewRepairFeedbackContext } from "./review-repair-context-reader.js";
 import { normalizeCiRepairEvidence } from '../domain/ci-repair-evidence.js';
 import { githubEntitySessionKey } from "../lib/session-key.js";
+import { INCOMPLETE_READ_CODE, pendingOverwriteRecoveryCandidate } from './code-job-read-recovery.js';
 import {
   assertSessionBinding,
   assertPreparedWriteRead,
@@ -300,6 +301,7 @@ export class CodeJobWorkerService {
   #conflictSourceReader;
   #managedExecutions = new Map();
   #managedWorkers = new Map();
+  #unstartedWriteRecovery;
 
   constructor({
     jobStore,
@@ -308,6 +310,7 @@ export class CodeJobWorkerService {
     taskRuns = null,
     reviewRepairContextReader,
     conflictSourceReader,
+    unstartedWriteRecovery = null,
     grantVerifier,
     actionAdmissionGate = DIRECT_ACTION_ADMISSION,
     operationQueue = new OperationQueue(),
@@ -359,6 +362,8 @@ export class CodeJobWorkerService {
       typeof brainDirectory?.describe === "function" ? ["decide", "describe"] : ["decide"],
       "code job brain");
     this.#taskRuns = taskRuns;
+    this.#unstartedWriteRecovery = unstartedWriteRecovery === null ? null :
+      requirePort(unstartedWriteRecovery, ['canRecover'], 'unstarted write recovery');
     this.#recordTimeoutContinuation = typeof jobStore?.recordTimeoutContinuation === "function"
       ? jobStore.recordTimeoutContinuation.bind(jobStore) : null;
     if (typeof clock !== "function") throw new TypeError("code job worker clock is invalid");
@@ -494,6 +499,7 @@ export class CodeJobWorkerService {
       jobStore: { ...this.#jobs, listRunnable: query => page(query, false), listReconcilable: query => page(query, true),
         ...(this.#recordTimeoutContinuation === null ? {} : { recordTimeoutContinuation: this.#recordTimeoutContinuation }) },
       executor: this.#executor, brainDirectory: this.#brain, taskRuns: this.#taskRuns,
+      unstartedWriteRecovery: this.#unstartedWriteRecovery,
       ...(this.#reviewRepairContextReader === null ? {} : { reviewRepairContextReader: this.#reviewRepairContextReader }),
       ...(this.#conflictSourceReader === null ? {} : { conflictSourceReader: this.#conflictSourceReader }),
       grantVerifier: { verify: this.#verifyGrant }, actionAdmissionGate: { run: this.#actionAdmission },
@@ -1392,9 +1398,44 @@ export class CodeJobWorkerService {
     ) {
       const passed = successfulProfiles(job, session);
       const remaining = job.grant.requiredProfiles.filter(({ id }) => !passed.has(id));
-      assertPreparedWriteRead(job, session, pending.action, this.#brainContext(job, remaining).observations);
+      try {
+        assertPreparedWriteRead(job, session, pending.action, this.#brainContext(job, remaining).observations);
+      } catch (error) {
+        if (error?.code !== INCOMPLETE_READ_CODE) throw error;
+        const recovered = await this.#replanUnstartedWrite(job, session, error);
+        if (recovered !== null) return recovered;
+        throw error;
+      }
     }
     return this.#performPending(job, session);
+  }
+
+  async #replanUnstartedWrite(job, session, error) {
+    if (this.#unstartedWriteRecovery === null || job.status !== 'active' ||
+        !pendingOverwriteRecoveryCandidate(job) || session.cleanupPending === true ||
+        !await this.#unstartedWriteRecovery.canRecover(job)) return null;
+    return this.#actionAdmission(async () => {
+      this.#cycleSignal?.throwIfAborted();
+      const fresh = await this.#jobs.getForWorker(job.jobId);
+      if (!sameSessionTransitionFence(job, fresh)) return currentJobOutcome(job.jobId, fresh);
+      if (!pendingOverwriteRecoveryCandidate(fresh) || !await this.#unstartedWriteRecovery.canRecover(fresh)) return null;
+      await this.#verifyAuthority(fresh.grant);
+      const pending = fresh.execution.pendingAction;
+      const latest = await this.#executor.reconcileAction({ sessionId: fresh.jobId, action: pending.action });
+      assertJobSessionBinding(fresh, latest.session);
+      if (latest.status !== 'absent' || latest.session.status !== 'active' || latest.session.cleanupPending === true ||
+          latest.session.workspaceRevision !== fresh.execution.workspaceRevision ||
+          latest.session.attempt.number !== session.attempt.number) {
+        throw workerError('CODE_JOB_ACTION_BUSY', 'Prepared write needs a fresh executor reconciliation');
+      }
+      this.#cycleSignal?.throwIfAborted();
+      const changed = await this.#jobs.recordObservation({ jobId: fresh.jobId, expectedRevision: fresh.revision,
+        actionId: pending.actionId, status: 'failed', workspaceRevision: fresh.execution.workspaceRevision,
+        detail: { schemaVersion: 1, origin: 'host_pre_execution_rejection', notExecuted: true,
+          result: { bytes: 0, error: { code: INCOMPLETE_READ_CODE,
+            message: `宿主在执行前拒绝旧写入，工作区未修改。${cleanText(error.message, 1_536)}` } } } });
+      return { jobId: fresh.jobId, status: changed.job.status, actionType: 'write_text', code: INCOMPLETE_READ_CODE };
+    });
   }
 
   async #reconcileUnknown(job) {

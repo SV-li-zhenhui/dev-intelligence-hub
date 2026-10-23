@@ -389,6 +389,31 @@ export class AutomaticOwnPrRepair {
     });
   }
 
+  async canReplanUnstartedWrite(job) {
+    const grant = job?.grant, source = grant?.executionSource;
+    if (source?.kind === 'conflict_preparation') return this.conflictRepair?.canReplanUnstartedWrite(job) ?? false;
+    if (grant?.operation !== 'modify' || !isHeadRepairExecutionSource(source) ||
+        !samePullRequestExecutionBinding(source.inputBinding, grant.inputBinding)) return false;
+    const record = this.#state.repairs.find(row => row.jobId === job.jobId && row.status === 'working' &&
+      sourceKindFor(row) === source.kind && samePullRequestExecutionBinding(row.inputBinding, grant.inputBinding));
+    if (!record) return false;
+    const item = await this.confirmations.get(record.confirmationId);
+    if (item.kind !== 'local.code-job-create' || item.status !== 'completed' || item.receipt?.id !== job.jobId ||
+        !isDeepStrictEqual(item.display?.payload?.action?.grant, grant) || !await this.#grantCurrent(grant)) return false;
+    const current = await this.#current(record.inputBinding);
+    if (!matchesCurrentRepair(record, current)) return false;
+    if (source.kind === 'review_repair') {
+      // The Review reader seals feedback and Head, not the current Base tip.
+      if (typeof this.github.readPullRequestLocalWorkFacts !== 'function') return false;
+      const actor = current.config.githubActions.actorAccountId;
+      const facts = await this.github.readPullRequestLocalWorkFacts({ repository: grant.inputBinding.repository,
+        number: grant.inputBinding.pullRequestNumber, account: actor, authorAccountId: actor });
+      if (facts.state !== 'open' || !sameLogin(facts.author, actor) || facts.headRefOid !== grant.inputBinding.headRefOid ||
+          facts.baseRefOid !== grant.inputBinding.gitTarget?.baseRefOid) return false;
+    }
+    return this.#state.repairs.some(row => row.jobId === record.jobId && row.confirmationId === record.confirmationId && row.status === 'working');
+  }
+
   runRecoveryCycle({ limit = 10 } = {}) {
     return this.conflictRepair?.runRecoveryCycle({ limit }) ?? Promise.resolve({});
   }

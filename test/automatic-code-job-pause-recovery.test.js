@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AutomaticCodeJobPauseRecovery } from '../src/services/automatic-code-job-pause-recovery.js';
+import { digestValue } from '../src/domain/code-executor-contract.js';
+import { incompleteReadPauseReason } from '../src/services/code-job-read-recovery.js';
 
 function fixture() {
   const job = { jobId: 'job-1', sequence: 1, revision: 12, status: 'paused', createdAt: '2026-10-10T03:00:00Z',
@@ -33,6 +35,54 @@ test('settled provider format pause automatically resumes the same checkpoint on
   assert.deepEqual(f.calls, [{ jobId: 'job-1', expectedRevision: 12 }]);
   assert.equal(f.job.status, 'active');
   assert.equal((await f.create().runCycle()).scanned, 0);
+});
+
+function readPauseFixture() {
+  const f = fixture();
+  const action = { type: 'write_text', actionId: 'write-old', path: 'src/app.js', content: 'old candidate',
+    expectedWorkspaceRevision: 'a'.repeat(64), expectedSha256: 'b'.repeat(64) };
+  f.job.grant.operation = 'modify';
+  Object.assign(f.job.execution, { turn: 4, workspaceRevision: action.expectedWorkspaceRevision,
+    pendingAction: { turn: 5, actionId: action.actionId, actionDigest: digestValue(action), action } });
+  f.job.execution.pause.reason = incompleteReadPauseReason(action.path);
+  f.proof.receipt.registeredAt = '2026-10-10T03:00:20Z';
+  f.proof.receipt.outcomeCode = 'STRUCTURED_PROVIDER_CANCELLED';
+  f.eligibility.canRecover = async () => { assert.fail('a host read pause cannot use provider-format recovery'); };
+  f.eligibility.canReplanUnstartedWrite = async () => true;
+  return f;
+}
+
+test('a host incomplete-read pause resumes from an older stopped run without inventing a new Native failure', async () => {
+  const f = readPauseFixture(), previous = structuredClone(f.proof);
+  assert.equal((await f.create().runCycle()).resumed, 1);
+  assert.equal(f.job.status, 'active');
+  assert.equal(f.job.execution.pendingAction.actionId, 'write-old', 'resume alone does not approve or replay the old write');
+  assert.deepEqual(f.proof, previous);
+  assert.equal((await f.create().runCycle()).scanned, 0);
+});
+
+test('host incomplete-read recovery preserves manual holds, exact pending identity, source policy and unknown owners', async (t) => {
+  for (const [name, change] of [
+    ['owner reason', f => { f.job.execution.pause.reason = '用户暂停'; }],
+    ['different file reason', f => { f.job.execution.pause.reason = incompleteReadPauseReason('src/other.js'); }],
+    ['admitted action', f => { f.job.execution.actionAdmission = {}; }],
+    ['unknown write', f => { f.job.execution.uncertainty = {}; }],
+    ['tampered candidate', f => { f.job.execution.pendingAction.action.content = 'changed'; }],
+    ['different workspace', f => { f.job.execution.workspaceRevision = 'd'.repeat(64); }],
+    ['active model', f => { f.proof.active = true; }],
+    ['owner command', f => { f.proof.pendingCommand = 'pause'; }],
+    ['missing stop', f => { f.proof.receipt.stopConfirmed = false; }],
+    ['later model', f => { f.proof.receipt.finishedAt = '2026-10-10T03:01:02Z'; }],
+    ['source not authorized', f => { f.eligibility.canReplanUnstartedWrite = async () => false; }],
+    ['source reader absent', f => { delete f.eligibility.canReplanUnstartedWrite; }],
+    ['new run during policy read', f => { f.eligibility.canReplanUnstartedWrite = async () => {
+      f.proof.runId = f.proof.receipt.runId = 'new-run'; return true;
+    }; }],
+  ]) await t.test(name, async () => {
+    const f = readPauseFixture(); change(f);
+    assert.equal((await f.create().runCycle()).resumed, 0);
+    assert.equal(f.calls.length, 0);
+  });
 });
 
 for (const [name, change] of [

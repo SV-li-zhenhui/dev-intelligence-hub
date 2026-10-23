@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AutomaticLocalCodeAuthorization } from '../src/services/automatic-local-code-authorization.js';
+import { digestValue } from '../src/domain/code-executor-contract.js';
 
 function fixture(role = 'developer', operation = 'modify') {
   const binding = { schemaVersion: 2, kind: 'pull_request', repository: 'acme/repo', pullRequestNumber: 42,
@@ -31,6 +32,77 @@ function fixture(role = 'developer', operation = 'modify') {
     roleStateReader: { async read() { return roleState; } } };
   return { config, root, facts, roleState, ports, item, grant, calls, service: new AutomaticLocalCodeAuthorization(ports) };
 }
+
+function readRecoveryFixture(sourceKind = null) {
+  const f = fixture(), workControls = new Map();
+  const grant = { ...f.grant, requestedBy: f.item.requestedBy };
+  if (sourceKind) grant.executionSource = { kind: sourceKind, inputBinding: grant.inputBinding };
+  const action = { type: 'write_text', path: 'src/app.js', content: 'old', actionId: 'write-old',
+    expectedWorkspaceRevision: 'a'.repeat(64), expectedSha256: 'b'.repeat(64) };
+  const job = { jobId: 'job-write', status: 'active', createdAt: '2026-10-10T03:00:00Z', grant,
+    execution: { turn: 1, workspaceRevision: action.expectedWorkspaceRevision, actionAdmission: null, uncertainty: null,
+      pendingAction: { turn: 2, actionId: action.actionId, actionDigest: digestValue(action), action } } };
+  const proof = { runId: 'old-run', mode: 'active', active: false, pendingCommand: null, stopUnconfirmed: false,
+    receipt: { runId: 'old-run', kind: 'code-job', taskId: job.jobId, roleId: 'developer', phase: 'failed', stopConfirmed: true,
+      registeredAt: '2026-10-10T03:00:10Z', modelStartedAt: '2026-10-10T03:00:20Z', finishedAt: '2026-10-10T03:00:30Z' } };
+  let specialized = true, sourceCalls = 0;
+  f.ports.specialized.canReplanUnstartedWrite = async value => { sourceCalls += 1; assert.equal(value, job); return specialized; };
+  const service = new AutomaticLocalCodeAuthorization({ ...f.ports, clock: () => new Date('2026-10-10T03:01:00Z'),
+    taskRuns: { async get(kind, id) { if (kind === 'code-job') return structuredClone(proof);
+      if (workControls.has(id)) return workControls.get(id);
+      throw Object.assign(new Error('no hold'), { code: 'TASK_RUN_NOT_FOUND' }); } } });
+  return { ...f, service, job, proof, workControls, sourceCalls: () => sourceCalls,
+    setSourceEligible: value => { specialized = value; } };
+}
+
+test('unstarted overwrite recovery keeps generic authorization and dedicated repair provenance separate', async () => {
+  const generic = readRecoveryFixture();
+  assert.equal(await generic.service.canReplanUnstartedWrite(generic.job), true);
+  assert.equal(generic.sourceCalls(), 0);
+  for (const source of ['conflict_preparation', 'review_repair', 'ci_repair']) {
+    const f = readRecoveryFixture(source);
+    f.root.status = 'blocked';
+    assert.equal(await f.service.canReplanUnstartedWrite(f.job), true, 'a legacy source task may be blocked while its exact repair remains authorized');
+    assert.equal(await f.service.canRecoverPausedCodeJob(f.job), false, 'generic recovery must still exclude source-bearing jobs');
+    f.setSourceEligible(false);
+    assert.equal(await f.service.canReplanUnstartedWrite(f.job), false);
+  }
+});
+
+test('automatic overwrite replanning preserves owner holds, model ownership and current source scope', async (t) => {
+  for (const source of [null, 'conflict_preparation']) for (const [name, change] of [
+    ['manual mode', f => { f.config.githubActions.automaticOwnPrRepair = false; }],
+    ['role pause', f => { f.roleState.paused = true; }],
+    ['task pause', f => { f.root.status = 'paused'; }],
+    ['task completed', f => { f.root.status = 'completed'; }],
+    ['scope revoked', f => { f.root.source.scope.active = false; }],
+    ['role changed', f => { f.root.currentTarget.id = 'tester'; }],
+    ['active Native', f => { f.proof.active = true; }],
+    ['unknown stop', f => { f.proof.receipt.stopConfirmed = false; }],
+    ['owner job command', f => { f.proof.pendingCommand = 'pause'; }],
+    ['owner work hold', f => { f.workControls.set('root', { mode: 'paused', pendingCommand: null, stopUnconfirmed: false }); }],
+    ['owner work command', f => { f.workControls.set('root', { mode: 'active', pendingCommand: 'cancel', stopUnconfirmed: true }); }],
+  ]) await t.test(`${source ?? 'generic'}: ${name}`, async () => {
+    const f = readRecoveryFixture(source); change(f);
+    assert.equal(await f.service.canReplanUnstartedWrite(f.job), false);
+    assert.equal(f.calls.length, 0, 'eligibility cannot publish or approve');
+  });
+});
+
+test('source replanning distinguishes obsolete technical blockers from explicit root and child rejection', async (t) => {
+  for (const target of ['root', 'child']) for (const reason of ['proposal_stale', 'attention_rejected', 'proposal_rejected']) {
+    await t.test(`${target}: ${reason}`, async () => {
+      const f = readRecoveryFixture('conflict_preparation');
+      const child = structuredClone(f.root);
+      f.job.grant.requestedBy = { roleId: 'developer', workItemId: 'child' };
+      f.ports.ledger.readItemForReconciliation = async ({ itemId }) => itemId === 'root' ? f.root : child;
+      const changed = target === 'root' ? f.root : child;
+      changed.status = 'blocked'; changed.statusReason = reason;
+      assert.equal(await f.service.canReplanUnstartedWrite(f.job), reason === 'proposal_stale');
+      assert.equal(f.calls.length, 0);
+    });
+  }
+});
 
 for (const [role, operation] of [['developer', 'modify'], ['developer', 'inspect'], ['developer', 'verify'], ['tester', 'inspect'], ['tester', 'verify']]) {
   test(`automatic own-PR routine ${role} ${operation} uses the existing grant without user confirmation`, async () => {

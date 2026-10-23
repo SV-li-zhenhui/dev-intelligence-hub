@@ -23,6 +23,8 @@ import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { createTaskRunSettler } from '../src/services/work-ledger-run-control.js';
 import { currentTaskExecution } from '../src/lib/task-execution-context.js';
 import { PreparationAbortedError } from '../src/lib/preparation-cancellation.js';
+import { AutomaticCodeJobPauseRecovery } from '../src/services/automatic-code-job-pause-recovery.js';
+import { incompleteReadPauseReason } from '../src/services/code-job-read-recovery.js';
 import { assertPreparedWriteRead, bindTrustedAction, modelObservation, observationDetail, verificationFailure } from "../src/services/code-job-worker-policy.js";
 
 const REVISION_A = "a".repeat(64);
@@ -3174,6 +3176,154 @@ test("absent legacy prepared overwrite requires a fully visible trusted read", a
   assert.equal(executor.calls.some(({ method }) => method === "perform"), false);
   assert.deepEqual(executor.calls.find(({ method }) => method === "reconcileAction").value.action, action);
   assert.deepEqual((await store.getForWorker(initial.jobId)).execution.pendingAction.action, action);
+});
+
+function automaticReadRecoveryFixture() {
+  const action = { type: 'write_text', path: 'src/app.js', content: 'old candidate',
+    actionId: 'legacy-auto-write', expectedWorkspaceRevision: REVISION_A, expectedSha256: FILE_SHA };
+  const initial = job({ status: 'active', execution: { ...job().execution, sessionId: job().jobId,
+    workspaceRevision: REVISION_A, turn: 1, observations: [trustedRead('x'.repeat(30 * 1024))],
+    pendingAction: { turn: 2, actionId: action.actionId, actionDigest: digestValue(action), action,
+      preparedAt: '2026-08-01T00:00:01.000Z' } } });
+  const store = new FakeJobStore([initial]), executor = new FakeExecutor(initial);
+  const directory = brain([{ type: 'read_text', path: 'src/app.js' },
+    { type: 'write_text', path: 'src/app.js', content: 'fresh candidate' }]);
+  const options = { jobStore: store, executor, brainDirectory: directory,
+    grantVerifier: verifier([]), unstartedWriteRecovery: { async canRecover() { return true; } } };
+  return { action, initial, store, executor, directory, options, worker: () => new CodeJobWorkerService(options) };
+}
+
+test("automatic recovery rejects an absent legacy overwrite and replans through a fresh complete read", async (t) => {
+  for (const managed of [false, true]) await t.test(managed ? 'managed child worker' : 'ordinary worker', async () => {
+  const { action, initial, store, executor, directory, worker: createWorker } = automaticReadRecoveryFixture();
+  const worker = createWorker();
+  const run = async () => {
+    if (!managed) return worker.runCycle();
+    let operation;
+    await worker.runReady({ limit: 1 }, callback => { operation = callback(); return operation; });
+    return operation;
+  };
+  const first = await run();
+  assert.equal(first.outcomes[0].status, 'active');
+  assert.equal(first.outcomes[0].code, 'CODE_BRAIN_INCOMPLETE_READ');
+  assert.equal(executor.calls.some(x => x.method === 'perform'), false);
+  const rejected = await store.getForWorker(initial.jobId);
+  assert.equal(rejected.execution.pendingAction, null);
+  assert.equal(rejected.execution.turn, 2);
+  assert.equal(rejected.execution.workspaceRevision, REVISION_A);
+  const audit = rejected.execution.observations.at(-1);
+  assert.equal(audit.status, 'failed');
+  assert.equal(audit.detail.origin, 'host_pre_execution_rejection');
+  assert.equal(audit.detail.notExecuted, true);
+  assert.deepEqual(audit.action, action, 'retain the old candidate as history, never replay it');
+  assert.equal(JSON.parse(modelObservation(audit).detail).notExecuted, true);
+  await run();
+  await run();
+  const performed = executor.calls.filter(x => x.method === 'perform').map(x => x.value.action);
+  assert.deepEqual(performed.map(x => x.type), ['read_text', 'write_text']);
+  assert.notEqual(performed[1].actionId, action.actionId);
+  assert.equal(performed[1].content, 'fresh candidate');
+  assert.equal(directory.calls.length, 2);
+  });
+});
+
+test('automatic read recovery cannot discard admitted, uncertain, busy or drifted writes', async (t) => {
+  for (const [name, change] of [
+    ['not automatically authorized', f => { f.options.unstartedWriteRecovery.canRecover = async () => false; }],
+    ['admitted', f => { f.initial.execution.actionAdmission = { actionId: f.action.actionId,
+      actionDigest: digestValue(f.action), epoch: 1, admittedAt: '2026-08-01T00:00:01.500Z' };
+      f.options.jobStore = new FakeJobStore([f.initial]); }],
+    ['unknown action settles before any rejection', f => {
+      f.initial.status = 'unknown';
+      f.initial.execution.actionAdmission = { actionId: f.action.actionId, actionDigest: digestValue(f.action),
+        epoch: 1, admittedAt: '2026-08-01T00:00:01.500Z' };
+      f.initial.execution.uncertainty = { from: 'active', code: 'LOST_ACK', message: 'Uncertain action', at: '2026-08-01T00:00:02.000Z' };
+      f.options.jobStore = new FakeJobStore([f.initial]);
+    }],
+    ['running executor action', f => { f.executor.reconcileAction = async () => ({ status: 'running', session: structuredClone(f.executor.session) }); }],
+    ['workspace changed during policy read', f => { f.options.unstartedWriteRecovery.canRecover = async () => {
+      f.executor.session.workspaceRevision = REVISION_B; return true; }; }],
+    ['owner pause at mutation admission', f => { f.options.actionAdmissionGate = { async run(operation) {
+      const job = await f.store.getForWorker(f.initial.jobId);
+      await f.store.pause({ jobId: job.jobId, expectedRevision: job.revision, reason: 'owner pause' });
+      return operation(); } }; }],
+  ]) await t.test(name, async () => {
+    const f = automaticReadRecoveryFixture(); change(f);
+    const worker = f.worker();
+    await worker.runCycle();
+    const stored = await f.options.jobStore.getForWorker(f.initial.jobId);
+    assert.equal(stored.execution.observations.some(x => x.detail.origin === 'host_pre_execution_rejection'), false);
+    assert.equal(f.executor.calls.some(x => x.method === 'perform'), false);
+    assert.equal(f.directory.calls.length, 0);
+    assert.equal(stored.execution.pendingAction.actionId, f.action.actionId);
+  });
+});
+
+test('host read-rejection persistence failures retain or consume the old pending exactly once', async (t) => {
+  for (const afterWrite of [false, true]) await t.test(afterWrite ? 'lost acknowledgement' : 'failed write', async () => {
+    const f = automaticReadRecoveryFixture();
+    const record = f.store.recordObservation.bind(f.store);
+    let unavailable = true;
+    f.store.recordObservation = async value => {
+      if (!unavailable) return record(value);
+      if (afterWrite) await record(value);
+      throw new Error('storage unavailable');
+    };
+    const worker = f.worker();
+    await worker.runCycle();
+    const stored = await f.store.getForWorker(f.initial.jobId);
+    assert.equal(stored.execution.pendingAction === null, afterWrite);
+    assert.equal(f.executor.calls.some(x => x.method === 'perform'), false);
+    unavailable = false;
+    if (!afterWrite) await worker.runCycle();
+    await worker.runCycle();
+    assert.equal((await f.store.getForWorker(f.initial.jobId)).execution.observations
+      .filter(x => x.detail.origin === 'host_pre_execution_rejection').length, 1);
+    assert.equal(f.executor.calls.filter(x => x.method === 'perform').every(x => x.value.action.type === 'read_text'), true);
+  });
+});
+
+test('real durable store resumes a host read pause, audits nonexecution and survives restart before fresh read and write', async () => {
+  const storage = new IntegrationMemoryStore(), clock = () => new Date('2026-08-02T08:00:00.000Z');
+  const { jobs, durableJob } = await createRealApprovedJob({ operation: 'modify',
+    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify], writablePaths: ['src'] }, { storage, clock });
+  let current = (await jobs.claimStarting({ jobId: durableJob.jobId, expectedRevision: durableJob.revision })).job;
+  current = (await jobs.activate({ jobId: current.jobId, expectedRevision: current.revision, workspaceRevision: REVISION_A })).job;
+  const oldRead = trustedRead('x'.repeat(30 * 1024));
+  current = (await jobs.prepareAction({ jobId: current.jobId, expectedRevision: current.revision, action: oldRead.action })).job;
+  current = (await jobs.recordObservation({ jobId: current.jobId, expectedRevision: current.revision, actionId: oldRead.actionId,
+    status: 'succeeded', workspaceRevision: REVISION_A, detail: oldRead.detail })).job;
+  const action = { type: 'write_text', actionId: 'old-durable-write', path: 'src/app.js', content: 'old candidate',
+    expectedWorkspaceRevision: REVISION_A, expectedSha256: FILE_SHA };
+  current = (await jobs.prepareAction({ jobId: current.jobId, expectedRevision: current.revision, action })).job;
+  current = (await jobs.pause({ jobId: current.jobId, expectedRevision: current.revision, reason: incompleteReadPauseReason(action.path) })).job;
+  const proof = { runId: 'stopped-model', mode: 'active', active: false, pendingCommand: null, stopUnconfirmed: false,
+    receipt: { runId: 'stopped-model', kind: 'code-job', taskId: current.jobId, roleId: 'developer', phase: 'failed',
+      outcomeCode: 'STRUCTURED_PROVIDER_CANCELLED', stopConfirmed: true, registeredAt: current.createdAt,
+      modelStartedAt: current.createdAt, finishedAt: current.createdAt } };
+  const recovery = new AutomaticCodeJobPauseRecovery({ jobs, taskRuns: { async get() { return structuredClone(proof); } },
+    eligibility: { async canRecover() { return false; }, async canReplanUnstartedWrite() { return true; } } });
+  assert.equal((await recovery.runCycle()).resumed, 1);
+  const executor = new FakeExecutor(await jobs.getForWorker(current.jobId));
+  const directory = brain([{ type: 'read_text', path: action.path }, { type: 'write_text', path: action.path, content: 'fresh durable candidate' }]);
+  const workerOptions = { executor, brainDirectory: directory, grantVerifier: verifier([]),
+    unstartedWriteRecovery: { async canRecover() { return true; } } };
+  const first = await new CodeJobWorkerService({ ...workerOptions, jobStore: jobs }).runCycle();
+  assert.equal(first.outcomes[0].status, 'active');
+  assert.equal(executor.calls.some(x => x.method === 'perform'), false);
+  const restarted = new CodeJobStore({ store: storage, clock, operationQueue: new OperationQueue(),
+    exclusiveLease: { run: operation => operation() } });
+  await restarted.recover();
+  const saved = await restarted.getForWorker(current.jobId);
+  assert.equal(saved.execution.pendingAction, null);
+  assert.deepEqual(saved.execution.observations.at(-1).action, action);
+  const resumed = new CodeJobWorkerService({ ...workerOptions, jobStore: restarted });
+  await resumed.runCycle(); await resumed.runCycle();
+  const final = await restarted.getForWorker(current.jobId);
+  assert.equal(final.execution.observations.filter(x => x.detail.origin === 'host_pre_execution_rejection').length, 1);
+  assert.deepEqual(executor.calls.filter(x => x.method === 'perform').map(x => x.value.action.type), ['read_text', 'write_text']);
+  assert.equal(executor.calls.find(x => x.method === 'perform' && x.value.action.type === 'write_text').value.action.content,
+    'fresh durable candidate');
 });
 
 test("admitted legacy overwrite pauses after absent reconciliation without performing", async () => {
