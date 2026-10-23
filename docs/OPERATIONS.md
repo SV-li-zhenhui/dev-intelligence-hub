@@ -982,6 +982,15 @@ the proposal, reset the child, replace a change-package with a test-report, or
 discard prior successful package evidence. The parent must arrange compatible
 work and require the actual repaired snapshot for verification.
 
+Structured local-owner `fix_ci` requests can enter the same CI repair pipeline
+after the ledger verifies their current owner root and fresh GitHub observations
+prove the configured actor is the PR author at the exact Head/Base with failed
+checks. The event need not claim `relation: authored`. Missing evidence defers
+the repair instead of creating another generic modify job. Existing source-null
+jobs/packages remain unchanged. Developer duplication is suppressed while the
+repair runs or its original Head is consumed; the orchestrator can still settle
+children, and normal local completion does not interrupt an authorized push.
+
 ## Automatic work continuations
 
 In automatic mode, schema 2 of `work-continuations.json` records the source task,

@@ -5,12 +5,13 @@ import { createPullRequestReadFacts, createPullRequestReadIdentity } from '../sr
 import { normalizeWorkflowEvent } from '../src/domain/workflow-events.js';
 import { createPullRequestExecutionBinding } from '../src/domain/pull-request-execution-binding.js';
 
-function fixture() {
+function fixture({ ownerRequested = false } = {}) {
   const target = { schemaVersion: 1, provider: 'github', sourceAccountId: 'me', baseRepository: 'acme/repo',
     baseRefName: 'main', baseRefOid: 'a'.repeat(40), headRepository: 'acme/repo', headRefName: 'fix/ci', headRefOid: 'b'.repeat(40) };
-  const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: 'pull_request.updated', occurredAt: '2026-10-23T10:00:00.000Z',
-    source: { provider: 'github', scopeId: 'github-dashboard' }, subject: { id: 'acme/repo#42', repository: 'acme/repo', number: 42 },
-    payload: { relation: 'authored', nextAction: 'fix_ci', headRefOid: target.headRefOid, gitTargetAvailable: true, gitTarget: target } });
+  const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: ownerRequested ? 'pull_request.owner_requested' : 'pull_request.updated', occurredAt: '2026-10-23T10:00:00.000Z',
+    source: ownerRequested ? { provider: 'local-owner', scopeId: 'owner-request:123e4567-e89b-42d3-a456-426614174000' }
+      : { provider: 'github', scopeId: 'github-dashboard' }, subject: { id: 'acme/repo#42', repository: 'acme/repo', number: 42 },
+    payload: { ...(ownerRequested ? { workType: 'general', suggestedCapability: 'development', expectedHeadRefOid: target.headRefOid } : { relation: 'authored' }), nextAction: 'fix_ci', headRefOid: target.headRefOid, gitTargetAvailable: true, gitTarget: target } });
   const inputBinding = createPullRequestExecutionBinding({ event, sourceBinding: { kind: 'pull_request', rootItemId: 'work-ci', workKey: 'ci-repair',
     inputRevision: 1, headRevision: 1, headRefOid: target.headRefOid, eventId: event.eventId, eventDigest: event.contentDigest, inputDigest: 'f'.repeat(64) } });
   const identity = createPullRequestReadIdentity({ executionBinding: inputBinding, event });
@@ -34,11 +35,26 @@ test('host CI evidence uses current GitHub checks and exact target even for an o
   assert.deepEqual(f.calls, ['target', 'checks', 'diagnostics', 'target']);
 });
 
+test('an explicit owner CI request reads fresh own-author checks without inventing an authored event', async () => {
+  const f = fixture({ ownerRequested: true }), original = structuredClone(f.input.event);
+  const value = await f.reader().read(f.input);
+  assert.equal(value?.facts.author, 'me');
+  assert.equal(value?.ciEvidence.checks[0].conclusion, 'FAILURE');
+  assert.deepEqual(f.input.event, original);
+  assert.equal(Object.hasOwn(f.input.event.payload, 'relation'), false);
+  for (const field of ['author', 'headRefOid', 'baseRefOid']) {
+    const other = fixture({ ownerRequested: true }); other.live[field] = field === 'author' ? 'other' : 'c'.repeat(40);
+    assert.equal(await other.reader().read(other.input), null, field);
+  }
+});
+
 test('wrong author, changed Head/Base, merge conflict, success or incomplete checks do not authorize CI repair', async () => {
+  for (const ownerRequested of [false, true]) {
   for (const mutate of [f => { f.live.author = 'other'; }, f => { f.live.headRefOid = 'd'.repeat(40); },
     f => { f.live.baseRefOid = 'd'.repeat(40); }, f => { f.live.mergeStateStatus = 'DIRTY'; },
     f => { f.factsInput.checks[0].conclusion = 'SUCCESS'; }, f => { f.factsInput.truncation.checks = true; }]) {
-    const f = fixture(); mutate(f); assert.equal(await f.reader().read(f.input), null);
+    const f = fixture({ ownerRequested }); mutate(f); assert.equal(await f.reader().read(f.input), null);
+  }
   }
 });
 

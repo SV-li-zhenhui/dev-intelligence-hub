@@ -8,6 +8,7 @@ import { normalizePullRequestExecutionBinding, samePullRequestExecutionBinding }
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
 import { createPullRequestExternalActionConfirmationPlan } from "../domain/pull-request-external-action.js";
 import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
+import { isOwnerRequestedCiRepairEvent } from "./ci-repair-context-reader.js";
 import { approveOwnPrAction, repairCommitMatchesJob, planOwnPrPushRetry, retryOwnPrPush, validateOwnPrPushRetry } from "./automatic-own-pr-repair-authorization.js";
 import { normalizeOwnerWorkRequest } from "../domain/owner-work-request.js";
 import { internalRepairReviewRequestId, normalizeInternalReviewMetadata } from "../domain/internal-repair-review.js";
@@ -199,10 +200,13 @@ export class AutomaticOwnPrRepair {
   async shouldRun(item) {
     if (this.conflictRepair && !await this.conflictRepair.shouldRun(item)) return false;
     const event = currentWorkItemEvent(item);
+    const ciRequest = event?.payload?.nextAction === 'fix_ci' &&
+      (event.payload.relation === 'authored' ||
+        (item.currentTarget?.id === 'developer' && isOwnerRequestedCiRepairEvent(event)));
     if (event?.payload?.nextAction === "resolve_conflict" && this.#isInFlight(event.subject?.repository, event.subject?.number)) return false;
-    if (event?.payload?.relation === 'authored' && event.payload.nextAction === 'fix_ci' && this.ciRepairContextReader !== null &&
+    if (ciRequest && this.ciRepairContextReader !== null &&
         this.#isInFlight(event.subject?.repository, event.subject?.number)) return false;
-    if (event?.payload?.relation === 'authored' && event.payload.nextAction === 'fix_ci' && this.#state.published.some(row =>
+    if (ciRequest && this.#state.published.some(row =>
       sourceKindFor(row) === 'ci_repair' && row.repository === event.subject?.repository && row.number === event.subject?.number &&
       row.feedbackSnapshotArchive?.originalHeadRefOid === event.payload.headRefOid)) return false;
     if (event?.payload?.relation !== "authored" || event.payload.nextAction !== "address_review") return true;
@@ -229,17 +233,25 @@ export class AutomaticOwnPrRepair {
       if (error?.code === 'WORK_LEDGER_PR_EXECUTION_BINDING_STALE') return null;
       throw error;
     }
-    if (!samePullRequestExecutionBinding(context.inputBinding, binding) ||
-        !sameLogin(context.author, config.githubActions.actorAccountId)) return null;
+    if (!samePullRequestExecutionBinding(context.inputBinding, binding)) return null;
     const root = await this.ledger.readItemForReconciliation({ itemId: binding.rootItemId });
     const event = currentWorkItemEvent(root);
-    if (event?.payload?.relation !== "authored") return null;
+    const ownerCiRequest = isOwnerRequestedCiRepairEvent(event) && root?.kind === 'source_root' &&
+      root.itemId === binding.rootItemId && root.source?.kind === 'pull_request' &&
+      root.source.scope.kind === 'owner_requested' && root.source.scope.active === true &&
+      ['queued', 'working', 'dispatch_pending', 'retry_wait', 'waiting_condition', 'waiting_external', 'completed'].includes(root.status) && root.sourceQuarantine === null &&
+      root.source.identity.provider === event.source.provider && root.source.identity.scopeId === event.source.scopeId &&
+      event.eventId === binding.eventId && event.contentDigest === binding.eventDigest &&
+      sameLogin(binding.gitTarget?.sourceAccountId, config.githubActions.actorAccountId);
+    if (event?.eventType === 'pull_request.owner_requested' && !ownerCiRequest) return null;
+    if (!ownerCiRequest && (event?.payload?.relation !== "authored" || !sameLogin(context.author, config.githubActions.actorAccountId))) return null;
+    if (ownerCiRequest && context.author !== null && !sameLogin(context.author, config.githubActions.actorAccountId)) return null;
     if (event.payload.nextAction === 'fix_ci' && this.ciRepairContextReader !== null) {
       const current = await this.ciRepairContextReader.read({ inputBinding: binding, event });
       if (current === null) return null;
       const ciEvidence = normalizeCiRepairEvidence(current.ciEvidence);
       const facts = current.facts;
-      if (facts?.state !== 'open' || !sameLogin(facts.author, context.author) || facts.headRefOid !== binding.headRefOid ||
+      if (facts?.state !== 'open' || !sameLogin(facts.author, config.githubActions.actorAccountId) || facts.headRefOid !== binding.headRefOid ||
           facts.baseRefOid !== binding.gitTarget.baseRefOid || ciEvidence.repository !== binding.repository ||
           ciEvidence.number !== binding.pullRequestNumber || ciEvidence.headRefOid !== binding.headRefOid ||
           ciEvidence.headRefName !== binding.gitTarget.headRefName || this.#ciWasPublished(binding.repository, binding.pullRequestNumber, ciEvidence.triggerDigest)) return null;
@@ -259,12 +271,14 @@ export class AutomaticOwnPrRepair {
   }
 
   async prepare({ item, intent, inputBinding, roleId }) {
+    const event = currentWorkItemEvent(item);
     if (roleId !== "developer" || intent.type !== "propose_code_action" || intent.operation !== "modify" ||
-        currentWorkItemEvent(item)?.payload?.relation !== "authored" ||
-        !['address_review', 'fix_ci'].includes(currentWorkItemEvent(item)?.payload?.nextAction)) return undefined;
+        (event?.payload?.relation !== "authored" && !isOwnerRequestedCiRepairEvent(event)) ||
+        !['address_review', 'fix_ci'].includes(event?.payload?.nextAction)) return undefined;
     const current = await this.#current(inputBinding);
     if (!current) {
-      if (currentWorkItemEvent(item)?.payload?.nextAction === 'fix_ci' && this.ciRepairContextReader !== null &&
+      if (event?.payload?.nextAction === 'fix_ci' &&
+          (this.ciRepairContextReader !== null || isOwnerRequestedCiRepairEvent(event)) &&
           (await this.#configuration())?.githubActions?.automaticOwnPrRepair === true) {
         throw repairError('OWN_PR_CI_SOURCE_NOT_READY', 'CI 修复来源需要重新读取当前检查');
       }

@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { createPrTriageWorkRequest } from "../src/domain/owner-work-request.js";
+import { OrchestratorService } from "../src/services/orchestrator-service.js";
+import { CiRepairContextReader } from "../src/services/ci-repair-context-reader.js";
+import { createPullRequestReadFacts, createPullRequestReadIdentity } from "../src/domain/pull-request-read-facts.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -132,13 +137,19 @@ function controlledCommit(grant, overrides = {}) {
   });
 }
 
-async function fixture({ enabled = true, conflict = false, ci = false, ciDiagnostics = () => [], operation = "modify", objectSync = null, pushOutcome = "applied", store = new MemoryStore(), clock = () => new Date(CREATED_AT), codeJobControl, taskRuns, recoveryLedger = {}, conflictInspectionReader } = {}) {
-  const binding = pullRequestExternalActionBinding({
+async function fixture({ enabled = true, conflict = false, ci = false, ownerRequestedCi = false, ownerGraph = null, ciContextReader = null, ciDiagnostics = () => [], operation = "modify", objectSync = null, pushOutcome = "applied", store = new MemoryStore(), clock = () => new Date(CREATED_AT), codeJobControl, taskRuns, recoveryLedger = {}, conflictInspectionReader } = {}) {
+  const originalBinding = ownerGraph?.binding ?? pullRequestExternalActionBinding({
     gitTarget: { headRepository: "acme/repo", headRefName: "fix/review-feedback" },
   });
-  const proposal = codeProposal(binding, conflict, operation, ci, ciDiagnostics(binding));
+  const ownerEvent = ownerGraph?.root.source.current.event ?? (ownerRequestedCi ? normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.owner_requested", occurredAt: CREATED_AT,
+    source: { provider: "local-owner", scopeId: "owner-request:123e4567-e89b-42d3-a456-426614174000" },
+    subject: { id: originalBinding.rootItemId, repository: originalBinding.repository, number: originalBinding.pullRequestNumber },
+    payload: { workType: "general", nextAction: "fix_ci", suggestedCapability: "development", expectedHeadRefOid: originalBinding.headRefOid,
+      headRefOid: originalBinding.headRefOid, gitTargetAvailable: true, gitTarget: originalBinding.gitTarget } }) : null);
+  const binding = ownerEvent === null ? originalBinding : { ...originalBinding, eventId: ownerEvent.eventId, eventDigest: ownerEvent.contentDigest };
+  let proposal = codeProposal(binding, conflict, operation, ci, ciDiagnostics(binding));
   let observedCiEvidence = ci ? clone(proposal.binding.executionSource.ciEvidence) : null;
-  const grant = grantFor(proposal);
+  let grant = grantFor(proposal);
   const config = {
     trackedRepositories: [binding.repository],
     githubActions: { enabled: true, automaticOwnPrRepair: enabled, actorAccountId: "runtime-user" },
@@ -154,6 +165,16 @@ async function fixture({ enabled = true, conflict = false, ci = false, ciDiagnos
     mergeStateStatus: conflict ? "DIRTY" : "CLEAN", baseRefOid: binding.gitTarget.baseRefOid,
     reviewFeedbackAvailable: true, reviewFeedbackCount: 1, reviewFeedbackDigest: FEEDBACK_DIGEST, feedback: clone(ORIGINAL_FEEDBACK) };
   const context = { inputBinding: binding, author: "runtime-user" };
+  if (ownerRequestedCi) {
+    // The pipeline's mock ledger represents the already verified owner root.
+    // Exercise the real missing-author/event branch without rewriting history.
+    Object.assign(item, { kind: "source_root", status: "queued", sourceQuarantine: null, event: ownerEvent,
+      currentTarget: { type: "role", id: "developer" },
+      source: { kind: "pull_request", identity: { provider: ownerEvent.source.provider, scopeId: ownerEvent.source.scopeId },
+        scope: { kind: "owner_requested", active: true }, current: { event: ownerEvent } } });
+    context.author = null;
+    if (ownerGraph) Object.assign(item, clone(ownerGraph.root));
+  }
   const jobs = new Map();
   const details = new Map();
   const verified = new Map();
@@ -165,6 +186,7 @@ async function fixture({ enabled = true, conflict = false, ci = false, ciDiagnos
   const reviewLedger = await createWorkLedgerRuntime({ store, assignmentSource: routing, createGuard: guardFactory,
     clock, idFactory: () => "review-delivery-lease" });
   const ownerWorkRequests = new OwnerWorkRequestService({ store, workflowRouting: routing, ledger: reviewLedger,
+    capabilityReadiness: { async read(capability) { return { capability, roleId: capability === "development" ? "developer" : "pr-engineer", enabled: true, paused: false }; } },
     roleReadiness: { async read(roleId) { return { roleId, enabled: true, paused: false }; } },
     pullRequestResolver: { async resolvePullRequestTarget() { return { repository: binding.repository,
       number: binding.pullRequestNumber, title: "Review repaired PR", state: facts.state,
@@ -241,10 +263,10 @@ async function fixture({ enabled = true, conflict = false, ci = false, ciDiagnos
     const dependencies = {
       objectSync,
       configurationReader: { async readActive() { return { configuration: config }; } }, store,
-      ledger: { async readPullRequestExecutionContext() { return clone(context); }, async readItemForReconciliation() { return clone(item); }, ...recoveryLedger },
+      ledger: { ...(ownerGraph?.ledger ?? { async readPullRequestExecutionContext() { return clone(context); }, async readItemForReconciliation() { return clone(item); } }), ...recoveryLedger },
       github: { async readOwnPullRequestFeedback() { return clone(facts); }, async readOwnPullRequestConflict() { return clone(facts); },
         async readPullRequestLocalWorkFacts() { return clone(facts); } }, confirmations: confirmationPort,
-      ...(ci ? { ciRepairContextReader: { async read() { return { facts: clone(facts), ciEvidence: clone(observedCiEvidence) }; } } } : {}),
+      ...(ci ? { ciRepairContextReader: ciContextReader ?? { async read() { return { facts: clone(facts), ciEvidence: clone(observedCiEvidence) }; } } } : {}),
       codeJobReader: { async get(jobId) { return clone(jobs.get(jobId) ?? null); }, async getDetail({ jobId }) { return clone(details.get(jobId) ?? null); } },
       conflictInspectionReader,
       confirmationSettlementReader: { read: request => queue.readSettlement(request) },
@@ -274,7 +296,10 @@ async function fixture({ enabled = true, conflict = false, ci = false, ciDiagnos
     });
   }
   return {
-    store, binding, proposal, grant, config, item, facts, context, jobs, pushes, ownerWorkRequests, reviewLedger, details, verified,
+    store, binding, config, item, facts, context, jobs, pushes, ownerWorkRequests, reviewLedger, details, verified,
+    get proposal() { return proposal; }, get grant() { return grant; },
+    adoptProposal(value) { proposal = normalizeBoundWorkProposal(value); grant = grantFor(proposal);
+      observedCiEvidence = clone(grant.executionSource.ciEvidence); },
     get service() { return service; }, get queue() { return queue; },
     get codeJobApprovalCount() { return codeJobApprovalCount; },
     async deliver() { return handler().handle({ proposal, status: "pending_delivery", attempt: 1, downstreamRef: null }); },
@@ -312,6 +337,7 @@ test('CI failure repairs automatically publish a controlled commit and hand off 
   assert.deepEqual(prepared, f.grant.executionSource);
   await f.deliver();
   assert.equal(f.codeJobApprovalCount, 1);
+  assert.equal(await f.service.shouldRun(f.item), false, 'in-flight CI repair suppresses another decision');
   const repair = (await f.store.read(STATE_KEY)).repairs[0];
   assert.equal(repair.sourceKind, 'ci_repair');
   const archived = await f.store.read(originalRepairFeedbackArchiveKey(repair.feedbackSnapshotId));
@@ -331,6 +357,132 @@ test('CI failure repairs automatically publish a controlled commit and hand off 
   await f.restart(); await f.service.runCycle();
   assert.equal(f.pushes.length, 1);
   assert.equal(await f.service.shouldRun(f.item), false);
+});
+
+test("owner-requested CI repair seals fresh ownership and uses controlled commit, auto publication and internal review", async () => {
+  const f = await fixture({ ci: true, ownerRequestedCi: true });
+  const original = clone(f.item.event);
+  const source = await f.service.prepare({ item: f.item, inputBinding: f.binding,
+    intent: { type: 'propose_code_action', operation: 'modify' }, roleId: 'developer' });
+  assert.equal(source?.kind, 'ci_repair');
+  assert.equal(f.context.author, null);
+  assert.deepEqual(f.item.event, original);
+  await f.deliver();
+  assert.equal(f.codeJobApprovalCount, 1);
+  assert.equal(await f.service.shouldRun(f.item), false, 'in-flight owner CI repair suppresses another decision');
+  f.completeJob();
+  await f.restart(); await f.service.runCycle(); await f.service.runCycle();
+  assert.equal(f.pushes.length, 1);
+  const published = (await f.store.read(STATE_KEY)).published[0];
+  assert.equal(published.sourceKind, 'ci_repair');
+  assert.equal(published.reviewDelivery.status, 'completed');
+  assert.equal(published.reviewDelivery.request.internalReview.kind, 'own_pr_ci_repair');
+  await f.restart(); await f.service.runCycle();
+  assert.equal(f.pushes.length, 1);
+  assert.equal(await f.service.shouldRun(f.item), false, 'published original Head remains consumed');
+});
+
+test("normal local completion cannot strand an already controlled owner CI publication", async () => {
+  const f = await fixture({ ci: true, ownerRequestedCi: true });
+  await f.deliver(); f.completeJob();
+  f.item.status = 'completed';
+  await f.service.runCycle(); await f.service.runCycle();
+  assert.equal(f.pushes.length, 1);
+});
+
+for (const drift of ['author', 'head', 'base', 'actor', 'paused', 'rejected', 'inactive', 'source-scope', 'event-binding', 'checks', 'reader-unavailable']) {
+  test(`owner CI provenance cannot bypass current authority (${drift})`, async () => {
+    const f = await fixture({ ci: true, ownerRequestedCi: true });
+    if (drift === 'author') f.facts.author = 'other-author';
+    if (drift === 'head') f.facts.headRefOid = '9'.repeat(40);
+    if (drift === 'base') f.facts.baseRefOid = '9'.repeat(40);
+    if (drift === 'actor') f.config.githubActions.actorAccountId = 'other-account';
+    if (drift === 'paused') f.item.status = 'paused';
+    if (drift === 'rejected') { f.item.status = 'blocked'; f.item.statusReason = 'proposal_rejected'; }
+    if (drift === 'inactive') f.item.source.scope.active = false;
+    if (drift === 'source-scope') f.item.source.identity.scopeId = 'other-scope';
+    if (drift === 'event-binding') f.item.source.current.event = { ...f.item.source.current.event, eventId: 'workflow-event-stale' };
+    if (drift === 'checks') f.service.ciRepairContextReader.read = async () => null;
+    if (drift === 'reader-unavailable') f.service.ciRepairContextReader = null;
+    await assert.rejects(f.service.prepare({ item: f.item, inputBinding: f.binding,
+      intent: { type: 'propose_code_action', operation: 'modify' }, roleId: 'developer' }),
+      error => error.code === 'OWN_PR_CI_SOURCE_NOT_READY');
+    assert.equal(f.codeJobApprovalCount, 0);
+    assert.equal(f.pushes.length, 0);
+  });
+}
+
+test("real owner triage and graph dispatch generate CI provenance before automatic publication", async () => {
+  const store = new MemoryStore(), initial = await fixture({ ci: true, store });
+  const request = await initial.ownerWorkRequests.submit(createPrTriageWorkRequest({ requestKey: "owner-ci-real-dispatch",
+    targetRoleId: "developer", repository: initial.binding.repository, number: initial.binding.pullRequestNumber,
+    nextAction: "fix_ci", expectedHeadRefOid: initial.binding.headRefOid }));
+  const root = await initial.reviewLedger.readItemForReconciliation({ itemId: request.workItemId });
+  const originalEvent = clone(root.source.current.event);
+  const assembler = new RoleContextAssembler({ graphReader: initial.reviewLedger.graphReader });
+  const packet = await assembler.assemble({ roleId: "orchestrator", item: root, trigger: "scheduled" });
+  const orchestrator = new OrchestratorService({ contextAssembler: assembler, graphReader: initial.reviewLedger.graphReader,
+    scopedGraphPlannerFactory: initial.reviewLedger.scopedGraphPlannerFactory, graphDelivererFactory: initial.reviewLedger.graphDelivererFactory,
+    capabilityRoles: { development: "developer" }, clock: () => new Date(CREATED_AT) });
+  const reason = "Route current owner-requested CI repair through controlled execution";
+  await orchestrator.execute({ worker: { roleId: "orchestrator", workerId: "employee-orchestrator" }, item: root, contextPacket: packet,
+    intent: { schemaVersion: 1, type: "orchestrate", summary: "Create CI repair child", reason, action: {
+      schemaVersion: 1, type: "decompose", sourceTaskId: root.itemId, sourceTaskRevision: root.revision,
+      expectedGraphRevision: packet.context.requirements.graph.revision, reason, childKey: "controlled-ci-repair",
+      work: { title: "Repair CI", description: "Repair the current failed checks and publish a controlled commit" },
+      capability: "development", dependsOn: [], acceptanceContract: { revision: 1, acceptanceCriteria: [],
+        expectedDeliverables: [{ deliverableId: "implementation", kind: "change-package", description: "Controlled repair", required: true }] },
+    } } });
+  const child = (await initial.reviewLedger.listItems({ limit: 100 })).items.find(item => item.graph.parentItemId === root.itemId);
+  const binding = currentWorkItemExecutionBinding(child);
+  assert.equal(Object.hasOwn(originalEvent.payload, "relation"), false);
+  assert.equal((await initial.reviewLedger.readPullRequestExecutionContext(binding)).author, null);
+  let f;
+  const ciReader = new CiRepairContextReader({ github: {
+    async readPullRequestLocalWorkFacts() { return clone(f.facts); },
+    async loadPullRequestFacts(input) {
+      return createPullRequestReadFacts({ identity: createPullRequestReadIdentity(input), observedAt: CREATED_AT,
+        reviewDecision: "NONE", comments: [], reviews: [], reviewThreads: [],
+        checks: f.grant.executionSource.ciEvidence.checks.map(check => ({ ...check, status: "COMPLETED",
+          startedAt: null, completedAt: null, requirement: "required" })),
+        truncation: { comments: false, reviews: false, reviewThreads: false, checks: false, byteBudget: false } });
+    },
+  } });
+  f = await fixture({ ci: true, ownerRequestedCi: true, store, ciContextReader: ciReader,
+    ownerGraph: { binding, root: await initial.reviewLedger.readItemForReconciliation({ itemId: root.itemId }), ledger: initial.reviewLedger } });
+  const claimed = await initial.reviewLedger.claim({ itemId: child.itemId, expectedRevision: child.revision,
+    workerId: "employee-developer", leaseDurationMs: 30_000 });
+  await initial.reviewLedger.stageIntent({ itemId: child.itemId, expectedRevision: claimed.revision, leaseId: claimed.leaseId,
+    actorId: "employee-developer", roleId: "developer", intent: { schemaVersion: 1, type: "propose_code_action", operation: "modify",
+      summary: "Repair current CI", reason: "Current GitHub checks fail", objective: "Fix the bound failed CI checks",
+      acceptanceCriteria: ["Configured regression passes"], evidence: ["Current CI check failure"] } });
+  let prepared = 0;
+  const dispatcher = new WorkIntentDispatcher({ ledger: initial.reviewLedger,
+    policy: createWorkIntentPolicy({ codeActionRoles: ["developer"], workspaceByRepository: { [binding.repository]: f.grant.workspaceId } }),
+    reviewRepairSourcePreparer: { async prepare(input) { prepared++; return f.service.prepare(input); } },
+    attentionProducer: { async create() { assert.fail("Routine CI repair must not ask the owner"); } },
+    proposalProducer: { async create(value) {
+      const proposal = normalizeBoundWorkProposal(value);
+      assert.equal(proposal.binding.executionSource?.kind, "ci_repair");
+      f.adoptProposal(value);
+      return { proposalId: proposal.proposalId, contentDigest: proposal.contentDigest, kind: proposal.kind,
+        status: "pending_delivery", revision: 1, createdAt: CREATED_AT };
+    } }, clock: () => new Date(CREATED_AT) });
+  const dispatched = await dispatcher.dispatchPending();
+  assert.equal(dispatched.delivered, 1, JSON.stringify(dispatched));
+  assert.equal(prepared, 1);
+  assert.equal(f.grant.executionSource.kind, "ci_repair");
+  await f.deliver();
+  assert.equal(await f.service.shouldRun(child), false, "only the developer is suppressed while its CI repair is active");
+  assert.equal(await f.service.shouldRun(f.item), true, "the orchestrator remains able to settle and coordinate its children");
+  f.completeJob();
+  await f.restart(); await f.service.runCycle(); await f.service.runCycle();
+  assert.equal(f.pushes.length, 1);
+  const published = (await store.read(STATE_KEY)).published[0];
+  assert.equal(published.reviewDelivery.request.internalReview.kind, "own_pr_ci_repair");
+  assert.deepEqual((await initial.reviewLedger.readItemForReconciliation({ itemId: root.itemId })).source.current.event, originalEvent);
+  await f.restart(); await f.service.runCycle();
+  assert.equal(f.pushes.length, 1);
 });
 
 for (const change of ['head', 'base', 'author', 'disabled', 'grant']) test(`CI publication stops after ${change} authority changes`, async () => {

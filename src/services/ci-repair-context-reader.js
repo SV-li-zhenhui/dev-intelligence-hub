@@ -4,6 +4,14 @@ import { createCiRepairEvidence, normalizeCiRepairEvidence, FAILED_CI_CONCLUSION
 
 const unavailable = () => Object.assign(new Error('当前 CI 修复证据暂不可用'), { code: 'CODE_CI_REPAIR_CONTEXT_UNAVAILABLE' });
 
+export function isOwnerRequestedCiRepairEvent(event) {
+  return event?.eventType === 'pull_request.owner_requested' && event.source?.provider === 'local-owner' &&
+    /^owner-request:[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(event.source.scopeId ?? '') &&
+    event.payload?.workType === 'general' && event.payload.nextAction === 'fix_ci' &&
+    event.payload.suggestedCapability === 'development' && event.payload.expectedHeadRefOid === event.payload.headRefOid &&
+    [undefined, 'authored'].includes(event.payload.relation);
+}
+
 export function ciRepairMessages(value) {
   if (value === undefined) return [];
   const evidence = normalizeCiRepairEvidence(value);
@@ -23,7 +31,7 @@ export class CiRepairContextReader {
     try {
       signal?.throwIfAborted();
       const identity = createPullRequestReadIdentity({ executionBinding: inputBinding, event });
-      if (event.payload.relation !== 'authored' || event.payload.nextAction !== 'fix_ci') return null;
+      if ((event.payload.relation !== 'authored' && !isOwnerRequestedCiRepairEvent(event)) || event.payload.nextAction !== 'fix_ci') return null;
       const actor = inputBinding.gitTarget.sourceAccountId;
       const currentFacts = () => this.github.readPullRequestLocalWorkFacts({ repository: inputBinding.repository,
         number: inputBinding.pullRequestNumber, account: actor, authorAccountId: actor }, signal ? { signal } : {});
