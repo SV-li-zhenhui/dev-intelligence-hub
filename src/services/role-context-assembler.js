@@ -17,6 +17,7 @@ import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
 import { WORK_LEDGER_STATUSES } from "./work-ledger-values.js";
 import { createRoleContextEvidenceCatalogAdapter } from "./role-context-evidence-catalog.js";
 import { normalizeRecordedDeliveryFailure } from "./work-ledger-delivery-failure.js";
+import { normalizeRecordedDecisionFailure } from './work-ledger-decision-failure.js';
 import {
   RoleContextAssemblerError,
   roleContextError,
@@ -539,12 +540,17 @@ function normalizeSnapshot(value) {
     const work = exactData(fields.get("work"), ["title", "description"], "task work");
     let dispatchFailure = null;
     let deliveryFailure = null;
+    let decisionFailure = null;
     if (ledgerStatus === "blocked" && fields.get("statusReason") === "intent_failed" && fields.get("dispatchFailure") != null) {
       dispatchFailure = normalizeDispatchFailure(fields.get("dispatchFailure"), tasksById.get(taskId));
     }
     if (ledgerStatus === "blocked" && fields.get("statusReason") === "delivery_attempts_exhausted" && fields.get("deliveryFailure") != null) {
       deliveryFailure = normalizeRecordedDeliveryFailure(fields.get("deliveryFailure"), fields.get("taskRevision"));
       if (deliveryFailure === null) throw invalid("delivery failure binding is invalid");
+    }
+    if (ledgerStatus === 'blocked' && fields.get('statusReason') === 'decision_attempts_exhausted' && fields.get('decisionFailure') != null) {
+      decisionFailure = normalizeRecordedDecisionFailure(fields.get('decisionFailure'), fields.get('taskRevision'));
+      if (decisionFailure === null) throw invalid('decision failure binding is invalid');
     }
     if (statesById.has(taskId)) throw invalid("task state IDs are duplicated");
     statesById.set(taskId, {
@@ -555,9 +561,10 @@ function normalizeSnapshot(value) {
       ),
       ledgerStatus,
       blockingCondition: ledgerStatus === "blocked" && fields.get("statusReason") === "proposal_stale"
-        ? "proposal-stale" : dispatchFailure?.code ?? deliveryFailure?.code ?? null,
+        ? "proposal-stale" : dispatchFailure?.code ?? deliveryFailure?.code ?? decisionFailure?.code ?? null,
       dispatchFailure,
       deliveryFailure,
+      decisionFailure,
       work: {
         title: nullableText(work.get("title"), "work.title", 256),
         description: nullableText(
@@ -936,6 +943,7 @@ function projectRootCoordination(roleId, currentTask, snapshot) {
       blockingCondition: taskState.blockingCondition,
       ...(taskState.dispatchFailure === null ? {} : { dispatchFailure: { ...taskState.dispatchFailure } }),
       ...(taskState.deliveryFailure === null ? {} : { deliveryFailure: { ...taskState.deliveryFailure } }),
+      ...(taskState.decisionFailure === null ? {} : { decisionFailure: { ...taskState.decisionFailure } }),
       responsibility: { ...child.responsibility },
       work: {
         title: taskState.work.title,

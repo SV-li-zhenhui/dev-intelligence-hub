@@ -1,4 +1,5 @@
 import { scheduler } from "node:timers/promises";
+import { indexRecordedDecisionFailures, decisionFailureParentIds } from './work-ledger-decision-failure.js';
 import { ciMaterialRecoveryCandidate, ciMaterialRetirement, planCiMaterialRecovery } from "./work-ledger-ci-material-recovery.js";
 import { hostContextRecoveryCandidate, planHostContextRecovery, hostContextRetirement, hasPendingHostContextRecovery } from "./work-ledger-host-context-recovery.js";
 import { automaticRoleHandoffCandidate } from "./work-ledger-role-handoff.js";
@@ -809,8 +810,9 @@ export class WorkLedgerService {
   async listClaimCandidates(options = {}) {
     this.#assertReady();
     const page = queryClaimCandidatePage(this.state.items, options);
+    const failedChildParents = decisionFailureParentIds(this.state, indexRecordedDecisionFailures(this.state));
     page.items.forEach((item, index) => {
-      if (hasPendingHostContextRecovery(this.state, item)) page.facts[index].orchestrationReady = true;
+      if (hasPendingHostContextRecovery(this.state, item) || failedChildParents.has(item.itemId)) page.facts[index].orchestrationReady = true;
     });
     return page;
   }

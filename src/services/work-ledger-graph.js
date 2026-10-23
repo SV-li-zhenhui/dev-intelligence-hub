@@ -16,6 +16,7 @@ import { currentWorkItemInputBinding } from "./work-ledger-pr-source.js";
 import { isRecoveredConflictInspection } from "./work-ledger-inspection-continuation.js";
 import { unstartedConflictDispatchFailure } from "./work-ledger-conflict-failure.js";
 import { unstartedDeliveryContractFailure, unstartedCodePolicyBindingFailure, recordedDeliveryFailure } from "./work-ledger-delivery-failure.js";
+import { indexRecordedDecisionFailures } from './work-ledger-decision-failure.js';
 
 export const WORK_LEDGER_GRAPH_ID = "work-ledger";
 
@@ -412,6 +413,7 @@ export function projectWorkLedgerGraphView(state, options) {
       latestTimelineByItem.set(entry.itemId, entry);
     }
   }
+  const decisionFailures = indexRecordedDecisionFailures(state);
   const taskStates = graph.tasks.map((task) => {
     const item = itemsById.get(task.taskId);
     if (!item || item.get("revision") !== task.revision) {
@@ -439,6 +441,7 @@ export function projectWorkLedgerGraphView(state, options) {
       statusReason: item.get("statusReason"),
       ...(dispatchFailure === null ? {} : { dispatchFailure }),
       ...(deliveryFailure === null ? {} : { deliveryFailure }),
+      ...(decisionFailures.has(task.taskId) ? { decisionFailure: decisionFailures.get(task.taskId) } : {}),
       updatedAt: item.get("updatedAt"),
       work: projectedItemWork(item),
     };

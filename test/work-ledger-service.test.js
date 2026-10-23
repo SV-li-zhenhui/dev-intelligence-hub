@@ -7,6 +7,7 @@ import { EventEmitter } from "node:events";
 import test from "node:test";
 import { automaticRoleHandoffCandidate } from "../src/services/work-ledger-role-handoff.js";
 import { indexWorkLedgerGraphProgress } from "../src/services/work-ledger-graph-progress.js";
+import { indexRecordedDecisionFailures, decisionFailureParentIds } from '../src/services/work-ledger-decision-failure.js';
 import { unstartedDeliveryContractFailure, unstartedCodePolicyBindingFailure } from "../src/services/work-ledger-delivery-failure.js";
 import { hostContextRecoveryCandidate, planHostContextRecovery, hasPendingHostContextRecovery } from "../src/services/work-ledger-host-context-recovery.js";
 import { WorkContinuationScheduler } from "../src/services/work-continuation-scheduler.js";
@@ -18307,6 +18308,49 @@ test('legacy CI parent admission still requires its unchanged retirement proof a
       if (variant === 'source-pending') root.source.pendingRevision = 2;
       assert.equal(hasPendingCiMaterialRecovery(state, root), false);
     });
+  }
+});
+
+test('a retained child decision failure wakes its coordinating parent with the exact host diagnostic', async () => {
+  const record = ownerRequestedPrAssignment(1, { gitFacts: { ...prGitFacts(PR_HEAD_A), workType: 'general',
+    nextAction: 'fix_ci', suggestedCapability: 'development', expectedHeadRefOid: PR_HEAD_A } });
+  record.assignment.target = { type: 'role', id: 'orchestrator' };
+  const f = await createFixture({ records: [record] });
+  await f.service.intake();
+  const root = (await f.service.listItems()).items[0];
+  const created = await f.service.createGraphChild(prGraphChildCommand(root,
+    (await f.service.getSummary()).revision, 'ci-decision-diagnostic'));
+  let child = await f.service.readItemForReconciliation({ itemId: created.taskId });
+  child = await f.service.claim({ itemId: child.itemId, expectedRevision: child.revision,
+    workerId: 'employee-developer', leaseDurationMs: 30000 });
+  await f.service.transition({ itemId: child.itemId, expectedRevision: child.revision,
+    leaseId: child.leaseId, actorId: 'employee-developer', toStatus: 'blocked',
+    reason: 'decision_attempts_exhausted', details: { code: 'ROLE_DECISION_PR_REVIEW_REQUIRED' } });
+  const before = await f.service.readItemForReconciliation({ itemId: child.itemId });
+  const graph = await f.service.getGraphSnapshot();
+  const projected = graph.taskStates.find(row => row.taskId === child.itemId);
+  assert.equal(projected.decisionFailure?.code, 'ROLE_DECISION_PR_REVIEW_REQUIRED');
+  assert.equal(projected.decisionFailure.stage, 'decision');
+  assert.equal(projected.decisionFailure.taskRevision, before.revision);
+  const page = await f.service.listClaimCandidates({ at: f.time.clock(), roleId: 'orchestrator' });
+  assert.equal(page.facts.find(row => row.itemId === root.itemId).orchestrationReady, true);
+  assert.deepEqual(await f.service.readItemForReconciliation({ itemId: child.itemId }), before,
+    'parent notification does not requeue the child or reset its attempts');
+  const durable = await f.store.read(STATE_KEY);
+  for (const variant of ['paused-child', 'owned-child', 'active-intent', 'changed-claim', 'changed-input', 'old-timeline', 'paused-parent', 'inactive-source']) {
+    const state = clone(durable), changedChild = state.items.find(item => item.itemId === child.itemId);
+    const changedParent = state.items.find(item => item.itemId === root.itemId);
+    const latest = state.timeline.findLast(entry => entry.itemId === child.itemId);
+    const claim = state.timeline.findLast(entry => entry.itemId === child.itemId && entry.type === 'claimed');
+    if (variant === 'paused-child') changedChild.status = 'paused';
+    if (variant === 'owned-child') changedChild.ownerId = 'another-worker';
+    if (variant === 'active-intent') changedChild.activeIntentId = 'unsettled-intent';
+    if (variant === 'changed-claim') claim.actorId = 'another-worker';
+    if (variant === 'changed-input') changedChild.inputDigest = 'f'.repeat(64);
+    if (variant === 'old-timeline') latest.at = '2026-08-01T00:00:00.000Z';
+    if (variant === 'paused-parent') changedParent.status = 'paused';
+    if (variant === 'inactive-source') changedParent.source.scope.active = false;
+    assert.equal(decisionFailureParentIds(state, indexRecordedDecisionFailures(state)).has(root.itemId), false, variant);
   }
 });
 
