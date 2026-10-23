@@ -50,7 +50,7 @@ test("fact intake stays a separate fast operation", async () => {
   assert.deepEqual(calls, [["intake", { limit: 73 }]]);
 });
 
-test("automatic owner source refresh precedes global and PR engineer work without entering other roles", async () => {
+test("housekeeping owns automatic source refresh without adding it to role work", async () => {
   const refreshed = [];
   const { service, calls } = fixture({ ownerPullRequestSourceRefresher: { async runCycle(options) {
     refreshed.push(options); calls.push(["owner_refresh", options]); return { refreshed: 1 };
@@ -59,11 +59,48 @@ test("automatic owner source refresh precedes global and PR engineer work withou
     calls.length = 0;
     const result = await service.runCycle({ ...(roleId === null ? {} : { roleId }) });
     assert.equal(result.stages.owner_pull_request_source_refresh?.ok === true,
-      roleId === null || roleId === "pr-engineer");
-    if (roleId === null || roleId === "pr-engineer") assert.equal(calls[0][0], "owner_refresh");
+      roleId === null);
+    if (roleId === null) assert.equal(calls[0][0], "owner_refresh");
   }
-  assert.equal(refreshed.length, 2);
+  assert.equal(refreshed.length, 1);
 });
+
+for (const targeted of [false, true]) {
+  test(`PR engineer work proceeds while housekeeping is refreshing unrelated owner sources (${targeted ? "targeted" : "scheduled"})`, async () => {
+    const refreshing = deferred(), release = deferred(), workStarted = deferred();
+    let refreshCalls = 0;
+    const { service } = fixture({
+      ownerPullRequestSourceRefresher: { async runCycle() {
+        refreshCalls += 1;
+        refreshing.resolve();
+        await release.promise;
+        return { refreshed: 0 };
+      } },
+      workLoop: { async runCycle(options) {
+        assert.equal(options.roleId, "pr-engineer");
+        if (targeted) assert.equal(options.continuationTarget.itemId, "work-one");
+        workStarted.resolve();
+        return {};
+      } },
+    });
+    const housekeeping = service.runCycle({ includeWork: false });
+    await refreshing.promise;
+    const role = service.runCycle({ roleId: "pr-engineer", ...(targeted ? {
+      continuationTarget: { itemId: "work-one", fingerprint: "a".repeat(64) },
+    } : {}) });
+    try {
+      assert.equal(await Promise.race([
+        workStarted.promise.then(() => true),
+        new Promise(resolve => setImmediate(() => resolve(false))),
+      ]), true, "unrelated source refresh must not hold the PR engineer's work lane");
+      assert.equal(refreshCalls, 1, "housekeeping owns the global refresh");
+      await role;
+    } finally {
+      release.resolve();
+      await Promise.allSettled([housekeeping, role]);
+    }
+  });
+}
 
 test('pending proposal authorizations advance before long running code work', async () => {
   const started = deferred(), release = deferred(); let approvals = 0;

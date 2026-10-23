@@ -575,7 +575,9 @@ export class WorkCoordinationService {
     if (this.#recoverCodeJobPauses !== null && (options.roleId === null || options.roleId === "developer")) {
       stages.unshift(["code_job_pause_recovery", () => this.#recoverCodeJobPauses({ limit: this.#defaults.codeJobLimit, signal: options.signal })]);
     }
-    if (this.#refreshOwnerPullRequestSources !== null && (options.roleId === null || options.roleId === "pr-engineer")) {
+    // Source refresh can read many historical requests and wait for GitHub.
+    // Housekeeping owns that global sweep; role work must have an independent lane.
+    if (this.#refreshOwnerPullRequestSources !== null && options.roleId === null) {
       stages.unshift(["owner_pull_request_source_refresh", () => this.#refreshOwnerPullRequestSources({
         limit: this.#defaults.codeJobLimit, signal: options.signal })]);
     }
