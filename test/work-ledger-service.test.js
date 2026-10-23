@@ -17290,3 +17290,40 @@ test("a changed ledger during code-job reading cannot admit obsolete cancellatio
   assert.equal(cancellations, 0);
   assert.equal((await fixture.jobs.list()).items[0].status, "paused");
 });
+
+
+for (const eventType of ["issue.left_scope", "issue.completed"]) {
+  test(`${eventType} retires a submitted child delivery without blocking unrelated PR intake`, async () => {
+    const f = await createFixture({ records: [issueAssignment(1)] });
+    await f.service.intake();
+    const root = (await f.service.listItems()).items[0];
+    const create = prGraphChildCommand(root, (await f.service.getSummary()).revision, "issue-analysis");
+    create.command.acceptanceContract.expectedDeliverables = [{ deliverableId: "analysis", kind: "text-report",
+      description: "Scoped analysis", required: true }];
+    const created = await f.service.createGraphChild(create);
+    let child = await f.service.readItemForReconciliation({ itemId: created.taskId });
+    child = await f.service.claim({ itemId: child.itemId, expectedRevision: child.revision,
+      workerId: "employee-developer", leaseDurationMs: 30000 });
+    await f.service.submitGraphDelivery({ authority: { actorId: "employee-developer", scopeRootTaskId: root.itemId,
+      taskId: child.itemId, leaseId: child.leaseId }, command: { deliveryRevision: 1, contractRevision: 1,
+      deliverableId: "analysis", summary: "Analysis awaiting review", evidence: [{ kind: "work-inputs",
+        referenceId: "fixture-inputs", contentDigest: "a".repeat(64) }],
+      expectedGraphRevision: (await f.service.getSummary()).revision, expectedTaskRevision: child.revision } });
+    const submitted = (await f.service.readItemForReconciliation({ itemId: child.itemId })).graph.deliveries[0];
+    f.source.records.push(issueAssignment(2, { eventType, state: "closed", occurredAt: "2026-08-02T02:05:00.000Z" }),
+      prAssignment(3, { occurredAt: "2026-08-02T02:06:00.000Z" }));
+    f.source.highWatermark = 3;
+    await f.service.intake();
+    const retired = await f.service.readItemForReconciliation({ itemId: child.itemId });
+    assert.equal(retired.status, "cancelled");
+    assert.deepEqual(retired.graph.deliveries[0], submitted);
+    assert.equal(retired.graph.deliveries.length, 2);
+    assert.equal(retired.graph.deliveries[1].status, "rejected");
+    assert.deepEqual(retired.graph.deliveries[1].evidence, submitted.evidence);
+    assert.equal(f.store.stored().intakeCursor, 3);
+    assert.ok((await f.service.listItems()).items.some(i => i.source?.kind === "pull_request"));
+    const recovered = await createFixture({ store: f.store, source: f.source, time: f.time });
+    await recovered.service.intake();
+    assert.deepEqual((await recovered.service.readItemForReconciliation({ itemId: child.itemId })).graph.deliveries, retired.graph.deliveries);
+  });
+}
