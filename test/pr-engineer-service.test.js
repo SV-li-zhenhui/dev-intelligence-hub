@@ -227,7 +227,10 @@ test("fresh observations are idempotent and survive a service restart", async ()
   assert.deepEqual(await restarted.observe(fixture.input), facts);
 });
 
-test("task context includes exact-Head review material within its byte budget", async () => {
+for (const [kind, patch] of [
+  ["plain", "x".repeat(120 * 1024)],
+  ["escaped-source", '+ QStringLiteral("中文🙂\\\\path");\n'.repeat(12_000)],
+]) test(`task context includes exact-Head review material within its byte budget (${kind})`, async () => {
   const store = new MemoryStore();
   const fixture = executionFixture();
   const facts = factsFixture(fixture);
@@ -246,7 +249,7 @@ test("task context includes exact-Head review material within its byte budget", 
           { path: "src/codec.cpp", additions: 10, deletions: 3 },
           { path: "test/codec.test.cpp", additions: 2, deletions: 0 },
         ],
-        patch: "x".repeat(120 * 1024),
+        patch,
         patchTruncated: false,
       };
     },
@@ -263,7 +266,9 @@ test("task context includes exact-Head review material within its byte budget", 
   );
   assert.equal(context.reviewMaterial.changedFiles, 2);
   assert.equal(context.reviewMaterial.patchTruncated, true);
-  assert.equal(context.reviewMaterial.patch.length < 120 * 1024, true);
+  assert.equal(context.reviewMaterial.patch.length < patch.length, true);
+  assert.equal(patch.startsWith(context.reviewMaterial.patch), true);
+  assert.equal(context.reviewMaterial.patch.isWellFormed(), true);
   assert.equal(
     Buffer.byteLength(JSON.stringify(context), "utf8") <= 96 * 1024,
     true,
