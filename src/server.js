@@ -4295,9 +4295,24 @@ export function startApplicationBackgroundWork(
       });
   }
 
-  function enqueueBackgroundOperation(priority, operation) {
+  function enqueueBackgroundOperation(priority, operation, signal = null) {
     return new Promise((resolve, reject) => {
-      backgroundQueues.get(priority).push({ operation, resolve, reject });
+      signal?.throwIfAborted();
+      const queue = backgroundQueues.get(priority);
+      const onAbort = () => {
+        const index = queue.indexOf(entry);
+        if (index < 0) return;
+        queue.splice(index, 1);
+        signal.removeEventListener('abort', onAbort);
+        reject(signal.reason);
+      };
+      const entry = { operation() {
+        signal?.removeEventListener('abort', onAbort);
+        signal?.throwIfAborted();
+        return operation();
+      }, resolve, reject };
+      queue.push(entry);
+      signal?.addEventListener('abort', onAbort, { once: true });
       runNextBackgroundOperation();
     });
   }
@@ -4539,7 +4554,7 @@ export function startApplicationBackgroundWork(
     const operation = () => admitOnDequeue
       ? operationalAdmission.run(() => performAgencyCycle(options))
       : performAgencyCycle(options);
-    return enqueueBackgroundOperation(priority, operation);
+    return enqueueBackgroundOperation(priority, operation, options.signal);
   }
 
   function coalesceCycle(cycles, key, createCycle) {

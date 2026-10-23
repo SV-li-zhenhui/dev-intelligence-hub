@@ -87,6 +87,44 @@ test('continuation watchdog still stops owned work after fact refresh fails', { 
   } finally { release.resolve(); await background.stop(); }
 });
 
+test('a continuation cancelled before background admission settles without waiting for unrelated code work', { timeout: 5_000 }, async () => {
+  const codeStarted = deferred(), releaseCode = deferred();
+  const item = { itemId: 'queued-requirements-timeout', revision: 1, status: 'queued', currentTarget: { type: 'role', id: 'requirements-analyst' } };
+  const config = { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true }, workCoordination: { leaseDurationMs: 1_000 } };
+  let now = Date.now(), state, roleCalls = 0;
+  const scheduler = new WorkContinuationScheduler({
+    store: { async read(_key, fallback) { return structuredClone(state ?? fallback); }, async write(_key, value) { state = structuredClone(value); } },
+    ledger: {
+      async listClaimCandidates() { return { items: [structuredClone(item)], facts: [{ itemId: item.itemId, graphBlocked: false }], nextCursor: null }; },
+      async listItems() { return { items: [], nextCursor: null }; },
+      async readItemForReconciliation() { return structuredClone(item); }, async readItemProgress() { return [structuredClone(item)]; },
+    },
+    configurationReader: { async readActive() { return { configuration: config }; } },
+    roleStateReader: { async read() { return { enabled: true, paused: false }; } }, clock: () => new Date(now),
+  });
+  const timers = [];
+  const background = startApplicationBackgroundWork({ config, workContinuationScheduler: scheduler,
+    refreshService: { async refresh() {} },
+    workCoordination: { async runCycle() { codeStarted.resolve(); await releaseCode.promise; } },
+    employeeRegistry: { schedules: () => [], async runSelected(ids) { if (ids.includes('requirements-analyst')) roleCalls += 1; } },
+  }, { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {}, reportError() {} });
+  try {
+    await codeStarted.promise;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(state.records[0].receipts[0].outcome, 'running');
+    assert.equal(roleCalls, 0);
+    now += 1_001;
+    await timers.find(timer => timer.delay === 10_000).callback();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(state.records[0].receipts[0].outcome, 'timed_out');
+    assert.equal(scheduler.readStatus().overdueCount, 0);
+    assert.equal(roleCalls, 0);
+    releaseCode.resolve(); await background.initialRefresh;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(roleCalls, 0, 'cancelled queued work must never execute later');
+  } finally { releaseCode.resolve(); await background.initialRefresh; await background.stop(); }
+});
+
 test('automatic local proposal retries run during long code work and remain in lifecycle drain', { timeout: 5_000 }, async () => {
   const refreshed = deferred(), codeStarted = deferred(), releaseCode = deferred();
   const retried = deferred(), releaseRetry = deferred(); const timers = []; let polls = 0;
