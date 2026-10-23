@@ -21,6 +21,17 @@ export const emptyWorkContinuations = () => ({ schemaVersion: 2, records: [] });
 export const continuationFingerprint = item => createHash('sha256')
   .update(JSON.stringify([item.itemId, item.revision, item.currentTarget?.id])).digest('hex');
 
+export function normalizeContinuationTarget(value) {
+  if (value === null || value === undefined) return null;
+  if (!hasExactLedgerKeys(value, ['itemId', 'fingerprint']) || !identifier(value.itemId) ||
+      typeof value.fingerprint !== 'string' || !SHA.test(value.fingerprint)) throw invalid();
+  return Object.freeze({ itemId: value.itemId, fingerprint: value.fingerprint });
+}
+
+export function matchesContinuationTarget(item, target) {
+  return item.itemId === target.itemId && continuationFingerprint(item) === target.fingerprint;
+}
+
 function validDetails(record) {
   const { source, condition, receipts, recovery } = record;
   if (!hasExactLedgerKeys(source, ['rootItemId', 'parentItemId', 'inputRevision', 'itemRevision']) ||

@@ -153,6 +153,63 @@ test("concurrent run requests share one in-flight employee run", async () => {
   assert.equal(calls, 1);
 });
 
+test("targeted employee runs wait for unrelated work, coalesce identical targets, and preserve a hidden abort signal", async () => {
+  let release, started;
+  const gate = new Promise(resolve => { release = resolve; });
+  const running = new Promise(resolve => { started = resolve; });
+  const calls = [];
+  const controller = new EmployeeController({ definition: { id: 'developer' }, store: new MemoryStore(), stateKey: 'developer-state',
+    async run({ state, continuationTarget, signal }) {
+      calls.push(continuationTarget?.itemId ?? 'ordinary');
+      if (!continuationTarget) { started(); await gate; }
+      else assert.equal(signal, abort.signal);
+      return state;
+    } });
+  const abort = new AbortController();
+  const first = controller.run(); await running;
+  const options = { continuationTarget: { itemId: 'work-target', fingerprint: 'a'.repeat(64) } };
+  Object.defineProperty(options, 'signal', { value: abort.signal });
+  const target = controller.run(options);
+  assert.equal(controller.run(options), target);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls, ['ordinary']);
+  release(); await Promise.all([first, target]);
+  assert.deepEqual(calls, ['ordinary', 'work-target']);
+});
+
+test("cancelling a queued target never cancels its current role owner or starts it later", async () => {
+  let release, started;
+  const gate = new Promise(resolve => { release = resolve; });
+  const running = new Promise(resolve => { started = resolve; });
+  const calls = [];
+  const controller = new EmployeeController({ definition: { id: 'developer' }, store: new MemoryStore(), stateKey: 'developer-state',
+    async run({ state, continuationTarget }) { calls.push(continuationTarget?.itemId ?? 'ordinary'); started(); await gate; return state; } });
+  const first = controller.run(); await running;
+  const abort = new AbortController();
+  const target = controller.run({ continuationTarget: { itemId: 'work-target', fingerprint: 'a'.repeat(64) }, signal: abort.signal });
+  abort.abort(new Error('target cancelled'));
+  await assert.rejects(target, /target cancelled/);
+  assert.deepEqual(calls, ['ordinary']);
+  release(); await first;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls, ['ordinary']);
+});
+
+test("a role pause queued before targeted execution is rechecked after its existing owner settles", async () => {
+  let release, started;
+  const gate = new Promise(resolve => { release = resolve; });
+  const running = new Promise(resolve => { started = resolve; });
+  const calls = [];
+  const controller = new EmployeeController({ definition: { id: 'developer' }, store: new MemoryStore(), stateKey: 'developer-state',
+    async run({ state, continuationTarget }) { calls.push(continuationTarget?.itemId ?? 'ordinary'); started(); await gate; return state; } });
+  const first = controller.run(); await running;
+  const target = controller.run({ continuationTarget: { itemId: 'work-target', fingerprint: 'a'.repeat(64) } });
+  const pause = controller.control('pause', 0);
+  release(); await Promise.all([first, pause, target]);
+  assert.deepEqual(calls, ['ordinary']);
+  assert.equal((await controller.roleView()).paused, true);
+});
+
 test("a failed employee run releases the in-flight lock for the next run", async () => {
   const store = new MemoryStore();
   let attempts = 0;

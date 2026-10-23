@@ -2399,7 +2399,7 @@ export async function createApplication({
           ...(ordinaryActionAdmissionGate === null
             ? {}
             : { actionAdmissionGate: ordinaryActionAdmissionGate }),
-          onRun: ({ roleId, signal = null }) => {
+          onRun: ({ roleId, signal = null, continuationTarget = null }) => {
             if (!workCoordination) {
               const error = new Error("员工主动循环尚未就绪");
               error.code = "WORK_COORDINATION_NOT_READY";
@@ -2409,6 +2409,7 @@ export async function createApplication({
               trigger: `employee:${roleId}`,
               includeWork: true,
               roleId,
+              ...(continuationTarget === null ? {} : { continuationTarget }),
               ...(signal === null ? {} : { signal }),
             });
           },

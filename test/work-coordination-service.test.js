@@ -594,6 +594,18 @@ test("role cycles forward the role scope to the proactive work loop", async () =
   assert.equal(result.roleId, "developer");
 });
 
+test("targeted role cycles forward the immutable selector and limit execution to one item", async () => {
+  const { service, calls } = fixture();
+  const continuationTarget = { itemId: 'work-one', fingerprint: 'a'.repeat(64) };
+  await service.runCycle({ roleId: 'developer', continuationTarget });
+  const work = calls.find(([name]) => name === 'work')[1];
+  assert.deepEqual(work.continuationTarget, continuationTarget);
+  assert.equal(Object.isFrozen(work.continuationTarget), true);
+  assert.equal(work.workLimit, 1);
+  assert.throws(() => service.runCycle({ continuationTarget }), /requires a work role/);
+  assert.throws(() => service.runCycle({ includeWork: false, roleId: 'developer', continuationTarget }), /requires a work role/);
+});
+
 test("a failed work stage cannot strand an already durable dispatch", async () => {
   const calls = [];
   const failure = new Error("brain unavailable");

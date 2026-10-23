@@ -1,6 +1,8 @@
 import { MAX_WORK_LEDGER_QUERY_PAGE } from "./work-ledger-records.js";
 import { MAX_WORK_LEDGER_ITEMS } from "./work-ledger-state.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
+import { TargetedCycleQueue } from "../lib/targeted-cycle-queue.js";
+import { normalizeContinuationTarget } from "./work-continuation-state.js";
 
 const SAFE_TRIGGER = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
@@ -50,7 +52,7 @@ function cycleOptions(value = {}) {
     Array.isArray(value) ||
     Object.getPrototypeOf(value) !== Object.prototype ||
     Object.keys(value).some(
-      (key) => !["trigger", "includeWork", "roleId", "signal"].includes(key),
+      (key) => !["trigger", "includeWork", "roleId", "signal", "continuationTarget"].includes(key),
     )
   ) {
     throw new TypeError("runCycle options are invalid");
@@ -60,6 +62,8 @@ function cycleOptions(value = {}) {
     throw new TypeError("includeWork is invalid");
   }
   const roleId = value.roleId == null ? null : safeRoleId(value.roleId);
+  const continuationTarget = normalizeContinuationTarget(value.continuationTarget);
+  if (continuationTarget !== null && (!includeWork || roleId === null)) throw new TypeError('target requires a work role');
   if (!includeWork && roleId !== null) {
     throw new TypeError("roleId requires includeWork");
   }
@@ -67,6 +71,7 @@ function cycleOptions(value = {}) {
     trigger: safeTrigger(value.trigger ?? "scheduled"),
     includeWork,
     roleId,
+    continuationTarget,
     signal: normalizeAbortSignal(value.signal ?? null),
   });
 }
@@ -373,6 +378,7 @@ export class WorkCoordinationService {
   #defaults;
   #inFlightByScope = new Map();
   #cycleTail = Promise.resolve();
+  #targetedCycles = new TargetedCycleQueue();
 
   constructor({
     ledger,
@@ -487,6 +493,15 @@ export class WorkCoordinationService {
     const scope = options.includeWork
       ? `work:${options.roleId ?? NO_ROLE_SCOPE}`
       : "housekeeping";
+    if (options.continuationTarget !== null) return this.#targetedCycles.run(
+      JSON.stringify([scope, options.continuationTarget]), {
+        signal: options.signal, current: () => this.#inFlightByScope.get(scope),
+        execute: () => this.#startCycle(options, scope),
+      });
+    return this.#startCycle(options, scope);
+  }
+
+  #startCycle(options, scope) {
     const running = this.#inFlightByScope.get(scope);
     if (running) return running;
     const serialized = options.roleId === null;
@@ -571,8 +586,9 @@ export class WorkCoordinationService {
           this.#runWork({
             trigger: options.trigger,
             intakeLimit: this.#defaults.intakeLimit,
-            workLimit: this.#defaults.workLimit,
+            workLimit: options.continuationTarget === null ? this.#defaults.workLimit : 1,
             ...(options.roleId === null ? {} : { roleId: options.roleId }),
+            ...(options.continuationTarget === null ? {} : { continuationTarget: options.continuationTarget }),
             ...(options.signal === null ? {} : { signal: options.signal }),
           }),
       ]);

@@ -518,7 +518,7 @@ export class ConfiguredRoleEmployee {
         lastRun: state.lastRun ? { ...state.lastRun } : null,
         lastErrorCode: state.lastErrorCode,
       }),
-      run: async ({ state, trigger = "scheduled", signal = null }) => {
+      run: async ({ state, trigger = "scheduled", signal = null, continuationTarget = null }) => {
         signal = normalizeAbortSignal(signal);
         throwIfDecisionAborted(signal);
         const normalizedTrigger = safeTrigger(trigger);
@@ -529,6 +529,7 @@ export class ConfiguredRoleEmployee {
             roleId: this.roleId,
             workerId: this.workerId,
             trigger: normalizedTrigger,
+            ...(continuationTarget === null ? {} : { continuationTarget }),
             ...(signal === null ? {} : { signal }),
           });
           throwIfDecisionAborted(signal);

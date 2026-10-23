@@ -10,6 +10,100 @@ import test from "node:test";
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { WorkContinuationScheduler } from '../src/services/work-continuation-scheduler.js';
 
+async function targetedContinuationChain({ holdOrdinary = false } = {}) {
+  const values = new Map(), decisions = [], finished = deferred(), ordinaryStarted = deferred(), ordinaryRelease = deferred();
+  let enabled = !holdOrdinary;
+  const store = { async read(k, fallback) { return structuredClone(values.get(k) ?? fallback); },
+    async write(k, v) { values.set(k, structuredClone(v)); } };
+  const now = '2026-10-23T16:00:00.000Z';
+  const items = ['first', 'continuation'].map((id, index) => ({
+    itemId: `work-${id}`, kind: 'assignment', assignmentId: `assignment-${id}`, sourceSequence: index + 1,
+    inputDigest: 'a'.repeat(64), assignment: { assignmentId: `assignment-${id}`, target: { type: 'role', id: 'developer' } },
+    event: { eventId: `event-${id}`, eventType: 'pull_request.updated', subject: { id }, payload: {} },
+    graph: { parentItemId: null, dependsOnItemIds: [], acceptanceContracts: [], deliveries: [] },
+    currentTarget: { type: 'role', id: 'developer' }, activeIntentId: null, decisionContext: null,
+    status: 'queued', revision: 1, ownerId: null, leaseId: null, leaseUntil: null,
+    attempt: 0, availableAt: null, statusReason: null, createdAt: now, updatedAt: now,
+  }));
+  const ledger = { async intake() { return { received: 0 }; },
+    async listItems() { return { items: structuredClone(items), nextCursor: null }; },
+    async readItemForReconciliation({ itemId }) { return structuredClone(items.find(x => x.itemId === itemId) ?? null); },
+    async readItemProgress(ids) { return structuredClone(items.filter(x => ids.includes(x.itemId))); },
+    async claim(input) {
+      const item = items.find(x => x.itemId === input.itemId);
+      assert.equal(input.expectedRevision, item.revision);
+      Object.assign(item, { status: 'working', revision: item.revision + 1, ownerId: input.workerId,
+        leaseId: `lease-${item.itemId}`, leaseUntil: '2026-10-23T16:10:00.000Z', attempt: item.attempt + 1 });
+      return structuredClone(item);
+    },
+    async stageIntent({ itemId }) { const item = items.find(x => x.itemId === itemId);
+      Object.assign(item, { status: 'dispatch_pending', revision: item.revision + 1, ownerId: null, leaseId: null, leaseUntil: null }); },
+    async scheduleRetry() { assert.fail('valid continuation must not retry its decision'); }, async transition() {},
+  };
+  const config = { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } };
+  const scheduler = new WorkContinuationScheduler({ store,
+    ledger: { ...ledger, async listClaimCandidates() { return { items: [structuredClone(items[1])],
+      facts: [{ itemId: items[1].itemId, graphBlocked: false }], nextCursor: null }; } },
+    configurationReader: { async readActive() { return { configuration: config }; } },
+    roleStateReader: { async read() { return { enabled, paused: false }; } },
+  });
+  const definition = { id: 'developer', name: 'Developer', mission: 'Implement work', enabled: true, scheduleMinutes: 5 };
+  const permissions = { allowedIntents: ['complete'] };
+  const brain = { provider: 'local-test', model: 'target-chain', remoteData: { requirements: false, code: false, memory: false } };
+  let coordination, cycleResult;
+  const engine = { view() { return { definition, permissions, brain: { ...brain, remote: false } }; },
+      async decide({ item }) { decisions.push(item.itemId);
+        if (holdOrdinary && item.itemId === 'work-first') { ordinaryStarted.resolve(); await ordinaryRelease.promise; }
+        else enabled = false;
+        return { schemaVersion: 1, confidence: 100, summary: 'Done', intent: { schemaVersion: 1,
+          type: 'complete', summary: 'Done', reason: 'Test complete', outcome: 'no-action', evidence: [] } }; } };
+  const employee = new ConfiguredRoleEmployee({ definition, permissions, brain, taskBrain: brain, store,
+    decisionEngine: engine, taskDecisionEngine: engine,
+    onRun: async ({ roleId, signal, continuationTarget }) => {
+      try { cycleResult = await coordination.runCycle({ roleId, signal,
+        ...(continuationTarget ? { continuationTarget } : {}) }); return cycleResult;
+      } finally { if (items[1].status === 'dispatch_pending' || !holdOrdinary) finished.resolve(); }
+    },
+  });
+  const legacy = { id: 'pr-reviewer', scheduleMinutes: 0, async view() { return {}; },
+    async roleView() { return { id: 'pr-reviewer', enabled: true, paused: false }; }, async run() {}, async control() {} };
+  const registry = new EmployeeRegistry([legacy, employee]);
+  const loop = new ProactiveWorkLoop({ ledger, clock: () => now,
+    roleDirectory: new RoleWorkerDirectory({ workers: [employee.asRoleWorker()], legacyEmployeeRegistry: registry, legacyOwnedRoleIds: [] }) });
+  const noOp = { async runCycle() {} };
+  coordination = new WorkCoordinationService({ ledger, workLoop: loop, workLimit: 1,
+    proposalResultReconciler: noOp, attentionResultReconciler: noOp, conditionWaker: noOp,
+    dispatcher: { async dispatchPending() {} } });
+  const timers = [];
+  const background = startApplicationBackgroundWork({ config, employeeRegistry: registry,
+    workContinuationScheduler: scheduler, refreshService: { async refresh() {} } },
+    { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {} });
+  try {
+    await background.initialRefresh;
+    if (holdOrdinary) {
+      const ordinary = background.runEmployee('developer', { trigger: 'manual' });
+      await ordinaryStarted.promise;
+      enabled = true;
+      await timers.find(t => t.delay === 10_000).callback();
+      for (let index = 0; index < 10; index += 1) await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(decisions, ['work-first'], 'the target must wait rather than start a parallel role decision');
+      assert.equal(scheduler.readStatus().running, 1, 'the target wake remains owned while queued');
+      ordinaryRelease.resolve(); await ordinary;
+    }
+    await finished.promise;
+    assert.deepEqual(cycleResult.stages.work.result.outcomes.map(x => ({ status: x.status, code: x.code })),
+      [{ status: 'staged', code: undefined }]);
+    assert.deepEqual(decisions, holdOrdinary ? ['work-first', 'work-continuation'] : ['work-continuation']);
+    assert.equal(items[0].revision, holdOrdinary ? 3 : 1, 'a target wake must not spend its budget on the first ordinary candidate');
+    assert.equal(items[1].status, 'dispatch_pending');
+  } finally { ordinaryRelease.resolve(); enabled = false; await background.stop(); }
+}
+
+test('a durable continuation executes its exact lower-ranked item through the configured role chain', { timeout: 5_000 },
+  () => targetedContinuationChain());
+test('a targeted wake waits for an existing ordinary role cycle and executes afterwards without coalescing it away', { timeout: 5_000 },
+  () => targetedContinuationChain({ holdOrdinary: true }));
+
 test('automatic continuation timeout reaches the role and keeps shutdown waiting for late work', { timeout: 5_000 }, async () => {
   const started = deferred(), cancelled = deferred(), release = deferred();
   const item = { itemId: 'work-timeout', revision: 1, status: 'queued', currentTarget: { type: 'role', id: 'developer' } };

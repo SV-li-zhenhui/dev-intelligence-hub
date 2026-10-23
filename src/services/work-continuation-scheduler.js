@@ -240,7 +240,8 @@ export class WorkContinuationScheduler {
       else if (!item || continuationFingerprint(item) !== claim.fingerprint) result = 'input_changed';
       else if (this.#ports.taskRuns && (await this.#ports.taskRuns.order([item], 'work-item', 'itemId')).length === 0) result = 'runtime_deferred';
       else {
-        const dispatched = await dispatch({ roleId: claim.roleId, signal });
+        const dispatched = await dispatch({ roleId: claim.roleId, signal,
+          continuationTarget: { itemId: claim.itemId, fingerprint: claim.fingerprint } });
         signal.throwIfAborted();
         if (dispatched?.skipped) result = 'runtime_deferred';
         else {

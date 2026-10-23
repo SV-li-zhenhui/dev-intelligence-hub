@@ -3,6 +3,8 @@ import { samePullRequestExecutionBinding } from "../domain/pull-request-executio
 import { TaskRunControlError } from './task-run-registry.js';
 import { automaticReviewEligibility, automaticReviewContinuationEligibility, automaticReviewWorkAdmission } from "../domain/automatic-review-policy.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
+import { TargetedCycleQueue } from "../lib/targeted-cycle-queue.js";
+import { normalizeContinuationTarget, matchesContinuationTarget } from "./work-continuation-state.js";
 import { brainFailureOwnerAttention } from "./brain-failure-policy.js";
 import { OrchestratorServiceError } from "./orchestrator-service.js";
 import { RoleContextAssemblerError } from "./role-context-error.js";
@@ -211,14 +213,17 @@ function cycleOptions(value = {}) {
   if (
     Object.keys(input).some(
       (key) =>
-        !["trigger", "intakeLimit", "workLimit", "roleId", "signal"].includes(
+        !["trigger", "intakeLimit", "workLimit", "roleId", "signal", "continuationTarget"].includes(
           key,
         ),
     )
   ) {
     throw new TypeError("runCycle options are invalid");
   }
+  const continuationTarget = normalizeContinuationTarget(input.continuationTarget);
+  if (continuationTarget !== null && input.roleId == null) throw new TypeError('target requires a work role');
   return Object.freeze({
+    continuationTarget,
     trigger:
       input.trigger === undefined
         ? "scheduled"
@@ -889,6 +894,7 @@ export class ProactiveWorkLoop {
       ? this.decideTimeoutMs
       : Math.min(this.decideTimeoutMs * 3, leaseSafeDecisionPhaseMs);
     this.inFlightByScope = new Map();
+    this.targetedCycles = new TargetedCycleQueue();
     this.inFlightItemIds = new Set();
     this.inFlightQuestionTargets = new Set();
     this.lastIssueRetirementKey = null;
@@ -904,6 +910,15 @@ export class ProactiveWorkLoop {
     const options = cycleOptions(input);
     throwIfLoopAborted(options.signal);
     const scope = options.roleId ?? "*";
+    if (options.continuationTarget !== null) return this.targetedCycles.run(
+      JSON.stringify([scope, options.continuationTarget]), {
+        signal: options.signal, current: () => this.inFlightByScope.get(scope),
+        execute: () => this.#startCycle(options, scope),
+      });
+    return this.#startCycle(options, scope);
+  }
+
+  #startCycle(options, scope) {
     const running = this.inFlightByScope.get(scope);
     if (running) return running;
     const execution = this.#executeCycle(options);
@@ -985,7 +1000,9 @@ export class ProactiveWorkLoop {
     );
     const claimAttemptLimit = Math.max(availabilityCheckLimit * 8, 32);
 
-    const prioritized = prioritizeWorkItems(items, candidateWindow.facts, graphBlocked);
+    const selectedItems = options.continuationTarget === null ? items : items.filter(item =>
+      matchesContinuationTarget(item, options.continuationTarget));
+    const prioritized = prioritizeWorkItems(selectedItems, candidateWindow.facts, graphBlocked);
     const scheduled = this.taskRuns ? await this.taskRuns.order(prioritized, 'work-item', 'itemId') : prioritized;
     const blockedRoots = scheduled.filter((item) =>
       item.currentTarget?.type === "role" && item.currentTarget.id === ORCHESTRATOR_ROLE_ID &&
@@ -1008,6 +1025,7 @@ export class ProactiveWorkLoop {
       return relatedItems === null ? null : blockedRootSweepFingerprint(item, relatedItems);
     };
     for (const [itemId, visited] of blockedRootSweep) {
+      if (options.continuationTarget !== null && itemId !== options.continuationTarget.itemId) continue;
       const item = blockedRoots.find((candidate) => candidate.itemId === itemId);
       if (!item || item.revision !== visited.revision || await sweepFingerprint(item) !== visited.fingerprint) {
         blockedRootSweep.delete(itemId);
@@ -1026,7 +1044,7 @@ export class ProactiveWorkLoop {
       }
       if (stalePrFactSweep.get(item.itemId) === item.revision) continue;
       if (preparationSweep.get(item.itemId) === item.revision) continue;
-      if (blockedRootSweep.has(item.itemId)) continue;
+      if (blockedRootSweep.has(item.itemId) && options.continuationTarget === null) continue;
       const fencedDeferral = this.fencedClaimDeferrals.get(item.itemId);
       if (
         fencedDeferral?.revision === item.revision &&
@@ -1280,9 +1298,11 @@ export class ProactiveWorkLoop {
 
     // Continue a bounded stale-fact sweep across cycles without moving new or
     // urgent candidates behind old work. A changed revision is never skipped.
-    if (completedCandidateSweep) this.stalePrFactSweeps.delete(scope);
-    if (completedCandidateSweep) this.prPreparationSweeps.delete(scope);
-    if (completedCandidateSweep) this.blockedRootSweeps.delete(scope);
+    if (completedCandidateSweep && options.continuationTarget === null) {
+      this.stalePrFactSweeps.delete(scope);
+      this.prPreparationSweeps.delete(scope);
+      this.blockedRootSweeps.delete(scope);
+    }
     throwIfLoopAborted(options.signal);
     return {
       trigger: options.trigger,

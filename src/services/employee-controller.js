@@ -1,4 +1,6 @@
 import { OperationQueue } from "../lib/operation-queue.js";
+import { TargetedCycleQueue } from "../lib/targeted-cycle-queue.js";
+import { normalizeContinuationTarget } from "./work-continuation-state.js";
 
 function employeeError(statusCode, message) {
   return Object.assign(new Error(message), { statusCode });
@@ -65,6 +67,7 @@ export class EmployeeController {
     this.projectWork = projectWork;
     this.operationQueue = operationQueue || new OperationQueue();
     this.running = null;
+    this.targetedCycles = new TargetedCycleQueue();
   }
 
   get id() {
@@ -72,6 +75,15 @@ export class EmployeeController {
   }
 
   run(options = {}) {
+    const continuationTarget = normalizeContinuationTarget(options?.continuationTarget);
+    if (continuationTarget !== null) return this.targetedCycles.run(JSON.stringify(continuationTarget), {
+      signal: options.signal, current: () => this.running,
+      execute: () => this.#startRun({ ...options, signal: options.signal, continuationTarget }),
+    });
+    return this.#startRun(options);
+  }
+
+  #startRun(options) {
     if (this.running) return this.running;
     const operation = this.enqueue(async () => {
       const state = await this.readState();

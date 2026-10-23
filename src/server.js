@@ -21,6 +21,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import http from "node:http";
+import { TargetedCycleQueue } from "./lib/targeted-cycle-queue.js";
+import { normalizeContinuationTarget } from "./services/work-continuation-state.js";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -4211,6 +4213,7 @@ export function startApplicationBackgroundWork(
   let factCycleSequence = 0;
   let readyFactCycleSequence = 0;
   const coalescedAgencyCycles = new Map();
+  const targetedEmployeeCycles = new TargetedCycleQueue();
   const coalescedRefreshCycles = new Map();
 
   function releaseIndependentEmployeeFactWaiters(ready) {
@@ -4267,7 +4270,8 @@ export function startApplicationBackgroundWork(
       // Each role keeps its scoped coordination and execution checks. General
       // code jobs and memory projection must not delay role handoffs or Reviews.
       await runDrainParticipant(DRAIN_PARTICIPANTS.employeeExecution, () => {
-        const runOptions = backgroundOperationOptions({ trigger: options.trigger }, options.signal);
+        const runOptions = backgroundOperationOptions({ trigger: options.trigger,
+          ...(options.continuationTarget == null ? {} : { continuationTarget: options.continuationTarget }) }, options.signal);
         if (typeof employeeRegistry.runSelected === "function") return employeeRegistry.runSelected([employeeId], runOptions);
         if (typeof employeeRegistry.run === "function") return employeeRegistry.run(employeeId, runOptions);
         if (employeeId === "pr-reviewer" && typeof employeeRegistry.runAll === "function") return employeeRegistry.runAll(runOptions);
@@ -4470,6 +4474,7 @@ export function startApplicationBackgroundWork(
 
   async function performAgencyCycle({
     trigger,
+    continuationTarget = null,
     includeLegacyEmployees = false,
     employeeIds = [],
     discardWhenFactsPending = false,
@@ -4518,7 +4523,8 @@ export function startApplicationBackgroundWork(
     if (signal.aborted) throwAgencyCycleFailures(failures, signal);
     if (selectedEmployeeIds.length > 0 && !stopped) {
       try {
-        const runOptions = backgroundOperationOptions({ trigger }, signal);
+        const runOptions = backgroundOperationOptions({ trigger,
+          ...(continuationTarget === null ? {} : { continuationTarget }) }, signal);
         await runDrainParticipant(
           DRAIN_PARTICIPANTS.employeeExecution,
           async () => {
@@ -4621,6 +4627,23 @@ export function startApplicationBackgroundWork(
     priority,
     runOptions = {},
   ) {
+    const continuationTarget = normalizeContinuationTarget(options.continuationTarget);
+    if (continuationTarget === null) return startCoalescedAgencyCycle(key, options, priority, runOptions);
+    if (options.employeeIds?.length !== 1 || options.includeLegacyEmployees) throw new TypeError('target requires one employee');
+    const roleKey = `employee:${options.employeeIds[0]}`;
+    return targetedEmployeeCycles.run(JSON.stringify([roleKey, continuationTarget]), {
+      signal: options.signal ? AbortSignal.any([workController.signal, options.signal]) : workController.signal,
+      current: () => coalescedAgencyCycles.get(roleKey),
+      execute: () => startCoalescedAgencyCycle(roleKey, { ...options, continuationTarget }, priority, runOptions),
+    });
+  }
+
+  function startCoalescedAgencyCycle(
+    key,
+    options,
+    priority,
+    runOptions = {},
+  ) {
     if (isIndependentEmployeeCycle(options)) {
       key = `employee:${options.employeeIds[0]}`;
     }
@@ -4675,8 +4698,8 @@ export function startApplicationBackgroundWork(
       runDrainParticipant(DRAIN_PARTICIPANTS.workContinuation, () => application.workContinuationScheduler.runCycle({
         signal,
         allowDispatch: independentEmployeeFactsReady(),
-        dispatch: ({ roleId, signal: executionSignal }) => runCoalescedAgencyCycle(`employee:${roleId}`, {
-          trigger: "scheduled", employeeIds: [roleId], discardWhenFactsPending: true, signal: executionSignal,
+        dispatch: ({ roleId, signal: executionSignal, continuationTarget }) => runCoalescedAgencyCycle(`employee:${roleId}`, {
+          trigger: "scheduled", employeeIds: [roleId], discardWhenFactsPending: true, signal: executionSignal, continuationTarget,
         }, backgroundPriority.scheduled, { rethrow: true, admitOnDequeue: true }),
         runOperation: operation => runTracked(
           () => runDrainParticipant(DRAIN_PARTICIPANTS.workContinuation, operation), { rethrow: true },

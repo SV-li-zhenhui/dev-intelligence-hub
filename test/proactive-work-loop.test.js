@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
+import { continuationFingerprint } from '../src/services/work-continuation-state.js';
 import { createTaskRunSettler, planWorkItemRunControl } from '../src/services/work-ledger-run-control.js';
 
 test('busy model admission leaves work unclaimed without consuming decision attempts', async () => {
@@ -1607,6 +1608,33 @@ test("higher owner priority retains waiting-root orchestration ahead of ready pe
   assert.deepEqual(decisions, [waitingRoot.itemId]);
   assert.deepEqual(executions, [waitingRoot.itemId]);
   assert.equal(ledger.calls.claim.length, 0);
+});
+
+test("a targeted continuation coordinates its current lower-ranked root without an ordinary claim", async () => {
+  const { loop, ledger, waitingRoot, decisions, executions } = rootProgressPriorityLoop({
+    useCandidateFacts: true, orchestrateWaiting: true });
+  const result = await loop.runCycle({ roleId: 'orchestrator', workLimit: 1,
+    continuationTarget: { itemId: waitingRoot.itemId, fingerprint: continuationFingerprint(waitingRoot) } });
+  assert.equal(result.orchestrated, 1);
+  assert.deepEqual(decisions, [waitingRoot.itemId]);
+  assert.deepEqual(executions, [waitingRoot.itemId]);
+  assert.equal(ledger.calls.claim.length, 0);
+});
+
+test("a stale, paused or missing continuation target never falls back to a ready peer", async (t) => {
+  for (const state of ['stale', 'paused', 'missing', 'role-changed']) await t.test(state, async () => {
+    const { loop, ledger, waitingRoot, decisions, executions } = rootProgressPriorityLoop({ orchestrateWaiting: true });
+    const continuationTarget = { itemId: waitingRoot.itemId, fingerprint: continuationFingerprint(waitingRoot) };
+    const item = ledger.source.find(x => x.itemId === waitingRoot.itemId);
+    if (state === 'stale') item.revision += 1;
+    if (state === 'paused') item.status = 'paused';
+    if (state === 'missing') continuationTarget.itemId = 'work-missing';
+    if (state === 'role-changed') item.currentTarget.id = 'tester';
+    await loop.runCycle({ roleId: 'orchestrator', workLimit: 1, continuationTarget });
+    assert.deepEqual(decisions, []);
+    assert.deepEqual(executions, []);
+    assert.equal(ledger.calls.claim.length, 0);
+  });
 });
 
 test("urgent issue roots retain priority while waiting for blocked child work", async () => {
@@ -4006,6 +4034,16 @@ test("unchanged blocked roots complete a fair sweep across role cycles without e
   assert.equal(retry.workAttempts, 1, "a completed sweep starts its next round on the next role cycle");
   assert.equal(retry.claimAttempts, 0);
   assert.equal(decisions.at(-1), roots[0].itemId);
+});
+
+test("targeted coordination preserves an ordinary partial sweep across other blocked roots", async () => {
+  const { loop, ledger, roots, decisions } = await blockedRootSweepLoop();
+  await loop.runCycle({ roleId: 'orchestrator', workLimit: 1 });
+  const target = await ledger.readItemForReconciliation({ itemId: roots[2].itemId });
+  await loop.runCycle({ roleId: 'orchestrator', workLimit: 1,
+    continuationTarget: { itemId: target.itemId, fingerprint: continuationFingerprint(target) } });
+  await loop.runCycle({ roleId: 'orchestrator', workLimit: 1 });
+  assert.deepEqual(decisions, [roots[0].itemId, roots[2].itemId, roots[1].itemId]);
 });
 
 test("a blocked-root sweep reaches lower-priority ready work before retrying earlier roots", async () => {

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { WorkContinuationScheduler } from '../src/services/work-continuation-scheduler.js';
 import { WORK_CONTINUATION_STATE_KEY, normalizeWorkContinuationState, migrateWorkContinuationState } from '../src/services/work-continuation-state.js';
+import { continuationFingerprint, normalizeContinuationTarget } from '../src/services/work-continuation-state.js';
 
 const clone = value => structuredClone(value);
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
@@ -49,6 +50,36 @@ test('a durable wake survives restart and advances through the existing role dis
   await f.drain();
   assert.deepEqual(f.dispatched, ['developer']);
   assert.equal(f.state().records[0].status, 'delivered');
+});
+
+test('dispatch carries only the exact durable target fingerprint and progresses that item', async () => {
+  const f = fixture();
+  f.items.push({ ...clone(f.items[0]), itemId: 'work-other' });
+  const expected = { itemId: f.items[0].itemId, fingerprint: continuationFingerprint(f.items[0]) };
+  await new WorkContinuationScheduler(f.options).runCycle({ ...f, async dispatch({ roleId, continuationTarget }) {
+    assert.equal(roleId, 'developer');
+    assert.deepEqual(continuationTarget, expected);
+    assert.equal(f.state().records.find(x => x.itemId === expected.itemId).status, 'running');
+    f.items.find(x => x.itemId === continuationTarget.itemId).revision += 1;
+  } });
+  await f.drain();
+  assert.equal(f.items[0].revision, 2);
+  assert.equal(f.items[1].revision, 1);
+  assert.equal(f.state().records.find(x => x.itemId === expected.itemId).status, 'delivered');
+});
+
+test('continuation target normalization rejects malformed or executable input without evaluating it', () => {
+  const valid = { itemId: 'work-one', fingerprint: 'a'.repeat(64) };
+  assert.deepEqual(normalizeContinuationTarget(valid), valid);
+  assert.equal(Object.isFrozen(normalizeContinuationTarget(valid)), true);
+  for (const value of [{ ...valid, extra: true }, { itemId: '../outside', fingerprint: valid.fingerprint },
+    { ...valid, fingerprint: [valid.fingerprint] }, { ...valid, fingerprint: 'not-a-hash' }]) {
+    assert.throws(() => normalizeContinuationTarget(value));
+  }
+  let calls = 0;
+  const getter = { fingerprint: valid.fingerprint };
+  Object.defineProperty(getter, 'itemId', { enumerable: true, get() { calls += 1; return valid.itemId; } });
+  assert.throws(() => normalizeContinuationTarget(getter)); assert.equal(calls, 0);
 });
 
 test('interrupted third attempts recover without exceeding the persisted schema', async () => {
