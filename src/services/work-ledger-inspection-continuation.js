@@ -12,7 +12,8 @@ export function continuesOwnPullRequestRepairInspection(item, outbox, result) {
       outbox.intent.operation !== "inspect" || bound?.payload?.operation !== "inspect" ||
       item.source?.kind !== "pull_request" || item.source.scope.active !== true || item.source.scope.kind !== "automatic" ||
       item.source.pendingRevision !== null || item.source.identity.targetRoleId !== "developer" ||
-      event.source.provider !== "github" || event.payload.relation !== "authored" || event.payload.isDraft === true ||
+      event.source.provider !== "github" || event.payload.relation !== "authored" ||
+      (event.payload.isDraft === true && event.payload.nextAction !== "resolve_conflict") ||
       event.payload.actionState !== "action_now" || !["address_review", "resolve_conflict"].includes(event.payload.nextAction)) return false;
   try {
     const current = currentWorkItemExecutionBinding(item);

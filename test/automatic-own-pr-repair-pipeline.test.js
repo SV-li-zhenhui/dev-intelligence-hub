@@ -479,8 +479,11 @@ test("own PR feedback creates and publishes an approved repair through the real 
   assert.equal(f.store.values.get(STATE_KEY).published.length, 1);
 });
 
-test("automatic mode resolves and publishes own PR conflicts without an owner confirmation, including after restart", async () => {
+for (const isDraft of [false, true]) {
+test(`automatic mode resolves and publishes own PR conflicts without an owner confirmation, including after restart (Draft=${isDraft})`, async () => {
   const f = await fixture({ conflict: true });
+  f.facts.isDraft = isDraft;
+  f.item.event.payload.isDraft = isDraft;
   f.facts.reviewFeedbackCount = 0;
   const transition = await f.deliver();
   assert.equal(transition.status, "running");
@@ -498,6 +501,8 @@ test("automatic mode resolves and publishes own PR conflicts without an owner co
   assert.equal(history.items.length, 2);
   assert.ok(history.items.every(row => row.status === "completed" && row.automaticOwnPrRepair));
 });
+
+}
 
 test("conflict checks and verification start automatically for orchestrator-assigned owner PR work", async () => {
   for (const operation of ["inspect", "verify"]) {

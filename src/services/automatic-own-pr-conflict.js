@@ -156,7 +156,7 @@ export class AutomaticOwnPrConflict {
         (facts.headRefOid !== binding.headRefOid || facts.baseRefOid !== binding.gitTarget.baseRefOid)) {
       throw Object.assign(new Error("冲突任务绑定的远端 Head/Base 已变化"), { code: "OWN_PR_CONFLICT_TARGET_CHANGED" });
     }
-    if (facts.state !== "open" || facts.isDraft === true || facts.draft === true ||
+    if (facts.state !== "open" ||
         !sameLogin(facts.author, config.githubActions.actorAccountId) || facts.headRefOid !== binding.headRefOid ||
         facts.baseRefOid !== binding.gitTarget.baseRefOid || facts.mergeStateStatus !== "DIRTY") return null;
     return config;

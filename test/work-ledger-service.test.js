@@ -16438,9 +16438,10 @@ test("contracted PR child inspection settles without reviving a pending newer He
   assert.deepEqual(oldChild.graph.deliveries, []);
 });
 
-test("own PR conflict inspection continues and a historical inspect-only completion recovers once", async () => {
+for (const isDraft of [false, true]) {
+test(`own PR conflict inspection continues and a historical inspect-only completion recovers once (Draft=${isDraft})`, async () => {
   const fixture = await createFixture({ records: [authoredReviewRepairAssignment(1, { gitFacts: {
-    ...prGitFacts(PR_HEAD_A), relation: "authored", actionState: "action_now", nextAction: "resolve_conflict", isDraft: false,
+    ...prGitFacts(PR_HEAD_A), relation: "authored", actionState: "action_now", nextAction: "resolve_conflict", isDraft,
   } })] });
   const result = await prepareProposalResult(fixture, { kind: "code_action_proposal", sealSource: true,
     intentOverrides: { operation: "inspect" } });
@@ -16459,10 +16460,12 @@ test("own PR conflict inspection continues and a historical inspect-only complet
   assert.equal((await restarted.service.listItems()).items[0].revision, current.revision);
 });
 
-test("conflict continuation never reopens a completed modification, Draft or owner-stopped task", async () => {
+}
+
+test("conflict continuation never reopens a completed modification, Draft review repair or owner-stopped task", async () => {
   for (const variant of ["modify", "draft", "paused", "cancelled"]) {
     const fixture = await createFixture({ records: [authoredReviewRepairAssignment(1, { gitFacts: {
-      ...prGitFacts(PR_HEAD_A), relation: "authored", actionState: "action_now", nextAction: "resolve_conflict", isDraft: variant === "draft",
+      ...prGitFacts(PR_HEAD_A), relation: "authored", actionState: "action_now", nextAction: variant === "draft" ? "address_review" : "resolve_conflict", isDraft: variant === "draft",
     } })] });
     const result = await prepareProposalResult(fixture, { kind: "code_action_proposal", sealSource: true,
       intentOverrides: { operation: variant === "modify" ? "modify" : "inspect" } });
