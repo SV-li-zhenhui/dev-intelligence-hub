@@ -15,6 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { withPreparationCancellation } from "../src/lib/preparation-cancellation.js";
 
 import {
   createConflictPreparationBinding,
@@ -404,6 +405,22 @@ test("preparation rejects mirror mutations during inspection", async (t) => {
     setup.createService().inspectConflict(inspectionRequest(setup)),
     error => error?.code === "CONTROLLED_GIT_BOUNDARY_CHANGED",
   );
+});
+
+test("sealed conflict verification responds to preparation cancellation before writing output", async t => {
+  const setup = await fixture(t), service = setup.createService();
+  const preparation = await service.inspectConflict(inspectionRequest(setup));
+  const binding = createConflictPreparationBinding({ preparation, gitTarget: gitTarget() });
+  const controller = new AbortController(), preflight = setup.mirrorInspector.preflight.bind(setup.mirrorInspector);
+  setup.mirrorInspector.preflight = async request => { const result = await preflight(request); controller.abort(); return result; };
+  const cancelled = setup.createService();
+  const targetRoot = path.join(setup.root, "cancelled-target"); await mkdir(targetRoot);
+  await assert.rejects(withPreparationCancellation(controller.signal, () => cancelled.materializeConflictPreparationForCodeJob({ binding, targetRoot, excludePaths: [] })),
+    { code: "CODE_PREPARATION_ABORTED" });
+  assert.deepEqual(await readdir(targetRoot), []);
+  setup.mirrorInspector.preflight = preflight;
+  const receipt = await service.materializeConflictPreparationForCodeJob({ binding, targetRoot, excludePaths: [] });
+  assert.equal(receipt.fileCount, 2);
 });
 
 test("verifies and materializes only the complete sealed conflict binding", async (t) => {

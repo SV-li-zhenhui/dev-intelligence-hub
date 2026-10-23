@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { withPreparationCancellation, withoutPreparationCancellation, throwIfPreparationAborted,
+  isPreparationAbort } from "../lib/preparation-cancellation.js";
 import {
   ControlledCodeExecutorError,
   digestValue,
@@ -1761,16 +1763,18 @@ export class ControlledCodeExecutor {
     return recovery;
   }
 
-  start(request) {
+  start(request, options = {}) {
     let normalized;
+    let runtime;
     try {
       normalized = normalizeStartRequest(request);
+      runtime = normalizeRuntimeOptions(options);
       this.#assertReady();
     } catch (error) {
       return Promise.reject(error);
     }
     return this.#queueForSession(normalized.sessionId).enqueue(() =>
-      this.#start(normalized),
+      withPreparationCancellation(runtime.signal, () => this.#start(normalized)),
     );
   }
 
@@ -1978,16 +1982,18 @@ export class ControlledCodeExecutor {
     });
   }
 
-  resume(request) {
+  resume(request, options = {}) {
     let normalized;
+    let runtime;
     try {
       normalized = normalizeResumeRequest(request);
+      runtime = normalizeRuntimeOptions(options);
       this.#assertReady();
     } catch (error) {
       return Promise.reject(error);
     }
     return this.#queueForSession(normalized.sessionId).enqueue(() =>
-      this.#resume(normalized),
+      withPreparationCancellation(runtime.signal, () => this.#resume(normalized)),
     );
   }
 
@@ -2183,7 +2189,9 @@ export class ControlledCodeExecutor {
         await this.broker.createExecution(reference),
         reference,
       );
+      throwIfPreparationAborted();
     } catch (error) {
+      if (isPreparationAbort(error)) return this.#abortPreparation(request.sessionId, claimed.executionId, error);
       await this.#discardWorkspaceAttempt({
         sessionId: request.sessionId,
         workspaceId: request.workspaceId,
@@ -2203,6 +2211,7 @@ export class ControlledCodeExecutor {
     }
     try {
       await this.#mutateState((state) => {
+        throwIfPreparationAborted();
         const session = this.#requireSession(state, request.sessionId);
         const attempt = currentAttempt(session);
         if (
@@ -2225,6 +2234,7 @@ export class ControlledCodeExecutor {
         return {};
       });
     } catch (error) {
+      if (isPreparationAbort(error)) return this.#abortPreparation(request.sessionId, claimed.executionId, error);
       this.runtimeFences.add(request.sessionId);
       await this.#discardWorkspaceAttempt({
         sessionId: request.sessionId,
@@ -2235,6 +2245,35 @@ export class ControlledCodeExecutor {
       throw error;
     }
     return this.#readProjectedSession(request.sessionId);
+  }
+
+  async #abortPreparation(sessionId, executionId, error) {
+    return withoutPreparationCancellation(async () => {
+      await this.#discardWorkspaceAttempt({ sessionId,
+        workspaceId: (await this.#readProjectedSession(sessionId)).workspaceId, executionId,
+        message: "中断准备后的隔离工作区清理尚未确认" });
+      try {
+        await this.#mutateState(state => {
+          const session = this.#requireSession(state, sessionId), attempt = currentAttempt(session);
+          if (attempt.executionId !== executionId || !["preparing", "replaying"].includes(session.status)) {
+            throw executorError("EXECUTION_FENCED", "准备生命周期已变化，中断结果不能提交");
+          }
+          const at = this.#now();
+          session.status = "interrupted";
+          attempt.status = "interrupted";
+          attempt.finishedAt = at;
+          for (const replay of attempt.replays) if (replay.status === "running") {
+            replay.status = "interrupted"; replay.finishedAt = at;
+            replay.error = { code: "RESULT_UNKNOWN", message: "准备中断，恢复副本已清理" };
+            appendEvent(session, "replay_interrupted", at, replay.sourceActionId);
+          }
+          appendEvent(session, "session_interrupted", at);
+          touchSession(session, at);
+          return {};
+        });
+      } catch (stateError) { this.runtimeFences.add(sessionId); throw stateError; }
+      throw error;
+    });
   }
 
   async #markSessionFailed(
@@ -2280,7 +2319,7 @@ export class ControlledCodeExecutor {
     message,
   }) {
     try {
-      await this.broker.discardExecution({ workspaceId, executionId });
+      await withoutPreparationCancellation(() => this.broker.discardExecution({ workspaceId, executionId }));
     } catch {
       this.runtimeFences.add(sessionId);
       throw executorError("WORKSPACE_DISPOSAL_PENDING", message);
@@ -3682,7 +3721,9 @@ export class ControlledCodeExecutor {
         await this.broker.createExecution(reference),
         reference,
       );
+      throwIfPreparationAborted();
     } catch (error) {
+      if (isPreparationAbort(error)) return this.#abortPreparation(sessionId, prepared.executionId, error);
       await this.#discardWorkspaceAttempt({
         sessionId,
         workspaceId: prepared.workspaceId,
@@ -3804,6 +3845,7 @@ export class ControlledCodeExecutor {
 
     try {
       for (const write of prepared.writes) {
+        throwIfPreparationAborted();
         const storedInput = await this.journal.readJson(write.inputArtifact);
         let action;
         try {
@@ -3896,6 +3938,7 @@ export class ControlledCodeExecutor {
           throw error;
         }
       }
+      throwIfPreparationAborted();
       const revision = await this.broker.getWorkspaceRevision({
         workspaceId: prepared.workspaceId,
         executionId: prepared.executionId,
@@ -3903,8 +3946,10 @@ export class ControlledCodeExecutor {
       if (revision !== prepared.targetWorkspaceRevision) {
         throw executorError("REPLAY_DIVERGED", "恢复后的工作区版本不一致");
       }
+      throwIfPreparationAborted();
     } catch (error) {
       if (this.runtimeFences.has(sessionId)) throw error;
+      if (isPreparationAbort(error)) return this.#abortPreparation(sessionId, prepared.executionId, error);
       await this.#discardWorkspaceAttempt({
         sessionId,
         workspaceId: prepared.workspaceId,
@@ -3940,6 +3985,7 @@ export class ControlledCodeExecutor {
             "执行生命周期已变化，恢复结果不能提交",
           );
         }
+        throwIfPreparationAborted();
         const at = this.#now();
         session.status = "active";
         attempt.status = "active";
@@ -3948,6 +3994,7 @@ export class ControlledCodeExecutor {
         return {};
       });
     } catch (error) {
+      if (isPreparationAbort(error)) return this.#abortPreparation(sessionId, prepared.executionId, error);
       this.runtimeFences.add(sessionId);
       await this.#discardWorkspaceAttempt({
         sessionId,

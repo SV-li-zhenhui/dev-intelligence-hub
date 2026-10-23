@@ -29,6 +29,7 @@ import {
 import { sameConflictPreparationBinding } from "../domain/conflict-preparation-binding.js";
 import { normalizePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { workspaceRevisionFromFileHashes } from "../domain/workspace-revision.js";
+import { throwIfPreparationAborted, isPreparationAbort, withoutPreparationCancellation } from "../lib/preparation-cancellation.js";
 
 const DEFAULT_LIMITS = Object.freeze({
   maxFiles: 5_000,
@@ -47,6 +48,7 @@ function sha256(value) {
 }
 
 function safeError(error, fallbackCode, fallbackMessage) {
+  if (isPreparationAbort(error)) return error;
   if (error instanceof CodeExecutionError) return error;
   return new CodeExecutionError(fallbackCode, fallbackMessage);
 }
@@ -370,6 +372,7 @@ function normalizeConflictMaterializationReceipt(
 }
 
 function conflictMaterializationFailure(error) {
+  if (isPreparationAbort(error)) return error;
   if (error instanceof CodeExecutionError) return error;
   const code = typeof error?.code === "string" &&
       error.code.startsWith("CONTROLLED_GIT_")
@@ -442,6 +445,7 @@ function normalizeGitSnapshotReceipt(value, { workspace, inputBinding, limits })
 }
 
 function gitSnapshotFailure(error) {
+  if (isPreparationAbort(error)) return error;
   if (error instanceof CodeExecutionError) return error;
   const limitCodes = new Set([
     "FILE_COUNT_LIMIT",
@@ -574,6 +578,7 @@ export class CodeWorkspaceBroker {
   async createExecution(request) {
     return guarded(
       async () => {
+        throwIfPreparationAborted();
         const {
           workspaceId,
           executionId,
@@ -734,7 +739,7 @@ export class CodeWorkspaceBroker {
             }
           } catch (error) {
             try {
-              await this.#discardExecutionDirectory(workspaceId, executionId);
+              await withoutPreparationCancellation(() => this.#discardExecutionDirectory(workspaceId, executionId));
             } catch (cleanupError) {
               const failure = new CodeExecutionError(
                 "EXECUTION_STORAGE_UNAVAILABLE",
@@ -1275,8 +1280,10 @@ export class CodeWorkspaceBroker {
   }
 
   async #currentFileHashes(execution) {
+    throwIfPreparationAborted();
     const fileHashes = new Map();
     for (const relativePath of await this.#collectFiles(execution, "")) {
+      throwIfPreparationAborted();
       const file = await this.#readFileBuffer(execution, relativePath);
       fileHashes.set(relativePath, sha256(file.value));
     }
@@ -1347,9 +1354,11 @@ export class CodeWorkspaceBroker {
     let totalBytes = 0;
     let directoryCount = 0;
     const visit = async (directory, relativeDirectory) => {
+      throwIfPreparationAborted();
       const entries = await readdir(directory, { withFileTypes: true });
       entries.sort((left, right) => left.name.localeCompare(right.name, "en"));
       for (const entry of entries) {
+        throwIfPreparationAborted();
         const relativePath = relativeDirectory
           ? `${relativeDirectory}/${entry.name}`
           : entry.name;
@@ -1456,9 +1465,11 @@ export class CodeWorkspaceBroker {
     let totalBytes = 0;
     let directoryCount = 0;
     const visit = async (directory, relativeDirectory) => {
+      throwIfPreparationAborted();
       const entries = await readdir(directory, { withFileTypes: true });
       entries.sort((left, right) => left.name.localeCompare(right.name));
       for (const entry of entries) {
+        throwIfPreparationAborted();
         const relativePath = relativeDirectory
           ? `${relativeDirectory}/${entry.name}`
           : entry.name;
@@ -1536,6 +1547,7 @@ export class CodeWorkspaceBroker {
     baseline,
     copyState,
   }) {
+    throwIfPreparationAborted();
     const sourceStats = await lstat(sourceDirectory);
     if (sourceStats.isSymbolicLink()) {
       throw new CodeExecutionError("SYMLINK_REJECTED", "源工作区包含符号链接");
@@ -1547,6 +1559,7 @@ export class CodeWorkspaceBroker {
     const entries = await readdir(sourceDirectory, { withFileTypes: true });
     entries.sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
+      throwIfPreparationAborted();
       const relativePath = relativeDirectory
         ? `${relativeDirectory}/${entry.name}`
         : entry.name;
@@ -1636,6 +1649,7 @@ export class CodeWorkspaceBroker {
   }
 
   async #collectFiles(execution, relativePath) {
+    throwIfPreparationAborted();
     const scope = await this.#inspect(execution, relativePath);
     if (scope.stats.isFile()) return [relativePath];
     if (!scope.stats.isDirectory()) {
@@ -1643,9 +1657,11 @@ export class CodeWorkspaceBroker {
     }
     const files = [];
     const visit = async (directoryPath, relativeDirectory) => {
+      throwIfPreparationAborted();
       const entries = await readdir(directoryPath, { withFileTypes: true });
       entries.sort((left, right) => left.name.localeCompare(right.name));
       for (const entry of entries) {
+        throwIfPreparationAborted();
         const childRelative = relativeDirectory
           ? `${relativeDirectory}/${entry.name}`
           : entry.name;

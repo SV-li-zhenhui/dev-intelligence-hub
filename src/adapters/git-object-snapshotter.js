@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { throwIfPreparationAborted, isPreparationAbort, withoutPreparationCancellation,
+  watchPreparationProcess, PreparationAbortedError } from "../lib/preparation-cancellation.js";
 import { execFile } from "node:child_process";
 import {
   lstat,
@@ -536,8 +538,10 @@ function parseBlobs(value, oids, limits, objectFormat) {
 
 class BinaryExecFileRunner {
   async run({ command, args, cwd, env, input, timeoutMs, maxOutputBytes }) {
+    throwIfPreparationAborted();
     return new Promise((resolve, reject) => {
       let child;
+      let releaseAbort = () => false;
       try {
         child = execFile(
           command,
@@ -553,6 +557,7 @@ class BinaryExecFileRunner {
             windowsHide: true,
           },
           (error, stdout, stderr) => {
+            if (releaseAbort() && error?.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") { reject(new PreparationAbortedError()); return; }
             if (
               error &&
               (error.killed || error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")
@@ -589,6 +594,7 @@ class BinaryExecFileRunner {
         );
         return;
       }
+      releaseAbort = watchPreparationProcess(child);
       child.stdin?.once("error", (error) => {
         if (error?.code !== "EPIPE") {
           child.kill("SIGKILL");
@@ -665,6 +671,7 @@ export class GitObjectSnapshotter {
   }
 
   async materialize(value) {
+    throwIfPreparationAborted();
     exactDataObject(value, [
       "sourceRoot",
       "targetRoot",
@@ -780,6 +787,7 @@ export class GitObjectSnapshotter {
       // A whole repository can exceed one command's deadline. Keep each read
       // bounded while validating the complete object set before writing files.
       for (let offset = 0; offset < oids.length; offset += MAX_BLOBS_PER_BATCH) {
+        throwIfPreparationAborted();
         const batchOids = oids.slice(offset, offset + MAX_BLOBS_PER_BATCH);
         const remainingBytes = this.#limits.maxTotalBytes - uniqueBlobBytes;
         const blobOutput = await this.#gitBytes(
@@ -819,6 +827,7 @@ export class GitObjectSnapshotter {
       const createdDirectories = new Set();
       try {
         for (const entry of entries) {
+          throwIfPreparationAborted();
           const content = blobs.get(entry.oid);
           const target = path.resolve(
             targetRoot,
@@ -852,11 +861,11 @@ export class GitObjectSnapshotter {
         }
       } catch (cause) {
         try {
-          await this.#cleanupCreatedOutput(
+          await withoutPreparationCancellation(() => this.#cleanupCreatedOutput(
             targetRoot,
             createdFiles,
             createdDirectories,
-          );
+          ));
         } catch (cleanupCause) {
           throw snapshotError(
             "GIT_SNAPSHOT_CLEANUP_FAILED",
@@ -874,6 +883,7 @@ export class GitObjectSnapshotter {
         totalBytes,
       };
     } catch (cause) {
+      if (isPreparationAbort(cause)) throw cause;
       if (cause instanceof GitObjectSnapshotterError) throw cause;
       throw snapshotError(
         "GIT_SNAPSHOT_FAILED",
@@ -1383,6 +1393,7 @@ export class GitObjectSnapshotter {
   }
 
   async #gitOptionalText(args, cwd) {
+    throwIfPreparationAborted();
     const result = await this.#run({
       command: this.#gitCommand,
       args: [...SAFE_GIT_PREFIX, ...args],
@@ -1414,6 +1425,7 @@ export class GitObjectSnapshotter {
   }
 
   async #gitOptionalBytes(args, cwd, maxOutputBytes) {
+    throwIfPreparationAborted();
     return optionalOutput(
       await this.#run({
         command: this.#gitCommand,
@@ -1429,6 +1441,7 @@ export class GitObjectSnapshotter {
   }
 
   async #gitBytes(args, cwd, input, maxOutputBytes) {
+    throwIfPreparationAborted();
     return successfulOutput(
       await this.#run({
         command: this.#gitCommand,

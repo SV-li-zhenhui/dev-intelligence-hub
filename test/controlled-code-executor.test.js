@@ -17,6 +17,7 @@ import { ConfiguredTestRunner } from "../src/adapters/configured-test-runner.js"
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
+import { preparationSignal, throwIfPreparationAborted } from "../src/lib/preparation-cancellation.js";
 import { StateStore } from "../src/lib/state-store.js";
 import { CodeExecutionJournal } from "../src/services/code-execution-journal.js";
 import {
@@ -24,6 +25,7 @@ import {
   ControlledCodeExecutorError,
 } from "../src/services/controlled-code-executor.js";
 import { CodeWorkspaceBroker } from "../src/services/code-workspace-broker.js";
+import { startApplicationBackgroundWork } from "../src/server.js";
 
 const profileImage =
   "node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32";
@@ -646,6 +648,143 @@ test("startup recovery gates creation and create is idempotent", async (t) => {
     ),
     hasCode("IDEMPOTENCY_CONFLICT"),
   );
+});
+
+test("cancelled workspace preparation drains and remains resumable without losing confirmed writes", async t => {
+  for (const phase of ["start", "resume"]) await t.test(phase, async t => {
+    const setup = await fixture(t);
+    let current = setup.createExecutor();
+    await current.executor.recover();
+    let prior = null;
+    if (phase === "resume") {
+      const initial = await current.executor.start(startRequest());
+      const read = await current.executor.perform(actionRequest(initial, { type: "read_text", actionId: "cancel-read", path: "src/app.js" }));
+      prior = (await current.executor.perform(actionRequest(read.session, { type: "write_text", actionId: "cancel-write", path: "src/app.js",
+        content: "export const saved = true;\n", expectedSha256: read.result.sha256 }))).session;
+      current = setup.createExecutor();
+      await current.executor.recover();
+    }
+    const entered = deferred(), release = deferred(), controller = new AbortController();
+    const create = current.broker.createExecution.bind(current.broker);
+    let received;
+    current.broker.createExecution = async request => {
+      received = preparationSignal();
+      entered.resolve();
+      await new Promise(resolve => {
+        release.promise.then(resolve);
+        if (received?.aborted) resolve();
+        else received?.addEventListener("abort", resolve, { once: true });
+      });
+      throwIfPreparationAborted();
+      return create(request);
+    };
+    const operation = phase === "start" ? current.executor.start(startRequest(), { signal: controller.signal }) :
+      current.executor.resume(sessionRequest("session-one"), { signal: controller.signal });
+    // Observe rejection immediately, including while asserting the plumbing.
+    const settled = operation.then(value => ({ value }), error => ({ error }));
+    await entered.promise;
+    try {
+      assert.strictEqual(received, controller.signal);
+      controller.abort(new Error("managed shutdown"));
+    } finally { release.resolve(); }
+    const outcome = await settled;
+    assert.equal(outcome.error?.code, "CODE_PREPARATION_ABORTED");
+    const interrupted = await current.executor.view({ sessionId: "session-one" });
+    assert.equal(interrupted.status, "interrupted");
+    if (prior) {
+      assert.equal(interrupted.workspaceRevision, prior.workspaceRevision);
+      assert.equal(interrupted.actions.find(action => action.id === "cancel-write").status, "succeeded");
+    }
+    assert.equal(current.broker.executions.size, 0, "the aborted owned attempt is disposed before returning");
+    current.broker.createExecution = create;
+    const resumed = await current.executor.resume(sessionRequest("session-one"));
+    assert.equal(resumed.status, "active");
+    const read = await current.executor.perform(actionRequest(resumed, { type: "read_text", actionId: "after-cancel", path: "src/app.js" }));
+    assert.equal(read.result.content, prior ? "export const saved = true;\n" : "export const value = 1;\n");
+  });
+});
+
+test("preparation abort never disguises persistence, cleanup or integrity failure as a safe interruption", async t => {
+  for (const failure of ["persist", "cleanup", "integrity"]) await t.test(failure, async t => {
+    const setup = await fixture(t, { failingStore: true });
+    const current = setup.createExecutor(), controller = new AbortController();
+    await current.executor.recover();
+    const create = current.broker.createExecution.bind(current.broker);
+    current.broker.createExecution = async request => {
+      const result = await create(request);
+      controller.abort();
+      if (failure === "persist") setup.store.failNextWrite = true;
+      if (failure === "cleanup") current.broker.discardExecution = async () => { throw new Error("scratch still locked"); };
+      if (failure === "integrity") throw Object.assign(new Error("manifest was tampered"), { code: "GIT_SNAPSHOT_OBJECT_MISMATCH" });
+      throwIfPreparationAborted();
+      return result;
+    };
+    const outcome = await current.executor.start(startRequest(), { signal: controller.signal }).then(() => null, error => error);
+    assert.ok(outcome);
+    assert.notEqual(outcome.code, "CODE_PREPARATION_ABORTED");
+    assert.notEqual((await current.executor.view({ sessionId: "session-one" })).status, "interrupted");
+    if (failure !== "integrity") await assert.rejects(current.executor.resume(sessionRequest("session-one")), { code: "EXECUTION_FENCED" });
+  });
+});
+
+test("resume cancellation stops the final workspace hash traversal instead of reading the remaining tree", async t => {
+  const setup = await fixture(t);
+  await writeFile(path.join(setup.sourceRoot, "src", "z-unneeded.js"), "must not be scanned after cancellation\n");
+  const initial = setup.createExecutor(); await initial.executor.recover();
+  await initial.executor.start(startRequest());
+  const current = setup.createExecutor(); await current.executor.recover();
+  const controller = new AbortController(), policy = current.broker.workspaces.get("dashboard").policy;
+  const excluded = policy.isExcluded.bind(policy), revision = current.broker.getWorkspaceRevision.bind(current.broker);
+  let hashing = false, unnecessary = 0;
+  current.broker.getWorkspaceRevision = async request => { hashing = true; return revision(request); };
+  policy.isExcluded = relative => {
+    if (hashing && preparationSignal() === controller.signal) {
+      if (relative === "src/app.js") controller.abort();
+      if (controller.signal.aborted && relative === "src/z-unneeded.js") unnecessary++;
+    }
+    return excluded(relative);
+  };
+  await assert.rejects(current.executor.resume(sessionRequest("session-one"), { signal: controller.signal }), { code: "CODE_PREPARATION_ABORTED" });
+  assert.equal(unnecessary, 0, "stop at a file boundary instead of hashing the remaining repository");
+  assert.equal((await current.executor.view({ sessionId: "session-one" })).status, "interrupted");
+  assert.equal(current.broker.executions.size, 0);
+  const retried = await current.executor.resume(sessionRequest("session-one"));
+  assert.equal(retried.status, "active");
+});
+
+test("background shutdown drains owned preparation and its scratch cleanup before completing", { timeout: 5_000 }, async t => {
+  const setup = await fixture(t), current = setup.createExecutor();
+  await current.executor.recover();
+  const create = current.broker.createExecution.bind(current.broker), entered = deferred(), release = deferred();
+  current.broker.createExecution = async request => {
+    const result = await create(request), signal = preparationSignal();
+    entered.resolve();
+    await new Promise(resolve => { release.promise.then(resolve); signal?.addEventListener("abort", resolve, { once: true }); });
+    throwIfPreparationAborted(); return result;
+  };
+  let launched = false;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    refreshService: { refresh: async () => {} }, employeeRegistry: { schedules: () => [], runSelected: async () => {} },
+    codeJobExecution: { async runCycle({ signal }, runOperation) {
+      if (!launched) {
+        launched = true;
+        runOperation(async () => {
+          try { return await current.executor.start(startRequest(), { signal }); }
+          catch (error) { signal.throwIfAborted(); throw error; }
+        }).catch(() => {});
+      }
+      return { scheduled: 1 };
+    } },
+  }, { setIntervalFn: () => ({ unref() {} }), clearIntervalFn() {}, reportError() {} });
+  try {
+    await background.initialRefresh; await entered.promise;
+    assert.equal(current.broker.executions.size, 1);
+    await background.stop();
+    assert.equal(current.broker.executions.size, 0);
+    assert.equal((await current.executor.view({ sessionId: "session-one" })).status, "interrupted");
+    assert.equal(background.drainStatus().activeTaskCount, 0);
+  } finally { release.resolve(); await background.stop(); }
 });
 
 test("start persists the exact PR input binding and requires the broker to echo it", async (t) => {

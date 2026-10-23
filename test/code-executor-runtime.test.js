@@ -440,6 +440,7 @@ test("configured Controlled Git exposes only frozen production ports", async (t)
     "create",
     "find",
     "verify",
+    "readSealed",
   ]);
   assert.deepEqual(Object.keys(runtime.controlledCommitPublisher), ["publish"]);
   assert.equal(Object.isFrozen(runtime.conflictPreparationVerifier), true);

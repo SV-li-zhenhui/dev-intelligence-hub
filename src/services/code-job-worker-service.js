@@ -1491,24 +1491,24 @@ export class CodeJobWorkerService {
   ) {
     return this.#runUnchangedSessionTransition(
       job,
-      (current) => this.#executor.resume({
+      (current, runtime) => this.#executor.resume({
         sessionId: current.jobId,
         inputBinding: structuredClone(inputBindingForJob(current)),
         ...executionSourceRequestForJob(current),
-      }),
+      }, runtime),
       { trustedReconciliation },
     );
   }
 
   async #startUnchangedSession(job) {
-    return this.#runUnchangedSessionTransition(job, (current) =>
+    return this.#runUnchangedSessionTransition(job, (current, runtime) =>
       this.#executor.start({
         sessionId: current.jobId,
         workspaceId: current.grant.workspaceId,
         requestedBy: current.grant.requestedBy,
         inputBinding: structuredClone(inputBindingForJob(current)),
         ...executionSourceRequestForJob(current),
-      }),
+      }, runtime),
     );
   }
 
@@ -1517,34 +1517,46 @@ export class CodeJobWorkerService {
     invoke,
     { trustedReconciliation = false } = {},
   ) {
-    const enter = () => this.#sessionTransitions.run(async () => {
+    const controller = new AbortController(), parent = this.#cycleSignal;
+    const abort = () => controller.abort(parent.reason);
+    parent?.addEventListener("abort", abort, { once: true });
+    if (parent?.aborted) abort();
+    this.#cancellationControllers.set(job.jobId, controller);
+    try {
+      const enter = () => this.#sessionTransitions.run(async () => {
+        controller.signal.throwIfAborted();
+        const current = await this.#jobs.getForWorker(job.jobId);
+        if (!sameSessionTransitionFence(job, current)) {
+          return { job: current, operation: null };
+        }
+        if (!trustedReconciliation) {
+          await this.#verifyAuthority(current.grant);
+        }
+
+        // Invocation must enqueue synchronously. The returned Promise is carried
+        // as data so this narrow lease never waits for the executor operation.
+        controller.signal.throwIfAborted();
+        const operation = Promise.resolve(invoke(current, { signal: controller.signal }));
+        return { job: current, operation };
+      });
+      const admitted = trustedReconciliation
+        ? await enter()
+        : await this.#actionAdmission(enter);
+      if (admitted.operation === null) {
+        return { job: admitted.job, session: null };
+      }
+
+      const session = await admitted.operation;
       const current = await this.#jobs.getForWorker(job.jobId);
-      if (!sameSessionTransitionFence(job, current)) {
-        return { job: current, operation: null };
+      if (!sameSessionTransitionFence(admitted.job, current)) {
+        return { job: current, session: null };
       }
-      if (!trustedReconciliation) {
-        await this.#verifyAuthority(current.grant);
-      }
-
-      // Invocation must enqueue synchronously. The returned Promise is carried
-      // as data so this narrow lease never waits for the executor operation.
-      const operation = Promise.resolve(invoke(current));
-      return { job: current, operation };
-    });
-    const admitted = trustedReconciliation
-      ? await enter()
-      : await this.#actionAdmission(enter);
-    if (admitted.operation === null) {
-      return { job: admitted.job, session: null };
+      assertJobSessionInputBinding(current, session);
+      return { job: current, session };
+    } finally {
+      parent?.removeEventListener("abort", abort);
+      if (this.#cancellationControllers.get(job.jobId) === controller) this.#cancellationControllers.delete(job.jobId);
     }
-
-    const session = await admitted.operation;
-    const current = await this.#jobs.getForWorker(job.jobId);
-    if (!sameSessionTransitionFence(admitted.job, current)) {
-      return { job: current, session: null };
-    }
-    assertJobSessionInputBinding(current, session);
-    return { job: current, session };
   }
 
   async #performPending(...args) {

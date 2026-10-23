@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { throwIfPreparationAborted, isPreparationAbort, withoutPreparationCancellation,
+  watchPreparationProcess, PreparationAbortedError } from "../lib/preparation-cancellation.js";
 import { execFile } from "node:child_process";
 import {
   lstat,
@@ -1475,8 +1477,10 @@ function parsePublishedHead(result, refName, oidLength) {
 
 class BinaryExecFileRunner {
   async run({ command, args, cwd, env, input, timeoutMs, maxOutputBytes }) {
+    throwIfPreparationAborted();
     return new Promise((resolve, reject) => {
       let child;
+      let releaseAbort = () => false;
       try {
         child = execFile(
           command,
@@ -1492,6 +1496,7 @@ class BinaryExecFileRunner {
             windowsHide: true,
           },
           (error, stdout, stderr) => {
+            if (releaseAbort() && error?.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") { reject(new PreparationAbortedError()); return; }
             if (error?.killed || error?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
               reject(
                 controlledGitError(
@@ -1527,6 +1532,7 @@ class BinaryExecFileRunner {
         );
         return;
       }
+      releaseAbort = watchPreparationProcess(child);
       child.stdin?.once("error", (error) => {
         if (error?.code !== "EPIPE") child.kill("SIGKILL");
       });
@@ -1680,7 +1686,9 @@ export class ControlledGitService {
       expectedCommitOid: gitTarget.headRefOid,
     };
     const baseBoundary = await this.#preflight(baseRequest);
+    throwIfPreparationAborted();
     const headBoundary = await this.#preflight(headRequest);
+    throwIfPreparationAborted();
     assertSeparateBoundaries(
       baseBoundary,
       headBoundary,
@@ -1846,6 +1854,7 @@ export class ControlledGitService {
   }
 
   async materializeForCodeJob(value) {
+    throwIfPreparationAborted();
     const hasExcludePaths = isPlainRecord(value) &&
       Object.hasOwn(value, "excludePaths");
     const fields = exactDataObject(value, [
@@ -1883,6 +1892,7 @@ export class ControlledGitService {
         preparationId,
       );
       for (const entry of manifest.treeEntries) {
+        throwIfPreparationAborted();
         if (materializationPolicy.isExcluded(entry.path)) continue;
         await this.#assertMaterializationFence(targetBoundary, lease);
         const content = await this.#readSealedBlob(
@@ -1970,6 +1980,7 @@ export class ControlledGitService {
         createdDirectories.ordered,
       );
       for (const file of createdFiles) {
+        throwIfPreparationAborted();
         await this.#assertMaterializedFile(file);
       }
       await this.#releaseMaterializationLease(targetBoundary, lease);
@@ -1980,12 +1991,13 @@ export class ControlledGitService {
         "Code Job target root 在 materialization 结束时发生变化",
       );
     } catch (cause) {
-      await this.#cleanupMaterialization({
+      await withoutPreparationCancellation(() => this.#cleanupMaterialization({
         targetBoundary,
         lease,
         files: createdFiles,
         directories: createdDirectories.ordered,
-      });
+      }));
+      if (isPreparationAbort(cause)) throw cause;
       if (cause instanceof ControlledGitServiceError) throw cause;
       throw controlledGitError(
         "CONTROLLED_GIT_MATERIALIZATION_FAILED",
@@ -2825,6 +2837,7 @@ export class ControlledGitService {
 
     directories.push(await directorySnapshot(root, ""));
     for (let index = 0; index < directories.length; index += 1) {
+      throwIfPreparationAborted();
       const directory = directories[index];
       let entries;
       try {
@@ -2833,6 +2846,7 @@ export class ControlledGitService {
         fail("Preparation directory 不可读取", cause);
       }
       for await (const entry of entries) {
+        throwIfPreparationAborted();
         const absolute = path.join(directory.absolute, entry.name);
         const relative = normalizeEvidencePath(
           directory.relative === ""
@@ -3042,6 +3056,7 @@ export class ControlledGitService {
   }
 
   async #runGit({ args, cwd, env, input, maxOutputBytes }) {
+    throwIfPreparationAborted();
     try {
       return await this.#run({
         command: this.#gitCommand,
@@ -3053,6 +3068,7 @@ export class ControlledGitService {
         maxOutputBytes,
       });
     } catch (cause) {
+      if (isPreparationAbort(cause)) throw cause;
       if (cause instanceof ControlledGitServiceError) throw cause;
       throw controlledGitError(
         "CONTROLLED_GIT_PROCESS_FAILED",
@@ -3134,6 +3150,7 @@ export class ControlledGitService {
   }
 
   async #verifiedManifest(preparationId) {
+    throwIfPreparationAborted();
     await this.#assertPreparationRoot();
     const manifest = await this.#loadManifest(preparationId);
     if (
@@ -3158,7 +3175,9 @@ export class ControlledGitService {
       expectedCommitOid: manifest.headBoundary.commitOid,
     };
     const baseBoundary = await this.#preflight(baseRequest);
+    throwIfPreparationAborted();
     const headBoundary = await this.#preflight(headRequest);
+    throwIfPreparationAborted();
     assertSeparateBoundaries(
       baseBoundary,
       headBoundary,
@@ -3236,6 +3255,7 @@ export class ControlledGitService {
       ...manifest.treeEntries,
       ...manifest.conflicts.flatMap(({ stages }) => stages),
     ]) {
+      throwIfPreparationAborted();
       expectedBlobs.set(evidence.sha256, {
         path: `${evidence.sha256}.blob`,
         byteLength: evidence.byteLength,

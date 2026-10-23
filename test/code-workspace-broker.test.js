@@ -17,6 +17,7 @@ import test from "node:test";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { CodeWorkspaceBroker } from "../src/services/code-workspace-broker.js";
+import { withPreparationCancellation, preparationSignal } from "../src/lib/preparation-cancellation.js";
 
 async function fixture(t, {
   files = { "src/app.js": "export const value = 1;\n" },
@@ -552,6 +553,32 @@ test("a conflict execution uses only its bound materializer and exact-file write
     (error) => error.code === "INVALID_EXECUTION_REQUEST",
   );
   assert.equal(materializer.calls.length, 1);
+});
+
+test("cancelled Git and sealed conflict preparation cleans the actual owned tree before rejecting", async t => {
+  for (const kind of ["head", "conflict", "uncertain-cleanup"]) await t.test(kind, async t => {
+    const controller = new AbortController(), source = conflictExecutionSource();
+    const materializer = kind === "head" ? fixedSnapshotter({ "src/app.js": "prepared\n" }) :
+      fixedConflictMaterializer({ "src/value.js": "prepared\n" });
+    const materialize = materializer.materialize.bind(materializer);
+    materializer.materialize = async request => { const receipt = await materialize(request); controller.abort(); return receipt; };
+    let cleanup = false;
+    const { broker, scratchRoot, sourceRoot } = await fixture(t, { files: { "src/original.js": "untouched\n" },
+      writablePaths: ["src"], ...(kind === "head" ? { gitSnapshotter: materializer, gitBoundaryDigest: "f".repeat(64) } : { conflictMaterializer: materializer }),
+      removeDirectory: async (...args) => {
+        cleanup = true;
+        assert.equal(preparationSignal(), null, "abort cannot cancel owned cleanup");
+        if (kind === "uncertain-cleanup") throw new Error("locked scratch file");
+        return rm(...args);
+      } });
+    await assert.rejects(withPreparationCancellation(controller.signal, () => broker.createExecution({ workspaceId: "dashboard", executionId: "aborted",
+      inputBinding: source.inputBinding, ...(kind === "head" ? {} : { executionSource: source }) })),
+      { code: kind === "uncertain-cleanup" ? "EXECUTION_STORAGE_UNAVAILABLE" : "CODE_PREPARATION_ABORTED" });
+    assert.equal(cleanup, true);
+    assert.equal(broker.executions.size, 0);
+    if (kind !== "uncertain-cleanup") await assert.rejects(access(path.join(scratchRoot, "dashboard", "aborted")), { code: "ENOENT" });
+    assert.equal(await readFile(path.join(sourceRoot, "src", "original.js"), "utf8"), "untouched\n");
+  });
 });
 
 test("conflict receipt evidence rejects same-size content replacement", async (t) => {

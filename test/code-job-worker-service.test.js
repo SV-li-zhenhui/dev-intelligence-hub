@@ -22,6 +22,7 @@ import { CodeJobWorkerService } from "../src/services/code-job-worker-service.js
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { createTaskRunSettler } from '../src/services/work-ledger-run-control.js';
 import { currentTaskExecution } from '../src/lib/task-execution-context.js';
+import { PreparationAbortedError } from '../src/lib/preparation-cancellation.js';
 import { assertPreparedWriteRead, bindTrustedAction, modelObservation, observationDetail, verificationFailure } from "../src/services/code-job-worker-policy.js";
 
 const REVISION_A = "a".repeat(64);
@@ -1607,6 +1608,50 @@ function verifier(events, error = null) {
     },
   };
 }
+
+test("worker shutdown and task controls cancel preparation without producing a business failure", async t => {
+  for (const phase of ["start", "resume"]) for (const control of ["shutdown", "cancel", "pause"]) await t.test(`${phase}/${control}`, async () => {
+    const initial = job();
+    if (phase === "resume") Object.assign(initial, { status: "active", execution: { ...initial.execution,
+      sessionId: initial.jobId, workspaceRevision: REVISION_A } });
+    const jobs = new FakeJobStore([initial]), executor = new FakeExecutor(initial, [], { sessionStatus: phase === "resume" ? "interrupted" : "active" });
+    const entered = deferred(), release = deferred(), shutdown = new AbortController();
+    let received, preparations = 0;
+    executor[phase] = async (_request, options) => {
+      preparations++;
+      received = options?.signal;
+      entered.resolve();
+      await new Promise(resolve => {
+        release.promise.then(resolve);
+        if (received?.aborted) resolve(); else received?.addEventListener("abort", resolve, { once: true });
+      });
+      if (received?.aborted) throw new PreparationAbortedError();
+      throw new Error("preparation did not receive cancellation");
+    };
+    const decisions = brain([]), worker = new CodeJobWorkerService({ jobStore: jobs, executor, brainDirectory: decisions, grantVerifier: verifier([]) });
+    const cycle = worker.runCycle({ signal: shutdown.signal }).then(value => ({ value }), error => ({ error }));
+    await entered.promise;
+    try {
+      assert.ok(received instanceof AbortSignal);
+      if (control === "shutdown") shutdown.abort(new Error("shutdown requested"));
+      else {
+        const current = await jobs.getForWorker(initial.jobId);
+        await jobs[control]({ jobId: initial.jobId, expectedRevision: current.revision, reason: `owner ${control}` });
+        assert.equal(worker.requestCancellation(initial.jobId), true);
+      }
+    } finally { release.resolve(); }
+    const outcome = await cycle;
+    if (control === "shutdown") assert.strictEqual(outcome.error, shutdown.signal.reason);
+    else {
+      assert.equal(outcome.error, undefined);
+      await worker.runCycle();
+      assert.equal((await jobs.getForWorker(initial.jobId)).status, control === "cancel" ? "cancelled" : "paused");
+      assert.equal(preparations, 1, "owner control must not resume another preparation");
+    }
+    assert.notEqual((await jobs.getForWorker(initial.jobId)).status, "failed");
+    assert.equal(decisions.calls.length, 0);
+  });
+});
 
 function reviewRepairFixture() {
   const inputBinding = conflictInputBinding();
