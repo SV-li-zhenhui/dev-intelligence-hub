@@ -371,6 +371,27 @@ test("merge preparation and repeated verification preserve donor object metadata
   }
 });
 
+test("sealed preparation survives unrelated fetch and repack without rewriting its evidence", { skip: gitCommand === null }, async t => {
+  const setup = await createRepositoryFixture(t, gitCommand);
+  const prepared = await serviceFor(gitCommand, setup).inspectConflict(setup.request);
+  const binding = createConflictPreparationBinding({ preparation: prepared, gitTarget: setup.request.gitTarget });
+  const sealedBefore = await preparationSnapshot(setup.preparationRoot);
+  const inspector = new GitBareMirrorInspector({ gitCommand });
+  const request = { repository: setup.request.gitTarget.baseRepository, mirrorRoot: setup.baseMirrorRoot,
+    expectedCommitOid: setup.request.gitTarget.baseRefOid };
+  const before = await inspector.preflight(request);
+  const repositoryRoot = path.join(setup.root, "source");
+  await writeFile(path.join(repositoryRoot, "unrelated.txt"), "another PR's objects\n");
+  await git(gitCommand, repositoryRoot, ["add", "unrelated.txt"]);
+  await git(gitCommand, repositoryRoot, ["commit", "-m", "unrelated change"]);
+  await git(gitCommand, setup.baseMirrorRoot, ["fetch", repositoryRoot, "HEAD:refs/heads/unrelated"]);
+  assert.notEqual((await inspector.preflight(request)).boundaryDigest, before.boundaryDigest);
+  await serviceFor(gitCommand, setup).verifyConflictPreparation({ binding });
+  await git(gitCommand, setup.baseMirrorRoot, ["repack", "-ad"]);
+  await serviceFor(gitCommand, setup).verifyConflictPreparation({ binding });
+  assert.deepEqual(await preparationSnapshot(setup.preparationRoot), sealedBefore);
+});
+
 test(
   "real isolated mirrors produce a durable full conflict workspace without source writes",
   { skip: gitCommand === null ? "Git is unavailable" : false },

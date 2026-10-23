@@ -353,7 +353,7 @@ test("rejects widened/accessor/proxy requests and unsafe merge protocols", async
   );
 });
 
-test("verification survives restart and detects manifest or mirror-boundary tampering", async (t) => {
+test("verification survives mirror object updates and detects manifest or boundary tampering", async (t) => {
   const setup = await fixture(t);
   const prepared = await setup.createService().inspectConflict(inspectionRequest(setup));
   const restarted = setup.createService();
@@ -364,11 +364,18 @@ test("verification survives restart and detects manifest or mirror-boundary tamp
   assert.equal(verified.preparationId, prepared.preparationId);
 
   setup.boundaries.get(setup.baseMirrorRoot).boundaryDigest = "6".repeat(64);
+  assert.equal(
+    (await restarted.verifyPreparation({ preparationId: prepared.preparationId })).preparationId,
+    prepared.preparationId,
+  );
+  const baseBoundary = setup.boundaries.get(setup.baseMirrorRoot);
+  const originalObjectDirectory = baseBoundary.objectDirectory;
+  baseBoundary.objectDirectory = path.join(setup.baseMirrorRoot, "other-objects");
   await assert.rejects(
     restarted.verifyPreparation({ preparationId: prepared.preparationId }),
     (error) => error?.code === "CONTROLLED_GIT_BOUNDARY_CHANGED",
   );
-  setup.boundaries.get(setup.baseMirrorRoot).boundaryDigest = "4".repeat(64);
+  baseBoundary.objectDirectory = originalObjectDirectory;
 
   const manifestPath = path.join(
     setup.preparationRoot,
@@ -382,6 +389,20 @@ test("verification survives restart and detects manifest or mirror-boundary tamp
   await assert.rejects(
     restarted.verifyPreparation({ preparationId: prepared.preparationId }),
     (error) => error?.code === "CONTROLLED_GIT_PREPARATION_TAMPERED",
+  );
+});
+
+test("preparation rejects mirror mutations during inspection", async (t) => {
+  const setup = await fixture(t);
+  const preflight = setup.mirrorInspector.preflight.bind(setup.mirrorInspector);
+  let calls = 0;
+  setup.mirrorInspector.preflight = async request => {
+    if (++calls === 3) setup.boundaries.get(setup.baseMirrorRoot).boundaryDigest = "6".repeat(64);
+    return preflight(request);
+  };
+  await assert.rejects(
+    setup.createService().inspectConflict(inspectionRequest(setup)),
+    error => error?.code === "CONTROLLED_GIT_BOUNDARY_CHANGED",
   );
 });
 

@@ -952,6 +952,20 @@ function normalizeBoundary(value, expected) {
   });
 }
 
+function preparationMirrorIdentity(boundary) {
+  // Fetch/repack changes boundaryDigest. Reuse still requires a fresh safe
+  // preflight and verification of the sealed files and recomputed merge result.
+  return {
+    schemaVersion: boundary.schemaVersion,
+    repository: boundary.repository,
+    canonicalRoot: boundary.canonicalRoot,
+    objectDirectory: boundary.objectDirectory,
+    objectFormat: boundary.objectFormat,
+    oidLength: boundary.oidLength,
+    commitOid: boundary.commitOid,
+  };
+}
+
 function assertSeparateBoundaries(
   base,
   head,
@@ -3143,8 +3157,14 @@ export class ControlledGitService {
       manifest.gitExecutable.path,
     );
     if (
-      !sameCanonicalValue(baseBoundary, manifest.baseBoundary) ||
-      !sameCanonicalValue(headBoundary, manifest.headBoundary)
+      !sameCanonicalValue(
+        preparationMirrorIdentity(baseBoundary),
+        preparationMirrorIdentity(manifest.baseBoundary),
+      ) ||
+      !sameCanonicalValue(
+        preparationMirrorIdentity(headBoundary),
+        preparationMirrorIdentity(manifest.headBoundary),
+      )
     ) {
       throw controlledGitError(
         "CONTROLLED_GIT_BOUNDARY_CHANGED",
