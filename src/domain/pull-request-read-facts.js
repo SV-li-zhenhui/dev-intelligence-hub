@@ -349,7 +349,7 @@ function nullableBoolean(value, name) {
   throw invalid(`${name} is invalid`);
 }
 
-function httpsUrl(value, name) {
+function httpsUrl(value, name, { allowHttp = false } = {}) {
   if (value === "") return "";
   const normalized = text(value, name, 2_048);
   let parsed;
@@ -359,7 +359,7 @@ function httpsUrl(value, name) {
     throw invalid(`${name} is invalid`);
   }
   if (
-    parsed.protocol !== "https:" ||
+    (parsed.protocol !== "https:" && !(allowHttp && parsed.protocol === 'http:')) ||
     parsed.username ||
     parsed.password
   ) {
@@ -617,7 +617,7 @@ function normalizeCheck(value, name) {
       CHECK_CONCLUSIONS,
       `${name}.conclusion`,
     ),
-    url: httpsUrl(fields.get("url"), `${name}.url`),
+    url: httpsUrl(fields.get("url"), `${name}.url`, { allowHttp: true }),
     startedAt: timestamp(fields.get("startedAt"), `${name}.startedAt`, {
       nullable: true,
     }),

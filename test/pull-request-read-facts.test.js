@@ -408,6 +408,17 @@ test("nullable thread and lifecycle facts remain explicit", () => {
   assert.equal(nullable.checks[0].completedAt, null);
 });
 
+test("HTTP CI details links remain visible while unsafe check URLs and HTTP discussion URLs are rejected", () => {
+  const facts = factsFixture(), url = 'http://10.6.23.95:8080/job/OCT-QuickTest/1744/';
+  const withJenkins = createPullRequestReadFacts(factInput(facts, { checks: [{ ...facts.checks[0], url }] }));
+  assert.equal(withJenkins.checks[0].url, url);
+  assert.equal(projectPullRequestReadFactsContext(withJenkins).checks[0].url, url);
+  for (const unsafe of ['javascript:alert(1)', 'file:///C:/private', 'https://user:password@ci.example/job/1/']) {
+    assert.throws(() => createPullRequestReadFacts(factInput(facts, { checks: [{ ...facts.checks[0], url: unsafe }] })));
+  }
+  assert.throws(() => createPullRequestReadFacts(factInput(facts, { comments: [{ ...facts.comments[0], url: 'http://github.com/acme/repo/issues/1' }] })));
+});
+
 test("a bounded summary projects digests and urgent facts without thread bodies", () => {
   const facts = factsFixture();
   const withUrgency = createPullRequestReadFacts(

@@ -335,7 +335,7 @@ function requiredTimestamp(value, name) {
   return timestamp;
 }
 
-function optionalUrl(value, name) {
+function optionalUrl(value, name, { allowHttp = false } = {}) {
   if (value === null || value === "") return "";
   const url = remoteText(value, name, 2_048);
   let parsed;
@@ -344,7 +344,7 @@ function optionalUrl(value, name) {
   } catch {
     throw invalid(`${name} is invalid`);
   }
-  if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
+  if ((parsed.protocol !== "https:" && !(allowHttp && parsed.protocol === 'http:')) || parsed.username || parsed.password) {
     throw invalid(`${name} is invalid`);
   }
   return parsed.href;
@@ -352,7 +352,7 @@ function optionalUrl(value, name) {
 
 function safeCheckUrl(value, name) {
   try {
-    return optionalUrl(value, name);
+    return optionalUrl(value, name, { allowHttp: true });
   } catch (error) {
     if (error instanceof GitHubPullRequestFactsError) return "";
     throw error;

@@ -431,7 +431,7 @@ test("invalid live Refs within detailed facts are rejected before final target v
   }
 });
 
-test("insecure check links are omitted without discarding check facts", async () => {
+test("HTTP Jenkins links survive fact projection as data for the configured diagnostic reader", async () => {
   const graph = graphResponse({
     commits: {
       nodes: [
@@ -454,7 +454,7 @@ test("insecure check links are omitted without discarding check facts", async ()
   assert.equal(facts.checks.length, 1);
   assert.equal(facts.checks[0].name, "license");
   assert.equal(facts.checks[0].status, "PENDING");
-  assert.equal(facts.checks[0].url, "");
+  assert.equal(facts.checks[0].url, "http://ci.example.test/build/1");
 });
 
 test("unknown GitHub enums and nullable facts are explicit and fail-safe", async () => {
