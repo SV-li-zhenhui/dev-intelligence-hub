@@ -111,7 +111,8 @@ export class WorkContinuationScheduler {
         if (!roleStates.has(roleId)) roleStates.set(roleId, await this.#ports.roleStateReader.read(roleId));
         const role = roleStates.get(roleId);
         const canRun = eligible.has(item.itemId) && fact &&
-          (!fact.graphBlocked || (roleId === 'orchestrator' && fact.submittedChildren > 0)) && role?.enabled === true && role.paused === false;
+          (!fact.graphBlocked || (roleId === 'orchestrator' && (fact.submittedChildren > 0 || fact.orchestrationReady === true))) &&
+          role?.enabled === true && role.paused === false;
         const condition = conditionFor(item, fact);
         if ((role?.enabled !== true || role.paused !== false || (fact && !eligible.has(item.itemId))) && !fact?.graphBlocked) {
           condition.type = 'manual_resume'; condition.reference = roleId;

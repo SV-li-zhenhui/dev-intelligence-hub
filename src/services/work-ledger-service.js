@@ -1,5 +1,5 @@
 import { scheduler } from "node:timers/promises";
-import { hostContextRecoveryCandidate, planHostContextRecovery, hostContextRetirement } from "./work-ledger-host-context-recovery.js";
+import { hostContextRecoveryCandidate, planHostContextRecovery, hostContextRetirement, hasPendingHostContextRecovery } from "./work-ledger-host-context-recovery.js";
 import { automaticRoleHandoffCandidate } from "./work-ledger-role-handoff.js";
 import { completedConflictInspectionRecoveryProof } from "./work-ledger-inspection-continuation.js";
 import { automaticReviewWorkAdmission } from "../domain/automatic-review-policy.js";
@@ -809,7 +809,11 @@ export class WorkLedgerService {
 
   async listClaimCandidates(options = {}) {
     this.#assertReady();
-    return queryClaimCandidatePage(this.state.items, options);
+    const page = queryClaimCandidatePage(this.state.items, options);
+    page.items.forEach((item, index) => {
+      if (hasPendingHostContextRecovery(this.state, item)) page.facts[index].orchestrationReady = true;
+    });
+    return page;
   }
 
   async listPendingPullRequestSources(options = {}) {

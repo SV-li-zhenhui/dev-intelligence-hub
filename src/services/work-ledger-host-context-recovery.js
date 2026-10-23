@@ -64,6 +64,33 @@ export function hostContextRecoveryCandidate(state, item) {
     snapshotDigest: ledgerDigest({ item, child, ask, failure }) };
 }
 
+// A blocked specialist still prevents an ordinary claim. The completed host
+// recovery instead needs the configured root orchestrator's unleased decision.
+export function hasPendingHostContextRecovery(state, item) {
+  if (item?.kind !== "source_root" || item.currentTarget?.id !== "orchestrator" ||
+      item.status !== "retry_wait" || item.statusReason !== HOST_CONTEXT_RECOVERED ||
+      item.activeIntentId !== null || item.sourceQuarantine !== null || item.ownerId !== null ||
+      item.leaseId !== null || item.leaseUntil !== null) return false;
+  const binding = currentWorkItemExecutionBinding(item);
+  if (!binding) return false;
+  let proof = null;
+  for (const outbox of state.outbox) {
+    if (outbox.itemId !== item.itemId) continue;
+    const stored = hostContextRetirement(outbox);
+    if (stored?.workItemRevision === item.revision && isDeepStrictEqual(stored.inputBinding, binding)) {
+      proof = stored;
+      break;
+    }
+  }
+  if (!proof) return false;
+  const child = state.items.find(entry => entry.itemId === proof.childId);
+  if (child?.revision !== proof.childRevision || child.graph?.parentItemId !== item.itemId ||
+      !isDeepStrictEqual(currentWorkItemInputBinding(child), proof.childInputBinding) ||
+      !isDeepStrictEqual(unstartedDeliveryContractFailure(child, state.outbox), proof.failure)) return false;
+  try { verifyPullRequestExecutionBinding(state, binding); } catch { return false; }
+  return true;
+}
+
 function hasStoppedDecision(candidate, control) {
   const { item, ask, inputBinding } = candidate;
   const run = control?.run, receipt = run?.receipt;

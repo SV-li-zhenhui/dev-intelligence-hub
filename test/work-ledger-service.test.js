@@ -4,7 +4,8 @@ import { EventEmitter } from "node:events";
 import test from "node:test";
 import { automaticRoleHandoffCandidate } from "../src/services/work-ledger-role-handoff.js";
 import { unstartedDeliveryContractFailure } from "../src/services/work-ledger-delivery-failure.js";
-import { hostContextRecoveryCandidate, planHostContextRecovery } from "../src/services/work-ledger-host-context-recovery.js";
+import { hostContextRecoveryCandidate, planHostContextRecovery, hasPendingHostContextRecovery } from "../src/services/work-ledger-host-context-recovery.js";
+import { WorkContinuationScheduler } from "../src/services/work-continuation-scheduler.js";
 import { createWorkflowRoutingRuntime } from "../src/workflow-routing-runtime.js";
 import { createWorkLedgerRuntime } from "../src/work-ledger-runtime.js";
 import { createHash } from "node:crypto";
@@ -12872,7 +12873,6 @@ test("new host facts retire only the obsolete question and give its parent one n
   assert.equal(inboxStore.stored("attention-inbox").items[0].result, null);
   assert.equal(inboxStore.stored("attention-inbox").items[0].question, fixture.request.question);
   assert.equal((await inbox.readOutbox()).items.length, 0);
-  await runtime.close();
   const after = fixture.store.stored();
   const parent = after.items.find(item => item.itemId === fixture.parentId);
   const oldParent = before.items.find(item => item.itemId === fixture.parentId);
@@ -12885,6 +12885,31 @@ test("new host facts retire only the obsolete question and give its parent one n
   assert.equal(proof.reason, "host_context_facts_recovered");
   assert.equal(proof.failure.downstreamCreated, false);
   assert.equal(proof.failure.code, "delivery-evidence-incompatible");
+  const candidates = await runtime.listClaimCandidates({ at: fixture.time.clock(), limit: 100 });
+  const fact = candidates.facts.find(entry => entry.itemId === parent.itemId);
+  assert.equal(fact.graphBlocked, true, "the specialist still cannot claim a child-blocked root");
+  assert.equal(fact.orchestrationReady, true, "the host-proven recovery needs a fresh coordinating decision");
+  await assert.rejects(runtime.claim({ itemId: parent.itemId, expectedRevision: parent.revision,
+    workerId: "employee-orchestrator", leaseDurationMs: 30_000 }), { code: "WORK_LEDGER_GRAPH_BLOCKED" });
+  const wakes = [], operations = [];
+  const scheduler = new WorkContinuationScheduler({ store: new MemoryStore(), ledger: runtime,
+    configurationReader: { readActive: async () => ({ configuration: { githubActions: { enabled: true, automaticOwnPrRepair: true } } }) },
+    roleStateReader: { read: async () => ({ enabled: true, paused: false }) }, clock: fixture.time.clock });
+  await scheduler.runCycle({ dispatch: async ({ roleId }) => { wakes.push(roleId); },
+    runOperation: operation => { const pending = operation(); operations.push(pending); return pending; } });
+  await Promise.all(operations);
+  assert.deepEqual(wakes, ["orchestrator"], "the real ledger fact reaches the durable role wake path");
+  for (const boundary of ["child-revision", "parent-revision", "proof-digest", "root-pause", "child-unknown"]) {
+    const snapshot = clone(after), root = snapshot.items.find(item => item.itemId === parent.itemId);
+    const failedChild = snapshot.items.find(item => item.itemId === fixture.childId);
+    if (boundary === "child-revision") failedChild.revision++;
+    if (boundary === "parent-revision") root.revision++;
+    if (boundary === "proof-digest") snapshot.outbox.find(entry => entry.intentId === fixture.askId).outcome.details.hostContextRetirement.digest = "f".repeat(64);
+    if (boundary === "root-pause") root.status = "paused";
+    if (boundary === "child-unknown") snapshot.outbox.find(entry => entry.itemId === fixture.childId).status = "unknown";
+    assert.equal(hasPendingHostContextRecovery(snapshot, root), false, boundary);
+  }
+  await runtime.close();
   const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time,
     hostContextRecoveryReader: { read: async () => fixture.control } });
   assert.deepEqual(await restarted.service.readAttentionRequestRetirement({ requestKey: fixture.askId,

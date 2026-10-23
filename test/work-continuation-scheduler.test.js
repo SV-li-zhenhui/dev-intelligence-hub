@@ -132,6 +132,21 @@ test('automatic mode, role pause, task pause and graph dependencies retain their
   }
 });
 
+test('a host-proven root coordination retry wakes despite its blocked child while role and task holds win', async t => {
+  for (const boundary of ['ready', 'unproven', 'specialist', 'role-pause', 'task-hold']) await t.test(boundary, async () => {
+    const f = fixture();
+    Object.assign(f.items[0], { kind: 'source_root', status: 'retry_wait', statusReason: 'host_context_facts_recovered',
+      currentTarget: { type: 'role', id: boundary === 'specialist' ? 'developer' : 'orchestrator' } });
+    const list = f.ledger.listClaimCandidates;
+    f.ledger.listClaimCandidates = async () => { const page = await list();
+      Object.assign(page.facts[0], { graphBlocked: true, submittedChildren: 0, orchestrationReady: boundary !== 'unproven' }); return page; };
+    if (boundary === 'role-pause') f.role.paused = true;
+    if (boundary === 'task-hold') f.options.taskRuns = { async order() { return []; } };
+    await new WorkContinuationScheduler(f.options).runCycle(f); await f.drain();
+    assert.deepEqual(f.dispatched, boundary === 'ready' ? ['orchestrator'] : []);
+  });
+});
+
 test('task pause introduced after persistence is rechecked before dispatch', async () => {
   const f = fixture(); let paused = false;
   f.options.taskRuns = { async order(items) { return paused ? [] : items; } };
