@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { cp, lstat, mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { digestValue } from "../domain/code-executor-contract.js";
 import { CodeExecutionPolicy } from "../domain/code-execution-policy.js";
@@ -11,6 +12,8 @@ import { copyWindowsTestResources, windowsTestFileDigest } from "./windows-test-
 
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/u;
 const LAUNCHER = fileURLToPath(new URL("./windows-test-launcher.ps1", import.meta.url));
+const COMPLETED_CLEANUP_ATTEMPTS = 3;
+const COMPLETED_CLEANUP_RETRY_MS = 250;
 
 export class WindowsTestRunnerError extends Error {
   constructor(code, message, details) {
@@ -114,6 +117,7 @@ export class WindowsFixedTestRunner {
     let launched = false;
     let supervisorStarted = false;
     let created = false;
+    let completedEvidenceWritten = false;
     const dataPath = path.join(directory, "data");
     const workspacePath = path.join(dataPath, "workspace");
     const leasePath = path.join(directory, "lease.json");
@@ -195,6 +199,7 @@ export class WindowsFixedTestRunner {
         runtimeIdentity: lease.runtimeIdentity, profileFingerprint: profile.fingerprint, workspaceRevision: request.workspaceRevision,
         assetVersion: definition.asset.version, verificationKind: definition.kind === "windows-test" ? "test" : "build" };
       await writeFile(path.join(directory, "result.json"), JSON.stringify(evidence));
+      completedEvidenceWritten = true;
       return evidence;
     } catch (error) {
       let reported = error;
@@ -209,7 +214,21 @@ export class WindowsFixedTestRunner {
       this.#active.delete(directory);
       if (created) {
         if (!supervisorStarted) await writeFile(path.join(directory, "supervisor-stopped.json"), JSON.stringify({ executionId: request.executionId, actionId: request.actionId, stopped: true }));
+        await this.#cleanupAfterRun(request, completedEvidenceWritten);
+      }
+    }
+  }
+  async #cleanupAfterRun(request, completedEvidenceWritten) {
+    const attempts = completedEvidenceWritten ? COMPLETED_CLEANUP_ATTEMPTS : 1;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      try {
         await this.cleanup({ executionId: request.executionId, actionId: request.actionId });
+        return;
+      } catch (error) {
+        if (!(error instanceof WindowsTestRunnerError) || error.code !== "SANDBOX_CLEANUP_FAILED" ||
+            error.details?.cleanupPending !== true || attempt + 1 === attempts || request.signal?.aborted) throw error;
+        try { await delay(COMPLETED_CLEANUP_RETRY_MS, undefined, { signal: request.signal ?? undefined }); }
+        catch { throw error; }
       }
     }
   }

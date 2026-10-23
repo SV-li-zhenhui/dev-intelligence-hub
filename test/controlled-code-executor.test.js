@@ -216,30 +216,49 @@ test("Windows build proof remains distinct from unit test statistics", async (t)
   assert.equal(Object.hasOwn(tested.result, "testSummary"), false);
 });
 
-test("real Windows asset, broker, journal and executor produce a restartable completed proof", { skip: process.platform !== "win32" }, async (t) => {
-  const setup = await fixture(t);
-  await mkdir(path.join(setup.sourceRoot, "test"));
-  await writeFile(path.join(setup.sourceRoot, "test", "value.test.mjs"), 'import test from "node:test"; import assert from "node:assert/strict"; test("product value",()=>assert.equal(2+2,4));');
-  const profile = { kind: "windows-test", nodeExecutable: process.execPath,
-    nodeSha256: createHash("sha256").update(await readFile(process.execPath)).digest("hex"), timeoutMs: 20_000,
-    asset: { schemaVersion: 1, title: "Native integration", description: "Real assertions through the controlled executor", version: 1,
-      source: 'import { spawnSync } from "node:child_process"; const r=spawnSync(process.execPath,["--test","--test-isolation=none","--test-reporter=tap","test/value.test.mjs"],{stdio:"inherit",env:process.env}); process.exitCode=r.status??1;' } };
-  const profiles = { "node-tests": profile };
-  const windowsRunner = new WindowsFixedTestRunner({ allowedWorkspaceRoot: setup.scratchRoot, runRoot: path.join(setup.root, "native-runs"), profiles });
-  const sandbox = new ConfiguredTestRunner({ windowsRunner, profiles });
-  const { executor } = setup.createExecutor({ profiles, nextSandbox: sandbox });
-  await executor.recover();
-  const session = await executor.start(startRequest());
-  const checked = await executor.perform(actionRequest(session, { type: "run_profile", actionId: "native-real-test", profileId: "node-tests" }));
-  assert.equal(checked.action.status, "succeeded");
-  assert.equal(checked.result.testSummary.passed, 1);
-  const completed = await executor.perform(actionRequest(checked.session, { type: "complete", actionId: "native-real-complete" }));
-  assert.equal(completed.session.status, "completed");
-  const restarted = setup.createExecutor({ profiles, nextSandbox: sandbox }).executor;
-  await restarted.recover();
-  const exported = await restarted.exportCompletedChangeSet({ sessionId: session.id, completedActionId: "native-real-complete", expectedWorkspaceRevision: session.workspaceRevision });
-  assert.equal(exported.passedProfiles[0].runtimeIdentity.executableSha256, profile.nodeSha256);
-});
+for (const transientCleanupFailure of [false, true]) {
+  test(`real Windows asset, broker, journal and executor produce a restartable completed proof (${transientCleanupFailure ? "transient cleanup failure" : "normal cleanup"})`, { skip: process.platform !== "win32" }, async (t) => {
+    const setup = await fixture(t);
+    await mkdir(path.join(setup.sourceRoot, "test"));
+    await writeFile(path.join(setup.sourceRoot, "test", "value.test.mjs"), 'import test from "node:test"; import assert from "node:assert/strict"; test("product value",()=>assert.equal(2+2,4));');
+    const profile = { kind: "windows-test", nodeExecutable: process.execPath,
+      nodeSha256: createHash("sha256").update(await readFile(process.execPath)).digest("hex"), timeoutMs: 20_000,
+      asset: { schemaVersion: 1, title: "Native integration", description: "Real assertions through the controlled executor", version: 1,
+        source: 'import { spawnSync } from "node:child_process"; const r=spawnSync(process.execPath,["--test","--test-isolation=none","--test-reporter=tap","test/value.test.mjs"],{stdio:"inherit",env:process.env}); process.exitCode=r.status??1;' } };
+    const profiles = { "node-tests": profile };
+    const windowsRunner = new WindowsFixedTestRunner({ allowedWorkspaceRoot: setup.scratchRoot, runRoot: path.join(setup.root, "native-runs"), profiles });
+    const cleanup = windowsRunner.cleanup.bind(windowsRunner);
+    let cleanupCalls = 0, cleanupRequest;
+    if (transientCleanupFailure) windowsRunner.cleanup = async request => {
+      cleanupRequest = request;
+      cleanupCalls += 1;
+      if (cleanupCalls === 1) {
+        const evidence = JSON.parse(await readFile(path.join(windowsRunner.executionDirectory(request.executionId, request.actionId), "result.json"), "utf8"));
+        assert.equal(evidence.exitCode, 0);
+        throw new WindowsTestRunnerError("SANDBOX_CLEANUP_FAILED", "Stopped profile cleanup is temporarily busy", { cleanupPending: true });
+      }
+      return cleanup(request);
+    };
+    const sandbox = new ConfiguredTestRunner({ windowsRunner, profiles });
+    const { executor } = setup.createExecutor({ profiles, nextSandbox: sandbox });
+    await executor.recover();
+    const session = await executor.start(startRequest());
+    try {
+      const checked = await executor.perform(actionRequest(session, { type: "run_profile", actionId: "native-real-test", profileId: "node-tests" }));
+      assert.equal(checked.action.status, "succeeded");
+      assert.equal(checked.result.testSummary.passed, 1);
+      const completed = await executor.perform(actionRequest(checked.session, { type: "complete", actionId: "native-real-complete" }));
+      assert.equal(completed.session.status, "completed");
+      const restarted = setup.createExecutor({ profiles, nextSandbox: sandbox }).executor;
+      await restarted.recover();
+      const exported = await restarted.exportCompletedChangeSet({ sessionId: session.id, completedActionId: "native-real-complete", expectedWorkspaceRevision: session.workspaceRevision });
+      assert.equal(exported.passedProfiles[0].runtimeIdentity.executableSha256, profile.nodeSha256);
+      if (transientCleanupFailure) assert.equal(cleanupCalls, 2);
+    } finally {
+      if (cleanupRequest) await cleanup(cleanupRequest);
+    }
+  });
+}
 
 test("Windows test proof rejects zero tests, mismatched workspace, and forged Docker identity", async (t) => {
   const profile = { kind: "windows-test", nodeExecutable: "C:/node.exe", nodeSha256: "d".repeat(64), timeoutMs: 30_000,

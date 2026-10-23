@@ -7,7 +7,7 @@ import test from "node:test";
 import net from "node:net";
 import { spawnSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
-import { WindowsFixedTestRunner } from "../src/adapters/windows-fixed-test-runner.js";
+import { WindowsFixedTestRunner, WindowsTestRunnerError } from "../src/adapters/windows-fixed-test-runner.js";
 
 async function fixture(t, { source, kind = "windows-test", timeoutMs = 10_000 } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "windows-fixed-test-"));
@@ -61,6 +61,41 @@ test("Windows fixed assets execute real tests in an isolated copy with native id
   assert.equal(JSON.parse(await readFile(path.join(directory, "result.json"), "utf8")).runtimeIdentity.schemaVersion, 2);
   await new WindowsFixedTestRunner(setup.options).cleanup({ executionId: "run-one", actionId: "action-one" });
 });
+
+for (const mode of ["failed-test", "persistent-cleanup", "cancelled-cleanup", "unclassified-cleanup"]) {
+  test(`completed Windows profile cleanup preserves the recorded outcome (${mode})`, { skip: process.platform !== "win32" }, async t => {
+    const setup = await fixture(t, { source: `console.log("fixed asset finished"); process.exitCode=${mode === "failed-test" ? 7 : 0};` });
+    const cleanup = setup.runner.cleanup.bind(setup.runner), controller = new AbortController();
+    const cleanupError = new WindowsTestRunnerError("SANDBOX_CLEANUP_FAILED", "Completed profile data remains busy", { cleanupPending: true });
+    const unclassifiedError = new Error("unexpected cleanup failure");
+    let attempts = 0, cleanupRequest, abortTimer;
+    setup.runner.cleanup = async request => {
+      cleanupRequest = request;
+      attempts += 1;
+      const evidence = JSON.parse(await readFile(path.join(setup.runner.executionDirectory(request.executionId, request.actionId), "result.json"), "utf8"));
+      assert.equal(evidence.exitCode, mode === "failed-test" ? 7 : 0);
+      if (mode === "failed-test" && attempts === 3) return cleanup(request);
+      if (mode === "cancelled-cleanup") abortTimer = setTimeout(() => controller.abort(), 25);
+      throw mode === "unclassified-cleanup" ? unclassifiedError : cleanupError;
+    };
+    try {
+      const execution = setup.runner.run({ ...setup.request, signal: controller.signal });
+      if (mode === "failed-test") {
+        const result = await execution;
+        assert.equal(result.exitCode, 7);
+        assert.equal(attempts, 3);
+        await assertDataRemoved(setup);
+      } else {
+        await assert.rejects(execution, error => error === (mode === "unclassified-cleanup" ? unclassifiedError : cleanupError));
+        assert.equal(attempts, mode === "persistent-cleanup" ? 3 : 1);
+        await assert.rejects(readFile(path.join(setup.runner.executionDirectory("run-one", "action-one"), "cleanup.json")), { code: "ENOENT" });
+      }
+    } finally {
+      clearTimeout(abortTimer);
+      if (cleanupRequest) await cleanup(cleanupRequest);
+    }
+  });
+}
 
 test("actual LPAC blocks imported code, descendants, AAP files, control changes and local network", { skip: process.platform !== "win32" }, async t => {
   const setup = await fixture(t);
