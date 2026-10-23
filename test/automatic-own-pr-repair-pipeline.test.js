@@ -1036,6 +1036,49 @@ test("automatic modification captures original complete feedback before approval
   assert.equal(JSON.stringify(await f.store.read(STATE_KEY)), beforeRead, "independent review reader cannot write state");
 });
 
+test("published feedback reads do not wait for unrelated conflict reconciliation", async () => {
+  const f = await fixture(); await f.deliver();
+  f.completeJob(); await f.service.runCycle(); await f.service.runCycle();
+  const request = (await f.ownerWorkRequests.list()).items[0];
+  const current = await f.reviewLedger.readItemForReconciliation({ itemId: request.workItemId });
+  const inputBinding = currentWorkItemExecutionBinding(current);
+  f.context.inputBinding = inputBinding;
+  const entered = Promise.withResolvers();
+  const released = Promise.withResolvers();
+  f.service.conflictRepair = { async runCycle() {
+    entered.resolve(); await released.promise;
+    return { scanned: 0, published: 0, failed: 0, stale: 0 };
+  } };
+  const cycle = f.service.runCycle();
+  await entered.promise;
+  const stateBefore = await f.store.read(STATE_KEY);
+  const reading = f.service.readOriginalFeedbackBinding({ inputBinding, internalReview: request.request.internalReview });
+  let timer;
+  try {
+    const descriptor = await Promise.race([reading,
+      new Promise(resolve => { timer = setTimeout(() => resolve(null), 200); })]);
+    assert.ok(descriptor, "sealed original feedback must be readable while another PR reconciliation is pending");
+    assert.equal(descriptor.feedbackDigest, FEEDBACK_DIGEST);
+    assert.deepEqual(await f.store.read(STATE_KEY), stateBefore, "the read cannot mutate repair state");
+  } finally {
+    clearTimeout(timer); released.resolve(); await cycle; await reading;
+  }
+  f.context.inputBinding = { ...inputBinding, headRefOid: "9".repeat(40),
+    gitTarget: { ...inputBinding.gitTarget, headRefOid: "9".repeat(40) } };
+  await assert.rejects(f.service.readOriginalFeedbackBinding({ inputBinding, internalReview: request.request.internalReview }),
+    { code: "OWN_PR_REPAIR_ORIGINAL_FEEDBACK_INVALID" });
+  f.context.inputBinding = inputBinding;
+  await assert.rejects(f.service.readOriginalFeedbackBinding({ inputBinding,
+    internalReview: { ...request.request.internalReview, feedbackDigest: "9".repeat(64) } }),
+    { code: "OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE" });
+  const archiveKey = originalRepairFeedbackArchiveKey(stateBefore.published[0].feedbackSnapshotId);
+  const archive = await f.store.read(archiveKey);
+  archive.snapshot.feedback.changeRequests[0].body = "corrupt archive";
+  await f.store.write(archiveKey, archive);
+  await assert.rejects(f.service.readOriginalFeedbackBinding({ inputBinding, internalReview: request.request.internalReview }),
+    { code: "OWN_PR_REPAIR_ORIGINAL_FEEDBACK_INVALID" });
+});
+
 function historicalFeedbackState(count, bodyBytes = 32) {
   const feedbackSnapshots = Array.from({ length: count }, (_, index) => {
     const feedback = { changeRequests: [{ id: `historical-review-${index}`, author: "reviewer", body: `${index}:` + "x".repeat(bodyBytes) }], threads: [] };

@@ -710,19 +710,24 @@ export class AutomaticOwnPrRepair {
   }
 
   async readOriginalFeedbackBinding({ inputBinding, internalReview }) {
-    return this.#queue.enqueue(async () => {
-      const metadata = normalizeInternalReviewMetadata(internalReview);
-      const row = this.#state.published.find((entry) => entry.repository === inputBinding.repository && entry.number === inputBinding.pullRequestNumber &&
+    const metadata = normalizeInternalReviewMetadata(internalReview);
+    const published = () => this.#state.published.find((entry) => entry.repository === inputBinding.repository && entry.number === inputBinding.pullRequestNumber &&
         entry.commitOid === inputBinding.headRefOid && entry.commitOid === metadata.headRefOid &&
         entry.feedbackDigest === metadata.feedbackDigest && entry.confirmationId === metadata.publicationConfirmationId);
+    const read = async () => {
+      const row = published();
       if (!row) throw repairError("OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE", "内部复审没有匹配的修复发布记录");
-      await this.#ensurePublishedSnapshot(row);
+      if (!row.feedbackSnapshotId) await this.#ensurePublishedSnapshot(row);
+      const state = this.#state;
       const current = await this.ledger.readPullRequestExecutionContext(inputBinding);
       if (!samePullRequestExecutionBinding(current.inputBinding, inputBinding)) throw repairError("OWN_PR_REPAIR_ORIGINAL_FEEDBACK_INVALID", "内部复审当前 Head 授权已变化");
-      const descriptor = originalRepairFeedbackBinding(this.#state, inputBinding, metadata);
-      await readOriginalRepairFeedbackSnapshot(this.store, this.#state, { ...descriptor, repository: inputBinding.repository, number: inputBinding.pullRequestNumber });
+      const descriptor = originalRepairFeedbackBinding(state, inputBinding, metadata);
+      await readOriginalRepairFeedbackSnapshot(this.store, state, { ...descriptor, repository: inputBinding.repository, number: inputBinding.pullRequestNumber });
       return descriptor;
-    });
+    };
+    // A sealed archive is immutable. Only historical snapshot creation needs
+    // serialization with repair mutations and their potentially slow network I/O.
+    return published()?.feedbackSnapshotId ? read() : this.#queue.enqueue(read);
   }
 
   async readOriginalFeedbackSnapshot(query) {
