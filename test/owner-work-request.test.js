@@ -902,27 +902,40 @@ for (const variant of ["closed", "unassigned", "assigned", "unavailable", "concu
   });
 }
 
-for (const variant of ["changed-head", "same-target", "paused", "unavailable", "concurrent-pause", "unassigned", "assignment-unavailable", "concurrent-unassignment"]) {
+for (const variant of [
+  "changed-head", "same-target", "paused", "unavailable", "concurrent-pause", "unassigned",
+  "assignment-unavailable", "concurrent-unassignment", "concurrent-owner-read", "concurrent-owner-submit",
+  "preflight-pause", "preflight-unassignment", "assignment-pause", "queued-owner-unassignment",
+  "queued-owner-stable", "queued-owner-failed-unassignment", "cancelled", "concurrent-sweep",
+]) {
   test(`automatic owner PR refresh uses ordinary source intake after unstarted fact failures (${variant})`, async t => {
     const root = await mkdtemp(path.join(tmpdir(), "owner-pr-refresh-"));
     t.after(() => rm(root, { recursive: true, force: true }));
     const store = new StateStore(path.join(root, "state")), clock = clockFixture();
     const { routing, ledger } = await createRoutingAndLedger(store, clock);
     let head = "a".repeat(40), unavailable = false, assigned = true, assignmentUnavailable = false, duringResolve = async () => {};
+    let duringPreflight = async () => {}, duringAssignment = async () => {};
+    const readiness = roleReadiness();
     const ownerLedger = { ...ledger, async listItems(options) {
       // A large unrelated blocked history must not delay the owner's current PR.
       if (options?.status === "blocked") return { items: Array.from({ length: 10 }, (_, index) => ({ itemId: `historical-${index}` })),
         nextCursor: "historical-page" };
       return ledger.listItems(options);
     } };
-    const options = { store, workflowRouting: routing, ledger: ownerLedger, roleReadiness: roleReadiness(), clock, createGuard: guardFactory,
+    const options = { store, workflowRouting: routing, ledger: ownerLedger,
+      roleReadiness: { async read(roleId) { await duringPreflight(); return readiness.read(roleId); } }, clock, createGuard: guardFactory,
       incomingReviewReader: { async read() {
+        await duringAssignment();
         if (assignmentUnavailable) throw new Error("Assignment facts unavailable");
         return { kind: "pull_request", state: "open", isDraft: false, incomingReviewFactsAvailable: true,
           headRefOid: head, reviewRecipient: assigned ? "runtime-user" : null,
           reviewReceivedVia: assigned ? "assignee" : null, reviewRequestEventId: assigned ? "assignment-1" : null };
       } },
       pullRequestResolver: { async resolvePullRequestTarget(target) {
+        if (target.number === 43 && variant === "queued-owner-failed-unassignment") {
+          assigned = false;
+          throw new Error("Queued PR resolution failed after the assignment was revoked");
+        }
         if (unavailable) throw new Error("GitHub unavailable");
         await duringResolve();
         return { ...target, title: "PR 42", state: "open", gitTarget: { schemaVersion: 1, provider: "github",
@@ -960,16 +973,78 @@ for (const variant of ["changed-head", "same-target", "paused", "unavailable", "
     if (variant === "unassigned") assigned = false;
     if (variant === "assignment-unavailable") assignmentUnavailable = true;
     if (variant === "concurrent-unassignment") duringResolve = async () => { assigned = false; };
-    assert.equal((await owner.refreshBlockedPullRequestSources()).refreshed, variant === "changed-head" ? 1 : 0);
-    if (variant === "changed-head") {
+    if (variant === "preflight-pause") duringPreflight = async () => { duringPreflight = async () => {}; await pause(); };
+    if (variant === "preflight-unassignment") duringPreflight = async () => { assigned = false; };
+    let queuedOwnerSubmission;
+    const failedQueuedSubmission = variant === "queued-owner-failed-unassignment";
+    if (["queued-owner-unassignment", "queued-owner-stable", "queued-owner-failed-unassignment"].includes(variant)) {
+      let assignmentReads = 0;
+      duringAssignment = async () => {
+        if (++assignmentReads === 2) {
+          const nextRequest = failedQueuedSubmission
+            ? pullRequest({ requestId: "123e4567-e89b-42d3-a456-426614174001", pullRequest: { repository: "acme/repo", number: 43 } })
+            : request({ requestId: "123e4567-e89b-42d3-a456-426614174001" });
+          queuedOwnerSubmission = owner.submit(nextRequest).then(result => {
+            if (variant === "queued-owner-unassignment") assigned = false;
+            return result;
+          }, error => {
+            if (!failedQueuedSubmission) throw error;
+            assert.equal(error.code, "OWNER_PULL_REQUEST_RESOLUTION_FAILED");
+            return error;
+          });
+        }
+      };
+    }
+    if (variant === "assignment-pause") {
+      let assignmentReads = 0;
+      duringAssignment = async () => { if (++assignmentReads === 2) await pause(); };
+    }
+    const controller = new AbortController(), abortReason = new Error("refresh cancelled during remote read");
+    if (variant === "cancelled") duringResolve = async () => { controller.abort(abortReason); };
+    let otherSweep;
+    if (variant === "concurrent-sweep") duringResolve = async () => {
+      duringResolve = async () => { assert.fail("concurrent sweeps must not duplicate the remote refresh"); };
+      otherSweep = owner.refreshBlockedPullRequestSources();
+    };
+    let pendingOwnerOperation, ownerOperationCompletedDuringFetch;
+    const concurrentOwner = ["concurrent-owner-read", "concurrent-owner-submit"].includes(variant);
+    if (concurrentOwner) duringResolve = async () => {
+      pendingOwnerOperation = variant === "concurrent-owner-read" ? owner.get(original.requestId)
+        : owner.submit(request({ requestId: "123e4567-e89b-42d3-a456-426614174001" }));
+      let timer;
+      try {
+        ownerOperationCompletedDuringFetch = await Promise.race([
+          pendingOwnerOperation.then(() => true),
+          new Promise(resolve => { timer = setTimeout(() => resolve(false), 2_000); }),
+        ]);
+      } finally { clearTimeout(timer); }
+    };
+    const shouldRefresh = variant === "changed-head" || concurrentOwner || variant === "concurrent-sweep" || variant === "queued-owner-stable";
+    const beforeRefreshRevision = (await store.read(OWNER_WORK_REQUEST_STATE_KEY)).revision;
+    const refresh = owner.refreshBlockedPullRequestSources({ signal: controller.signal });
+    if (variant === "cancelled") await assert.rejects(refresh, error => error === abortReason);
+    else {
+      const result = await refresh;
+      await queuedOwnerSubmission;
+      if (failedQueuedSubmission) assert.equal((await store.read(OWNER_WORK_REQUEST_STATE_KEY)).revision, beforeRefreshRevision);
+      assert.equal(result.refreshed, shouldRefresh ? 1 : 0);
+    }
+    if (otherSweep) assert.equal((await otherSweep).refreshed, 0);
+    if (concurrentOwner) {
+      await pendingOwnerOperation;
+      assert.equal(ownerOperationCompletedDuringFetch, true,
+        "a remote source fetch must not hold the shared owner request queue");
+    }
+    if (shouldRefresh) {
       const pending = (await ledger.listPendingPullRequestSources()).items.find(candidate => candidate.itemId === item.itemId);
       if (pending) await ledger.reconcilePullRequestSource({ itemId: pending.itemId, expectedRevision: pending.revision,
         expectedPendingRevision: pending.source.pendingRevision, expectedGraphRevision: (await ledger.getSummary()).revision });
     }
     const current = await ledger.readItemForReconciliation({ itemId: item.itemId });
-    assert.equal(current.source.current.headRefOid, variant === "changed-head" ? head : "a".repeat(40));
+    assert.equal(current.source.current.headRefOid, shouldRefresh ? head : "a".repeat(40));
     assert.equal((await owner.get(original.requestId)).eventId, original.eventId);
-    if (variant === "changed-head") {
+    if (variant === "concurrent-owner-submit") assert.equal((await owner.list()).items.length, 2);
+    if (shouldRefresh) {
       const binding = currentWorkItemExecutionBinding(current);
       await owner.verifyAutomaticReviewContinuation(binding);
       assigned = false;
@@ -978,7 +1053,9 @@ for (const variant of ["changed-head", "same-target", "paused", "unavailable", "
       await assert.rejects(owner.verifyAutomaticReviewContinuation(binding), { code: "OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE" });
     }
     await owner.close(); owner = await createOwnerWorkRequestRuntime(options);
-    assert.equal((await owner.refreshBlockedPullRequestSources()).refreshed, 0);
+    // Cancellation stops that sweep; a later live cycle can still refresh the request.
+    if (variant === "cancelled") duringResolve = async () => {};
+    assert.equal((await owner.refreshBlockedPullRequestSources()).refreshed, variant === "cancelled" ? 1 : 0);
     assert.equal((await ledger.listOutbox()).items.length, 0);
   });
 }

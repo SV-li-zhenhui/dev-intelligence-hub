@@ -29,6 +29,7 @@ function throwIfCancelled(signal) {
 const INTAKE_BATCH_LIMIT = 100;
 const MAX_INTAKE_PAGES = 50;
 const MAX_ITEM_PAGES = 50;
+const MAX_SOURCE_REFRESH_COMMIT_ATTEMPTS = 2;
 const SAFE_REQUEST_ID =
   /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 
@@ -213,6 +214,8 @@ function listOptions(value = {}) {
 }
 
 export class OwnerWorkRequestService {
+  #requestEpoch = 0;
+
   constructor({
     store,
     workflowRouting,
@@ -260,19 +263,25 @@ export class OwnerWorkRequestService {
     if (typeof clock !== "function") throw new TypeError("clock must be a function");
     this.clock = clock;
     this.operationQueue = operationQueue || new OperationQueue();
+    this.refreshQueue = new OperationQueue();
     this.state = emptyOwnerWorkRequestState();
     this.refreshCursor = null;
     this.ready = false;
   }
 
+  #withRequestLease(operation) {
+    return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
+      this.#requestEpoch += 1;
+      return operation();
+    }));
+  }
+
   async recover() {
-    const recovered = await this.operationQueue.enqueue(() =>
-      this.exclusiveLease.run(async () => {
+    const recovered = await this.#withRequestLease(async () => {
         this.state = await this.#readState();
         this.ready = true;
         return this.#recoveryStatus();
-      }),
-    );
+      });
     if (recovered.pending > 0) await this.resumePending();
     return this.#recoveryStatus();
   }
@@ -284,15 +293,13 @@ export class OwnerWorkRequestService {
       .map(({ requestId: id }) => id);
     let resumed = 0;
     for (const id of pendingIds) {
-      await this.operationQueue.enqueue(() =>
-        this.exclusiveLease.run(async () => {
+      await this.#withRequestLease(async () => {
           this.state = await this.#readState();
           const record = this.#requireRecord(id);
           if (record.phase === "intaken") return;
           await this.#advance(record);
           resumed += 1;
-        }),
-      );
+        });
     }
     return { resumed, ...this.#recoveryStatus() };
   }
@@ -306,17 +313,21 @@ export class OwnerWorkRequestService {
     if (this.incomingReviewReader === null || typeof this.ledger.readItemForReconciliation !== "function" ||
         typeof this.ledger.listOutbox !== "function" ||
         typeof this.ledger.verifyPullRequestExecutionBinding !== "function") return { refreshed: 0 };
-    const admitted = await this.runNewWorkAdmission(() => ({ operation: this.operationQueue.enqueue(() =>
-      this.exclusiveLease.run(async () => {
-        this.state = await this.#readState();
-        const records = this.state.records.filter(record => record.phase === "intaken" &&
-          [2, 3, 4].includes(record.request.schemaVersion) && record.request.workType === "pull_request")
-          .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || left.requestId.localeCompare(right.requestId));
-        const start = records.findIndex(record => record.requestId === this.refreshCursor) + 1;
+    // Serialize sweeps without holding the shared request lease over remote reads.
+    const admitted = await this.runNewWorkAdmission(() => ({ operation: this.refreshQueue.enqueue(async () => {
+        const records = await this.#withRequestLease(async () => {
+          this.state = await this.#readState();
+          const eligible = this.state.records.filter(record => record.phase === "intaken" &&
+            [2, 3, 4].includes(record.request.schemaVersion) && record.request.workType === "pull_request")
+            .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || left.requestId.localeCompare(right.requestId));
+          const start = eligible.findIndex(record => record.requestId === this.refreshCursor) + 1;
+          const count = Math.min(eligible.length, Math.max(50, limit * 5));
+          return structuredClone(Array.from({ length: count }, (_, offset) => eligible[(start + offset) % eligible.length]));
+        });
         let refreshed = 0, deferred = 0, remoteAttempts = 0;
-        for (let offset = 0; offset < Math.min(records.length, Math.max(50, limit * 5)) && remoteAttempts < limit; offset++) {
+        for (const record of records) {
+          if (remoteAttempts >= limit) break;
           throwIfCancelled(signal);
-          const record = records[(start + offset) % records.length];
           this.refreshCursor = record.requestId;
           const item = await this.ledger.readItemForReconciliation({ itemId: record.workItemId });
           if (item?.kind !== "source_root" || item.status !== "blocked" || item.currentTarget?.id !== "pr-engineer" ||
@@ -339,15 +350,7 @@ export class OwnerWorkRequestService {
             if (event.payload.headRefOid !== previous.headRefOid) event = normalizeWorkflowEvent({
               ...workflowEventInput(event), payload: { ...event.payload,
                 previousHeadRefOid: previous.headRefOid, changedFields: ["headRefOid"] } });
-            await this.#preflight(event);
-            const latest = await this.ledger.readItemForReconciliation({ itemId: item.itemId });
-            if (!isDeepStrictEqual(latest, item)) continue;
-            await this.ledger.verifyPullRequestExecutionBinding(binding);
-            if (!await this.#hasCurrentReviewAssignment(binding, event.payload.headRefOid)) continue;
-            throwIfCancelled(signal);
-            const assignment = oneRoleAssignment(await this.workflowRouting.ingest({ event: workflowEventInput(event) }), "persisted");
-            await this.#intakeAssignment(assignment.assignmentId, signal);
-            refreshed++;
+            if (await this.#applySourceRefresh({ record, item, event, binding, signal })) refreshed++;
           } catch (error) {
             throwIfCancelled(signal);
             // One unavailable PR must not suppress other ordinary source refreshes.
@@ -357,8 +360,36 @@ export class OwnerWorkRequestService {
           }
         }
         return { refreshed, deferred };
-      })) }));
+      }) }));
     return admitted.operation;
+  }
+
+  async #applySourceRefresh({ record, item, event, binding, signal }) {
+    for (let attempt = 0; attempt < MAX_SOURCE_REFRESH_COMMIT_ATTEMPTS; attempt++) {
+      const observation = await this.#withRequestLease(async () => {
+        this.state = await this.#readState();
+        if (!isDeepStrictEqual(this.state.records.find(entry => entry.requestId === record.requestId), record)) return null;
+        await this.#preflight(event);
+        return { ownerRevision: this.state.revision, requestEpoch: this.#requestEpoch };
+      });
+      if (observation === null || !await this.#hasCurrentReviewAssignment(binding, event.payload.headRefOid)) return false;
+      const applied = await this.#withRequestLease(async () => {
+        this.state = await this.#readState();
+        if (!isDeepStrictEqual(this.state.records.find(entry => entry.requestId === record.requestId), record)) return false;
+        // A queued request can take time to resolve. Refresh the remote facts
+        // again if any owner operation intervened, even one that failed without a write.
+        if (this.#requestEpoch !== observation.requestEpoch + 1 || this.state.revision !== observation.ownerRevision) return null;
+        const latest = await this.ledger.readItemForReconciliation({ itemId: item.itemId });
+        if (!isDeepStrictEqual(latest, item)) return false;
+        await this.ledger.verifyPullRequestExecutionBinding(binding);
+        throwIfCancelled(signal);
+        const assignment = oneRoleAssignment(await this.workflowRouting.ingest({ event: workflowEventInput(event) }), "persisted");
+        await this.#intakeAssignment(assignment.assignmentId, signal);
+        return true;
+      });
+      if (applied !== null) return applied;
+    }
+    return false;
   }
 
   async #hasCurrentReviewAssignment(binding, expectedHead) {
@@ -426,9 +457,7 @@ export class OwnerWorkRequestService {
     this.#assertReady();
     const request = normalizeOwnerWorkRequest(value);
     const admitted = await this.runNewWorkAdmission(() => ({
-      operation: this.operationQueue.enqueue(() =>
-        this.exclusiveLease.run(() => this.#submitLocked(request, signal)),
-      ),
+      operation: this.#withRequestLease(() => this.#submitLocked(request, signal)),
     }));
     return (await this.#withProgress([await admitted.operation]))[0];
   }
@@ -436,22 +465,19 @@ export class OwnerWorkRequestService {
   async get(idValue) {
     this.#assertReady();
     const id = requestId(idValue);
-    return this.operationQueue.enqueue(() =>
-      this.exclusiveLease.run(async () => {
+    return this.#withRequestLease(async () => {
         this.state = await this.#readState();
         const record = this.state.records.find(
           ({ requestId: candidate }) => candidate === id,
         );
         return record ? (await this.#withProgress([publicRecord(record)]))[0] : null;
-      }),
-    );
+      });
   }
 
   async list(optionsValue = {}) {
     this.#assertReady();
     const options = listOptions(optionsValue);
-    return this.operationQueue.enqueue(() =>
-      this.exclusiveLease.run(async () => {
+    return this.#withRequestLease(async () => {
         this.state = await this.#readState();
         const records = [...this.state.records].reverse().filter(
           (record) => options.source === null || matchesSource(record, options.source),
@@ -474,8 +500,7 @@ export class OwnerWorkRequestService {
               ? page.at(-1).requestId
               : null,
         };
-      }),
-    );
+      });
   }
 
   async #withProgress(records) {
