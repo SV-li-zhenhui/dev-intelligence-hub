@@ -173,6 +173,31 @@ test('obsolete and terminal pending intents are retired without dispatch', async
   assert.equal(f.dispatched.length, 0);
 });
 
+test('retired cross-root PR work leaves the stalled wake backlog and can reenter on a real new revision', async () => {
+  const f = fixture(); const scheduler = new WorkContinuationScheduler(f.options);
+  const stalled = { ...f, dispatch: async () => {} };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await scheduler.runCycle(stalled); await f.drain(); f.advance(90_000);
+  }
+  assert.equal(scheduler.readStatus().stalledCount, 1);
+  const receipts = f.state().records[0].receipts;
+  f.items[0].status = 'blocked'; f.items[0].statusReason = 'pr_source_cross_root_cutover_retired';
+  f.items[0].revision++;
+  const candidates = f.ledger.listClaimCandidates;
+  f.ledger.listClaimCandidates = async () => f.items[0].status === 'blocked'
+    ? { items: [], facts: [], nextCursor: null } : candidates();
+  await scheduler.runCycle(f); await f.drain();
+  assert.equal(f.state().records[0].status, 'superseded');
+  assert.equal(scheduler.readStatus().stalledCount, 0);
+  assert.equal(scheduler.readStatus().handoffs.length, 0);
+  assert.deepEqual(f.state().records[0].receipts, receipts);
+  assert.equal(f.dispatched.length, 0);
+  f.items[0].status = 'queued'; f.items[0].statusReason = null; f.items[0].revision++;
+  await scheduler.runCycle(f); await f.drain();
+  assert.equal(f.state().records[0].status, 'delivered');
+  assert.equal(f.dispatched.length, 1);
+});
+
 test('persisted continuation timestamps and unknown schema versions fail validation', () => {
   assert.throws(() => normalizeWorkContinuationState({ schemaVersion: 3, records: [] }));
   assert.throws(() => normalizeWorkContinuationState({ schemaVersion: 1, records: [{
