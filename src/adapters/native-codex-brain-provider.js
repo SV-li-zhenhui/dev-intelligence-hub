@@ -295,7 +295,10 @@ export class NativeCodexBrainProvider {
       if (outcome === null) {
         let timer;
         try {
-          outcome = await Promise.race([processAttempt, new Promise((resolve) => { timer = setTimeout(() => resolve(null), 10_000); })]);
+          // Default supervision can need three 5s termination/wait phases,
+          // plus the app-server's 1s graceful stop. Keep tracking that same
+          // attempt until its bounded teardown has had time to settle.
+          outcome = await Promise.race([processAttempt, new Promise((resolve) => { timer = setTimeout(() => resolve(null), 20_000); })]);
         } finally { clearTimeout(timer); }
       }
       if (outcome === null || outcome.error?.code === "STRUCTURED_PROVIDER_REAP_FAILED") {

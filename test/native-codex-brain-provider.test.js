@@ -854,6 +854,35 @@ test("native timeout waits for supervised exit before the next queued provider l
   assert.deepEqual(await readdir(f.runtime), ["sessions"]);
 });
 
+test("native cancellation waits for supervised cleanup beyond ten seconds without blocking the home", async (t) => {
+  const f = await fixture(t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const started = gate(), aborted = gate(), reaped = gate();
+  const provider = f.create(async call => {
+    call.signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+    started.resolve();
+    await reaped.promise;
+    return result(call);
+  });
+  const controller = new AbortController();
+  const generation = provider.generate(request({ signal: controller.signal }));
+  const cancelled = assert.rejects(generation, { code: "STRUCTURED_PROVIDER_CANCELLED" });
+  let settled = false;
+  generation.then(() => { settled = true; }, () => { settled = true; });
+  await started.promise;
+  controller.abort();
+  await aborted.promise;
+  await new Promise(setImmediate);
+  t.mock.timers.tick(10_001);
+  await new Promise(setImmediate);
+  assert.equal(settled, false, "supervision still owns the bounded teardown");
+  t.mock.timers.tick(5_000);
+  reaped.resolve();
+  await cancelled;
+  await provider.close();
+  assert.deepEqual(await readdir(f.runtime), ["sessions"]);
+});
+
 test("malformed output keeps native session progress and does not fence later work", async (t) => {
   const f = await fixture(t);
   const bad = f.create(async (call) => {
