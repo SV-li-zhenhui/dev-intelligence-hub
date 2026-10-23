@@ -76,6 +76,39 @@ test('pending proposal authorizations advance before long running code work', as
   try { assert.equal(approvals, 1); } finally { release.resolve(); await running; }
 });
 
+test("developer can claim new work while housekeeping runs another PR's code job", async () => {
+  const started = deferred(), release = deferred(), workStarted = deferred();
+  let jobCycles = 0;
+  const { service } = fixture({
+    automaticOwnPrRepair: { async runCycle() { return {}; } },
+    codeJobRunner: { async runCycle() {
+      jobCycles += 1;
+      started.resolve();
+      await release.promise;
+      return {};
+    } },
+    workLoop: { async runCycle({ roleId }) {
+      assert.equal(roleId, "developer");
+      workStarted.resolve();
+      return {};
+    } },
+  });
+  const housekeeping = service.runCycle({ includeWork: false });
+  await started.promise;
+  const developer = service.runCycle({ roleId: "developer" });
+  try {
+    assert.equal(await Promise.race([
+      workStarted.promise.then(() => true),
+      new Promise(resolve => setImmediate(() => resolve(false))),
+    ]), true);
+    assert.equal(jobCycles, 1);
+    await developer;
+  } finally {
+    release.resolve();
+    await Promise.all([housekeeping, developer]);
+  }
+});
+
 test("agency executes proposals before reconciling their durable results", async () => {
   const { service, calls } = fixture({
     intakeLimit: 61,
@@ -131,20 +164,23 @@ test("own repair publication follows completed packages and remains outside inde
   assert.equal(calls.some(([name]) => name === "own_pr_repairs"), false);
 });
 
-test("automatic developer cycles advance admitted jobs and proposals without general memory scheduling", async () => {
+test("automatic developer cycles advance proposals and receipts without running general code jobs", async () => {
   const { service, calls } = fixture({
     automaticOwnPrRepair: { async runCycle(options) { calls.push(["own_pr_repairs", options]); return {}; } },
   });
   await service.runCycle({ roleId: "developer" });
-  assert.deepEqual(calls.map(([name]) => name), ["proposal_execution", "code_jobs", "code_job_change_packages",
+  assert.deepEqual(calls.map(([name]) => name), ["proposal_execution", "code_job_change_packages",
     "proposals", "own_pr_repairs", "work", "dispatch"]);
 });
 
 for (const roleId of [null, "developer"]) {
-  test(`material recovery precedes a long code job without publishing early (role ${roleId})`, async () => {
+  test(`material recovery precedes execution receipts without publishing early (role ${roleId})`, async () => {
     const blocked = deferred(), started = deferred(), recovered = [];
+    const blockedStage = roleId === null ? "code_jobs" : "code_job_change_packages";
     const { service, calls } = fixture({
-      codeJobRunner: { async runCycle() { calls.push(["code_jobs"]); started.resolve(); await blocked.promise; return {}; } },
+      [roleId === null ? "codeJobRunner" : "codeJobChangePackageDispatcher"]: {
+        async runCycle() { calls.push([blockedStage]); started.resolve(); await blocked.promise; return {}; },
+      },
       automaticOwnPrRepair: {
         async runRecoveryCycle(options) { recovered.push(options); calls.push(["recovery"]); return {}; },
         async runCycle(options) { calls.push(["own_pr_repairs", options]); return {}; },
@@ -153,7 +189,7 @@ for (const roleId of [null, "developer"]) {
     const options = { includeWork: roleId !== null, ...(roleId === null ? {} : { roleId }) };
     const running = service.runCycle(options);
     await started.promise;
-    assert.deepEqual(calls.map(([name]) => name), ["recovery", "proposal_execution", "code_jobs"]);
+    assert.deepEqual(calls.map(([name]) => name), ["recovery", "proposal_execution", blockedStage]);
     const coalesced = service.runCycle(options);
     assert.equal(recovered.length, 1);
     blocked.resolve();
