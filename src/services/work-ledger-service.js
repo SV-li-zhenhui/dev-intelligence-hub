@@ -1,4 +1,5 @@
 import { scheduler } from "node:timers/promises";
+import { ciMaterialRecoveryCandidate, ciMaterialRetirement, planCiMaterialRecovery } from "./work-ledger-ci-material-recovery.js";
 import { hostContextRecoveryCandidate, planHostContextRecovery, hostContextRetirement, hasPendingHostContextRecovery } from "./work-ledger-host-context-recovery.js";
 import { automaticRoleHandoffCandidate } from "./work-ledger-role-handoff.js";
 import { completedConflictInspectionRecoveryProof } from "./work-ledger-inspection-continuation.js";
@@ -1187,7 +1188,7 @@ export class WorkLedgerService {
     const state = await this.#readAttentionAuthorityState();
     const item = state.items.find((candidate) => candidate.itemId === input.producer.workItemId);
     const intent = state.outbox.find((candidate) => candidate.intentId === input.requestKey);
-    const maintenance = systemMaintenanceRetirement(intent) ?? hostContextRetirement(intent);
+    const maintenance = systemMaintenanceRetirement(intent) ?? hostContextRetirement(intent) ?? ciMaterialRetirement(intent);
     if (item && intent?.itemId === item.itemId && intent.requestedBy.roleId === input.producer.roleId && maintenance !== null) {
       return { status: "retry_wait", workItemRevision: maintenance.workItemRevision, reason: maintenance.reason };
     }
@@ -1686,19 +1687,24 @@ export class WorkLedgerService {
       const candidates = [];
       for (const item of this.state.items) {
         if (!pending.has(item.activeIntentId)) continue;
-        const candidate = hostContextRecoveryCandidate(this.state, item);
+        const ci = ciMaterialRecoveryCandidate(this.state, item);
+        const candidate = ci ?? hostContextRecoveryCandidate(this.state, item);
         if (candidate) candidates.push({ itemId: item.itemId, snapshotDigest: candidate.snapshotDigest,
+          ...(ci ? { ciMaterials: true, inputBinding: ci.readBinding, event: ci.readEvent } : {}),
           ...(candidate.decisionOwner ? { controlItemId: candidate.decisionOwner.itemId, childItemId: item.itemId } : {}) });
         if (candidates.length >= input.limit - result.retried) break;
       }
       return candidates;
     });
     for (const candidate of captured) {
-      const control = await this.hostContextRecoveryReader.read({ itemId: candidate.controlItemId ?? candidate.itemId,
-        ...(candidate.childItemId ? { childItemId: candidate.childItemId } : {}) });
-      const commit = () => this.#executeCommand(context => planHostContextRecovery({ ...context, captured: candidate, control }), {});
+      const control = candidate.ciMaterials
+        ? await this.hostContextRecoveryReader.readCiMaterials?.({ itemId: candidate.itemId, inputBinding: candidate.inputBinding, event: candidate.event })
+        : await this.hostContextRecoveryReader.read({ itemId: candidate.controlItemId ?? candidate.itemId,
+          ...(candidate.childItemId ? { childItemId: candidate.childItemId } : {}) });
+      const planner = candidate.ciMaterials ? planCiMaterialRecovery : planHostContextRecovery;
+      const commit = () => this.#executeCommand(context => planner({ ...context, captured: candidate, control }), {});
       const recovered = await this.#admitNewWork(() => {
-        if (!candidate.childItemId) return commit();
+        if (!candidate.childItemId && !candidate.ciMaterials) return commit();
         if (!control || typeof this.hostContextRecoveryReader.withStoppedRuns !== "function") return { retried: 0 };
         return this.hostContextRecoveryReader.withStoppedRuns(control, commit)
           .then(guarded => guarded.executed ? guarded.result : { retried: 0 });

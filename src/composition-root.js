@@ -1075,6 +1075,8 @@ export async function createApplication({
   let automaticRoleHandoffReader = null;
   let workflowRouting = null;
   let workLedgerRuntime = null;
+  let hostContextRecoveryReader = null;
+  let ciRepairContextReader = null;
   let workContinuationScheduler = null;
   const originalRepairFeedbackReader = new OriginalRepairFeedbackReader({
     store,
@@ -1405,28 +1407,38 @@ export async function createApplication({
       throw new Error("本地代码工作提案没有同时满足岗位和操作策略的执行角色");
     }
     if (coordinationEnabled) {
+      hostContextRecoveryReader = Object.freeze({
+        withStoppedRuns: (control, operation) => taskRuns.withStoppedRuns(
+          [control.run, ...(Object.hasOwn(control, "childRun") ? [control.childRun] : [])], operation),
+        async read({ itemId, childItemId }) {
+          const config = (await configurationRuntime?.reader?.readActive())?.configuration;
+          const role = await codeAuthorizationRoleRegistry?.get("orchestrator")?.roleView();
+          if (config?.githubActions?.enabled !== true || config.githubActions.automaticOwnPrRepair !== true ||
+              config.workCoordination?.enabled !== true || role?.enabled !== true || role.paused === true) return null;
+          if (childItemId) {
+            const developer = await codeAuthorizationRoleRegistry?.get("developer")?.roleView();
+            if (developer?.enabled !== true || developer.paused === true) return null;
+          }
+          try { return { actorAccountId: config.githubActions.actorAccountId, run: await taskRuns.get("work-item", itemId),
+            ...(childItemId ? { childRun: await taskRuns.get("work-item", childItemId) } : {}) }; }
+          catch (error) { if (error?.code === "TASK_RUN_NOT_FOUND") return null; throw error; }
+        },
+        async readCiMaterials({ itemId, inputBinding, event }) {
+          if (!ciRepairContextReader || !await hostContextRecoveryReader.read({ itemId })) return null;
+          try {
+            const observed = await ciRepairContextReader.read({ inputBinding, event });
+            const control = await hostContextRecoveryReader.read({ itemId });
+            return observed?.ciEvidence && control ? { ...control, ciEvidence: observed.ciEvidence } : null;
+          } catch (error) { if (error?.code === "CODE_CI_REPAIR_CONTEXT_UNAVAILABLE") return null; throw error; }
+        },
+      });
       workLedgerRuntime = trackRuntime(
         await workLedgerRuntimeFactory({
           ...runtimeDependencies(workLedgerDependencies),
           store,
           assignmentSource: workflowRouting,
           operationQueue: new OperationQueue(),
-          hostContextRecoveryReader: Object.freeze({
-            withStoppedRuns: (control, operation) => taskRuns.withStoppedRuns([control.run, control.childRun], operation),
-            async read({ itemId, childItemId }) {
-              const config = (await configurationRuntime?.reader?.readActive())?.configuration;
-              const role = await codeAuthorizationRoleRegistry?.get("orchestrator")?.roleView();
-              if (config?.githubActions?.enabled !== true || config.githubActions.automaticOwnPrRepair !== true ||
-                  config.workCoordination?.enabled !== true || role?.enabled !== true || role.paused === true) return null;
-              if (childItemId) {
-                const developer = await codeAuthorizationRoleRegistry?.get("developer")?.roleView();
-                if (developer?.enabled !== true || developer.paused === true) return null;
-              }
-              try { return { actorAccountId: config.githubActions.actorAccountId, run: await taskRuns.get("work-item", itemId),
-                ...(childItemId ? { childRun: await taskRuns.get("work-item", childItemId) } : {}) }; }
-              catch (error) { if (error?.code === "TASK_RUN_NOT_FOUND") return null; throw error; }
-            },
-          }),
+          hostContextRecoveryReader,
           confirmationSettlementReader: Object.freeze({
             read: (input) => confirmationRuntime?.confirmationSettlementReader?.read(input),
           }),
@@ -2059,10 +2071,11 @@ export async function createApplication({
           !codeJobReader || !codeExecutorRuntime?.controlledCommitBuilder || !changePackageRuntime) {
         throw new Error("自动修复我的 PR 需要版本化配置、开发执行器、验证配置及受控提交链路");
       }
+      ciRepairContextReader = new CiRepairContextReader({ github: frozenPort(github,
+        ['loadPullRequestFacts', 'readPullRequestLocalWorkFacts'], 'CI repair GitHub facts'), diagnostics: jenkinsRuntime?.diagnostics ?? null });
       const ownPrRepairDependencies = {
         configurationReader: configurationRuntime.reader, store, ledger: workLedgerRuntime,
-        ciRepairContextReader: new CiRepairContextReader({ github: frozenPort(github,
-          ['loadPullRequestFacts', 'readPullRequestLocalWorkFacts'], 'CI repair GitHub facts'), diagnostics: jenkinsRuntime?.diagnostics ?? null }),
+        ciRepairContextReader,
         confirmationSettlementReader: confirmationRuntime.confirmationSettlementReader,
         github, confirmations: Object.freeze({ ...confirmationRuntime.producerQueue, ...confirmationRuntime.queue }), codeJobReader,
         controlledCommitReader: codeExecutorRuntime.controlledCommitBuilder,

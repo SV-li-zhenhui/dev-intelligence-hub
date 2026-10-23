@@ -204,7 +204,7 @@ function requestFromItem(value) {
 function normalizeRetirement(value) {
   assertAttentionExactKeys(value, ["status", "workItemRevision", "reason"], invalidState());
   if (!RETIRED_WORK_STATUSES.has(value.status) &&
-      !(value.status === "retry_wait" && ["system_maintenance_auto_retry", "host_context_facts_recovered"].includes(value.reason))) throw invalidState();
+      !(value.status === "retry_wait" && ["system_maintenance_auto_retry", "host_context_facts_recovered", "ci_materials_recovered"].includes(value.reason))) throw invalidState();
   return {
     status: value.status,
     workItemRevision: safeStateInteger(value.workItemRevision, "archive.workItemRevision", 1),

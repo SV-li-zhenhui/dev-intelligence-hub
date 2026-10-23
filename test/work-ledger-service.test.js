@@ -1,4 +1,7 @@
 import { digestValue } from "../src/domain/code-executor-contract.js";
+import { createCiRepairEvidence } from "../src/domain/ci-repair-evidence.js";
+import { isDeepStrictEqual } from "node:util";
+import { ciMaterialRecoveryCandidate, planCiMaterialRecovery } from "../src/services/work-ledger-ci-material-recovery.js";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
@@ -18065,4 +18068,187 @@ test("an intake storage failure never starts source-prefix retries", async () =>
   f.store.write = async () => { writes++; throw new Error("storage unavailable"); };
   await assert.rejects(f.service.intake(), e => e.code === "WORK_LEDGER_STATE_WRITE_FAILED");
   assert.equal(writes, 1); assert.equal(f.store.stored().intakeCursor, 1);
+});
+
+function legacyCiMaterialQuestion(event) {
+  return { type: 'ask_user', summary: '请求补齐 QuickTest.cn 运行材料或可读取来源',
+    reason: '开发子任务已完成限制报告交付，未产生修复或测试证据。当前仅有 QuickTest.cn FAILURE 快照，缺少最新远端状态及实际失败运行材料，无法判断是否需要代码修复。重复派发相同任务不能消除渠道缺口，因此升级请求缺失信息，不请求例行修复授权，也不将工具限制认定为代码缺陷或结束根任务。',
+    question: `请提供 ${event.subject.repository} #${event.subject.number} 的最新 Head/检查状态，以及 QuickTest.cn 失败运行的链接或编号、检查对应 SHA、实际检出 SHA、失败阶段、首个有效错误和相关测试报告；也可提供这些材料的可读取来源。当前绑定 Head 为 ${event.payload.headRefOid}。补齐后继续交由 development 定位和处理必要修复。`,
+    choices: [{ id: 'provide-run-evidence', label: '提供运行材料', description: '补充最新状态及失败运行日志、提交绑定和测试报告。' },
+      { id: 'provide-readonly-source', label: '提供可读取来源', description: '指出现有只读渠道或日志材料位置，以便继续取证。' }] };
+}
+
+async function pendingCiMaterialFixture({ changedBase = true, duringRead = () => {} } = {}) {
+  const assignment = sequence => ownerRequestedPrAssignment(sequence, { occurredAt: sequence === 1 ? '2026-08-02T01:10:00.000Z' : '2026-08-02T02:00:00.000Z',
+    gitFacts: { ...prGitFacts(PR_HEAD_A, sequence > 1 ? { baseRefOid: 'e'.repeat(40) } : {}),
+      workType: 'general', nextAction: 'fix_ci', suggestedCapability: 'development', expectedHeadRefOid: PR_HEAD_A } });
+  const record = assignment(1); record.assignment.target = { type: 'role', id: 'orchestrator' };
+  let control;
+  const fixture = await createFixture({ records: [record], hostContextRecoveryReader: {
+    read: async () => null,
+    async readCiMaterials({ inputBinding, event }) {
+      assert.equal(inputBinding.gitTarget.baseRefOid, changedBase ? 'e'.repeat(40) : 'd'.repeat(40));
+      assert.equal(event.payload.gitTarget.baseRefOid, inputBinding.gitTarget.baseRefOid);
+      const result = clone(control); duringRead(control); return result;
+    },
+    async withStoppedRuns(expected, operation) {
+      return isDeepStrictEqual(expected, control) ? { executed: true, result: await operation() } : { executed: false };
+    },
+  } });
+  await fixture.service.intake();
+  let root = (await fixture.service.listItems()).items[0];
+  const created = await fixture.service.createGraphChild(prGraphChildCommand(root, (await fixture.service.getSummary()).revision, 'ci-diagnosis'));
+  let child = await fixture.service.readItemForReconciliation({ itemId: created.taskId });
+  child = await fixture.service.claim({ itemId: child.itemId, expectedRevision: child.revision, workerId: 'employee-developer', leaseDurationMs: 30000 });
+  await fixture.service.complete({ itemId: child.itemId, expectedRevision: child.revision, leaseId: child.leaseId,
+    actorId: 'employee-developer', result: { outcome: 'limitations-report-only' } });
+  root = await fixture.service.readItemForReconciliation({ itemId: root.itemId });
+  const requestIntent = legacyCiMaterialQuestion(currentWorkItemEvent(root));
+  control = { actorAccountId: 'runtime-user', run: { kind: 'work-item', taskId: root.itemId, roleId: 'orchestrator', active: false,
+    mode: 'active', pendingCommand: null, phase: 'completed', receipt: { kind: 'work-item', taskId: root.itemId, roleId: 'orchestrator',
+      taskRevision: root.revision, phase: 'completed', stopConfirmed: true, registeredAt: fixture.time.clock(),
+      modelStartedAt: fixture.time.clock(), finishedAt: fixture.time.clock() } } };
+  const { type: _type, ...question } = requestIntent;
+  const staged = await fixture.service.stageGraphEscalation({ authority: { actorId: 'employee-orchestrator', scopeRootTaskId: root.itemId },
+    command: { taskId: root.itemId, expectedTaskRevision: root.revision, expectedGraphRevision: (await fixture.service.getSummary()).revision, ...question } });
+  let ask = await fixture.service.claimIntent({ intentId: staged.outbox.intentId, expectedRevision: staged.outbox.revision,
+    dispatcherId: 'work-intent-dispatcher', leaseDurationMs: 30000 });
+  ask = await fixture.service.bindIntent({ intentId: ask.intentId, expectedRevision: ask.revision, dispatchLeaseId: ask.dispatchLeaseId,
+    dispatcherId: 'work-intent-dispatcher', itemExpectedRevision: staged.item.revision, boundIntent: boundAttentionIntent(staged.item, ask) });
+  const request = normalizeAttentionRequest({ requestKey: ask.intentId, type: 'ask_user', producer: { roleId: 'orchestrator', workItemId: root.itemId },
+    question: question.question, choices: question.choices, context: [] });
+  const attention = createAttentionItem(request, 1, fixture.time.clock());
+  await fixture.service.ackIntent({ intentId: ask.intentId, expectedRevision: ask.revision, dispatchLeaseId: ask.dispatchLeaseId,
+    itemExpectedRevision: staged.item.revision, actorId: 'work-intent-dispatcher', outcome: 'delivered', nextStatus: 'waiting_user', details: { questionRef: attention.requestId } });
+  if (changedBase) { const next = assignment(2); next.assignment.target = record.assignment.target;
+    fixture.source.records.push(next); fixture.source.highWatermark = 2; await fixture.service.intake(); }
+  const event = currentWorkItemEvent(root), branch = event.payload.gitTarget.headRefName;
+  control.ciEvidence = createCiRepairEvidence({ schemaVersion: 1, repository: event.subject.repository, number: event.subject.number,
+    headRefOid: PR_HEAD_A, headRefName: branch, checks: [{ kind: 'status_context', name: 'QuickTest.cn', url: 'https://ci.example/build/1742/', conclusion: 'FAILURE' }],
+    diagnostics: [{ state: 'available', check: 'QuickTest.cn', repository: event.subject.repository, headRefOid: PR_HEAD_A,
+      buildUrl: 'https://ci.example/build/1742/', untrustedEvidence: true, checkout: { matched: true, sha: PR_HEAD_A, branch },
+      failures: [{ message: 'compiler error observed' }] }] });
+  return { ...fixture, rootId: root.itemId, childId: child.itemId, askId: ask.intentId, request, attention, control,
+    retry: () => fixture.service.retrySystemMaintenanceQuestions({ limit: 10, requestKeys: [ask.intentId] }) };
+}
+
+test('available bound CI material retires its obsolete question before ordinary Base cutover', async () => {
+  const f = await pendingCiMaterialFixture();
+  const before = clone(f.store.stored());
+  assert.equal(before.items.find(item => item.itemId === f.rootId).status, 'waiting_user');
+  assert.deepEqual(await f.retry(), { retried: 1 });
+  let root = await f.service.readItemForReconciliation({ itemId: f.rootId });
+  assert.equal(root.status, 'retry_wait');
+  assert.equal(root.activeIntentId, null);
+  const retirement = await f.service.readAttentionRequestRetirement({ requestKey: f.askId, producer: f.request.producer });
+  assert.equal(retirement.reason, 'ci_materials_recovered');
+  await f.service.reconcilePullRequestSource({ itemId: root.itemId, expectedRevision: root.revision,
+    expectedPendingRevision: root.source.pendingRevision, expectedGraphRevision: (await f.service.getSummary()).revision });
+  root = await f.service.readItemForReconciliation({ itemId: f.rootId });
+  assert.equal(root.status, 'queued');
+  assert.equal(root.source.current.event.payload.gitTarget.baseRefOid, 'e'.repeat(40));
+  assert.deepEqual(await f.retry(), { retried: 0 });
+  const saved = clone(root);
+  const late = resolveAttentionItem(f.attention, { type: 'choice', choiceId: 'provide-run-evidence' }, 2, f.time.clock(), 1).outbox;
+  await f.service.applyAttentionBatch({ items: [late], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+  assert.deepEqual(await f.service.readItemForReconciliation({ itemId: root.itemId }), saved);
+});
+
+test('CI material recovery without a Base change makes the orchestrator ready and archives without an answer', async () => {
+  const f = await pendingCiMaterialFixture({ changedBase: false });
+  const inboxStore = new MemoryStore();
+  const inbox = new AttentionInbox({ store: inboxStore, exclusiveLease: new ExclusiveLease(), authority: f.service, clock: f.time.clock });
+  await inbox.recover(); await inbox.create(f.request);
+  assert.deepEqual(await inbox.retrySystemQuestions(), { retried: 1 });
+  const page = await f.service.listClaimCandidates({ limit: 100, at: f.time.clock() });
+  const index = page.items.findIndex(item => item.itemId === f.rootId);
+  assert.ok(index >= 0);
+  assert.equal(page.facts[index].graphBlocked, false);
+  assert.deepEqual(await inbox.archiveRetired(), { archived: 1 });
+  assert.equal(inboxStore.stored('attention-inbox').items[0].result, null);
+  assert.equal((await inbox.readOutbox()).items.length, 0);
+});
+
+test('CI material recovery preserves holds, real questions, source bindings and unknown effects', async t => {
+  const f = await pendingCiMaterialFixture();
+  for (const variant of ['root-paused', 'child-paused', 'extra-proposal', 'pending-answer', 'real-question', 'extra-choice',
+    'answered', 'new-head', 'new-account', 'source-left', 'wrong-actor', 'run-active', 'run-paused', 'run-command', 'stop-unknown',
+    'wrong-decision-revision', 'no-evidence', 'bad-evidence-digest', 'empty-failures', 'unavailable-material', 'changed-snapshot']) {
+    await t.test(variant, () => {
+      const state = clone(f.store.stored()), control = clone(f.control), root = state.items.find(item => item.itemId === f.rootId);
+      const candidate = ciMaterialRecoveryCandidate(state, root);
+      assert.ok(candidate);
+      const captured = { itemId: f.rootId, snapshotDigest: candidate.snapshotDigest };
+      const ask = state.outbox.find(box => box.intentId === f.askId), child = state.items.find(item => item.itemId === f.childId);
+      if (variant === 'root-paused') root.status = 'paused';
+      if (variant === 'child-paused') child.status = 'paused';
+      if (variant === 'extra-proposal') state.outbox.push({ ...clone(ask), intentId: `work-intent-${'f'.repeat(64)}`, itemId: child.itemId, status: 'unknown' });
+      if (variant === 'pending-answer') state.attentionHighWatermark++;
+      if (variant === 'real-question') ask.intent.question = 'Should we change the required acceptance scope?';
+      if (variant === 'extra-choice') ask.intent.choices.push({ id: 'pause', label: 'Pause' });
+      if (variant === 'answered') ask.outcome.details.resultAttestation = {};
+      if (variant === 'new-head') root.source.pending.event.payload.headRefOid = PR_HEAD_B;
+      if (variant === 'new-account') root.source.pending.event.payload.gitTarget.sourceAccountId = 'another-user';
+      if (variant === 'source-left') root.source.scope.active = false;
+      if (variant === 'wrong-actor') control.actorAccountId = 'another-user';
+      if (variant === 'run-active') control.run.active = true;
+      if (variant === 'run-paused') control.run.mode = 'paused';
+      if (variant === 'run-command') control.run.pendingCommand = { type: 'pause' };
+      if (variant === 'stop-unknown') control.run.receipt.stopConfirmed = false;
+      if (variant === 'wrong-decision-revision') control.run.receipt.taskRevision++;
+      if (variant === 'no-evidence') delete control.ciEvidence;
+      if (variant === 'bad-evidence-digest') control.ciEvidence.contentDigest = 'f'.repeat(64);
+      if (['empty-failures', 'unavailable-material'].includes(variant)) {
+        const { triggerDigest, contentDigest, ...material } = control.ciEvidence;
+        if (variant === 'empty-failures') material.diagnostics[0].failures = [];
+        else material.diagnostics[0].state = 'unavailable';
+        control.ciEvidence = createCiRepairEvidence(material);
+      }
+      if (variant === 'changed-snapshot') root.revision++;
+      const unchanged = clone(state);
+      assert.deepEqual(planCiMaterialRecovery({ state, captured, control, clock: f.time.clock }), { write: false, result: { retried: 0 } });
+      assert.deepEqual(state, unchanged);
+    });
+  }
+});
+
+for (const change of ['active', 'pause-command']) {
+  test(`a ${change} after the CI material read prevents automatic question retirement`, async () => {
+    const f = await pendingCiMaterialFixture({ duringRead(control) {
+      if (change === 'active') control.run.active = true;
+      else control.run.pendingCommand = { type: 'pause' };
+    } });
+    assert.deepEqual(await f.retry(), { retried: 0 });
+    assert.equal((await f.service.readItemForReconciliation({ itemId: f.rootId })).status, 'waiting_user');
+  });
+}
+
+test('CI material recovery fingerprints complete legal histories beyond the default aggregate digest budget', async () => {
+  const f = await pendingCiMaterialFixture();
+  const state = clone(f.store.stored());
+  for (const item of state.items.filter(item => [f.rootId, f.childId].includes(item.itemId))) {
+    item.revision += 31;
+    for (let revision = 2; revision <= 32; revision++) item.graph.acceptanceContracts.push({ revision,
+      acceptanceCriteria: Array.from({ length: 64 }, (_, index) => ({ criterionId: `criterion-${String(index).padStart(2, '0')}`, description: 'Historical criterion' })),
+      expectedDeliverables: Array.from({ length: 64 }, (_, index) => ({ deliverableId: `report-${String(index).padStart(2, '0')}`,
+        kind: 'text-report', description: 'Optional historical report', required: false })), recordedAt: item.updatedAt });
+  }
+  state.revision += 62;
+  const staged = state.timeline.find(entry => entry.itemId === f.rootId && entry.type === 'intent_staged');
+  staged.details.workItemRevision += 31;
+  const { timelineId, contentDigest, ...content } = staged;
+  staged.contentDigest = ledgerDigest(content); staged.timelineId = `work-timeline-${staged.contentDigest}`;
+  f.control.run.receipt.taskRevision += 31;
+  state.graphMemoryProjection = migrateWorkGraphMemoryProjection(state.items, state.revision, normalizeWorkLedgerLimits());
+  const legal = normalizeWorkLedgerPersistedState(state);
+  const root = legal.items.find(item => item.itemId === f.rootId);
+  const candidate = ciMaterialRecoveryCandidate(legal, root);
+  assert.ok(candidate);
+  const result = planCiMaterialRecovery({ state: legal, captured: { itemId: root.itemId, snapshotDigest: candidate.snapshotDigest },
+    control: f.control, clock: f.time.clock });
+  assert.equal(result.result.retried, 1);
+  const changed = clone(legal);
+  changed.items.find(item => item.itemId === f.childId).graph.acceptanceContracts[20].acceptanceCriteria[40].description = 'Changed historical evidence';
+  assert.deepEqual(planCiMaterialRecovery({ state: changed, captured: { itemId: root.itemId, snapshotDigest: candidate.snapshotDigest },
+    control: f.control, clock: f.time.clock }), { write: false, result: { retried: 0 } });
 });
