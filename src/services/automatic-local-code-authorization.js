@@ -40,6 +40,14 @@ export class AutomaticLocalCodeAuthorization {
       approvalBindingDigest: item.approvalBindingDigest, reason: 'authorization_changed' });
   }
 
+  async canRecoverPausedCodeJob(job) {
+    const grant = job?.grant;
+    const role = grant?.requestedBy?.roleId;
+    if (!grant?.inputBinding || Object.hasOwn(grant, 'executionSource') || !OPERATIONS[role]?.has(grant.operation)) return false;
+    const current = await this.#current({ requestedBy: grant.requestedBy }, grant);
+    return current !== null && current !== STALE_TARGET;
+  }
+
   async #current(item, grant) {
     const config = (await this.configurationReader.readActive())?.configuration;
     const actor = config?.githubActions?.actorAccountId;

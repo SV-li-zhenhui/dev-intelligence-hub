@@ -3988,6 +3988,18 @@ export class CodeJobStore {
     });
   }
 
+  listPaused(value = {}) {
+    const { limit, roleId, afterSequence } = normalizeRunnableOptions(value);
+    return this.#query(() => ({
+      revision: this.state.revision,
+      items: rotateWorkerCandidates(
+        this.state.jobs.filter(({ status, grant }) => status === "paused" &&
+          (roleId === null || grant.requestedBy.roleId === roleId))
+          .sort((left, right) => left.sequence - right.sequence), afterSequence, limit,
+      ).map(cloneCodeJobValue),
+    }));
+  }
+
   listReconcilable(value = {}) {
     const { limit, roleId, afterSequence } = normalizeRunnableOptions(value);
     return this.#query(() => ({

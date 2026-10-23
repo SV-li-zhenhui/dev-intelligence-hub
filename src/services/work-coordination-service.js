@@ -355,6 +355,7 @@ function stageFailure(stage, error) {
 export class WorkCoordinationService {
   #intake;
   #runCodeJobs;
+  #recoverCodeJobPauses;
   #dispatchCodeJobChangePackages;
   #reconcileChangePackageApplicationResults;
   #projectCodeJobMemory;
@@ -376,6 +377,7 @@ export class WorkCoordinationService {
   constructor({
     ledger,
     codeJobRunner,
+    codeJobPauseRecovery = null,
     codeJobChangePackageDispatcher,
     changePackageApplicationResultReconciler,
     codeJobMemoryProjector,
@@ -398,6 +400,7 @@ export class WorkCoordinationService {
     codeJobMemoryLimit = 50,
   } = {}) {
     this.#intake = requirePort(ledger, "intake", "ledger");
+    this.#recoverCodeJobPauses = codeJobPauseRecovery === null ? null : requirePort(codeJobPauseRecovery, "runCycle", "codeJobPauseRecovery");
     this.#runOwnPrRepairs = automaticOwnPrRepair === null ? null : requirePort(automaticOwnPrRepair, "runCycle", "automaticOwnPrRepair");
     this.#runOwnPrRecoveries = typeof automaticOwnPrRepair?.runRecoveryCycle === "function"
       ? requirePort(automaticOwnPrRepair, "runRecoveryCycle", "automaticOwnPrRepair") : null;
@@ -553,6 +556,9 @@ export class WorkCoordinationService {
         : [];
     if (this.#runOwnPrRecoveries !== null && (options.roleId === null || options.roleId === "developer")) {
       stages.unshift(["own_pr_material_recovery", () => this.#runOwnPrRecoveries({ limit: this.#defaults.codeJobLimit })]);
+    }
+    if (this.#recoverCodeJobPauses !== null && (options.roleId === null || options.roleId === "developer")) {
+      stages.unshift(["code_job_pause_recovery", () => this.#recoverCodeJobPauses({ limit: this.#defaults.codeJobLimit, signal: options.signal })]);
     }
     if (this.#refreshOwnerPullRequestSources !== null && (options.roleId === null || options.roleId === "pr-engineer")) {
       stages.unshift(["owner_pull_request_source_refresh", () => this.#refreshOwnerPullRequestSources({

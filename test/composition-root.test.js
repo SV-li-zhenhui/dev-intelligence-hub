@@ -4440,6 +4440,7 @@ test("automatic own PR repair composes internal push with ownership guards and c
         }),
         codeJobRuntimeFactory: async (options) => ({
           ...await base.codeJobRuntimeFactory(options),
+          pauseRecovery: { async runCycle(value) { calls.pauseRecoveryRequest = value; return { resumed: 1 }; } },
           changePackageDelivery: { async runCycle() {} },
         }),
         changePackageRuntimeFactory: async () => ({
@@ -4468,6 +4469,11 @@ test("automatic own PR repair composes internal push with ownership guards and c
       });
       try {
         assert.deepEqual(Object.keys(application.localCodeProposalRecovery), ["runCycle"]);
+        assert.equal(Object.isFrozen(calls.codeJobRuntime.automaticPauseRecovery), true);
+        assert.equal(await calls.codeJobRuntime.automaticPauseRecovery.canRecover({}), false);
+        assert.equal(Object.isFrozen(calls.coordination.codeJobPauseRecovery), true);
+        assert.deepEqual(await calls.coordination.codeJobPauseRecovery.runCycle({ limit: 2 }), { resumed: 1 });
+        assert.deepEqual(calls.pauseRecoveryRequest, { limit: 2 });
         assert.equal(Object.isFrozen(application.localCodeProposalRecovery), true);
         assert.equal(calls.codeRunner.handlerTimeoutMs, scenario.expectedBudget);
         assert.equal(calls.codeRunner.leaseDurationMs, scenario.leaseDurationMs ?? 120_000);

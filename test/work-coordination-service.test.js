@@ -109,6 +109,23 @@ test("developer can claim new work while housekeeping runs another PR's code job
   }
 });
 
+test("developer automatically reconciles paused jobs while housekeeping is executing another job", async () => {
+  const started = deferred(), release = deferred(); let recoveries = 0;
+  const { service } = fixture({
+    automaticOwnPrRepair: { async runCycle() { return {}; } },
+    codeJobPauseRecovery: { async runCycle() { recoveries++; return { resumed: 1 }; } },
+    codeJobRunner: { async runCycle() { started.resolve(); await release.promise; return {}; } },
+  });
+  const housekeeping = service.runCycle({ includeWork: false });
+  await started.promise;
+  try {
+    const developer = await service.runCycle({ roleId: 'developer' });
+    assert.equal(recoveries, 2);
+    assert.equal(developer.stages.code_job_pause_recovery.result.resumed, 1);
+    assert.equal('code_jobs' in developer.stages, false);
+  } finally { release.resolve(); await housekeeping; }
+});
+
 test("agency executes proposals before reconciling their durable results", async () => {
   const { service, calls } = fixture({
     intakeLimit: 61,

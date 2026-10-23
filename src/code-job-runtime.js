@@ -8,6 +8,7 @@ import { CodeJobApprovalExecutor } from "./services/code-job-approval-executor.j
 import { CodeJobChangePackageDispatcher } from "./services/code-job-change-package-dispatcher.js";
 import { CodeJobStore } from "./services/code-job-store.js";
 import { CodeJobWorkerService } from "./services/code-job-worker-service.js";
+import { AutomaticCodeJobPauseRecovery } from "./services/automatic-code-job-pause-recovery.js";
 
 const GUARD_NAME = "mydashboard-code-job-v1";
 
@@ -200,6 +201,7 @@ export async function createCodeJobRuntime({
   executor,
   brainDirectory,
   taskRuns,
+  automaticPauseRecovery,
   reviewRepairContextReader,
   conflictSourceReader,
   actionAdmissionGate,
@@ -317,6 +319,8 @@ export async function createCodeJobRuntime({
             ? {}
             : { changePackageDeliveryEnabled: true }),
         });
+    const pauseRecovery = worker === null || automaticPauseRecovery === undefined ? null :
+      new AutomaticCodeJobPauseRecovery({ jobs, taskRuns, eligibility: automaticPauseRecovery });
     const workerPort = worker === null
       ? null
       : bindPort(
@@ -385,6 +389,9 @@ export async function createCodeJobRuntime({
             runCycle: (value) =>
               admission.run(() => changePackageDispatcher.runCycle(value)),
           }),
+      ...(pauseRecovery === null ? {} : { pauseRecovery: frozenPort({
+        runCycle: value => admission.run(() => pauseRecovery.runCycle(value)),
+      }) }),
       worker: workerPort === null
         ? null
         : frozenPort({

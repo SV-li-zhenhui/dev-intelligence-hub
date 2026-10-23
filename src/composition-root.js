@@ -1747,6 +1747,9 @@ export async function createApplication({
       codeJobRuntime = trackRuntime(
         await codeJobRuntimeFactory({
           taskRuns,
+          ...(ownPrRepairEnabled ? { automaticPauseRecovery: Object.freeze({
+            canRecover: job => automaticLocalCodeAuthorization?.canRecoverPausedCodeJob(job) ?? false,
+          }) } : {}),
           ...runtimeDependencies(codeJobRuntimeDependencies),
           store,
           ...(ordinaryActionAdmissionGate === null
@@ -2713,6 +2716,9 @@ export async function createApplication({
       const coordinationService = workCoordinationFactory({
         ledger: workLedgerRuntime,
         codeJobRunner: codeJobWorker,
+        ...(codeJobRuntime?.pauseRecovery ? { codeJobPauseRecovery: frozenPort(
+          codeJobRuntime.pauseRecovery, ["runCycle"], "codeJobRuntime.pauseRecovery",
+        ) } : {}),
         codeJobMemoryProjector,
         codeJobChangePackageDispatcher,
         changePackageApplicationResultReconciler,

@@ -189,9 +189,13 @@ async function runtimeFixture({
   changePackageProducer,
   changePackageReader,
   controlledCommitDelivery,
+  taskRuns,
+  automaticPauseRecovery,
 } = {}) {
   const runtime = await createCodeJobRuntime({
     store,
+    taskRuns,
+    automaticPauseRecovery,
     grantVerifier: { async verify(value) { return structuredClone(value); } },
     operationQueue: new OperationQueue(),
     clock: () => new Date("2026-08-02T06:00:01.000Z"),
@@ -841,6 +845,40 @@ test("control transitions share the worker session-transition lease", async () =
   assert.equal(Object.isFrozen(workerOptions.sessionTransitionLease), true);
   assert.equal("sessionTransitionLease" in runtime, false);
   await runtime.close();
+});
+
+test("automatic paused-job recovery remains available while the code worker is busy", async () => {
+  let jobs, selectedJob;
+  let releaseWorker, enteredWorker;
+  const heldWorker = new Promise(resolve => { releaseWorker = resolve; });
+  const entered = new Promise(resolve => { enteredWorker = resolve; });
+  const { runtime } = await runtimeFixture({
+    executor: {}, brainDirectory: {},
+    automaticPauseRecovery: { async canRecover(job) { assert.equal(job.jobId, selectedJob.jobId); return true; } },
+    taskRuns: { async get() { return { runId: 'settled-run', mode: 'active', active: false, pendingCommand: null, stopUnconfirmed: false,
+      receipt: { runId: 'settled-run', kind: 'code-job', taskId: selectedJob.jobId, roleId: 'developer', phase: 'failed',
+        stopConfirmed: true, outcomeCode: 'STRUCTURED_PROVIDER_RESPONSE_INVALID', session: { transport: 'app-server' },
+        modelStartedAt: selectedJob.createdAt, finishedAt: selectedJob.createdAt } }; } },
+    workerFactory(options) {
+      jobs = options.jobStore;
+      return { async runCycle() { enteredWorker(); await heldWorker; return {}; }, requestCancellation() {} };
+    },
+  });
+  let working;
+  try {
+    const created = await runtime.confirmationExecutor.execute(envelope());
+    selectedJob = await jobs.getForWorker(created.receipt.id);
+    const starting = await jobs.claimStarting({ jobId: selectedJob.jobId, expectedRevision: selectedJob.revision });
+    const active = await jobs.activate({ jobId: selectedJob.jobId, expectedRevision: starting.job.revision, workspaceRevision: '4'.repeat(64) });
+    await jobs.pause({ jobId: selectedJob.jobId, expectedRevision: active.job.revision, reason: '等待人工处理（STRUCTURED_PROVIDER_RESPONSE_INVALID）' });
+    working = runtime.worker.runCycle();
+    await entered;
+    assert.equal((await runtime.pauseRecovery.runCycle()).resumed, 1);
+    assert.equal((await runtime.reader.get(selectedJob.jobId)).status, 'active');
+    assert.deepEqual(Object.keys(runtime.pauseRecovery), ['runCycle']);
+    assert.equal(Object.isFrozen(runtime.pauseRecovery), true);
+    assert.equal((await runtime.pauseRecovery.runCycle()).scanned, 0);
+  } finally { releaseWorker(); await working; await runtime.close(); }
 });
 
 test("cancel persists before best-effort worker interruption and keeps it private", async () => {

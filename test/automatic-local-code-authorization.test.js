@@ -40,6 +40,14 @@ for (const [role, operation] of [['developer', 'modify'], ['developer', 'inspect
     assert.match(f.calls[0].request.requestId, /^auto-own-pr-repair-v1-/);
     assert.equal(Object.hasOwn(f.grant, 'executionSource'), false, 'local authorization never fabricates publication provenance');
   });
+  test(`paused routine ${role} ${operation} rechecks the existing automatic local authority`, async () => {
+    const f = fixture(role, operation);
+    const job = { grant: { ...f.grant, requestedBy: f.item.requestedBy } };
+    assert.equal(await f.service.canRecoverPausedCodeJob(job), true);
+    assert.equal(f.calls.length, 0, 'recovery eligibility neither approves nor creates a task');
+    f.config.githubActions.automaticOwnPrRepair = false;
+    assert.equal(await f.service.canRecoverPausedCodeJob(job), false);
+  });
 }
 
 for (const [name, mutate] of [
@@ -58,6 +66,7 @@ for (const [name, mutate] of [
     const f = fixture(); mutate(f);
     assert.equal((await f.service.approveCodeJob(f.item)).status, ['changed Head', 'changed Base', 'closed PR'].includes(name) ? 'stale' : 'pending');
     assert.equal(f.calls.length, 0);
+    assert.equal(await f.service.canRecoverPausedCodeJob({ grant: { ...f.grant, requestedBy: f.item.requestedBy } }), false);
   });
 }
 
