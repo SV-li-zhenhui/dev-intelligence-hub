@@ -2614,23 +2614,121 @@ function currentReadJob(observations) {
 }
 
 function concurrentWorkerFixture(count, decide, concurrency, continuous = false) {
-  const initial = Array.from({ length: count }, (_, index) => {
+  const makeJob = index => {
     const value = currentReadJob([]);
     value.jobId = `code-job-${String(index + 1).repeat(55)}`;
     value.sequence = index + 1;
     value.execution.sessionId = value.jobId;
     value.grant.objective = `job-${index + 1}`;
     return value;
-  });
+  };
+  const initial = Array.from({ length: count }, (_, index) => makeJob(index));
   const jobs = new FakeJobStore(initial);
+  const listRunnable = jobs.listRunnable.bind(jobs);
+  jobs.listRunnable = async query => {
+    const page = await listRunnable({ ...query, limit: 100 });
+    const cursor = query.afterSequence ?? 0;
+    return { ...page, items: [...page.items.filter(job => job.sequence > cursor), ...page.items.filter(job => job.sequence <= cursor)].slice(0, query.limit) };
+  };
   const executors = new Map(initial.map(value => [value.jobId, new FakeExecutor(value)]));
   const executor = Object.fromEntries(['start', 'view', 'resume', 'perform', 'getActionResult', 'reconcileAction', 'reconcileCancellation']
     .map(method => [method, (value, options) => executors.get(value.sessionId)[method](value, options)]));
   const worker = new CodeJobWorkerService({ jobStore: jobs, executor, brainDirectory: { decide,
     ...(continuous ? { describe: () => ({ supportsCodeExecution: true }) } : {}) },
     grantVerifier: verifier([]), ...(concurrency === undefined ? {} : { concurrency }) });
-  return { worker, jobs, initial };
+  return { worker, jobs, initial, addJob() {
+    const value = makeJob(initial.length);
+    initial.push(value); jobs.jobs.set(value.jobId, structuredClone(value)); executors.set(value.jobId, new FakeExecutor(value));
+    return value;
+  } };
 }
+
+test('an idle managed execution slot admits a later job before the original long job finishes', async () => {
+  const release = Array.from({ length: 3 }, deferred), entered = [], owned = [], polls = [];
+  let active = 0, maximum = 0;
+  const f = concurrentWorkerFixture(1, async ({ task }) => {
+    const index = Number(task.objective.slice(-1)) - 1;
+    entered.push(index); active += 1; maximum = Math.max(maximum, active);
+    await release[index].promise; active -= 1;
+    return continuousDecision({ type: 'read_text', path: 'src/app.js' });
+  }, 2);
+  const track = operation => { const promise = Promise.resolve().then(operation); owned.push(promise); return promise; };
+  const tick = () => {
+    const promise = typeof f.worker.runReady === 'function' ? f.worker.runReady({ limit: 10 }, track) : f.worker.runCycle();
+    polls.push(promise); return promise;
+  };
+  try {
+    tick(); await new Promise(resolve => setImmediate(resolve)); assert.deepEqual(entered, [0]);
+    f.addJob(); f.addJob(); tick();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(entered, [0, 1], 'the second lane must discover work created after the first poll');
+    await tick(); assert.deepEqual(entered, [0, 1], 'capacity and same-job exclusion survive duplicate polls');
+    release[1].resolve(); await new Promise(resolve => setImmediate(resolve));
+    await tick(); await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(entered, [0, 1, 2]); assert.equal(maximum, 2);
+  } finally { release.forEach(value => value.resolve()); await Promise.allSettled([...polls, ...owned]); }
+});
+
+test('managed jobs keep independent abort signals and release a rejected owner reservation', async () => {
+  const releases = [deferred(), deferred()], signals = [], owned = [];
+  const controllers = [new AbortController(), new AbortController()];
+  const f = concurrentWorkerFixture(1, async ({ task }, { signal }) => {
+    const index = Number(task.objective.slice(-1)) - 1;
+    signals[index] = signal;
+    await releases[index].promise;
+    signal.throwIfAborted();
+    return continuousDecision({ type: 'read_text', path: 'src/app.js' });
+  }, 2);
+  const owner = operation => { const running = Promise.resolve().then(operation); owned.push(running); return running; };
+  try {
+    await assert.rejects(f.worker.runReady({ limit: 1 }, () => { throw new Error('owner closed'); }), /owner closed/);
+    assert.equal(signals.length, 0);
+    await f.worker.runReady({ limit: 1, signal: controllers[0].signal }, owner);
+    await new Promise(resolve => setImmediate(resolve));
+    f.addJob();
+    await f.worker.runReady({ limit: 1, signal: controllers[1].signal }, owner);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.strictEqual(signals[0], controllers[0].signal);
+    assert.strictEqual(signals[1], controllers[1].signal);
+    controllers[0].abort(new Error('first job stopped'));
+    assert.equal(signals[1].aborted, false);
+    releases.forEach(value => value.resolve());
+    const results = await Promise.allSettled(owned);
+    assert.equal(results[0].status, 'rejected');
+    assert.equal(results[1].status, 'fulfilled');
+    assert.equal((await f.jobs.getForWorker(f.initial[1].jobId)).execution.turn, 1);
+  } finally { releases.forEach(value => value.resolve()); await Promise.allSettled(owned); }
+});
+
+test('managed cancellation reaches only its active continuous worker and retains late execution ownership', async () => {
+  const release = deferred(), signals = [], owned = [];
+  const controller = new AbortController();
+  const f = concurrentWorkerFixture(2, async ({ task }, { signal }) => {
+    signals[Number(task.objective.slice(-1)) - 1] = signal;
+    await release.promise;
+    signal.throwIfAborted();
+  }, 2, true);
+  let settled = 0;
+  const owner = operation => {
+    const running = Promise.resolve().then(operation).finally(() => { settled += 1; });
+    running.catch(() => {}); owned.push(running); return running;
+  };
+  try {
+    await f.worker.runReady({ limit: 2, signal: controller.signal }, owner);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(signals.length, 2);
+    assert.equal(f.worker.requestCancellation(f.initial[0].jobId), true);
+    assert.equal(signals[0].aborted, true);
+    assert.equal(signals[1].aborted, false);
+    assert.equal(f.worker.requestCancellation('code-job-absent'), false);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, 0, 'an abort signal does not prove the admitted executions stopped');
+    controller.abort(new Error('shutdown'));
+    assert.equal(signals[1].aborted, true);
+    release.resolve(); await Promise.allSettled(owned);
+    assert.equal(settled, 2);
+  } finally { controller.abort(); release.resolve(); await Promise.allSettled(owned); }
+});
 
 test('bounded worker concurrency lets queued jobs progress while one decision remains active', async () => {
   const entered = Array.from({ length: 3 }, deferred), release = Array.from({ length: 3 }, deferred);

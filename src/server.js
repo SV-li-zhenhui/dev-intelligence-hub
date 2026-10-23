@@ -4656,7 +4656,8 @@ export function startApplicationBackgroundWork(
       // PR facts and completed-job publication must not wait for another model.
       runCoalescedTracked(coalescedAgencyCycles, "code-job-execution", signal =>
         runDrainParticipant(DRAIN_PARTICIPANTS.codeJobExecution, () =>
-          application.codeJobExecution.runCycle({ signal })),
+          application.codeJobExecution.runCycle({ signal }, operation => runTracked(
+            () => runDrainParticipant(DRAIN_PARTICIPANTS.codeJobExecution, operation), { rethrow: true }))),
       { rethrow: true }).catch(reportBackgroundError);
     }
     if (application.config.githubActions?.enabled === true &&

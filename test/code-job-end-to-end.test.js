@@ -449,6 +449,9 @@ for (const continuous of [false, true]) test(`${continuous ? "continuous native 
   );
   assert.notEqual(completedMemory, undefined);
   assert.equal(completedMemory.repository, "acme/repo");
+  // Proposal execution precedes code completion and memory projection within a
+  // cycle, so delivery is reconciled on the following cycle.
+  await runCycle();
   const proposalResults = await proposalRuntime.consumer.readResultBatch();
   assert.equal(proposalResults.items.length, 1);
   assert.equal(proposalResults.items[0].outcome, "succeeded");

@@ -927,7 +927,11 @@ The independent poll participates in operational admission and shutdown drain.
 
 Automatic own-PR code execution also uses a separate coalesced 10-second poll
 after facts are admitted. It reuses the controlled worker and configured batch
-limit, with at most two jobs executing concurrently. Housekeeping can reconcile
+limit, with at most two jobs executing concurrently. Each poll only schedules
+work: a free execution slot can accept a newly queued job while another job is
+still running. Each admitted job has its own worker and abort signal; the shared
+session transition lease, authority checks and persisted job revisions still apply.
+Housekeeping can reconcile
 results, publish completed repairs and refresh PR facts while another model runs.
 The `codeJobExecution.runCycle` drain participant retains ownership until every
 admitted operation actually settles; maintenance and shutdown still fence work.

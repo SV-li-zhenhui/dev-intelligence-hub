@@ -114,26 +114,37 @@ test('shutdown removes unstarted queued manual work while still draining admitte
 
 test('automatic code execution leaves result reconciliation and fact refresh free while retaining shutdown ownership', { timeout: 5_000 }, async () => {
   const facts = deferred(), release = deferred(), timers = [];
-  let refreshes = 0, reconciliations = 0, calls = 0, workerSignal;
+  let refreshes = 0, reconciliations = 0, calls = 0, executions = 0, workerSignal;
   const background = startApplicationBackgroundWork({
     config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
     refreshService: { async refresh() { await facts.promise; refreshes += 1; } },
     employeeRegistry: { schedules: () => [], async runSelected() {} },
     workCoordination: { async intake() {}, async runCycle() { reconciliations += 1; } },
-    codeJobExecution: { async runCycle({ signal }) { calls += 1; workerSignal = signal; await release.promise; signal.throwIfAborted(); } },
+    codeJobExecution: { async runCycle({ signal }, runOperation) {
+      calls += 1;
+      if (executions === 0) {
+        executions += 1;
+        runOperation(async () => { workerSignal = signal; await release.promise; signal.throwIfAborted(); }).catch(() => {});
+      }
+      return { scheduled: executions };
+    } },
   }, { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {}, reportError() {} });
   try {
     await new Promise(resolve => setImmediate(resolve)); assert.equal(calls, 0, 'execution needs admitted facts');
     facts.resolve(); await background.initialRefresh; await new Promise(resolve => setImmediate(resolve));
-    assert.equal(calls, 1);
+    assert.equal(executions, 1);
     const tick = timers.find(timer => timer.delay === 10_000);
-    await tick.callback(); await tick.callback(); assert.equal(calls, 1, 'one owned worker cycle coalesces across ticks');
+    const beforePolls = calls;
+    await tick.callback(); await tick.callback(); await new Promise(resolve => setImmediate(resolve));
+    assert.ok(calls > beforePolls, 'short admission polls must continue while a model runs');
+    assert.equal(executions, 1, 'continued polling must not duplicate the owned execution');
     await timers.find(timer => timer.delay === 7 * 60_000).callback();
     assert.equal(refreshes, 2); assert.equal(reconciliations, 2, 'fresh results can reconcile before the model returns');
     assert.ok(background.drainStatus().activeParticipants.some(participant => participant.id === DRAIN_PARTICIPANTS.codeJobExecution.id));
+    const beforeStop = calls;
     let stopped = false; const stopping = background.stop().then(() => { stopped = true; });
     await new Promise(resolve => setImmediate(resolve)); assert.equal(workerSignal.aborted, true); assert.equal(stopped, false);
-    release.resolve(); await stopping; await tick.callback(); assert.equal(calls, 1);
+    release.resolve(); await stopping; await tick.callback(); assert.equal(calls, beforeStop);
   } finally { facts.resolve(); release.resolve(); await background.initialRefresh; await background.stop(); }
 });
 

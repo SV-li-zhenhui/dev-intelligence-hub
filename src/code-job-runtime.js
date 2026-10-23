@@ -325,7 +325,7 @@ export async function createCodeJobRuntime({
       ? null
       : bindPort(
           worker,
-          ["runCycle", "requestCancellation"],
+          ["runCycle", "requestCancellation", ...(typeof worker.runReady === 'function' ? ['runReady'] : [])],
           "code job worker",
         );
     const signalWorkerCancellation = (jobId) => {
@@ -397,6 +397,11 @@ export async function createCodeJobRuntime({
         : frozenPort({
             runCycle: (value) =>
               admission.run(() => workerPort.runCycle(value)),
+            ...(workerPort.runReady === undefined ? {} : { runReady(value, runOperation) {
+              if (typeof runOperation !== 'function') throw new TypeError('managed code execution requires an operation owner');
+              return admission.run(() => workerPort.runReady(value,
+                operation => runOperation(() => admission.run(operation))));
+            } }),
           }),
       close,
     });

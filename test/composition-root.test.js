@@ -356,7 +356,7 @@ function codeJobControlPort() {
 }
 
 function codeJobWorkerPort() {
-  return { async runCycle() {} };
+  return { async runCycle() {}, async runReady() {} };
 }
 
 function codeJobProjectionSourcePort() {
@@ -4446,7 +4446,9 @@ test("automatic own PR repair composes internal push with ownership guards and c
         }),
         codeJobRuntimeFactory: async (options) => ({
           ...await base.codeJobRuntimeFactory(options),
-          worker: { ...codeJobWorkerPort(), async runCycle(request) { calls.codeWorkerRequest = request; return { processed: 1 }; } },
+          worker: { ...codeJobWorkerPort(), async runReady(request, runOperation) {
+            calls.codeWorkerRequest = request; calls.codeWorkerOwner = runOperation; return { processed: 1 };
+          } },
           pauseRecovery: { async runCycle(value) { calls.pauseRecoveryRequest = value; return { resumed: 1 }; } },
           changePackageDelivery: { async runCycle() {} },
         }),
@@ -4479,7 +4481,9 @@ test("automatic own PR repair composes internal push with ownership guards and c
         assert.equal(Object.isFrozen(application.codeJobExecution), true);
         assert.deepEqual(Object.keys(application.codeJobExecution), ['runCycle']);
         const workerSignal = new AbortController().signal;
-        assert.deepEqual(await application.codeJobExecution.runCycle({ signal: workerSignal }), { processed: 1 });
+        const owner = operation => operation();
+        assert.deepEqual(await application.codeJobExecution.runCycle({ signal: workerSignal }, owner), { processed: 1 });
+        assert.strictEqual(calls.codeWorkerOwner, owner);
         assert.equal(calls.codeWorkerRequest.limit, 9);
         assert.strictEqual(calls.codeWorkerRequest.signal, workerSignal);
         assert.deepEqual(Object.keys(application.localCodeProposalRecovery), ["runCycle"]);

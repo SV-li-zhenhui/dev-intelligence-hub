@@ -1877,13 +1877,13 @@ export async function createApplication({
       );
       codeJobWorker = frozenPort(
         codeJobRuntime.worker,
-        ["runCycle"],
+        ["runCycle", ...(config.githubActions?.enabled === true && config.githubActions.automaticOwnPrRepair === true ? ['runReady'] : [])],
         "codeJobRuntime.worker",
       );
       if (config.githubActions?.enabled === true && config.githubActions.automaticOwnPrRepair === true) {
-        codeJobExecution = Object.freeze({ runCycle: options => codeJobWorker.runCycle({
+        codeJobExecution = Object.freeze({ runCycle: (options, runOperation) => codeJobWorker.runReady({
           ...options, limit: coordinationConfig.codeJobLimit ?? 10,
-        }) });
+        }, runOperation) });
       }
     }
     if (changePackageActionsEnabled) {

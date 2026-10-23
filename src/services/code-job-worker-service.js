@@ -298,6 +298,8 @@ export class CodeJobWorkerService {
   #clock;
   #maintenanceRetryNotBefore = new Map();
   #conflictSourceReader;
+  #managedExecutions = new Map();
+  #managedWorkers = new Map();
 
   constructor({
     jobStore,
@@ -406,6 +408,8 @@ export class CodeJobWorkerService {
     const options = normalizeCycleOptions(value);
     return this.#queue.enqueue(async () => {
       options.signal?.throwIfAborted();
+      if (this.#managedExecutions.size > 0) return { selected: 0, processed: 0, succeeded: 0,
+        cancelled: 0, fenced: 0, failed: 0, outcomes: [], skipped: 'managed_jobs_active' };
       this.#cycleSignal = options.signal;
       const onAbort = () => {
         for (const controller of [...this.#cancellationControllers.values(), ...this.#continuousControllers.values()]) {
@@ -427,19 +431,85 @@ export class CodeJobWorkerService {
     }
     const controller = this.#cancellationControllers.get(jobId);
     const continuous = this.#continuousControllers.get(jobId);
+    const managed = this.#managedExecutions.get(jobId)?.worker.requestCancellation(jobId) ?? false;
     controller?.abort();
     continuous?.abort();
-    return controller !== undefined || continuous !== undefined;
+    return managed || controller !== undefined || continuous !== undefined;
   }
 
-  async #runCycle(options) {
+  runReady(value, runOperation) {
+    const options = normalizeCycleOptions(value);
+    if (typeof runOperation !== 'function') throw new TypeError('managed code execution requires an operation owner');
+    return this.#queue.enqueue(async () => {
+      options.signal?.throwIfAborted();
+      const idle = [...this.#managedWorkers].filter(([id]) => !this.#managedExecutions.has(id)).slice(0, options.limit);
+      for (const [id, worker] of idle) {
+        const job = await this.#jobs.getForWorker(id);
+        this.#managedWorkers.delete(id);
+        if (job && (RUNNABLE_STATUSES.has(job.status) || job.status === 'unknown')) this.#managedWorkers.set(id, worker);
+      }
+      const capacity = Math.min(options.limit, this.#concurrency - this.#managedExecutions.size);
+      if (capacity <= 0) return { selected: 0, scheduled: 0, active: this.#managedExecutions.size };
+      const selected = await this.#selectCycle(options, capacity, new Set(this.#managedExecutions.keys()));
+      let scheduled = 0;
+      for (const job of selected.items) {
+        options.signal?.throwIfAborted();
+        let worker = this.#managedWorkers.get(job.jobId);
+        if (!worker) {
+          worker = this.#createManagedWorker(job.jobId);
+          this.#managedWorkers.set(job.jobId, worker);
+        }
+        const record = { worker, promise: null };
+        this.#managedExecutions.set(job.jobId, record);
+        try {
+          record.promise = Promise.resolve(runOperation(() => worker.runCycle({ ...options, limit: 1 })))
+            .then(result => {
+              const status = result?.outcomes?.[0]?.status;
+              if (!status || TERMINAL_STATUSES.has(status) || status === 'paused') this.#managedWorkers.delete(job.jobId);
+              return result;
+            }, error => { this.#managedWorkers.delete(job.jobId); throw error; })
+            .finally(() => { if (this.#managedExecutions.get(job.jobId) === record) this.#managedExecutions.delete(job.jobId); });
+          // The supplied runtime/server owner retains and observes the whole
+          // operation. This observer only prevents an unhandled bookkeeping tail.
+          record.promise.catch(() => {});
+          scheduled += 1;
+        } catch (error) {
+          this.#managedExecutions.delete(job.jobId);
+          this.#managedWorkers.delete(job.jobId);
+          throw error;
+        }
+      }
+      return { selected: selected.items.length, scheduled, active: this.#managedExecutions.size };
+    });
+  }
+
+  #createManagedWorker(jobId) {
+    const page = async (query, reconcilable) => {
+      const job = await this.#jobs.getForWorker(jobId);
+      const matches = job && (query.roleId === undefined || job.grant.requestedBy.roleId === query.roleId) &&
+        (reconcilable ? job.status === 'unknown' : RUNNABLE_STATUSES.has(job.status));
+      return { revision: job?.revision ?? 0, items: matches ? [job] : [] };
+    };
+    return new CodeJobWorkerService({
+      jobStore: { ...this.#jobs, listRunnable: query => page(query, false), listReconcilable: query => page(query, true),
+        ...(this.#recordTimeoutContinuation === null ? {} : { recordTimeoutContinuation: this.#recordTimeoutContinuation }) },
+      executor: this.#executor, brainDirectory: this.#brain, taskRuns: this.#taskRuns,
+      ...(this.#reviewRepairContextReader === null ? {} : { reviewRepairContextReader: this.#reviewRepairContextReader }),
+      ...(this.#conflictSourceReader === null ? {} : { conflictSourceReader: this.#conflictSourceReader }),
+      grantVerifier: { verify: this.#verifyGrant }, actionAdmissionGate: { run: this.#actionAdmission },
+      sessionTransitionLease: this.#sessionTransitions, maxTurns: this.#maxTurns, observationLimit: this.#observationLimit,
+      changePackageDeliveryEnabled: this.#changePackageDeliveryEnabled, clock: this.#clock,
+    });
+  }
+
+  async #selectCycle(options, maximum = options.limit, excluded = new Set()) {
     const now = new Date(this.#clock()).getTime();
     if (!Number.isFinite(now)) throw workerError("CODE_JOB_CLOCK_INVALID", "Code job worker clock is invalid");
     for (const [jobId, notBefore] of this.#maintenanceRetryNotBefore) {
       if (notBefore <= now) this.#maintenanceRetryNotBefore.delete(jobId);
     }
     const query = {
-      limit: options.limit,
+      limit: Math.min(100, options.limit + excluded.size),
       ...(options.roleId === null ? {} : { roleId: options.roleId }),
     };
     const reconcilable = await this.#jobs.listReconcilable({
@@ -450,11 +520,12 @@ export class CodeJobWorkerService {
       ...query,
       afterSequence: this.#runnableCursor,
     });
-    const runnable = this.#taskRuns ? {...runnablePage,items:await this.#taskRuns.order(runnablePage.items,'code-job','jobId')} : runnablePage;
+    const available = runnablePage.items.filter(job => !excluded.has(job.jobId));
+    const runnable = this.#taskRuns ? {...runnablePage,items:await this.#taskRuns.order(available,'code-job','jobId')} : { ...runnablePage, items: available };
     const selection = selectCycleCandidates(
-      reconcilable.items,
+      reconcilable.items.filter(job => !excluded.has(job.jobId)),
       runnable.items,
-      options.limit,
+      maximum,
       this.#preferReconcilable,
     );
     this.#preferReconcilable = selection.preferReconcilable;
@@ -467,6 +538,11 @@ export class CodeJobWorkerService {
     );
     if (lastReconcilable) this.#reconcilableCursor = lastReconcilable.sequence;
     if (lastRunnable) this.#runnableCursor = lastRunnable.sequence;
+    return selected;
+  }
+
+  async #runCycle(options) {
+    const selected = await this.#selectCycle(options);
     const processSelected = async selectedJob => {
       options.signal?.throwIfAborted();
       if (selectedJob.status === "active" && this.#maintenanceRetryNotBefore.has(selectedJob.jobId)) {

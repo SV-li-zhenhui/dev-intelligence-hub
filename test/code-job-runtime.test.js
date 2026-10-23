@@ -940,6 +940,41 @@ test("cancel persists before best-effort worker interruption and keeps it privat
   await runtime.close();
 });
 
+test("close owns admitted managed executions after their scheduling poll returns", async () => {
+  const entered = deferred();
+  const release = deferred();
+  const owned = [];
+  const { runtime, guard } = await runtimeFixture({
+    executor: {}, brainDirectory: {},
+    workerFactory() {
+      return {
+        async runCycle() {}, requestCancellation() {},
+        async runReady(_options, own) {
+          own(async () => { entered.resolve(); await release.promise; });
+          return { scheduled: 1 };
+        },
+      };
+    },
+  });
+  const owner = operation => {
+    const running = operation();
+    owned.push(running);
+    return running;
+  };
+  try {
+    assert.deepEqual(await runtime.worker.runReady({}, owner), { scheduled: 1 });
+    await entered.promise;
+    const closing = runtime.close();
+    await Promise.resolve();
+    assert.equal(guard.closeCount, 0);
+    await assert.rejects(runtime.worker.runReady({}, owner), error => error.code === "CODE_JOB_RUNTIME_CLOSED");
+    release.resolve();
+    await Promise.all(owned);
+    await closing;
+    assert.equal(guard.closeCount, 1);
+  } finally { release.resolve(); await Promise.allSettled(owned); await runtime.close(); }
+});
+
 test("close drains an admitted approval before releasing the process guard", async () => {
   const enteredWrite = deferred();
   const releaseWrite = deferred();
