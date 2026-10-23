@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AutomaticOwnPrRepair } from "../src/services/automatic-own-pr-repair.js";
+import { ciRepairSource } from './support/ci-repair-fixture.js';
 
 const binding = {
   schemaVersion: 2, kind: "pull_request", repository: "acme/repo", pullRequestNumber: 42,
@@ -12,7 +13,7 @@ const binding = {
     headRepository: "acme/repo", headRefName: "fix/review", headRefOid: "1".repeat(40) },
 };
 
-function setup({ objectSync = null } = {}) {
+function setup({ objectSync = null, ciRepairContextReader = null } = {}) {
   const configuration = {
     githubActions: { enabled: true, automaticOwnPrRepair: true, actorAccountId: "me" },
     trackedRepositories: ["acme/repo"],
@@ -35,6 +36,7 @@ function setup({ objectSync = null } = {}) {
       readItemForReconciliation: async () => ({ event }) },
     github: { readOwnPullRequestFeedback: async () => structuredClone(facts) },
     objectSync,
+    ciRepairContextReader,
     grantVerifier: { async verify(grant) { return grant; } },
     confirmations: { approve: async (id, request) => { calls.push({ id, request }); return { ...item(), status: "completed" }; } },
   });
@@ -60,6 +62,27 @@ test("own review feedback prepares configured Head source and automatically star
   assert.equal((await s.service.approveCodeJob(s.item())).status, "completed");
   assert.equal(s.calls.length, 1);
   assert.match(s.calls[0].request.requestId, /^auto-own-pr-repair-v1-/);
+});
+
+test('owned fix_ci prepares explicit controlled CI provenance instead of an ordinary unpublishable modify', async () => {
+  const source = ciRepairSource(binding, ['src', 'test']); let reads = 0;
+  const s = setup({ ciRepairContextReader: { async read({ inputBinding, event }) {
+    reads++; assert.deepEqual(inputBinding, binding); assert.equal(event.payload.nextAction, 'fix_ci');
+    return { facts: { state: 'open', author: 'me', headRefOid: binding.headRefOid, baseRefOid: binding.gitTarget.baseRefOid }, ciEvidence: source.ciEvidence };
+  } } });
+  s.event.payload.nextAction = 'fix_ci';
+  await s.service.recover();
+  const prepared = await s.service.prepare({ item: { event: s.event }, inputBinding: binding,
+    intent: { type: 'propose_code_action', operation: 'modify' }, roleId: 'developer' });
+  assert.deepEqual(prepared, source);
+  assert.equal(reads, 1);
+});
+
+test('missing automatic CI provenance retries instead of falling back to an ordinary modify job', async () => {
+  const s = setup({ ciRepairContextReader: { async read() { return null; } } }); s.event.payload.nextAction = 'fix_ci';
+  await s.service.recover();
+  await assert.rejects(s.service.prepare({ item: { event: s.event }, inputBinding: binding,
+    intent: { type: 'propose_code_action', operation: 'modify' }, roleId: 'developer' }), { code: 'OWN_PR_CI_SOURCE_NOT_READY' });
 });
 
 test("disabled, someone else's PR, no feedback, changed Head or different role cannot auto execute", async () => {

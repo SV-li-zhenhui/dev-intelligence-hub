@@ -12,6 +12,8 @@ import { packCodeJobBrainContext } from "./code-job-context-packer.js";
 import { isCodeReadContext, describeCodeReadContext, revokeCodeReadContext } from "../lib/code-read-context.js";
 import { isCodeExecutionContext, revokeCodeExecutionContext } from "../lib/code-execution-context.js";
 import { normalizeReviewRepairFeedbackContext, reviewRepairMessages } from "./review-repair-context-reader.js";
+import { normalizeCiRepairEvidence } from '../domain/ci-repair-evidence.js';
+import { ciRepairMessages } from './ci-repair-context-reader.js';
 import { taskInstructionMessages } from '../lib/task-execution-context.js';
 import { createConfiguredBrainRouter } from "./configured-workforce.js";
 
@@ -245,6 +247,7 @@ function normalizeDecisionInput(value) {
     typeof value === "object" &&
     Object.hasOwn(value, "sessionKey");
   const hasReviewRepairFeedback = value !== null && typeof value === "object" && Object.hasOwn(value, "reviewRepairFeedback");
+  const hasCiRepairEvidence = value !== null && typeof value === 'object' && Object.hasOwn(value, 'ciRepairEvidence');
   const hasInstructions = value !== null && typeof value === 'object' && Object.hasOwn(value,'instructions');
   const hasCodeReadContext = value !== null && typeof value === "object" && Object.hasOwn(value, "codeReadContext");
   const hasCodeExecutionContext = value !== null && typeof value === "object" && Object.hasOwn(value, "codeExecutionContext");
@@ -254,6 +257,7 @@ function normalizeDecisionInput(value) {
       "roleId",
       ...(hasSessionKey ? ["sessionKey"] : []),
       ...(hasReviewRepairFeedback ? ["reviewRepairFeedback"] : []),
+      ...(hasCiRepairEvidence ? ['ciRepairEvidence'] : []),
       ...(hasInstructions ? ['instructions'] : []),
       ...(hasCodeReadContext ? ["codeReadContext"] : []),
       ...(hasCodeExecutionContext ? ["codeExecutionContext"] : []),
@@ -267,6 +271,7 @@ function normalizeDecisionInput(value) {
   if (typeof input.roleId !== "string" || !SAFE_ROLE_ID.test(input.roleId)) {
     throw new TypeError("code brain roleId is invalid");
   }
+  if (hasCiRepairEvidence && (input.roleId !== 'developer' || hasReviewRepairFeedback)) throw new TypeError('CI repair evidence requires a developer CI task');
   if (!Number.isSafeInteger(input.turn) || input.turn < 1 || input.turn > 200) {
     throw new TypeError("code brain turn is invalid");
   }
@@ -282,6 +287,8 @@ function normalizeDecisionInput(value) {
     turn: input.turn,
     observations: normalizeObservations(input.observations),
   });
+  const ciRepairEvidence = hasCiRepairEvidence ? normalizeCiRepairEvidence(input.ciRepairEvidence) : undefined;
+  if (ciRepairEvidence && ciRepairEvidence.repository !== context.task.repository) throw new TypeError('CI repair repository does not match the task');
   return {
     roleId: input.roleId,
     context,
@@ -289,6 +296,7 @@ function normalizeDecisionInput(value) {
     ...(hasCodeReadContext ? { codeReadContext: input.codeReadContext } : {}),
     ...(hasCodeExecutionContext ? { codeExecutionContext: input.codeExecutionContext } : {}),
     ...(hasReviewRepairFeedback ? { reviewRepairFeedback: normalizeReviewRepairFeedbackContext(input.reviewRepairFeedback) } : {}),
+    ...(hasCiRepairEvidence ? { ciRepairEvidence } : {}),
     ...(hasSessionKey
       ? { sessionKey: normalizeSessionKey(input.sessionKey) }
       : {}),
@@ -400,7 +408,7 @@ export class CodeJobBrainDirectory {
 
   async decide(value, authorization) {
     this.#assertOpen();
-    const { roleId, context, sessionKey, reviewRepairFeedback, instructions, codeReadContext, codeExecutionContext } = normalizeDecisionInput(value);
+    const { roleId, context, sessionKey, reviewRepairFeedback, ciRepairEvidence, instructions, codeReadContext, codeExecutionContext } = normalizeDecisionInput(value);
     const { beforeGenerate, admitGenerate, signal } =
       requireDecisionAuthorization(authorization);
     if (!this.#taskBrains.has(roleId)) {
@@ -425,6 +433,7 @@ export class CodeJobBrainDirectory {
       { role: "system", content: systemPrompt(roleId, context.task.operation, codeReadContext !== undefined, codeExecutionContext !== undefined) },
       { role: "user", content: JSON.stringify(modelContext) },
       ...reviewRepairMessages(reviewRepairFeedback),
+      ...ciRepairMessages(ciRepairEvidence),
       ...taskInstructionMessages(instructions),
     ];
     const maximumAttempts = codeExecutionContext !== undefined || isSingleAttemptBrain(this.#router, brain) ? 1 : 2;

@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import { ownReviewFeedbackDigest } from "../adapters/github-own-review-feedback.js";
+import { normalizeCiRepairEvidence } from './ci-repair-evidence.js';
+import { canonicalJsonDigest } from '../lib/canonical-json-digest.js';
 
 const OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const DIGEST = /^[a-f0-9]{64}$/;
@@ -38,6 +40,13 @@ export function createOriginalRepairFeedbackSnapshot({ repository, number, conte
 }
 
 export function normalizeOriginalRepairFeedbackSnapshot(value) {
+  if (Object.getOwnPropertyDescriptor(value ?? {}, 'ciEvidence')) {
+    if (!exact(value, ['snapshotId', 'schemaVersion', 'repository', 'number', 'originalHeadRefOid', 'feedbackDigest', 'ciEvidence', 'provenance']) || value.schemaVersion !== 1) throw invalid();
+    const snapshot = createOriginalCiRepairFeedbackSnapshot({ repository: value.repository, number: value.number,
+      ciEvidence: value.ciEvidence, provenance: value.provenance });
+    if (snapshot.snapshotId !== value.snapshotId || snapshot.originalHeadRefOid !== value.originalHeadRefOid || snapshot.feedbackDigest !== value.feedbackDigest) throw invalid();
+    return snapshot;
+  }
   if (!exact(value, ["snapshotId", "schemaVersion", "repository", "number", "originalHeadRefOid", "feedbackDigest", "feedback", "contextualObservations", "provenance"]) ||
       value.schemaVersion !== 1 || !exact(value.feedback, ["changeRequests", "threads"]) || !Array.isArray(value.contextualObservations) || typeof value.snapshotId !== "string" || !SNAPSHOT_ID.test(value.snapshotId)) throw invalid();
   const observations = new Map(value.contextualObservations.map((entry) => [entry.id, entry]));
@@ -48,6 +57,16 @@ export function normalizeOriginalRepairFeedbackSnapshot(value) {
     provenance: value.provenance });
   if (snapshot.snapshotId !== value.snapshotId) throw invalid();
   return snapshot;
+}
+
+export function createOriginalCiRepairFeedbackSnapshot({ repository, number, ciEvidence: value, provenance }) {
+  const ciEvidence = normalizeCiRepairEvidence(value);
+  if (repository !== ciEvidence.repository || number !== ciEvidence.number ||
+      !exact(provenance, ['kind', 'observedHeadRefOid', 'observedAt']) || provenance.kind !== 'captured_before_ci_repair' ||
+      provenance.observedHeadRefOid !== ciEvidence.headRefOid || typeof provenance.observedAt !== 'string' || !Number.isFinite(Date.parse(provenance.observedAt))) throw invalid();
+  const content = { schemaVersion: 1, repository, number, originalHeadRefOid: ciEvidence.headRefOid,
+    feedbackDigest: ciEvidence.contentDigest, ciEvidence, provenance: structuredClone(provenance) };
+  return freeze({ snapshotId: `repair-feedback-snapshot-${canonicalJsonDigest(content)}`, ...content });
 }
 
 export function normalizeRepairFeedbackDescriptor(value) {

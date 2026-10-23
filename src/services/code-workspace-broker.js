@@ -22,6 +22,7 @@ import {
 } from "../domain/code-execution-policy.js";
 import {
   codeExecutionSourceWritablePaths,
+  isHeadRepairExecutionSource,
   normalizeCodeExecutionSource,
   sameCodeExecutionSource,
 } from "../domain/code-execution-source.js";
@@ -581,7 +582,7 @@ export class CodeWorkspaceBroker {
           hasExecutionSource,
         } = normalizeCreateExecutionRequest(request);
         const workspace = this.#workspace(workspaceId);
-        if (executionSource?.kind === "review_repair" &&
+        if (isHeadRepairExecutionSource(executionSource) &&
             JSON.stringify(codeExecutionSourceWritablePaths(executionSource)) !==
             JSON.stringify([...workspace.policy.writablePaths].sort((left, right) => left.localeCompare(right, "en")))) {
           throw new CodeExecutionError("INVALID_EXECUTION_REQUEST", "Review repair 写范围与工作区配置不一致");

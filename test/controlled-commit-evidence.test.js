@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
+import { ciRepairSource } from './support/ci-repair-fixture.js';
 
 import { createChangePackage } from "../src/domain/change-package-contract.js";
 import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
@@ -211,17 +212,19 @@ test("Windows controlled commit evidence preserves native test identity and bind
   assert.throws(() => normalizeControlledCommitEvidence(tampered), hasControlledEvidenceError);
 });
 
-test("review repair evidence binds actual changed files and one exact Head parent", () => {
-  const source = createReviewRepairCodeExecutionSource({ inputBinding: pullRequestBinding(gitTarget()), writablePaths: ["src", "test"] });
+for (const sourceKind of ['review_repair', 'ci_repair']) test(`${sourceKind} evidence binds actual changed files and one exact Head parent`, () => {
+  const binding = pullRequestBinding(gitTarget());
+  const source = sourceKind === 'ci_repair' ? ciRepairSource(binding, ['src', 'test'])
+    : createReviewRepairCodeExecutionSource({ inputBinding: binding, writablePaths: ["src", "test"] });
   const manifest = manifestFor(source, { modified: [{ path: "src/value.js", beforeSha256: "1".repeat(64), content: Buffer.from("fixed\n") }] });
   const finalTreeOid = oid("5");
   const commit = commitFor({ source, manifest, finalTreeOid, overrides: { parents: [source.inputBinding.headRefOid] } });
   const input = evidenceInput({ source, manifest, commit, resolution: { resolvedPaths: ["src/value.js"], finalTreeOid } });
   const evidence = createControlledCommitEvidence(input);
-  assert.equal(evidence.executionSource.kind, "review_repair");
+  assert.equal(evidence.executionSource.kind, sourceKind);
   assert.equal(Object.hasOwn(evidence.resolution, "preparationId"), false);
   assert.deepEqual(evidence.commit.parents, [source.inputBinding.headRefOid]);
-  assert.match(createControlledCommitMessage({ executionSource: source, manifest }), /controlled review repair/);
+  assert.match(createControlledCommitMessage({ executionSource: source, manifest }), sourceKind === 'ci_repair' ? /controlled CI repair/ : /controlled review repair/);
   assert.deepEqual(normalizeControlledCommitEvidence(evidence), evidence);
   for (const changed of [
     { ...input, commit: { ...commit, parents: [source.inputBinding.gitTarget.baseRefOid] } },

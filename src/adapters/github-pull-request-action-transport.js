@@ -1,4 +1,5 @@
 import path from "node:path";
+import { isHeadRepairExecutionSource } from "../domain/code-execution-source.js";
 import { currentPullRequestTargetArgs, githubCurrentPullRequestGitTarget, projectGitHubCurrentPullRequestTarget } from "./github-current-pull-request-target.js";
 import { types as utilTypes } from "node:util";
 
@@ -327,7 +328,7 @@ function normalizeAction(value, input) {
         binding,
       ) ||
       evidence.commit.parents[0] !== target.headRefOid ||
-      (evidence.executionSource.kind !== "review_repair" &&
+      (!isHeadRepairExecutionSource(evidence.executionSource) &&
         evidence.commit.parents[1] !== target.baseRefOid)
     ) {
       throw transportError("GITHUB_PROTOCOL_ERROR", "absent");

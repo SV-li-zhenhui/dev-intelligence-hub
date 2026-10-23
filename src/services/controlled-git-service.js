@@ -22,7 +22,7 @@ import {
   CodeExecutionPolicy,
   normalizeWorkspacePath,
 } from "../domain/code-execution-policy.js";
-import { normalizeCodeExecutionSource } from "../domain/code-execution-source.js";
+import { normalizeCodeExecutionSource, isHeadRepairExecutionSource } from "../domain/code-execution-source.js";
 import { normalizeChangePackageManifest } from "../domain/change-package-contract.js";
 import {
   createControlledCommitMessage,
@@ -1319,7 +1319,7 @@ function normalizeControlledCommitPublicationAction(value) {
       inputBinding,
     ) ||
     evidence.commit.parents[0] !== target.headRefOid ||
-    (evidence.executionSource.kind !== "review_repair" &&
+    (!isHeadRepairExecutionSource(evidence.executionSource) &&
       evidence.commit.parents[1] !== target.baseRefOid)
   ) {
     throw controlledGitError(
@@ -2153,7 +2153,7 @@ export class ControlledGitService {
         "--no-follow-tags",
         "--no-signed",
         "--recurse-submodules=no",
-        ...(finalSource.evidence.executionSource.kind === "review_repair"
+        ...(isHeadRepairExecutionSource(finalSource.evidence.executionSource)
           ? [] : [`--force-with-lease=${fullRefName}:${target.headRefOid}`]),
         "--",
         remoteUrl,
@@ -2201,7 +2201,7 @@ export class ControlledGitService {
     return Object.freeze({
       evidence: source.evidence,
       commitObjectDirectory: source.objectDirectory,
-      preparationObjectDirectory: preparation.kind === "review_repair" ? null : path.join(
+      preparationObjectDirectory: isHeadRepairExecutionSource(preparation) ? null : path.join(
         this.#preparationRoot,
         "preparations",
         preparation.preparationId,
@@ -2336,7 +2336,7 @@ export class ControlledGitService {
   }
 
   async #verifiedCommitPreparation(executionSource, manifest) {
-    if (executionSource.kind === "review_repair") {
+    if (isHeadRepairExecutionSource(executionSource)) {
       return this.#verifiedReviewRepairHead(executionSource, manifest);
     }
     const binding = executionSource.preparationBinding;
@@ -2421,7 +2421,7 @@ export class ControlledGitService {
     if (manifest.changes.created.some(({ path }) => byPath.has(path))) {
       throw controlledGitError("CONTROLLED_GIT_CHANGE_PACKAGE_MISMATCH", "Review repair 新建路径已存在于原 PR Head");
     }
-    return Object.freeze({ kind: "review_repair", headBoundary, baseBoundary: headBoundary,
+    return Object.freeze({ kind: executionSource.kind, headBoundary, baseBoundary: headBoundary,
       resultTreeOid, treeEntries, gitExecutable });
   }
 

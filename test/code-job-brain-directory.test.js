@@ -10,6 +10,7 @@ import { BrainRouter } from "../src/services/brain-router.js";
 import { createHash } from "node:crypto";
 import { createCodeReadContext, beginCodeReadSession, hasCompleteCodeRead } from "../src/lib/code-read-context.js";
 import { createCodeExecutionContext, beginCodeExecutionSession } from "../src/lib/code-execution-context.js";
+import { createCiRepairEvidence } from '../src/domain/ci-repair-evidence.js';
 
 function roleBrain(remoteData = {
   requirements: false,
@@ -95,6 +96,21 @@ function fakeRouter(responses = [decision()]) {
 function authorized(callback = async () => {}) {
   return { beforeGenerate: callback };
 }
+
+test('CI tasks receive their own bounded original failure evidence without requiring Review feedback', async () => {
+  const router = fakeRouter();
+  const directory = new CodeJobBrainDirectory({ roles: roleBrain(), brainRouter: router.port });
+  const evidence = createCiRepairEvidence({ schemaVersion: 1, repository: 'acme/widgets', number: 42, headRefOid: 'a'.repeat(40), headRefName: 'fix/ci',
+    checks: [{ kind: 'status_context', name: 'QuickTest', url: 'https://ci.example/job/QuickTest/1/', conclusion: 'FAILURE' }], diagnostics: [] });
+  await directory.decide(input({ ciRepairEvidence: evidence }), authorized());
+  const message = router.calls[0].messages.find(message => message.content.startsWith('Original CI failure evidence JSON'));
+  assert.ok(message);
+  assert.deepEqual(JSON.parse(message.content.slice(message.content.indexOf('\n') + 1)), evidence);
+  assert.match(message.content, /does not say the repaired Head passes remote CI/);
+  await assert.rejects(directory.decide(input({ roleId: 'tester', ciRepairEvidence: evidence }), authorized()));
+  const wrong = { ...evidence, repository: 'other/repo' };
+  await assert.rejects(directory.decide(input({ ciRepairEvidence: wrong }), authorized()));
+});
 
 test("continuous directory returns only final complete and leaves fresh readiness to the host", async () => {
   const execution = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {} });

@@ -3,6 +3,7 @@ import { types as utilTypes } from "node:util";
 
 import {
   codeExecutionSourceWritablePaths,
+  isHeadRepairExecutionSource,
   normalizeCodeExecutionSource,
 } from "./code-execution-source.js";
 import { digestValue } from "./code-executor-contract.js";
@@ -335,7 +336,7 @@ function normalizeManifest(value) {
 
 function assertManifestResolvesCompleteSource(manifest, executionSource) {
   const expectedPaths = codeExecutionSourceWritablePaths(executionSource);
-  if (executionSource.kind === "review_repair") {
+  if (isHeadRepairExecutionSource(executionSource)) {
     const policy = new CodeExecutionPolicy({ writablePaths: expectedPaths });
     const changed = [...manifest.changes.created, ...manifest.changes.modified,
       ...manifest.changes.deleted].map(({ path }) => policy.assertWritable(path));
@@ -401,7 +402,7 @@ function messageFromBindings({
   workspaceRevision,
 }) {
   return [
-    sourceKind === "review_repair"
+    sourceKind === "ci_repair" ? "MyDashboard controlled CI repair" : sourceKind === "review_repair"
       ? "MyDashboard controlled review repair"
       : "MyDashboard controlled conflict resolution",
     "",
@@ -589,7 +590,7 @@ function exactStringArray(value, expected, name) {
 }
 
 function normalizeResolution(value, executionSource) {
-  if (executionSource.kind === "review_repair") {
+  if (isHeadRepairExecutionSource(executionSource)) {
     const fields = exactObject(value, REVIEW_REPAIR_RESOLUTION_KEYS, "resolution");
     const policy = new CodeExecutionPolicy({ writablePaths: codeExecutionSourceWritablePaths(executionSource) });
     const resolvedPaths = denseArray(fields.get("resolvedPaths"), 10_000, "resolution.resolvedPaths", { minimum: 1 })
@@ -697,7 +698,7 @@ function normalizeCommit(value, {
   if (oidLength === undefined || target.headRefOid.length !== oidLength) {
     throw invalid("commit.objectFormat 与 Git target 不一致");
   }
-  const parentCount = executionSource.kind === "review_repair" ? 1 : 2;
+  const parentCount = isHeadRepairExecutionSource(executionSource) ? 1 : 2;
   const parents = denseArray(fields.get("parents"), parentCount, "commit.parents", {
     minimum: parentCount,
   }).map((parent, index) =>
@@ -833,7 +834,7 @@ export function createControlledCommitEvidence(value) {
     );
     const resolution = normalizeResolution(
       {
-        ...(bindings.executionSource.kind === "review_repair" ? {} : { preparationId:
+        ...(isHeadRepairExecutionSource(bindings.executionSource) ? {} : { preparationId:
           bindings.executionSource.preparationBinding.preparationId,
         resultTreeOid:
           bindings.executionSource.preparationBinding.resultTreeOid }),

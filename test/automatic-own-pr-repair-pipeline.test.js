@@ -4,6 +4,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { ciRepairSource } from './support/ci-repair-fixture.js';
+import { createCiRepairEvidence } from '../src/domain/ci-repair-evidence.js';
 
 import { createChangePackage } from "../src/domain/change-package-contract.js";
 import { CODE_JOB_ACTIONS_BY_OPERATION, codeJobIdForGrant, createCodeJobGrant } from "../src/domain/code-job-contract.js";
@@ -49,7 +51,7 @@ class MemoryStore {
   async write(key, value) { this.values.set(key, clone(value)); }
 }
 
-function codeProposal(binding, conflict = false, operation = "modify") {
+function codeProposal(binding, conflict = false, operation = "modify", ci = false, diagnostics = []) {
   return normalizeBoundWorkProposal({
     proposalId: "own-pr-repair-code-proposal", policyVersion: 7, kind: "code_action_proposal",
     requestedBy: { roleId: "developer", workItemId: binding.rootItemId },
@@ -59,7 +61,7 @@ function codeProposal(binding, conflict = false, operation = "modify") {
       subject: { id: binding.rootItemId, repository: binding.repository, number: binding.pullRequestNumber },
       repository: binding.repository, workspaceId: "repair-workspace", inputBinding: binding,
       ...(operation !== "modify" ? {} : { executionSource: conflict ? externalActionControlledCommit(binding).executionSource
-        : createReviewRepairCodeExecutionSource({ inputBinding: binding, writablePaths: ["src", "test"] }) }),
+        : ci ? ciRepairSource(binding, ['src', 'test'], diagnostics) : createReviewRepairCodeExecutionSource({ inputBinding: binding, writablePaths: ["src", "test"] }) }),
     },
     payload: {
       operation, objective: conflict ? "Resolve the current PR merge conflict and verify the result" : "Fix the reviewed race and add a regression test",
@@ -130,11 +132,12 @@ function controlledCommit(grant, overrides = {}) {
   });
 }
 
-async function fixture({ enabled = true, conflict = false, operation = "modify", objectSync = null, pushOutcome = "applied", store = new MemoryStore(), clock = () => new Date(CREATED_AT), codeJobControl, taskRuns, recoveryLedger = {}, conflictInspectionReader } = {}) {
+async function fixture({ enabled = true, conflict = false, ci = false, ciDiagnostics = () => [], operation = "modify", objectSync = null, pushOutcome = "applied", store = new MemoryStore(), clock = () => new Date(CREATED_AT), codeJobControl, taskRuns, recoveryLedger = {}, conflictInspectionReader } = {}) {
   const binding = pullRequestExternalActionBinding({
     gitTarget: { headRepository: "acme/repo", headRefName: "fix/review-feedback" },
   });
-  const proposal = codeProposal(binding, conflict, operation);
+  const proposal = codeProposal(binding, conflict, operation, ci, ciDiagnostics(binding));
+  let observedCiEvidence = ci ? clone(proposal.binding.executionSource.ciEvidence) : null;
   const grant = grantFor(proposal);
   const config = {
     trackedRepositories: [binding.repository],
@@ -144,7 +147,7 @@ async function fixture({ enabled = true, conflict = false, operation = "modify",
   };
   const item = { itemId: binding.rootItemId, event: {
     subject: { repository: binding.repository, number: binding.pullRequestNumber },
-    payload: { relation: "authored", nextAction: conflict ? "resolve_conflict" : "address_review",
+    payload: { relation: "authored", nextAction: conflict ? "resolve_conflict" : ci ? 'fix_ci' : "address_review", headRefOid: binding.headRefOid,
       mergeStateStatus: conflict ? "DIRTY" : "CLEAN", reviewFeedbackDigest: FEEDBACK_DIGEST },
   } };
   const facts = { state: "open", author: "runtime-user", headRefOid: binding.headRefOid,
@@ -239,7 +242,9 @@ async function fixture({ enabled = true, conflict = false, operation = "modify",
       objectSync,
       configurationReader: { async readActive() { return { configuration: config }; } }, store,
       ledger: { async readPullRequestExecutionContext() { return clone(context); }, async readItemForReconciliation() { return clone(item); }, ...recoveryLedger },
-      github: { async readOwnPullRequestFeedback() { return clone(facts); }, async readOwnPullRequestConflict() { return clone(facts); } }, confirmations: confirmationPort,
+      github: { async readOwnPullRequestFeedback() { return clone(facts); }, async readOwnPullRequestConflict() { return clone(facts); },
+        async readPullRequestLocalWorkFacts() { return clone(facts); } }, confirmations: confirmationPort,
+      ...(ci ? { ciRepairContextReader: { async read() { return { facts: clone(facts), ciEvidence: clone(observedCiEvidence) }; } } } : {}),
       codeJobReader: { async get(jobId) { return clone(jobs.get(jobId) ?? null); }, async getDetail({ jobId }) { return clone(details.get(jobId) ?? null); } },
       conflictInspectionReader,
       confirmationSettlementReader: { read: request => queue.readSettlement(request) },
@@ -287,6 +292,10 @@ async function fixture({ enabled = true, conflict = false, operation = "modify",
     interruptApproval(kind) { interruptApprovalKind = kind; },
     interruptRetry() { interruptPushRetry = true; },
     revokeGrant() { grantCurrent = false; },
+    changeCiDiagnostics(diagnostics) {
+      const { contentDigest, triggerDigest, ...material } = observedCiEvidence;
+      observedCiEvidence = createCiRepairEvidence({ ...material, diagnostics });
+    },
     loseReviewAcknowledgement() { loseReviewAcknowledgement = true; },
     pauseReviewDelivery(value = true) { deliveryPaused = value; },
     async restart() {
@@ -295,6 +304,91 @@ async function fixture({ enabled = true, conflict = false, operation = "modify",
     },
   };
 }
+
+test('CI failure repairs automatically publish a controlled commit and hand off immutable CI evidence once across restart', async () => {
+  const f = await fixture({ ci: true });
+  const prepared = await f.service.prepare({ item: f.item, inputBinding: f.binding,
+    intent: { type: 'propose_code_action', operation: 'modify' }, roleId: 'developer' });
+  assert.deepEqual(prepared, f.grant.executionSource);
+  await f.deliver();
+  assert.equal(f.codeJobApprovalCount, 1);
+  const repair = (await f.store.read(STATE_KEY)).repairs[0];
+  assert.equal(repair.sourceKind, 'ci_repair');
+  const archived = await f.store.read(originalRepairFeedbackArchiveKey(repair.feedbackSnapshotId));
+  assert.equal(archived.snapshot.ciEvidence.contentDigest, repair.feedbackDigest);
+  assert.equal(Object.hasOwn(archived.snapshot, 'feedback'), false);
+  const evidence = f.completeJob();
+  await f.restart(); await f.service.runCycle(); await f.service.runCycle();
+  assert.equal(f.pushes.length, 1);
+  assert.deepEqual(f.pushes[0].action.controlledCommitEvidence.commit.parents, [f.binding.headRefOid]);
+  const published = (await f.store.read(STATE_KEY)).published[0];
+  assert.equal(published.sourceKind, 'ci_repair');
+  assert.equal(published.reviewDelivery.status, 'completed');
+  assert.equal(published.reviewDelivery.request.internalReview.kind, 'own_pr_ci_repair');
+  assert.equal(published.reviewDelivery.request.internalReview.headRefOid, evidence.commit.oid);
+  assert.match(published.reviewDelivery.request.description, /不表示新 Head 的 CI 已通过/);
+  assert.equal(published.reviewDelivery.roleId, 'pr-engineer');
+  await f.restart(); await f.service.runCycle();
+  assert.equal(f.pushes.length, 1);
+  assert.equal(await f.service.shouldRun(f.item), false);
+});
+
+for (const change of ['head', 'base', 'author', 'disabled', 'grant']) test(`CI publication stops after ${change} authority changes`, async () => {
+  const f = await fixture({ ci: true }); await f.deliver(); f.completeJob();
+  if (change === 'head') f.facts.headRefOid = '9'.repeat(40);
+  if (change === 'base') f.facts.baseRefOid = '9'.repeat(40);
+  if (change === 'author') f.facts.author = 'other';
+  if (change === 'disabled') f.config.githubActions.automaticOwnPrRepair = false;
+  if (change === 'grant') f.revokeGrant();
+  assert.equal((await f.service.runCycle()).stale, 1);
+  assert.equal(f.pushes.length, 0);
+});
+
+test('unknown CI push outcomes stay fenced across restart instead of publishing a second commit', async () => {
+  const f = await fixture({ ci: true, pushOutcome: 'unknown' });
+  await f.deliver(); f.completeJob(); await f.service.runCycle();
+  await f.restart(); await f.service.runCycle(); await f.service.runCycle();
+  assert.equal(f.pushes.length, 1);
+  assert.equal((await f.store.read(STATE_KEY)).repairs[0].status, 'pushing');
+  assert.equal(await f.service.shouldRun(f.item), false);
+});
+
+test('a retired ledger binding invalidates an unadmitted CI push instead of leaving a manual confirmation', async () => {
+  const f = await fixture({ ci: true }); await f.deliver(); f.completeJob();
+  f.interruptApproval('github.pull-request-push');
+  assert.equal((await f.service.runCycle()).failed, 1);
+  const record = (await f.store.read(STATE_KEY)).repairs[0];
+  assert.equal((await f.queue.get(record.pushConfirmationId)).status, 'pending');
+  f.service.ledger.readPullRequestExecutionContext = async () => {
+    throw Object.assign(new Error('source retired'), { code: 'WORK_LEDGER_PR_EXECUTION_BINDING_STALE' });
+  };
+  assert.equal((await f.service.runCycle()).stale, 1);
+  assert.equal((await f.queue.get(record.pushConfirmationId)).status, 'stale');
+  assert.equal(f.pushes.length, 0);
+  await f.restart(); await f.service.runCycle();
+  assert.equal((await f.store.read(STATE_KEY)).repairs[0].status, 'stale');
+});
+
+for (const phase of ['approval', 'publication']) test(`optional Jenkins outage at CI ${phase} preserves trigger authority and the original sealed diagnosis`, async () => {
+  const f = await fixture({ ci: true, ciDiagnostics: binding => [{ check: 'QuickTest', schemaVersion: 1,
+    repository: binding.repository, headRefOid: binding.headRefOid, buildUrl: 'https://ci.example/job/QuickTest/12/', buildNumber: 12,
+    state: 'available', result: 'FAILURE', untrustedEvidence: true,
+    checkout: { matched: true, sha: binding.headRefOid, branch: binding.gitTarget.headRefName },
+    failures: [{ name: 'CodeTest.Original', text: 'Original immutable CI defect', truncated: false }] }] });
+  const original = clone(f.grant.executionSource.ciEvidence);
+  const unavailable = [{ check: 'QuickTest', state: 'unavailable', code: 'JENKINS_AUTH_REQUIRED' }];
+  if (phase === 'approval') f.changeCiDiagnostics(unavailable);
+  await f.deliver(); f.completeJob();
+  if (phase === 'publication') f.changeCiDiagnostics(unavailable);
+  await f.restart(); await f.service.runCycle(); await f.service.runCycle();
+  assert.equal(f.pushes.length, 1);
+  const published = (await f.store.read(STATE_KEY)).published[0];
+  assert.equal(published.feedbackDigest, original.contentDigest);
+  assert.equal(published.ciTriggerDigest, original.triggerDigest);
+  const archive = await f.store.read(originalRepairFeedbackArchiveKey(published.feedbackSnapshotId));
+  assert.deepEqual(archive.snapshot.ciEvidence, original);
+  assert.equal(published.reviewDelivery.status, 'completed');
+});
 
 for (const kind of ["dispatch-stale", "authority-fenced", "proposal-before-confirmation"]) {
   for (const variant of ["recover", "disabled", "head-drift", "paused", "source-mismatch", "preparation-failed", "concurrent-change", "later-ledger-change", "budget-exhausted",

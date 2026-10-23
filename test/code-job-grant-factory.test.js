@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { ciRepairSource } from './support/ci-repair-fixture.js';
 import {
   createCodeJobGrant,
   normalizeCodeJobGrant,
@@ -270,20 +271,22 @@ test("ordinary modify grants verify with mixed-case configured paths and still r
   await assert.rejects(async () => changedFactory.verify(grant), { code: "INVALID_CODE_JOB_AUTHORITY" });
 });
 
-test("review repair grant uses live Head authority and exact configured paths without conflict evidence", async () => {
+for (const sourceKind of ['review_repair', 'ci_repair']) test(`${sourceKind} grant uses live Head authority and exact configured paths without conflict evidence`, async () => {
   const { contentDigest: _contentDigest, ...current } = proposal();
+  const sourceFor = paths => sourceKind === 'ci_repair' ? ciRepairSource(current.binding.inputBinding, paths)
+    : createReviewRepairCodeExecutionSource({ inputBinding: current.binding.inputBinding, writablePaths: paths });
   const bound = normalizeBoundWorkProposal({ ...current, binding: { ...current.binding,
-    executionSource: createReviewRepairCodeExecutionSource({ inputBinding: current.binding.inputBinding, writablePaths: ["src", "test"] }),
+    executionSource: sourceFor(['src', 'test']),
   } });
   const grantFactory = factory();
   const { grant } = await grantFactory.create(bound);
   assert.equal(grant.schemaVersion, 3);
-  assert.equal(grant.executionSource.kind, "review_repair");
+  assert.equal(grant.executionSource.kind, sourceKind);
   assert.deepEqual(grant.writablePaths, ["src", "test"]);
   assert.deepEqual(await grantFactory.verify(grant), grant);
   await assert.rejects(async () => factory({ inputAuthorityVerifier: { verify: (binding) => ({ ...binding, inputRevision: 2 }) } }).create(bound));
   const changed = normalizeBoundWorkProposal({ ...current, binding: { ...current.binding,
-    executionSource: createReviewRepairCodeExecutionSource({ inputBinding: current.binding.inputBinding, writablePaths: ["src"] }),
+    executionSource: sourceFor(['src']),
   } });
   assert.throws(() => grantFactory.create(changed), /写范围/);
 });

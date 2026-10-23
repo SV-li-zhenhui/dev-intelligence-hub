@@ -1,4 +1,5 @@
 import { types as utilTypes } from "node:util";
+import { isHeadRepairExecutionSource } from "../domain/code-execution-source.js";
 
 import { normalizeConfirmationReceipt } from "../domain/confirmation-contract.js";
 import {
@@ -668,7 +669,7 @@ class PullRequestExternalActionExecutor {
     }
     if (!this.#isEnabled(envelope)) {
       if (envelope.action.type === "pull_request_push" &&
-          envelope.action.controlledCommitEvidence.executionSource.kind === "review_repair") {
+          isHeadRepairExecutionSource(envelope.action.controlledCommitEvidence.executionSource)) {
         return errorResult(new PullRequestExternalActionTransportError("GITHUB_OUTCOME_UNKNOWN", "unknown"));
       }
       return { status: "stale" };
@@ -690,7 +691,7 @@ class PullRequestExternalActionExecutor {
           // Revoked permission cannot establish that an admitted push never happened.
           // Retain the recovery fence when the remote no longer shows its commit.
           if (envelope.action.type === "pull_request_push" &&
-              (this.#pushAuthorization !== null || envelope.action.controlledCommitEvidence.executionSource.kind === "review_repair")) {
+              (this.#pushAuthorization !== null || isHeadRepairExecutionSource(envelope.action.controlledCommitEvidence.executionSource))) {
             return errorResult(new PullRequestExternalActionTransportError(
               "GITHUB_OUTCOME_UNKNOWN", "unknown",
             ));

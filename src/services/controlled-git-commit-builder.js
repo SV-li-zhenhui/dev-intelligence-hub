@@ -13,6 +13,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
+import { isHeadRepairExecutionSource } from "../domain/code-execution-source.js";
 
 import { normalizeChangePackageManifest } from "../domain/change-package-contract.js";
 import {
@@ -370,7 +371,7 @@ export class ControlledGitCommitBuilder {
       ...environment, GIT_ALTERNATE_OBJECT_DIRECTORIES: seedObjectDirectory,
     } };
     const target = executionSource.inputBinding.gitTarget;
-    const parents = executionSource.kind === "review_repair"
+    const parents = isHeadRepairExecutionSource(executionSource)
       ? [target.headRefOid] : [target.headRefOid, target.baseRefOid];
     const treeRecords = await this.#git.listTrees({ ...context, treeOid: preparation.resultTreeOid });
     const treeOids = treeRecords.toString("utf8").split("\0").filter(Boolean).map(record => {
@@ -445,7 +446,7 @@ export class ControlledGitCommitBuilder {
         executionSource,
         manifest,
         resolution: {
-          resolvedPaths: executionSource.kind === "review_repair"
+          resolvedPaths: isHeadRepairExecutionSource(executionSource)
             ? [...manifest.changes.created, ...manifest.changes.modified, ...manifest.changes.deleted]
               .map(({ path }) => path).sort()
             : [...executionSource.writeScope.paths],
@@ -479,7 +480,7 @@ export class ControlledGitCommitBuilder {
   }
 
   #environment({ objectDirectory, indexFile, preparation, createdAt }) {
-    const preparationObjects = preparation.kind === "review_repair" ? null : path.join(
+    const preparationObjects = isHeadRepairExecutionSource(preparation) ? null : path.join(
       this.#preparationRoot,
       "preparations",
       preparation.preparationId,

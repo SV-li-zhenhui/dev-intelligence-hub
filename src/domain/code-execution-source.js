@@ -7,6 +7,7 @@ import {
 } from "./conflict-preparation-binding.js";
 import { normalizePullRequestExecutionBinding } from "./pull-request-execution-binding.js";
 import { CodeExecutionPolicy, normalizeWorkspacePath } from "./code-execution-policy.js";
+import { normalizeCiRepairEvidence } from "./ci-repair-evidence.js";
 
 const SOURCE_KEYS = Object.freeze([
   "schemaVersion",
@@ -18,6 +19,12 @@ const SOURCE_KEYS = Object.freeze([
 const REVIEW_REPAIR_KEYS = Object.freeze([
   "schemaVersion", "kind", "inputBinding", "writeScope",
 ]);
+const CI_REPAIR_KEYS = Object.freeze([...REVIEW_REPAIR_KEYS, "ciEvidence"]);
+
+export function isHeadRepairExecutionSource(value) {
+  if (!value || typeof value !== 'object' || utilTypes.isProxy(value)) return false;
+  return ['review_repair', 'ci_repair'].includes(Object.getOwnPropertyDescriptor(value, 'kind')?.value);
+}
 const WRITE_SCOPE_KEYS = Object.freeze(["mode", "paths"]);
 const MAX_EXECUTION_PATH_BYTES = 512;
 const MAX_EXECUTION_SEGMENT_BYTES = 255;
@@ -125,10 +132,10 @@ function normalizeReviewPaths(value, error) {
 
 function normalize(value, error) {
   const kind = new Map(dataEntries(value, error)).get("kind");
-  const source = exact(value, kind === "review_repair" ? REVIEW_REPAIR_KEYS : SOURCE_KEYS, error);
+  const source = exact(value, kind === "ci_repair" ? CI_REPAIR_KEYS : kind === "review_repair" ? REVIEW_REPAIR_KEYS : SOURCE_KEYS, error);
   if (
     source.get("schemaVersion") !== 1 ||
-    !["conflict_preparation", "review_repair"].includes(kind)
+    !["conflict_preparation", "review_repair", "ci_repair"].includes(kind)
   ) {
     throw error;
   }
@@ -138,13 +145,17 @@ function normalize(value, error) {
     error,
   );
   if (inputBinding.schemaVersion !== 2) throw error;
-  if (kind === "review_repair") {
+  if (isHeadRepairExecutionSource(value)) {
     const scope = exact(source.get("writeScope"), WRITE_SCOPE_KEYS, error);
     if (scope.get("mode") !== "configured_paths") throw error;
+    const ciEvidence = kind === 'ci_repair' ? normalizeCiRepairEvidence(source.get('ciEvidence')) : null;
+    if (ciEvidence && (ciEvidence.repository !== inputBinding.repository || ciEvidence.number !== inputBinding.pullRequestNumber ||
+        ciEvidence.headRefOid !== inputBinding.headRefOid || ciEvidence.headRefName !== inputBinding.gitTarget.headRefName)) throw error;
     return {
       schemaVersion: 1,
       kind,
       inputBinding,
+      ...(ciEvidence === null ? {} : { ciEvidence }),
       writeScope: { mode: "configured_paths", paths: normalizeReviewPaths(scope.get("paths"), error) },
     };
   }
@@ -205,6 +216,13 @@ export function createReviewRepairCodeExecutionSource(value) {
     inputBinding: fields.get("inputBinding"),
     writeScope: { mode: "configured_paths", paths: fields.get("writablePaths") },
   }, error);
+}
+
+export function createCiRepairCodeExecutionSource(value) {
+  const error = invalid();
+  const fields = exact(value, ["inputBinding", "writablePaths", "ciEvidence"], error);
+  return normalizeCodeExecutionSource({ schemaVersion: 1, kind: "ci_repair", inputBinding: fields.get("inputBinding"),
+    ciEvidence: fields.get("ciEvidence"), writeScope: { mode: "configured_paths", paths: fields.get("writablePaths") } }, error);
 }
 
 export function normalizeCodeExecutionSource(

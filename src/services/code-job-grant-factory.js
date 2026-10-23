@@ -8,6 +8,7 @@ import {
 import { digestValue } from "../domain/code-executor-contract.js";
 import {
   codeExecutionSourceWritablePaths,
+  isHeadRepairExecutionSource,
   normalizeCodeExecutionSource,
   sameCodeExecutionSource,
 } from "../domain/code-execution-source.js";
@@ -503,7 +504,7 @@ function writablePathsForGrant(operation, executionSource, workspace) {
   if (operation !== "modify") {
     throw invalid("Conflict preparation 只能授权 modify 代码任务");
   }
-  if (executionSource.kind === "review_repair" &&
+  if (isHeadRepairExecutionSource(executionSource) &&
       digestValue(codeExecutionSourceWritablePaths(executionSource)) !==
       digestValue([...workspace.writablePaths].sort((left, right) => left.localeCompare(right, "en")))) {
     throw invalid("Review repair 写范围必须与当前工作区配置一致");
@@ -834,7 +835,7 @@ export class CodeJobGrantFactory {
     ) {
       throw invalid("Conflict preparation 与当前 PR Head 不匹配");
     }
-    if (normalized.kind === "review_repair") {
+    if (isHeadRepairExecutionSource(normalized)) {
       if (!workspace.capabilities.includes("git_head_snapshot")) {
         throw invalid("Review repair 工作区缺少固定 Head 快照能力");
       }

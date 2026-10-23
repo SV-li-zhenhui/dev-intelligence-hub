@@ -13,6 +13,7 @@ import {
 } from "../domain/code-job-change-package-event.js";
 import { packCodeJobBrainContext } from "./code-job-context-packer.js";
 import { normalizeReviewRepairFeedbackContext } from "./review-repair-context-reader.js";
+import { normalizeCiRepairEvidence } from '../domain/ci-repair-evidence.js';
 import { githubEntitySessionKey } from "../lib/session-key.js";
 import {
   assertSessionBinding,
@@ -686,6 +687,7 @@ export class CodeJobWorkerService {
     const brainContext = this.#brainContext(job, remainingProfiles);
     const codeReadContext = await this.#codeReadContext(job);
     const reviewRepairFeedback = await this.#readReviewRepairFeedback(job);
+    const ciRepairEvidence = executionSourceForJob(job)?.kind === 'ci_repair' ? normalizeCiRepairEvidence(executionSourceForJob(job).ciEvidence) : null;
     const sessionKey = Number.isSafeInteger(job.grant.subject?.number) &&
         job.grant.subject.number > 0
       ? githubEntitySessionKey({
@@ -702,6 +704,7 @@ export class CodeJobWorkerService {
         ...(codeReadContext === null ? {} : { codeReadContext }),
         ...(instructions === undefined ? {} : {instructions}),
         ...(reviewRepairFeedback === null ? {} : { reviewRepairFeedback }),
+        ...(ciRepairEvidence === null ? {} : { ciRepairEvidence }),
       },
       {
         beforeGenerate: () => this.#verifyAuthority(job.grant),
@@ -1009,7 +1012,8 @@ export class CodeJobWorkerService {
         const decision = await this.#brain.decide({ roleId: initial.grant.requestedBy.roleId,
           ...state.context, codeExecutionContext: capability,
           ...(sessionKey === null ? {} : { sessionKey }), ...(instructions === undefined ? {} : { instructions }),
-          ...(feedback === null ? {} : { reviewRepairFeedback: feedback }) },
+          ...(feedback === null ? {} : { reviewRepairFeedback: feedback }),
+          ...(executionSourceForJob(initial)?.kind === 'ci_repair' ? { ciRepairEvidence: normalizeCiRepairEvidence(executionSourceForJob(initial).ciEvidence) } : {}) },
         { beforeGenerate: () => this.#verifyAuthority(initial.grant), brainDigest: initial.grant.brainDigest, signal: controller.signal });
         await closeCodeExecutionContext(capability);
         if (fatal) throw fatal;

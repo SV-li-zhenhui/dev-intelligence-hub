@@ -39,6 +39,8 @@ export function retryOwnPrPush(confirmations, item, retry) {
 
 export function repairCommitMatchesJob({ evidence, receipt, record, grant, sourceKind, requireProfiles = false }) {
   return evidence.evidenceDigest === receipt.evidenceDigest && evidence.commit.oid === receipt.commitOid &&
+    (sourceKind !== 'ci_repair' || (record.feedbackDigest === grant.executionSource?.ciEvidence?.contentDigest &&
+      record.ciTriggerDigest === grant.executionSource.ciEvidence.triggerDigest)) &&
     evidence.package.job.id === record.jobId && evidence.executionSource.kind === sourceKind &&
     codeJobIdForGrant(grant) === record.jobId && evidence.package.grant.digest === grant.grantDigest &&
     evidence.package.proposal.id === grant.proposalId && evidence.package.proposal.contentDigest === grant.contentDigest &&

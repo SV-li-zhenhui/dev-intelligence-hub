@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createCiRepairEvidence } from '../src/domain/ci-repair-evidence.js';
 
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import {
@@ -10,6 +11,31 @@ import {
   normalizeCodeExecutionSource,
   sameCodeExecutionSource,
 } from "../src/domain/code-execution-source.js";
+
+test("CI repair keeps its own failed-check provenance on a fixed Head without inventing Review feedback", () => {
+  const binding = inputBinding();
+  const material = { schemaVersion: 1, repository: binding.repository, number: binding.pullRequestNumber,
+    headRefOid: binding.headRefOid, headRefName: binding.gitTarget.headRefName,
+    checks: [{ kind: 'status_context', name: 'QuickTest', url: 'https://ci.example/job/QuickTest/12/', conclusion: 'FAILURE' }], diagnostics: [] };
+  const source = { schemaVersion: 1, kind: 'ci_repair', inputBinding: binding,
+    ciEvidence: createCiRepairEvidence(material),
+    writeScope: { mode: 'configured_paths', paths: ['src', 'test'] } };
+  const normalized = normalizeCodeExecutionSource(source);
+  assert.equal(normalized.kind, 'ci_repair');
+  assert.deepEqual(normalized.ciEvidence, source.ciEvidence);
+  assert.equal(Object.hasOwn(normalized, 'reviewFeedbackDigest'), false);
+  assert.equal(Object.hasOwn(normalized, 'preparationBinding'), false);
+  assert.equal(codeExecutionSourceAllowsWrite(normalized, 'src/fix.cpp'), true);
+  assert.equal(codeExecutionSourceAllowsWrite(normalized, 'unrelated/file.cpp'), false);
+  for (const field of ['repository', 'headRefOid', 'headRefName', 'number']) {
+    const changed = structuredClone(source);
+    changed.ciEvidence[field] = field === 'number' ? 43 : field === 'headRefOid' ? 'e'.repeat(40) : field === 'repository' ? 'other/repo' : 'other';
+    const { contentDigest, triggerDigest, ...body } = changed.ciEvidence;
+    changed.ciEvidence = createCiRepairEvidence(body);
+    assert.throws(() => normalizeCodeExecutionSource(changed));
+  }
+  assert.throws(() => normalizeCodeExecutionSource({ ...source, kind: 'review_repair' }));
+});
 
 test("review repair binds the exact PR input and configured prefixes without conflict provenance", () => {
   const source = createReviewRepairCodeExecutionSource({ inputBinding: inputBinding(), writablePaths: ["src", "test"] });

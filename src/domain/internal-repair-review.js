@@ -10,7 +10,7 @@ export function normalizeInternalReviewMetadata(value) {
       Reflect.ownKeys(value).length !== FIELDS.length ||
       !FIELDS.every((field) => Object.getOwnPropertyDescriptor(value, field)?.enumerable &&
         Object.hasOwn(Object.getOwnPropertyDescriptor(value, field), "value")) ||
-      value.kind !== "own_pr_repair" || typeof value.headRefOid !== "string" || !OID.test(value.headRefOid) ||
+      !["own_pr_repair", "own_pr_ci_repair"].includes(value.kind) || typeof value.headRefOid !== "string" || !OID.test(value.headRefOid) ||
       typeof value.feedbackDigest !== "string" || !DIGEST.test(value.feedbackDigest) ||
       !reference(value.publicationConfirmationId) || !reference(value.controlledCommitEvidenceId)) {
     throw Object.assign(new Error("内部修复复审来源绑定无效"), { code: "INTERNAL_REVIEW_METADATA_INVALID" });

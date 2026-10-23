@@ -5,6 +5,7 @@ import {
 import { codeJobTerminalLifecycleAt } from "./code-job-terminal-time.js";
 import {
   codeExecutionSourceWritablePaths,
+  isHeadRepairExecutionSource,
   normalizeCodeExecutionSource,
 } from "./code-execution-source.js";
 import { digestValue } from "./code-executor-contract.js";
@@ -349,7 +350,7 @@ function executionSourceSummary(value) {
   const writablePaths = codeExecutionSourceWritablePaths(source).sort((left, right) => left.localeCompare(right, "en"));
   return {
     kind: source.kind,
-    ...(source.kind === "review_repair" ? { sourceDigest: safeDigest(source) } : {
+    ...(isHeadRepairExecutionSource(source) ? { sourceDigest: safeDigest(source) } : {
     preparationId: binding.preparationId,
     resultTreeOid: binding.resultTreeOid,
     boundaryDigest: binding.boundaryDigest,
@@ -414,8 +415,8 @@ function memoryEvidence(snapshot) {
   }
   if (snapshot.executionSource !== undefined) {
     values.push(
-      snapshot.executionSource.kind === "review_repair"
-        ? `review-repair:${snapshot.executionSource.sourceDigest}`
+      isHeadRepairExecutionSource(snapshot.executionSource)
+        ? `${snapshot.executionSource.kind === 'ci_repair' ? 'ci-repair' : 'review-repair'}:${snapshot.executionSource.sourceDigest}`
         : `conflict-preparation:${snapshot.executionSource.preparationId}`,
     );
   }
@@ -431,7 +432,7 @@ function memoryEvidence(snapshot) {
   }
   if (snapshot.executionSource !== undefined) {
     values.push(...snapshot.executionSource.writablePathSamples.map(
-      (relativePath) => `${snapshot.executionSource.kind === "review_repair" ? "review-repair-path" : "conflict-path"}:${relativePath}`,
+      (relativePath) => `${isHeadRepairExecutionSource(snapshot.executionSource) ? (snapshot.executionSource.kind === 'ci_repair' ? 'ci-repair-path' : 'review-repair-path') : "conflict-path"}:${relativePath}`,
     ));
   }
   return [...new Set(values)].slice(0, 20);
@@ -459,7 +460,7 @@ function memoryRecordFromSnapshot(event, snapshot) {
       snapshot.operation,
       ...(snapshot.executionSource === undefined
         ? []
-        : [snapshot.executionSource.kind === "review_repair" ? "review-repair" : "conflict-preparation"]),
+        : [isHeadRepairExecutionSource(snapshot.executionSource) ? (snapshot.executionSource.kind === 'ci_repair' ? 'ci-repair' : 'review-repair') : "conflict-preparation"]),
     ])],
     sourceUrl: null,
     subjectNumber: snapshot.subjectNumber,
@@ -659,7 +660,7 @@ function normalizeTerminalSummary(value) {
 }
 
 function normalizeExecutionSourceSummary(value) {
-  const reviewRepair = dataFieldsOrNull(value)?.get("kind") === "review_repair";
+  const reviewRepair = ['review_repair', 'ci_repair'].includes(dataFieldsOrNull(value)?.get("kind"));
   const fields = exact(
     value,
     [
@@ -678,7 +679,7 @@ function normalizeExecutionSourceSummary(value) {
     ],
     "executionSource",
   );
-  if (!["conflict_preparation", "review_repair"].includes(fields.get("kind"))) {
+  if (!["conflict_preparation", "review_repair", "ci_repair"].includes(fields.get("kind"))) {
     throw invalid("executionSource.kind 无效");
   }
   const resultTreeOid = reviewRepair ? null : text(

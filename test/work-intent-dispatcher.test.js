@@ -2190,6 +2190,18 @@ test("own review repair binds its trusted source once and resumes the persisted 
   assert.equal(proposals.calls[0].binding.executionSource.kind, "review_repair");
 });
 
+for (const code of ['OWN_PR_CI_SOURCE_NOT_READY', 'CODE_CI_REPAIR_CONTEXT_UNAVAILABLE']) test(`CI source ${code} retries without submitting an ordinary unpublishable proposal`, async () => {
+  const pair = conflictWorkPair(6, codeIntent(), { mergeStateStatus: 'CLEAN', relation: 'authored', nextAction: 'fix_ci' });
+  const { dispatcher, proposals, ledger } = fixture([pair], {
+    reviewRepairSourcePreparer: { async prepare() { throw Object.assign(new Error('CI evidence not ready'), { code }); } },
+  });
+  const result = await dispatcher.dispatchPending();
+  assert.equal(result.retryWait, 1);
+  assert.equal(proposals.calls.length, 0);
+  assert.equal(ledger.ackCalls[0].details.code, 'ci-source-unavailable');
+  assert.equal(ledger.items[0].status, 'retry_wait');
+});
+
 test("upgrade recovery blocks a persisted conflict proposal without a sealed source", async () => {
   const pair = conflictWorkPair(15);
   const trustedPolicy = policy();

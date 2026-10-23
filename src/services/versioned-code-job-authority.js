@@ -5,7 +5,7 @@ import {
 import {
   normalizeConfigurationDocument,
 } from "../domain/configuration-contract.js";
-import { codeExecutionSourceWritablePaths } from "../domain/code-execution-source.js";
+import { codeExecutionSourceWritablePaths, isHeadRepairExecutionSource } from "../domain/code-execution-source.js";
 import { CodeExecutionPolicy } from "../domain/code-execution-policy.js";
 import { workProposalError } from "../domain/work-proposal-contract.js";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
@@ -169,12 +169,12 @@ function globalExecutorAuthority(configuration) {
 
 function conflictPreparationAuthority(configuration, executionSource) {
   if (executionSource === null) return null;
-  if (executionSource.kind === "review_repair") {
+  if (isHeadRepairExecutionSource(executionSource)) {
     const headRepository = executionSource.inputBinding.gitTarget.headRepository.toLowerCase();
     const headMirror = Object.entries(configuration.codeExecutor.conflictPreparation?.headMirrorsByRepository ?? {})
       .find(([repository]) => repository.toLowerCase() === headRepository)?.[1] ?? null;
     return {
-      kind: "review_repair",
+      kind: executionSource.kind,
       enabled: configuration.githubActions?.automaticOwnPrRepair === true,
       gitCommand: configuration.codeExecutor.gitCommand ?? null,
       headRepository,
@@ -264,7 +264,7 @@ function grantAuthorityDigest(authority, scope, brainBindingSchema) {
 
 export function codeJobAuthorityScopeCacheIdentity(scope) {
   const executionSource = scope.executionSource;
-  const gitTarget = executionSource?.kind === "review_repair"
+  const gitTarget = isHeadRepairExecutionSource(executionSource)
     ? executionSource.inputBinding.gitTarget
     : executionSource?.preparationBinding?.gitTarget;
   return {
@@ -273,7 +273,7 @@ export function codeJobAuthorityScopeCacheIdentity(scope) {
       executionSource === null || executionSource === undefined
         ? null
         : {
-            ...(executionSource.kind === "review_repair" ? { kind: "review_repair" } : {}),
+            ...(isHeadRepairExecutionSource(executionSource) ? { kind: executionSource.kind } : {}),
             baseRepository: gitTarget.baseRepository.toLowerCase(),
             headRepository: gitTarget.headRepository.toLowerCase(),
           },
@@ -641,9 +641,9 @@ function configurationAdmitsGrant(configuration, grant, executorAuthority) {
   if (grant.schemaVersion === 3) {
     if (
       grant.operation !== "modify" ||
-      !workspace.capabilities?.includes(grant.executionSource.kind === "review_repair"
+      !workspace.capabilities?.includes(isHeadRepairExecutionSource(grant.executionSource)
         ? "git_head_snapshot" : "conflict_preparation_snapshot") ||
-      (grant.executionSource.kind === "review_repair" &&
+      (isHeadRepairExecutionSource(grant.executionSource) &&
         (configuration.githubActions?.automaticOwnPrRepair !== true ||
           canonicalJsonDigest(expectedWritablePaths) !== canonicalJsonDigest([...workspace.writablePaths].sort((left, right) => left.localeCompare(right, "en")))))
     ) {
@@ -1014,7 +1014,7 @@ export class VersionedCodeJobAuthority {
         );
         if (
           !conflict.enabled ||
-          (scope.executionSource.kind !== "review_repair" && conflict.baseMirror === null) ||
+          (!isHeadRepairExecutionSource(scope.executionSource) && conflict.baseMirror === null) ||
           conflict.headMirror === null
         ) {
           throw invalid("Conflict preparation 的仓库镜像授权未配置");

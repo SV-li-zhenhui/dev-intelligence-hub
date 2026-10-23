@@ -4401,12 +4401,15 @@ test("automatic own PR repair composes internal push with ownership guards and c
         ...repairEnvelope, id: "ordinary-conflict-push",
         action: { controlledCommitEvidence: { executionSource: { kind: "conflict_preparation" } } },
       };
+      const ciEnvelope = { ...repairEnvelope, id: 'unowned-ci-push',
+        action: { controlledCommitEvidence: { executionSource: { kind: 'ci_repair', inputBinding: {} } } } };
       const base = defaultCodeJobApplicationOptions({
         config, calls, closeCalls, versioned: true,
         lifecycle: createApplicationRuntimeLifecycle(),
         confirmationRuntimeFactory: async (_config, dependencies) => {
           calls.confirmation = dependencies;
           assert.throws(() => calls.externalExecutor.pushAuthorization.verifyPush(repairEnvelope), { code: "GITHUB_AUTHORIZATION_UNAVAILABLE" });
+          assert.throws(() => calls.externalExecutor.pushAuthorization.verifyPush(ciEnvelope), { code: 'GITHUB_AUTHORIZATION_UNAVAILABLE' });
           return {
             reviewHandoffAssignee: { async assignAssignee() { throw new Error("No live assignment in composition test"); } },
             queue: confirmationQueuePort(), producerQueue: confirmationProducerPort(),
@@ -4538,6 +4541,8 @@ test("automatic own PR repair composes internal push with ownership guards and c
         }
         const { AutomaticLocalCodeAuthorization } = await import('../src/services/automatic-local-code-authorization.js');
         assert.ok(calls.codeRunner.automaticOwnPrRepair instanceof AutomaticLocalCodeAuthorization);
+        const { CiRepairContextReader } = await import('../src/services/ci-repair-context-reader.js');
+        assert.ok(calls.codeRunner.automaticOwnPrRepair.specialized.ciRepairContextReader instanceof CiRepairContextReader);
         assert.deepEqual(await application.reviewHandoffReconciler.runCycle(), [{ assigned: 0, already: 0, pending: 0 }]);
         assert.equal(application.prEmployee.config.automaticOwnPrRepair, true);
         assert.deepEqual(calls.externalExecutor.enabledActions, ["push"]);
@@ -4546,6 +4551,7 @@ test("automatic own PR repair composes internal push with ownership guards and c
         assert.equal(typeof calls.codeJobRuntime.reviewRepairContextReader.readBinding, "function");
         assert.strictEqual(calls.loop.reviewRepairContextReader, calls.codeJobRuntime.reviewRepairContextReader);
         assert.equal(await calls.externalExecutor.pushAuthorization.verifyPush(repairEnvelope), false);
+        assert.equal(await calls.externalExecutor.pushAuthorization.verifyPush(ciEnvelope), false, 'explicit generic push cannot bypass CI repair provenance');
         assert.equal(await calls.externalExecutor.pushAuthorization.verifyPush(conflictEnvelope), explicitPush);
       } finally {
         await application.close();

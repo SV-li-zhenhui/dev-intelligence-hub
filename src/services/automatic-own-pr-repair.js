@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { OperationQueue } from "../lib/operation-queue.js";
-import { createReviewRepairCodeExecutionSource } from "../domain/code-execution-source.js";
+import { createReviewRepairCodeExecutionSource, createCiRepairCodeExecutionSource, isHeadRepairExecutionSource } from "../domain/code-execution-source.js";
+import { normalizeCiRepairEvidence } from '../domain/ci-repair-evidence.js';
 import { codeJobIdForGrant } from "../domain/code-job-contract.js";
 import { normalizePullRequestExecutionBinding, samePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
@@ -11,7 +12,7 @@ import { approveOwnPrAction, repairCommitMatchesJob, planOwnPrPushRetry, retryOw
 import { normalizeOwnerWorkRequest } from "../domain/owner-work-request.js";
 import { internalRepairReviewRequestId, normalizeInternalReviewMetadata } from "../domain/internal-repair-review.js";
 import { isOwnerPublicationId, normalizeObservedOwnerPublication } from "../domain/observed-owner-publication.js";
-import { createOriginalRepairFeedbackSnapshot, normalizeOriginalRepairFeedbackSnapshot, normalizeOriginalRepairFeedbackArchiveReference,
+import { createOriginalRepairFeedbackSnapshot, createOriginalCiRepairFeedbackSnapshot, normalizeOriginalRepairFeedbackSnapshot, normalizeOriginalRepairFeedbackArchiveReference,
   originalRepairFeedbackBinding, originalRepairFeedbackForRow } from "../domain/original-repair-feedback.js";
 import { persistOriginalRepairFeedbackArchives, planOriginalRepairFeedbackArchives, readOriginalRepairFeedbackSnapshot,
   validateOriginalRepairFeedbackArchives } from "./original-repair-feedback-archive.js";
@@ -26,6 +27,10 @@ const fingerprintsValid = (value) => value === undefined ||
 const sameLogin = (left, right) => typeof left === "string" && typeof right === "string" && left.toLowerCase() === right.toLowerCase();
 const samePullRequest = (binding, repository, number) =>
   binding.repository === repository && binding.pullRequestNumber === number;
+const sourceKindFor = row => row.sourceKind ?? 'review_repair';
+const matchesCurrentRepair = (record, current) => current !== null &&
+  sourceKindFor(record) === current.sourceKind && (current.sourceKind === 'ci_repair'
+    ? record.ciTriggerDigest === current.ciEvidence.triggerDigest : record.feedbackDigest === current.feedbackDigest);
 
 function repairError(code, message) {
   return Object.assign(new Error(message), { code });
@@ -58,7 +63,8 @@ export function normalizeAutomaticOwnPrRepairState(value) {
     normalizePullRequestExecutionBinding(row.inputBinding);
     if (!STATUSES.has(row.status) || !DIGEST.test(row.feedbackDigest) ||
         typeof row.jobId !== "string" || typeof row.confirmationId !== "string" || ids.has(row.jobId) ||
-        !fingerprintsValid(row.feedbackFingerprints)) {
+        !fingerprintsValid(row.feedbackFingerprints) || !['review_repair', 'ci_repair'].includes(sourceKindFor(row)) ||
+        (sourceKindFor(row) === 'ci_repair' && !DIGEST.test(row.ciTriggerDigest))) {
       throw repairError("OWN_PR_REPAIR_STATE_INVALID", "自动修复记录绑定无效");
     }
     ids.add(row.jobId);
@@ -71,7 +77,8 @@ export function normalizeAutomaticOwnPrRepairState(value) {
   for (const row of value.published) {
     if (typeof row.repository !== "string" || !Number.isSafeInteger(row.number) ||
         !DIGEST.test(row.feedbackDigest) || !/^[a-f0-9]{40,64}$/.test(row.commitOid) ||
-        typeof row.confirmationId !== "string" || !fingerprintsValid(row.feedbackFingerprints)) {
+        typeof row.confirmationId !== "string" || !fingerprintsValid(row.feedbackFingerprints) || !['review_repair', 'ci_repair'].includes(sourceKindFor(row)) ||
+        (sourceKindFor(row) === 'ci_repair' && !DIGEST.test(row.ciTriggerDigest))) {
       throw repairError("OWN_PR_REPAIR_STATE_INVALID", "自动修复发布记录绑定无效");
     }
     const snapshot = snapshotFor(row);
@@ -93,6 +100,7 @@ export function normalizeAutomaticOwnPrRepairState(value) {
           request.pullRequest.number !== row.number || request.internalReview.headRefOid !== row.commitOid ||
           request.internalReview.publicationConfirmationId !== row.confirmationId ||
           request.internalReview.feedbackDigest !== row.feedbackDigest ||
+          request.internalReview.kind !== (sourceKindFor(row) === 'ci_repair' ? 'own_pr_ci_repair' : 'own_pr_repair') ||
           (provenance && request.internalReview.controlledCommitEvidenceId !== provenance.controlledCommitReceipt.evidenceId) ||
           request.requestId !== internalRepairReviewRequestId({ repository: row.repository, number: row.number, ...request.internalReview }) ||
           !["pending", "completed", "stale"].includes(delivery.status) ||
@@ -116,7 +124,7 @@ export class AutomaticOwnPrRepair {
 
   constructor({ configurationReader, store, ledger, github, confirmations,
     codeJobReader = null, controlledCommitReader = null, objectSync = null, grantVerifier, ownerWorkRequests = null,
-    historicalRepairFeedbackReader = null, historicalControlledCommitReader = null, conflictRepair = null, clock = () => new Date() }) {
+    historicalRepairFeedbackReader = null, historicalControlledCommitReader = null, ciRepairContextReader = null, conflictRepair = null, clock = () => new Date() }) {
     if (typeof grantVerifier?.verify !== "function") throw new TypeError("Automatic own PR repair requires current grant verification");
     this.configurationReader = configurationReader;
     this.store = store;
@@ -132,6 +140,7 @@ export class AutomaticOwnPrRepair {
     this.historicalControlledCommitReader = historicalControlledCommitReader;
     this.clock = clock;
     this.conflictRepair = conflictRepair;
+    this.ciRepairContextReader = ciRepairContextReader;
   }
 
   async recover() {
@@ -167,6 +176,11 @@ export class AutomaticOwnPrRepair {
       row.number === number && row.feedbackDigest === feedbackDigest);
   }
 
+  #ciWasPublished(repository, number, triggerDigest) {
+    return this.#state.published.some(row => row.repository === repository && row.number === number &&
+      sourceKindFor(row) === 'ci_repair' && row.ciTriggerDigest === triggerDigest);
+  }
+
   #isInFlight(repository, number) {
     return this.#state.repairs.some((row) => samePullRequest(row.inputBinding, repository, number) &&
       ["working", "pushing"].includes(row.status));
@@ -186,6 +200,11 @@ export class AutomaticOwnPrRepair {
     if (this.conflictRepair && !await this.conflictRepair.shouldRun(item)) return false;
     const event = currentWorkItemEvent(item);
     if (event?.payload?.nextAction === "resolve_conflict" && this.#isInFlight(event.subject?.repository, event.subject?.number)) return false;
+    if (event?.payload?.relation === 'authored' && event.payload.nextAction === 'fix_ci' && this.ciRepairContextReader !== null &&
+        this.#isInFlight(event.subject?.repository, event.subject?.number)) return false;
+    if (event?.payload?.relation === 'authored' && event.payload.nextAction === 'fix_ci' && this.#state.published.some(row =>
+      sourceKindFor(row) === 'ci_repair' && row.repository === event.subject?.repository && row.number === event.subject?.number &&
+      row.feedbackSnapshotArchive?.originalHeadRefOid === event.payload.headRefOid)) return false;
     if (event?.payload?.relation !== "authored" || event.payload.nextAction !== "address_review") return true;
     const config = await this.#configuration();
     if (config?.githubActions?.automaticOwnPrRepair !== true) return true;
@@ -204,12 +223,29 @@ export class AutomaticOwnPrRepair {
     const config = await this.#configuration();
     if (config?.githubActions?.enabled !== true || config.githubActions.automaticOwnPrRepair !== true ||
         !config.trackedRepositories.includes(binding.repository)) return null;
-    const context = await this.ledger.readPullRequestExecutionContext(binding);
+    let context;
+    try { context = await this.ledger.readPullRequestExecutionContext(binding); }
+    catch (error) {
+      if (error?.code === 'WORK_LEDGER_PR_EXECUTION_BINDING_STALE') return null;
+      throw error;
+    }
     if (!samePullRequestExecutionBinding(context.inputBinding, binding) ||
         !sameLogin(context.author, config.githubActions.actorAccountId)) return null;
     const root = await this.ledger.readItemForReconciliation({ itemId: binding.rootItemId });
     const event = currentWorkItemEvent(root);
-    if (event?.payload?.relation !== "authored" || event.payload.nextAction !== "address_review") return null;
+    if (event?.payload?.relation !== "authored") return null;
+    if (event.payload.nextAction === 'fix_ci' && this.ciRepairContextReader !== null) {
+      const current = await this.ciRepairContextReader.read({ inputBinding: binding, event });
+      if (current === null) return null;
+      const ciEvidence = normalizeCiRepairEvidence(current.ciEvidence);
+      const facts = current.facts;
+      if (facts?.state !== 'open' || !sameLogin(facts.author, context.author) || facts.headRefOid !== binding.headRefOid ||
+          facts.baseRefOid !== binding.gitTarget.baseRefOid || ciEvidence.repository !== binding.repository ||
+          ciEvidence.number !== binding.pullRequestNumber || ciEvidence.headRefOid !== binding.headRefOid ||
+          ciEvidence.headRefName !== binding.gitTarget.headRefName || this.#ciWasPublished(binding.repository, binding.pullRequestNumber, ciEvidence.triggerDigest)) return null;
+      return { config, facts, ciEvidence, feedbackDigest: ciEvidence.contentDigest, sourceKind: 'ci_repair' };
+    }
+    if (event.payload.nextAction !== 'address_review') return null;
     const facts = await this.github.readOwnPullRequestFeedback({
       repository: binding.repository, number: binding.pullRequestNumber,
       account: config.githubActions.actorAccountId,
@@ -219,19 +255,30 @@ export class AutomaticOwnPrRepair {
         !Number.isSafeInteger(facts.reviewFeedbackCount) || facts.reviewFeedbackCount < 1 || !DIGEST.test(facts.reviewFeedbackDigest) ||
         facts.reviewFeedbackDigest !== event.payload.reviewFeedbackDigest ||
         this.#feedbackPublished(binding.repository, binding.pullRequestNumber, facts)) return null;
-    return { config, facts };
+    return { config, facts, feedbackDigest: facts.reviewFeedbackDigest, sourceKind: 'review_repair' };
   }
 
   async prepare({ item, intent, inputBinding, roleId }) {
     if (roleId !== "developer" || intent.type !== "propose_code_action" || intent.operation !== "modify" ||
         currentWorkItemEvent(item)?.payload?.relation !== "authored" ||
-        currentWorkItemEvent(item)?.payload?.nextAction !== "address_review") return undefined;
+        !['address_review', 'fix_ci'].includes(currentWorkItemEvent(item)?.payload?.nextAction)) return undefined;
     const current = await this.#current(inputBinding);
-    if (!current) return undefined;
+    if (!current) {
+      if (currentWorkItemEvent(item)?.payload?.nextAction === 'fix_ci' && this.ciRepairContextReader !== null &&
+          (await this.#configuration())?.githubActions?.automaticOwnPrRepair === true) {
+        throw repairError('OWN_PR_CI_SOURCE_NOT_READY', 'CI 修复来源需要重新读取当前检查');
+      }
+      return undefined;
+    }
     const workspaceId = current.config.workCoordination.policy.workspaceByRepository[inputBinding.repository];
     const workspace = current.config.codeExecutor.workspaces.find(({ id }) => id === workspaceId);
-    if (!workspace || workspace.gitHeadSnapshot !== true) return undefined;
-    return createReviewRepairCodeExecutionSource({ inputBinding, writablePaths: workspace.writablePaths });
+    if (!workspace || workspace.gitHeadSnapshot !== true) {
+      if (current.sourceKind === 'ci_repair') throw repairError('OWN_PR_CI_SOURCE_NOT_READY', 'CI 修复需要配置的固定 Head 工作区');
+      return undefined;
+    }
+    return current.sourceKind === 'ci_repair'
+      ? createCiRepairCodeExecutionSource({ inputBinding, writablePaths: workspace.writablePaths, ciEvidence: current.ciEvidence })
+      : createReviewRepairCodeExecutionSource({ inputBinding, writablePaths: workspace.writablePaths });
   }
 
   async approveCodeJob(item) {
@@ -247,22 +294,32 @@ export class AutomaticOwnPrRepair {
     if (item.kind !== "local.code-job-create" || item.status !== "pending" || item.requestedBy.roleId !== "developer") return item;
     const grant = item.display?.payload?.action?.grant;
     if (!grant?.inputBinding || !["inspect", "modify", "verify"].includes(grant.operation) ||
-        (grant.operation === "modify" && grant.executionSource?.kind !== "review_repair")) return item;
+        (grant.operation === "modify" && !isHeadRepairExecutionSource(grant.executionSource))) return item;
     let current = await this.#current(grant.inputBinding);
-    if (!current) return item;
+    if (!current) return grant.executionSource?.kind === 'ci_repair' ? this.#invalidatePending(item) : item;
+    if (grant.operation === 'modify' && (grant.executionSource.kind !== current.sourceKind ||
+        (current.sourceKind === 'ci_repair' && grant.executionSource.ciEvidence.triggerDigest !== current.ciEvidence.triggerDigest))) return this.#invalidatePending(item);
     if (this.objectSync) {
       await this.objectSync.prepare({ configuration: current.config, inputBinding: grant.inputBinding });
       current = await this.#current(grant.inputBinding);
-      if (!current) return item;
+      if (!current) return grant.executionSource?.kind === 'ci_repair' ? this.#invalidatePending(item) : item;
+      if (grant.operation === 'modify' && (grant.executionSource.kind !== current.sourceKind ||
+          (current.sourceKind === 'ci_repair' && grant.executionSource.ciEvidence.triggerDigest !== current.ciEvidence.triggerDigest))) return this.#invalidatePending(item);
     }
     if (grant.operation === "modify") {
       const jobId = codeJobIdForGrant(grant);
       await this.#queue.enqueue(async () => {
         if (this.#state.repairs.some((row) => row.jobId === jobId)) return;
         const duplicate = this.#isInFlight(grant.repository, grant.inputBinding.pullRequestNumber) ||
-          this.#wasPublished(grant.repository, grant.inputBinding.pullRequestNumber, current.facts.reviewFeedbackDigest);
+          (current.sourceKind === 'ci_repair'
+            ? this.#ciWasPublished(grant.repository, grant.inputBinding.pullRequestNumber, current.ciEvidence.triggerDigest)
+            : this.#wasPublished(grant.repository, grant.inputBinding.pullRequestNumber, current.feedbackDigest));
         if (duplicate) throw repairError("OWN_PR_REPAIR_ALREADY_RUNNING", "此轮 Review 意见已经在修复");
-        const snapshot = createOriginalRepairFeedbackSnapshot({ repository: grant.inputBinding.repository,
+        const snapshot = current.sourceKind === 'ci_repair'
+          ? createOriginalCiRepairFeedbackSnapshot({ repository: grant.inputBinding.repository, number: grant.inputBinding.pullRequestNumber,
+            ciEvidence: grant.executionSource.ciEvidence, provenance: { kind: 'captured_before_ci_repair', observedHeadRefOid: grant.inputBinding.headRefOid,
+              observedAt: new Date(this.clock()).toISOString() } })
+          : createOriginalRepairFeedbackSnapshot({ repository: grant.inputBinding.repository,
           number: grant.inputBinding.pullRequestNumber,
           context: { schemaVersion: 1, headRefOid: grant.inputBinding.headRefOid,
             reviewFeedbackDigest: current.facts.reviewFeedbackDigest, feedback: current.facts.feedback },
@@ -273,7 +330,9 @@ export class AutomaticOwnPrRepair {
             ? this.#state.feedbackSnapshots : [...this.#state.feedbackSnapshots, snapshot], repairs: [...this.#state.repairs, {
           jobId, confirmationId: item.id, inputBinding: grant.inputBinding,
           feedbackSnapshotId: snapshot.snapshotId,
-          feedbackDigest: current.facts.reviewFeedbackDigest, status: "working", pushConfirmationId: null,
+          feedbackDigest: current.sourceKind === 'ci_repair' ? grant.executionSource.ciEvidence.contentDigest : current.feedbackDigest,
+          status: "working", pushConfirmationId: null,
+          ...(current.sourceKind === 'ci_repair' ? { sourceKind: 'ci_repair', ciTriggerDigest: grant.executionSource.ciEvidence.triggerDigest } : {}),
           ...(current.facts.reviewFeedbackFingerprints ? { feedbackFingerprints: current.facts.reviewFeedbackFingerprints } : {}),
         }] });
       });
@@ -285,20 +344,28 @@ export class AutomaticOwnPrRepair {
     return approveOwnPrAction(this.confirmations, item);
   }
 
+  #invalidatePending(item) {
+    if (item.status !== 'pending' || typeof this.confirmations.invalidate !== 'function') return item;
+    return this.confirmations.invalidate(item.id, { requestedBy: item.requestedBy,
+      approvalBindingDigest: item.approvalBindingDigest, reason: 'authorization_changed' });
+  }
+
   async verifyPush(envelope) {
     if (envelope.action?.controlledCommitEvidence?.executionSource?.kind === "conflict_preparation") {
       return this.conflictRepair === null ? false : this.conflictRepair.verifyPush(envelope);
     }
     if (envelope.kind !== "github.pull-request-push" || envelope.requestedBy?.roleId !== "developer" ||
-        envelope.action?.controlledCommitEvidence?.executionSource?.kind !== "review_repair") return false;
+        !isHeadRepairExecutionSource(envelope.action?.controlledCommitEvidence?.executionSource)) return false;
     const source = envelope.action.controlledCommitEvidence.executionSource;
     const record = this.#state.repairs.find((row) => row.pushConfirmationId === envelope.id &&
       samePullRequestExecutionBinding(row.inputBinding, source.inputBinding));
-    if (!record || record.status !== "pushing") return false;
+    if (!record || record.status !== "pushing" || sourceKindFor(record) !== source.kind) return false;
+    if (source.kind === 'ci_repair' && (source.ciEvidence?.contentDigest !== record.feedbackDigest ||
+        source.ciEvidence.triggerDigest !== record.ciTriggerDigest)) return false;
     const codeItem = await this.confirmations.get(record.confirmationId);
     if (!await this.#grantCurrent(codeItem.display.payload.action.grant)) return false;
     const current = await this.#current(source.inputBinding);
-    return current !== null && current.facts.reviewFeedbackDigest === record.feedbackDigest;
+    return matchesCurrentRepair(record, current);
   }
 
   async recordPublished(value) {
@@ -357,6 +424,7 @@ export class AutomaticOwnPrRepair {
         const published = { repository: record.inputBinding.repository,
           number: record.inputBinding.pullRequestNumber, feedbackDigest: record.feedbackDigest,
           commitOid, confirmationId: push.id };
+        if (sourceKindFor(record) === 'ci_repair') Object.assign(published, { sourceKind: 'ci_repair', ciTriggerDigest: record.ciTriggerDigest });
         if (record.feedbackSnapshotId) published.feedbackSnapshotId = record.feedbackSnapshotId;
         if (record.feedbackFingerprints) published.feedbackFingerprints = record.feedbackFingerprints;
         published.reviewDelivery = this.#reviewDelivery(published, push.display.payload.action.controlledCommitEvidence);
@@ -371,7 +439,7 @@ export class AutomaticOwnPrRepair {
       const retry = this.confirmations.retry && planOwnPrPushRetry(record, push);
       if (retry) {
         const codeItem = await this.confirmations.get(record.confirmationId);
-        if (!await this.#grantCurrent(codeItem.display.payload.action.grant) || !await this.#current(record.inputBinding)) {
+        if (!await this.#grantCurrent(codeItem.display.payload.action.grant) || !matchesCurrentRepair(record, await this.#current(record.inputBinding))) {
           await this.#update(record, { status: "stale" }); return "stale";
         }
         await this.#update(record, { pushRetry: retry });
@@ -382,7 +450,13 @@ export class AutomaticOwnPrRepair {
         await this.#update(record, { status: push.status === "stale" ? "stale" : "failed" });
         return push.status === "stale" ? "stale" : "failed";
       }
-      if (push.status === "pending" && await this.#current(record.inputBinding)) await this.#approve(push);
+      if (push.status === 'pending') {
+        const current = await this.#current(record.inputBinding);
+        if (matchesCurrentRepair(record, current)) await this.#approve(push);
+        else if (sourceKindFor(record) === 'ci_repair') {
+          await this.#invalidatePending(push); await this.#update(record, { status: 'stale' }); return 'stale';
+        }
+      }
       return "waiting";
     }
     const detail = await this.codeJobReader.getDetail({ jobId: record.jobId });
@@ -395,11 +469,17 @@ export class AutomaticOwnPrRepair {
       }
       if (codeItem.status === "pending") {
         let current = await this.#current(record.inputBinding);
-        if (!current) { await this.#update(record, { status: "stale" }); return "stale"; }
+        if (!matchesCurrentRepair(record, current)) {
+          if (sourceKindFor(record) === 'ci_repair') await this.#invalidatePending(codeItem);
+          await this.#update(record, { status: "stale" }); return "stale";
+        }
         if (this.objectSync) {
           await this.objectSync.prepare({ configuration: current.config, inputBinding: record.inputBinding });
           current = await this.#current(record.inputBinding);
-          if (!current) { await this.#update(record, { status: "stale" }); return "stale"; }
+          if (!matchesCurrentRepair(record, current)) {
+            if (sourceKindFor(record) === 'ci_repair') await this.#invalidatePending(codeItem);
+            await this.#update(record, { status: "stale" }); return "stale";
+          }
         }
         await this.#approve(codeItem);
       }
@@ -414,11 +494,13 @@ export class AutomaticOwnPrRepair {
     const grant = codeItem.display.payload.action.grant;
     if (!await this.#grantCurrent(grant)) { await this.#update(record, { status: "stale" }); return "stale"; }
     const evidence = await this.controlledCommitReader.verify({ evidenceId: receipt.evidenceId });
-    if (!repairCommitMatchesJob({ evidence, receipt, record, grant, sourceKind: "review_repair" })) {
+    if (!repairCommitMatchesJob({ evidence, receipt, record, grant, sourceKind: sourceKindFor(record) })) {
       throw repairError("OWN_PR_REPAIR_COMMIT_INVALID", "修复提交与代码任务不匹配");
     }
     const current = await this.#current(record.inputBinding);
-    if (!current) { await this.#update(record, { status: "stale" }); return "stale"; }
+    if (!matchesCurrentRepair(record, current)) {
+      await this.#update(record, { status: "stale" }); return "stale";
+    }
     const proposal = normalizeBoundWorkProposal({
       proposalId: `auto-own-pr-repair-push-${digest(record.jobId)}`,
       policyVersion: grant.policyVersion, kind: "github_pull_request_action_proposal",
@@ -427,7 +509,8 @@ export class AutomaticOwnPrRepair {
         repository: grant.repository, pullRequestNumber: grant.inputBinding.pullRequestNumber,
         headRefOid: grant.inputBinding.headRefOid, inputBinding: grant.inputBinding },
       payload: { action: { type: "push", controlledCommitEvidence: evidence },
-        summary: "自动修复 Review 意见，更新原 PR", reason: "隔离修改已通过配置的验证，推送受控提交",
+        summary: sourceKindFor(record) === 'ci_repair' ? '自动修复 CI 检查，更新原 PR' : "自动修复 Review 意见，更新原 PR",
+        reason: "隔离修改已通过配置的验证，推送受控提交",
         evidence: [`code-job:${record.jobId}`, `controlled-commit:${evidence.evidenceId}`] },
     });
     const plan = createPullRequestExternalActionConfirmationPlan(proposal,
@@ -439,13 +522,14 @@ export class AutomaticOwnPrRepair {
   }
 
   #reviewDelivery(published, evidence) {
-    const internalReview = normalizeInternalReviewMetadata({ kind: "own_pr_repair", headRefOid: published.commitOid,
+    const ci = sourceKindFor(published) === 'ci_repair';
+    const internalReview = normalizeInternalReviewMetadata({ kind: ci ? 'own_pr_ci_repair' : "own_pr_repair", headRefOid: published.commitOid,
       feedbackDigest: published.feedbackDigest, publicationConfirmationId: published.confirmationId,
       controlledCommitEvidenceId: evidence.evidenceId });
     const request = normalizeOwnerWorkRequest({ schemaVersion: 7,
       requestId: internalRepairReviewRequestId({ repository: published.repository, number: published.number, ...internalReview }),
       workType: "pull_request", priority: "high", title: `修复后内部复审：${published.repository} #${published.number}`,
-      description: `受控修复已确认发布到 Head ${published.commitOid}。请核对原 Review 反馈与当前代码，完成内部静态复审；有缺陷则退回研发。此交接不表示外部人员已收到通知或 GitHub 批准。`,
+      description: `受控修复已确认发布到 Head ${published.commitOid}。请核对${ci ? '原 CI 失败检查、诊断证据' : '原 Review 反馈'}与当前代码，完成内部静态复审；有缺陷则退回研发。此交接不表示${ci ? '新 Head 的 CI 已通过、' : ''}外部人员已收到通知或 GitHub 批准。`,
       acceptanceCriteria: ["逐项核对修复反馈和当前 Head 代码", "区分已有真实测试证据与未覆盖范围", "交付绑定 Head 和修复发布来源的内部结论；剩余缺陷交接研发"],
       pullRequest: { repository: published.repository, number: published.number }, internalReview });
     return { status: "pending", request };
@@ -455,10 +539,13 @@ export class AutomaticOwnPrRepair {
     const config = await this.#configuration();
     if (config?.githubActions?.enabled !== true || config.githubActions.automaticOwnPrRepair !== true ||
         !config.trackedRepositories?.includes(published.repository)) return "automation_disabled";
-    const facts = await this.github.readOwnPullRequestFeedback({ repository: published.repository,
-      number: published.number, account: config.githubActions.actorAccountId });
+    const facts = sourceKindFor(published) === 'ci_repair'
+      ? await this.github.readPullRequestLocalWorkFacts({ repository: published.repository, number: published.number,
+        account: config.githubActions.actorAccountId, authorAccountId: config.githubActions.actorAccountId })
+      : await this.github.readOwnPullRequestFeedback({ repository: published.repository,
+        number: published.number, account: config.githubActions.actorAccountId });
     if (facts.state !== "open") return "pull_request_closed";
-    if (facts.isDraft === true || facts.draft === true) return "pull_request_draft";
+    if (sourceKindFor(published) !== 'ci_repair' && (facts.isDraft === true || facts.draft === true)) return "pull_request_draft";
     if (!sameLogin(facts.author, config.githubActions.actorAccountId)) return "author_changed";
     if (facts.headRefOid !== published.commitOid) return "head_changed";
     return null;
@@ -475,7 +562,8 @@ export class AutomaticOwnPrRepair {
     }
     const evidence = push?.display?.payload?.action?.controlledCommitEvidence;
     if (push?.status !== "completed" || push.kind !== "github.pull-request-push" ||
-        evidence?.commit?.oid !== published.commitOid || evidence.executionSource?.kind !== "review_repair" ||
+        evidence?.commit?.oid !== published.commitOid || !isHeadRepairExecutionSource(evidence.executionSource) ||
+        evidence.executionSource.kind !== sourceKindFor(published) ||
         evidence.executionSource.inputBinding.repository !== published.repository ||
         evidence.executionSource.inputBinding.pullRequestNumber !== published.number) return null;
     const verified = await this.controlledCommitReader.verify({ evidenceId: evidence.evidenceId });

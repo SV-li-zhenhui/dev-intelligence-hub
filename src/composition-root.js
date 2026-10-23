@@ -13,6 +13,8 @@ import { AutomaticOwnPrHandoff } from "./services/automatic-own-pr-handoff.js";
 import { WorkContinuationScheduler } from "./services/work-continuation-scheduler.js";
 import { HistoricalControlledCommitReader } from "./services/historical-controlled-commit-reader.js";
 import { ReviewRepairContextReader, normalizeReviewRepairFeedbackContext } from "./services/review-repair-context-reader.js";
+import { CiRepairContextReader } from './services/ci-repair-context-reader.js';
+import { isHeadRepairExecutionSource } from './domain/code-execution-source.js';
 import { OriginalRepairFeedbackReader } from "./services/original-repair-feedback-reader.js";
 import { OwnPrRepairObjectSync } from "./adapters/own-pr-repair-object-sync.js";
 import { createGitHubPullRequestActionTransport } from "./adapters/github-pull-request-action-transport.js";
@@ -1941,7 +1943,7 @@ export async function createApplication({
           ...(!ownPrRepairEnabled ? {} : {
             pushAuthorization: {
               verifyPush(envelope) {
-                if (envelope.action?.controlledCommitEvidence?.executionSource?.kind !== "review_repair") {
+                if (!isHeadRepairExecutionSource(envelope.action?.controlledCommitEvidence?.executionSource)) {
                   return automaticOwnPrRepair === null ? explicitPullRequestActions.includes("push")
                     : automaticOwnPrRepair.verifyPush(envelope).then(approved => approved || explicitPullRequestActions.includes("push"));
                 }
@@ -2023,6 +2025,8 @@ export async function createApplication({
       }
       const ownPrRepairDependencies = {
         configurationReader: configurationRuntime.reader, store, ledger: workLedgerRuntime,
+        ciRepairContextReader: new CiRepairContextReader({ github: frozenPort(github,
+          ['loadPullRequestFacts', 'readPullRequestLocalWorkFacts'], 'CI repair GitHub facts'), diagnostics: jenkinsRuntime?.diagnostics ?? null }),
         confirmationSettlementReader: confirmationRuntime.confirmationSettlementReader,
         github, confirmations: Object.freeze({ ...confirmationRuntime.producerQueue, ...confirmationRuntime.queue }), codeJobReader,
         controlledCommitReader: codeExecutorRuntime.controlledCommitBuilder,

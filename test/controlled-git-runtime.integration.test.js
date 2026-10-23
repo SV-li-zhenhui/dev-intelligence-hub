@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
+import { ciRepairSource } from './support/ci-repair-fixture.js';
 
 import { createControlledGitRuntimeBundle } from "../src/controlled-git-runtime.js";
 import { createChangePackage } from "../src/domain/change-package-contract.js";
@@ -419,7 +420,7 @@ test("controlled conflict repair preserves a bounded full repository with non-co
     error => error.code === "CONTROLLED_GIT_PREPARATION_TAMPERED");
 });
 
-test("review repair builds a single-parent Head commit with creation and deletion, and publishes without force", {
+for (const sourceKind of ['review_repair', 'ci_repair']) test(`${sourceKind} builds a single-parent Head commit with creation and deletion, and publishes without force`, {
   skip: gitCommand === null ? "trusted Git is unavailable" : false,
 }, async (t) => {
   const setup = await createFixture(t, gitCommand);
@@ -429,7 +430,8 @@ test("review repair builds a single-parent Head commit with creation and deletio
     headMirrorsByRepository: { "contributor/runtime-test": setup.headMirrorRoot } };
   const bundle = await createControlledGitRuntimeBundle(config, { processRunner: runner });
   const binding = inputBinding(setup);
-  const executionSource = createReviewRepairCodeExecutionSource({ inputBinding: binding, writablePaths: ["src"] });
+  const executionSource = sourceKind === 'ci_repair' ? ciRepairSource(binding, ['src'])
+    : createReviewRepairCodeExecutionSource({ inputBinding: binding, writablePaths: ["src"] });
   const workspaceRevision = "e".repeat(64);
   const changePackage = createChangePackage({
     job: { id: "review-repair-job", revision: 3, recordDigest: "3".repeat(64) },

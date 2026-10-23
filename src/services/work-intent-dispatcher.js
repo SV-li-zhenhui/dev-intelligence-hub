@@ -13,6 +13,7 @@ import {
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
 import {
   normalizeCodeExecutionSource,
+  isHeadRepairExecutionSource,
   sameCodeExecutionSource,
 } from "../domain/code-execution-source.js";
 import { normalizeControlledCommitEvidence } from "../domain/controlled-commit-evidence.js";
@@ -1292,7 +1293,7 @@ export class WorkIntentDispatcher {
             code: "conflict-binding-unsealed",
           });
         }
-      } else if (hasExecutionSource && bound.binding.executionSource.kind !== "review_repair") {
+      } else if (hasExecutionSource && !isHeadRepairExecutionSource(bound.binding.executionSource)) {
         return this.#ackFailure(claimed, item, {
           nextStatus: "blocked",
           code: "conflict-source-unexpected",
@@ -1331,9 +1332,14 @@ export class WorkIntentDispatcher {
         }
       }
       if (executionSource === undefined && conflictRequirement !== "required" && this.#prepareReviewRepairSource !== null) {
-        executionSource = await this.#admitAction(() => this.#prepareReviewRepairSource({
-          item, inputBinding, intent: claimed.intent, roleId: requester.roleId,
-        }));
+        try {
+          executionSource = await this.#admitAction(() => this.#prepareReviewRepairSource({
+            item, inputBinding, intent: claimed.intent, roleId: requester.roleId,
+          }));
+        } catch (error) {
+          if (!['OWN_PR_CI_SOURCE_NOT_READY', 'CODE_CI_REPAIR_CONTEXT_UNAVAILABLE'].includes(ownErrorCode(error))) throw error;
+          return this.#ackFailure(claimed, item, { nextStatus: 'retry_wait', code: 'ci-source-unavailable' });
+        }
       }
       let controlledCommitEvidence;
       if (isPullRequestPushIntent(claimed.intent)) {

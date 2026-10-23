@@ -116,8 +116,11 @@ export class GitHubReviewReader {
       if (snapshot.snapshotId !== descriptor.snapshotId || snapshot.repository !== git.baseRepository || snapshot.number !== target.pullRequestNumber ||
           snapshot.feedbackDigest !== descriptor.feedbackDigest || snapshot.originalHeadRefOid !== descriptor.originalHeadRefOid) throw failure("OWN_PR_REPAIR_ORIGINAL_FEEDBACK_INVALID");
       feedbackDocuments = { "repair-feedback-manifest.json": JSON.stringify({ ...descriptor,
-        originalRequestCount: snapshot.feedback.changeRequests.length + snapshot.feedback.threads.length,
-        provenance: snapshot.provenance, contextualObservations: "Paths, positions and discussion are contextual observations; only changeRequests and thread id/comments are covered by feedbackDigest." }, null, 2),
+        feedbackKind: snapshot.ciEvidence ? 'ci_failure' : 'review_feedback',
+        originalRequestCount: snapshot.ciEvidence ? snapshot.ciEvidence.checks.length : snapshot.feedback.changeRequests.length + snapshot.feedback.threads.length,
+        provenance: snapshot.provenance, contextualObservations: snapshot.ciEvidence
+          ? "Original failed checks and immutable CI diagnostics are evidence of the failure before repair; they do not prove that the repaired Head passes CI."
+          : "Paths, positions and discussion are contextual observations; only changeRequests and thread id/comments are covered by feedbackDigest." }, null, 2),
         "repair-feedback.json": JSON.stringify(snapshot, null, 2) };
     }
     const manifestText = JSON.stringify({ repository: git.baseRepository, pullRequestNumber: target.pullRequestNumber, base: git.baseRefOid, head: git.headRefOid, changedFiles: files.length, files,

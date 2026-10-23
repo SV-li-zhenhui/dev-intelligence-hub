@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { ciRepairSource } from './support/ci-repair-fixture.js';
 import {
   CODE_JOB_ACTIONS_BY_OPERATION,
   createCodeJobGrant,
@@ -1666,6 +1667,26 @@ test("own PR repair worker delivers every full request and author reply through 
   assert.equal(executor.calls.filter(({ method }) => method === "perform").length, 1);
 });
 
+test('CI repair worker supplies immutable CI failure evidence to the real code brain without a Review reader', async () => {
+  const { jobs: store, durableJob: initial } = await createRealReviewRepairJob('ci_repair');
+  const source = initial.grant.executionSource;
+  const executor = new FakeExecutor(initial), calls = [];
+  const directory = new CodeJobBrainDirectory({ roles: { developer: { taskBrain: {
+    provider: 'local', model: 'code', remoteData: { requirements: false, code: false, memory: false } } } },
+    brainRouter: { describe(value) { return { ...value, remote: false }; }, async generate(value) {
+      calls.push(structuredClone(value));
+      return JSON.stringify({ schemaVersion: 1, confidence: 90, summary: 'Inspect CI defect', reason: 'Verify failure cause', action: { type: 'read_text', path: 'src/app.js' } });
+    } } });
+  const worker = new CodeJobWorkerService({ jobStore: store, executor, brainDirectory: directory, grantVerifier: verifier([]) });
+  const result = await worker.runCycle({ limit: 1, roleId: 'developer' });
+  assert.equal(result.outcomes[0].status, 'active');
+  assert.equal(result.outcomes[0].actionType, 'read_text');
+  const message = calls[0].messages.find(message => message.content.startsWith('Original CI failure evidence JSON'));
+  assert.ok(message);
+  assert.deepEqual(JSON.parse(message.content.slice(message.content.indexOf('\n') + 1)), source.ciEvidence);
+  assert.equal(calls[0].messages.some(message => message.content.startsWith('Own PR repair feedback JSON')), false);
+});
+
 test("own PR repair fences feedback changed while deciding before performing any action", async () => {
   const fixture = reviewRepairFixture();
   const store = new FakeJobStore([fixture.initial]);
@@ -3248,11 +3269,12 @@ async function createRealApprovedJob(grantOverrides = {}, {
   return {jobs,created,durableJob};
 }
 
-async function createRealReviewRepairJob() {
+async function createRealReviewRepairJob(sourceKind = 'review_repair') {
   const fixture = reviewRepairFixture();
   const inputBinding = fixture.initial.grant.inputBinding;
   const writablePaths = ["Source", "Test"];
-  const executionSource = createReviewRepairCodeExecutionSource({ inputBinding, writablePaths });
+  const executionSource = sourceKind === 'ci_repair' ? ciRepairSource(inputBinding, writablePaths)
+    : createReviewRepairCodeExecutionSource({ inputBinding, writablePaths });
   const approved = await createRealApprovedJob({
     ...fixture.initial.grant,
     executionSource,

@@ -13,8 +13,10 @@ export class OriginalRepairFeedbackReader {
     const current = await this.executionContextReader.readPullRequestExecutionContext(inputBinding);
     if (!isDeepStrictEqual(current.inputBinding, inputBinding)) throw Object.assign(new Error("内部复审输入已变化"), { code: "OWN_PR_REPAIR_ORIGINAL_FEEDBACK_INVALID" });
     const state = await this.#state();
-    const descriptor = originalRepairFeedbackBinding(state, inputBinding, normalizeInternalReviewMetadata(internalReview));
-    await readOriginalRepairFeedbackSnapshot(this.store, state, { ...descriptor, repository: inputBinding.repository, number: inputBinding.pullRequestNumber });
+    const metadata = normalizeInternalReviewMetadata(internalReview);
+    const descriptor = originalRepairFeedbackBinding(state, inputBinding, metadata);
+    const snapshot = await readOriginalRepairFeedbackSnapshot(this.store, state, { ...descriptor, repository: inputBinding.repository, number: inputBinding.pullRequestNumber });
+    if ((metadata.kind === 'own_pr_ci_repair') !== Boolean(snapshot.ciEvidence)) throw Object.assign(new Error('内部复审反馈类型不匹配'), { code: 'OWN_PR_REPAIR_ORIGINAL_FEEDBACK_INVALID' });
     return descriptor;
   }
   async read(query) {
