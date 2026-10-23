@@ -1,4 +1,4 @@
-import { types as utilTypes } from "node:util";
+import { isDeepStrictEqual, types as utilTypes } from "node:util";
 
 import {
   conflictPreparationBindingMatchesPullRequest,
@@ -272,8 +272,11 @@ export function createConflictCodeExecutionSource(value) {
 
 export function sameCodeExecutionSource(left, right) {
   try {
-    return JSON.stringify(normalizeCodeExecutionSource(left)) ===
-      JSON.stringify(normalizeCodeExecutionSource(right));
+    // Storage uses JSON number semantics (-0 becomes 0), while object key order
+    // can change during canonical proposal persistence. Validate before cloning.
+    const storedLeft = JSON.parse(JSON.stringify(normalizeCodeExecutionSource(left)));
+    const storedRight = JSON.parse(JSON.stringify(normalizeCodeExecutionSource(right)));
+    return isDeepStrictEqual(storedLeft, storedRight);
   } catch {
     return false;
   }

@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import { createDeliveryEvidenceTarget } from "../src/domain/delivery-evidence-contract.js";
+import { createCiRepairEvidence } from "../src/domain/ci-repair-evidence.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import {
   createConflictCodeExecutionSource,
   createReviewRepairCodeExecutionSource,
+  createCiRepairCodeExecutionSource,
   sameCodeExecutionSource,
 } from "../src/domain/code-execution-source.js";
 import { createPullRequestExecutionBinding } from "../src/domain/pull-request-execution-binding.js";
@@ -2202,6 +2204,33 @@ test("own review repair binds its trusted source once and resumes the persisted 
   assert.equal((await dispatcher.dispatchPending()).delivered, 1);
   assert.equal(preparations, 1);
   assert.equal(proposals.calls[0].binding.executionSource.kind, "review_repair");
+});
+
+test("CI repair diagnostics bind and resume through canonical proposal storage", async () => {
+  const pair = conflictWorkPair(6, codeIntent(), { mergeStateStatus: "CLEAN", relation: "authored", nextAction: "fix_ci" });
+  const time = controlledClock();
+  const ledger = new FakeLedger([pair], time);
+  ledger.failBindAfterOnce = true;
+  let preparations = 0;
+  const { dispatcher, proposals } = fixture([pair], {
+    time, ledger,
+    reviewRepairSourcePreparer: { async prepare({ inputBinding }) {
+      preparations += 1;
+      return createCiRepairCodeExecutionSource({ inputBinding, writablePaths: ["src"],
+        ciEvidence: createCiRepairEvidence({ schemaVersion: 1, repository: inputBinding.repository,
+          number: inputBinding.pullRequestNumber, headRefOid: inputBinding.headRefOid,
+          headRefName: inputBinding.gitTarget.headRefName,
+          checks: [{ kind: "status_context", name: "QuickTest", url: null, conclusion: "FAILURE" }],
+          diagnostics: [{ check: "QuickTest", state: "unavailable", failures: [{ message: "Fixture missing", file: "test.cpp" }] }] }) });
+    } },
+  });
+  assert.equal((await dispatcher.dispatchPending()).uncertain, 1);
+  assert.equal(proposals.calls.length, 0);
+  time.advance(1_001);
+  assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  assert.equal(preparations, 1);
+  assert.equal(proposals.calls[0].binding.executionSource.kind, "ci_repair");
+  assert.equal(proposals.calls[0].binding.executionSource.ciEvidence.diagnostics[0].failures[0].message, "Fixture missing");
 });
 
 for (const code of ['OWN_PR_CI_SOURCE_NOT_READY', 'CODE_CI_REPAIR_CONTEXT_UNAVAILABLE']) test(`CI source ${code} retries without submitting an ordinary unpublishable proposal`, async () => {

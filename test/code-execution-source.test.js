@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createCiRepairEvidence } from '../src/domain/ci-repair-evidence.js';
+import { cloneWorkProposalValue } from '../src/domain/work-proposal-contract.js';
 
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import {
@@ -35,6 +36,33 @@ test("CI repair keeps its own failed-check provenance on a fixed Head without in
     assert.throws(() => normalizeCodeExecutionSource(changed));
   }
   assert.throws(() => normalizeCodeExecutionSource({ ...source, kind: 'review_repair' }));
+});
+
+test("CI source identity survives canonical proposal key ordering without accepting changed diagnostics", () => {
+  const binding = inputBinding();
+  const material = { schemaVersion: 1, repository: binding.repository, number: binding.pullRequestNumber,
+    headRefOid: binding.headRefOid, headRefName: binding.gitTarget.headRefName,
+    checks: [{ kind: 'status_context', name: 'QuickTest', url: null, conclusion: 'FAILURE' }],
+    diagnostics: [{ check: 'QuickTest', state: 'unavailable',
+      failures: [{ message: 'Missing fixture', file: 'test.cpp', line: 42 }] }] };
+  const source = { schemaVersion: 1, kind: 'ci_repair', inputBinding: binding,
+    ciEvidence: createCiRepairEvidence(material), writeScope: { mode: 'configured_paths', paths: ['src'] } };
+  assert.equal(sameCodeExecutionSource(source, cloneWorkProposalValue(source)), true);
+  const zeroMaterial = structuredClone(material);
+  zeroMaterial.diagnostics[0].failures[0].line = -0;
+  const zeroSource = { ...source, ciEvidence: createCiRepairEvidence(zeroMaterial) };
+  assert.equal(sameCodeExecutionSource(zeroSource, cloneWorkProposalValue(zeroSource)), true,
+    "canonical JSON stores negative zero as zero");
+  const changed = structuredClone(material);
+  changed.diagnostics[0].failures[0].line += 1;
+  assert.equal(sameCodeExecutionSource(source, { ...source, ciEvidence: createCiRepairEvidence(changed) }), false);
+  const ordered = structuredClone(material);
+  ordered.diagnostics[0].failures.push({ message: 'Other fixture', file: 'other.cpp', line: 1 });
+  const reordered = structuredClone(ordered);
+  reordered.diagnostics[0].failures.reverse();
+  assert.equal(sameCodeExecutionSource({ ...source, ciEvidence: createCiRepairEvidence(ordered) },
+    { ...source, ciEvidence: createCiRepairEvidence(reordered) }), false);
+  assert.equal(sameCodeExecutionSource(source, { ...source, ciEvidence: { ...source.ciEvidence, contentDigest: '0'.repeat(64) } }), false);
 });
 
 test("review repair binds the exact PR input and configured prefixes without conflict provenance", () => {
