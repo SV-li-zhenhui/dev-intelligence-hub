@@ -4218,33 +4218,42 @@ export function startApplicationBackgroundWork(
     independentEmployeeFactWaiters.clear();
   }
 
-  function independentEmployeeFactsReady() {
+  function automaticAgencyCyclesEnabled() {
     const actions = application.config.githubActions;
-    const automatic = actions?.enabled === true &&
+    return actions?.enabled === true &&
       (actions.automaticReview === true || actions.automaticOwnPrRepair === true);
-    // Queuing a future refresh does not change the last fully admitted facts.
-    // Starting that refresh closes factsReady until routing and intake finish.
-    return factsReady && (automatic || readyFactCycleSequence === factCycleSequence);
   }
 
-  function waitForIndependentEmployeeFacts() {
+  function independentEmployeeFactsReady() {
+    // Queuing a future refresh does not change the last fully admitted facts.
+    // Starting that refresh closes factsReady until routing and intake finish.
+    return factsReady && (automaticAgencyCyclesEnabled() || readyFactCycleSequence === factCycleSequence);
+  }
+
+  function waitForIndependentEmployeeFacts(signal) {
+    signal?.throwIfAborted();
     if (stopped) return Promise.resolve(false);
     if (independentEmployeeFactsReady()) return Promise.resolve(true);
     if (pendingFactCycles === 0) return Promise.resolve(false);
-    return new Promise((resolve) => independentEmployeeFactWaiters.add(resolve));
+    return new Promise((resolve, reject) => {
+      const finish = ready => {
+        independentEmployeeFactWaiters.delete(finish);
+        signal?.removeEventListener('abort', onAbort);
+        resolve(ready);
+      };
+      const onAbort = () => {
+        independentEmployeeFactWaiters.delete(finish);
+        signal.removeEventListener('abort', onAbort);
+        reject(signal.reason);
+      };
+      independentEmployeeFactWaiters.add(finish);
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
   }
 
   function isIndependentEmployeeCycle(options) {
     if (options.includeLegacyEmployees || options.employeeIds?.length !== 1) return false;
-    const employeeId = options.employeeIds[0];
-    if (["orchestrator", "tester"].includes(employeeId)) {
-      return application.config.githubActions?.enabled === true &&
-        (application.config.githubActions.automaticReview === true ||
-          application.config.githubActions.automaticOwnPrRepair === true);
-    }
-    return employeeId === "pr-engineer" || (employeeId === "developer" &&
-      application.config.githubActions?.enabled === true &&
-      application.config.githubActions.automaticOwnPrRepair === true);
+    return options.employeeIds[0] === "pr-engineer" || automaticAgencyCyclesEnabled();
   }
 
   async function runIndependentEmployee(options) {
@@ -4259,9 +4268,10 @@ export function startApplicationBackgroundWork(
       // code jobs and memory projection must not delay role handoffs or Reviews.
       await runDrainParticipant(DRAIN_PARTICIPANTS.employeeExecution, () => {
         const runOptions = backgroundOperationOptions({ trigger: options.trigger }, options.signal);
-        return typeof employeeRegistry.runSelected === "function"
-          ? employeeRegistry.runSelected([employeeId], runOptions)
-          : employeeRegistry.run(employeeId, runOptions);
+        if (typeof employeeRegistry.runSelected === "function") return employeeRegistry.runSelected([employeeId], runOptions);
+        if (typeof employeeRegistry.run === "function") return employeeRegistry.run(employeeId, runOptions);
+        if (employeeId === "pr-reviewer" && typeof employeeRegistry.runAll === "function") return employeeRegistry.runAll(runOptions);
+        throw new TypeError("employee registry cannot run the selected role");
       });
       options.signal.throwIfAborted();
       if (employeeId === "pr-engineer") await recoverReviewHandoffs(options.signal);
@@ -4540,17 +4550,24 @@ export function startApplicationBackgroundWork(
     return { skipped: null };
   }
 
-  function enqueueAgencyCycle(
+  async function enqueueAgencyCycle(
     options,
     priority,
     { admitOnDequeue = false } = {},
   ) {
-    if (isIndependentEmployeeCycle(options)) {
+    if (isIndependentEmployeeCycle(options) || automaticAgencyCyclesEnabled()) {
       // Waiting for a refresh is not active work: maintenance must be able to
       // close admission without needing another admitted refresh to release it.
-      return waitForIndependentEmployeeFacts().then((ready) => ready && !stopped
-        ? operationalAdmission.run(() => runIndependentEmployee(options))
-        : { skipped: "facts_not_ready" });
+      while (!stopped) {
+        if (!await waitForIndependentEmployeeFacts(options.signal) || stopped) return { skipped: "facts_not_ready" };
+        const result = await operationalAdmission.run(() => {
+          options.signal?.throwIfAborted();
+          if (!independentEmployeeFactsReady()) return { skipped: "facts_changed_before_admission" };
+          return isIndependentEmployeeCycle(options) ? runIndependentEmployee(options) : performAgencyCycle(options);
+        });
+        if (result?.skipped !== "facts_changed_before_admission") return result;
+      }
+      return { skipped: "stopped" };
     }
     const operation = () => admitOnDequeue
       ? operationalAdmission.run(() => performAgencyCycle(options))
@@ -4606,6 +4623,8 @@ export function startApplicationBackgroundWork(
   ) {
     if (isIndependentEmployeeCycle(options)) {
       key = `employee:${options.employeeIds[0]}`;
+    }
+    if (isIndependentEmployeeCycle(options) || automaticAgencyCyclesEnabled()) {
       runOptions = { ...runOptions, admitOnDequeue: true };
     }
     return runCoalescedTracked(
@@ -4695,11 +4714,19 @@ export function startApplicationBackgroundWork(
         if (pendingFactCycles === 1) {
           confirmationAccess.open();
           try {
-            await performAgencyCycle({
-              trigger: "refresh_completed",
-              includeLegacyEmployees: true,
-              signal,
-            });
+            if (automaticAgencyCyclesEnabled()) {
+              // Fact ownership ends after intake and confirmation reconciliation.
+              // Every automatic cycle retains its own tracked lifetime instead.
+              for (const [key, cycle] of [
+                ["coordination", { includeLegacyEmployees: false }],
+                ["employee:pr-reviewer", { employeeIds: ["pr-reviewer"] }],
+              ]) {
+                runCoalescedAgencyCycle(key, { trigger: "refresh_completed", ...cycle, signal },
+                  backgroundPriority.scheduled, { rethrow: true, admitOnDequeue: true }).catch(reportBackgroundError);
+              }
+            } else {
+              await performAgencyCycle({ trigger: "refresh_completed", includeLegacyEmployees: true, signal });
+            }
           } catch (error) {
             if (signal.aborted) throw error;
             reportBackgroundError(error);

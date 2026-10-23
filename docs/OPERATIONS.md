@@ -932,6 +932,14 @@ results, publish completed repairs and refresh PR facts while another model runs
 The `codeJobExecution.runCycle` drain participant retains ownership until every
 admitted operation actually settles; maintenance and shutdown still fence work.
 
+Automatic agency cycles, including the legacy PR patrol and requirements role,
+have their own coalesced execution lifetimes. Fact refresh completes after source
+intake and confirmation reconciliation; it does not wait for model or memory
+projection work. Roles recheck admitted facts before entering and wait again if
+a refresh starts during admission. Cancelled fact waiters release their slot;
+already admitted work remains owned until it settles. Manual mode keeps its
+ordered background queue.
+
 ## Automatic work continuations
 
 In automatic mode, schema 2 of `work-continuations.json` records the source task,

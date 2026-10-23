@@ -87,42 +87,29 @@ test('continuation watchdog still stops owned work after fact refresh fails', { 
   } finally { release.resolve(); await background.stop(); }
 });
 
-test('a continuation cancelled before background admission settles without waiting for unrelated code work', { timeout: 5_000 }, async () => {
+test('shutdown removes unstarted queued manual work while still draining admitted work', { timeout: 5_000 }, async () => {
   const codeStarted = deferred(), releaseCode = deferred();
-  const item = { itemId: 'queued-requirements-timeout', revision: 1, status: 'queued', currentTarget: { type: 'role', id: 'requirements-analyst' } };
-  const config = { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true }, workCoordination: { leaseDurationMs: 1_000 } };
-  let now = Date.now(), state, roleCalls = 0;
-  const scheduler = new WorkContinuationScheduler({
-    store: { async read(_key, fallback) { return structuredClone(state ?? fallback); }, async write(_key, value) { state = structuredClone(value); } },
-    ledger: {
-      async listClaimCandidates() { return { items: [structuredClone(item)], facts: [{ itemId: item.itemId, graphBlocked: false }], nextCursor: null }; },
-      async listItems() { return { items: [], nextCursor: null }; },
-      async readItemForReconciliation() { return structuredClone(item); }, async readItemProgress() { return [structuredClone(item)]; },
-    },
-    configurationReader: { async readActive() { return { configuration: config }; } },
-    roleStateReader: { async read() { return { enabled: true, paused: false }; } }, clock: () => new Date(now),
-  });
-  const timers = [];
-  const background = startApplicationBackgroundWork({ config, workContinuationScheduler: scheduler,
+  let roleCalls = 0;
+  const background = startApplicationBackgroundWork({ config: { refreshMinutes: 7 },
     refreshService: { async refresh() {} },
     workCoordination: { async runCycle() { codeStarted.resolve(); await releaseCode.promise; } },
     employeeRegistry: { schedules: () => [], async runSelected(ids) { if (ids.includes('requirements-analyst')) roleCalls += 1; } },
-  }, { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {}, reportError() {} });
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError() {} });
+  const initial = background.initialRefresh.catch(error => error);
   try {
     await codeStarted.promise;
+    const queued = background.runEmployee('requirements-analyst').catch(error => error);
     await new Promise(resolve => setImmediate(resolve));
-    assert.equal(state.records[0].receipts[0].outcome, 'running');
+    assert.equal(background.drainStatus().queuedOperationCount, 1);
     assert.equal(roleCalls, 0);
-    now += 1_001;
-    await timers.find(timer => timer.delay === 10_000).callback();
-    await new Promise(resolve => setImmediate(resolve));
-    assert.equal(state.records[0].receipts[0].outcome, 'timed_out');
-    assert.equal(scheduler.readStatus().overdueCount, 0);
+    let stopped = false; const stopping = background.stop().then(() => { stopped = true; });
+    assert.equal((await queued).code, 'LIFECYCLE_SHUTDOWN_ABORTED');
+    assert.equal(background.drainStatus().queuedOperationCount, 0);
+    assert.equal(stopped, false);
     assert.equal(roleCalls, 0);
-    releaseCode.resolve(); await background.initialRefresh;
-    await new Promise(resolve => setImmediate(resolve));
+    releaseCode.resolve(); await stopping; await initial;
     assert.equal(roleCalls, 0, 'cancelled queued work must never execute later');
-  } finally { releaseCode.resolve(); await background.initialRefresh; await background.stop(); }
+  } finally { releaseCode.resolve(); await background.stop(); await initial; }
 });
 
 test('automatic code execution leaves result reconciliation and fact refresh free while retaining shutdown ownership', { timeout: 5_000 }, async () => {
@@ -148,6 +135,95 @@ test('automatic code execution leaves result reconciliation and fact refresh fre
     await new Promise(resolve => setImmediate(resolve)); assert.equal(workerSignal.aborted, true); assert.equal(stopped, false);
     release.resolve(); await stopping; await tick.callback(); assert.equal(calls, 1);
   } finally { facts.resolve(); release.resolve(); await background.initialRefresh; await background.stop(); }
+});
+
+for (const slowStage of ['legacy-review', 'housekeeping', 'memory-projection']) test(`automatic fact refresh remains free while ${slowStage} owns late work`, { timeout: 5_000 }, async () => {
+  const started = deferred(), release = deferred(), timers = [];
+  let refreshes = 0, reviews = 0, requirements = 0, initialSettled = false;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    refreshService: { async refresh() { refreshes += 1; } },
+    workCoordination: { async intake() {}, async runCycle() {
+      if (slowStage === 'housekeeping') { started.resolve(); await release.promise; }
+    } },
+    memoryProjector: { async runCycle() {
+      if (slowStage === 'memory-projection') { started.resolve(); await release.promise; }
+    } },
+    employeeRegistry: { schedules: () => [{ id: 'requirements-analyst', intervalMinutes: 1 }, { id: 'pr-reviewer', intervalMinutes: 2 }],
+      async runSelected(ids) {
+        if (ids.includes('requirements-analyst')) requirements += 1;
+        if (ids.includes('pr-reviewer')) {
+          reviews += 1;
+          if (slowStage === 'legacy-review') { started.resolve(); await release.promise; }
+        }
+      } },
+  }, { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {}, reportError() {} });
+  const initial = background.initialRefresh.then(() => { initialSettled = true; }, error => {
+    if (error.code !== 'LIFECYCLE_SHUTDOWN_ABORTED') throw error;
+  });
+  try {
+    await started.promise; await new Promise(resolve => setImmediate(resolve));
+    assert.equal(initialSettled, true, 'fresh facts must finish independently of model and projection work');
+    await timers.find(timer => timer.delay === 60_000).callback(); assert.equal(requirements, 1);
+    const duplicateReview = timers.find(timer => timer.delay === 120_000).callback();
+    if (slowStage !== 'legacy-review') await duplicateReview;
+    await timers.find(timer => timer.delay === 7 * 60_000).callback(); assert.equal(refreshes, 2);
+    if (slowStage === 'legacy-review') assert.equal(reviews, 1, 'refresh and scheduled legacy patrol must coalesce');
+    let stopped = false; const stopping = background.stop().then(() => { stopped = true; });
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(stopped, false);
+    release.resolve(); await stopping; await initial; await duplicateReview;
+  } finally { release.resolve(); await background.stop(); await initial; }
+});
+
+test('a continuation cancelled while waiting for fresh facts settles before the refresh and never runs later', async () => {
+  const refreshing = deferred(), releaseRefresh = deferred(), controller = new AbortController();
+  let refreshes = 0, dispatch, requirements = 0;
+  const timeout = Object.assign(new Error('continuation expired'), { code: 'WORK_CONTINUATION_TIMEOUT' });
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    refreshService: { async refresh() { if (++refreshes > 1) { refreshing.resolve(); await releaseRefresh.promise; } } },
+    employeeRegistry: { schedules: () => [], async runSelected(ids) { if (ids.includes('requirements-analyst')) requirements += 1; } },
+    workContinuationScheduler: { async runCycle(options) { dispatch = options.dispatch; return { started: 0 }; } },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError() {} });
+  try {
+    await background.initialRefresh;
+    await new Promise(resolve => setImmediate(resolve));
+    const refresh = background.refresh({ notify: true }); await refreshing.promise;
+    let settled = false;
+    const waiting = dispatch({ roleId: 'requirements-analyst', signal: controller.signal }).finally(() => { settled = true; });
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(settled, false);
+    controller.abort(timeout);
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(settled, true);
+    assert.deepEqual(await waiting, { skipped: 'continuation_timeout' });
+    assert.equal(requirements, 0);
+    releaseRefresh.resolve(); await refresh;
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(requirements, 0);
+  } finally { releaseRefresh.resolve(); await background.stop(); }
+});
+
+test('an automatic general fact waiter does not occupy operational admission and stops before the active refresh', async () => {
+  const gate = new OperationalQuiescenceGate(), refreshing = deferred(), release = deferred();
+  let work = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    operations: { admission: { run: gate.run.bind(gate) } },
+    refreshService: { async refresh() { refreshing.resolve(); await release.promise; } },
+    employeeRegistry: { schedules: () => [], async runSelected() { work += 1; } },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError() {} });
+  const initial = background.initialRefresh.catch(error => error);
+  try {
+    await refreshing.promise;
+    assert.equal(gate.readStatus().activeOperations, 1, 'the admitted fact read owns one lease');
+    let settled = false;
+    const waiting = background.signalAgency({ trigger: 'waiting-for-facts' }).finally(() => { settled = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(gate.readStatus().activeOperations, 1, 'unstarted general work must not own another lease');
+    let stopped = false; const stopping = background.stop().then(() => { stopped = true; });
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(settled, true); assert.equal(stopped, false);
+    await waiting; assert.equal(work, 0);
+    release.resolve(); await stopping; await initial;
+    assert.equal(gate.readStatus().activeOperations, 0);
+  } finally { release.resolve(); await background.stop(); await initial; }
 });
 
 test('automatic local proposal retries run during long code work and remain in lifecycle drain', { timeout: 5_000 }, async () => {
@@ -4257,7 +4333,7 @@ for (const blocker of ["memory projection", "legacy patrol"]) {
         assert.ok(background.drainStatus().activeParticipants.some(
           ({ id }) => id === DRAIN_PARTICIPANTS.employeeExecution.id,
         ));
-        const refreshed = assert.rejects(background.initialRefresh, { code: "LIFECYCLE_SHUTDOWN_ABORTED" });
+        const refreshed = background.initialRefresh;
         const manualStopped = assert.rejects(manual, { code: "LIFECYCLE_SHUTDOWN_ABORTED" });
         let stopped = false;
         const stopping = background.stop().then(() => { stopped = true; });
@@ -4325,7 +4401,7 @@ for (const roleId of ["developer", "orchestrator", "tester"]) {
 }
 
 for (const roleId of ["developer", "orchestrator", "pr-engineer", "tester"]) {
-  test(`automatic ${roleId} continues on admitted facts until a queued refresh starts`, async () => {
+  test(`automatic ${roleId} waits for refreshing facts without waiting for another role`, async () => {
     const timers = [];
     const generalStarted = deferred();
     const releaseGeneral = deferred();
@@ -4348,29 +4424,28 @@ for (const roleId of ["developer", "orchestrator", "pr-engineer", "tester"]) {
     });
     try {
       await background.initialRefresh;
-      const general = timers[1].callback();
+      let generalSettled = false;
+      const general = timers[1].callback().finally(() => { generalSettled = true; });
       await generalStarted.promise;
       const refresh = timers[0].callback();
       const role = timers[2].callback();
       await new Promise((resolve) => setImmediate(resolve));
-      assert.equal(roleRuns, 1, "a refresh queued behind general work must not stall automatic roles");
-      await role;
-      releaseGeneral.resolve();
-      await general;
-      await new Promise((resolve) => setImmediate(resolve));
-      const duringRefresh = background.runEmployee(roleId);
-      await new Promise((resolve) => setImmediate(resolve));
-      assert.equal(roleRuns, 1, "an actively refreshing snapshot must finish admission before new role work");
+      assert.equal(refreshes, 2, "refresh must begin while general work is still running");
+      assert.equal(roleRuns, 0, "an actively refreshing snapshot must finish admission before new role work");
       releaseRefresh.resolve();
-      await Promise.all([refresh, duringRefresh]);
+      await Promise.all([refresh, role]);
+      assert.equal(roleRuns, 1);
+      assert.equal(generalSettled, false, "newly admitted facts must release other roles before the long role ends");
+      await background.runEmployee(roleId);
       assert.equal(roleRuns, 2);
+      releaseGeneral.resolve(); await general;
     } finally {
       releaseGeneral.resolve(); releaseRefresh.resolve(); await background.stop();
     }
   });
 }
 
-test("automatic role waiters resume after admitted facts even when another refresh is queued", async () => {
+test("automatic role waiters resume and later refreshes do not wait for general work", async () => {
   const refreshing = deferred(), releaseRefresh = deferred();
   const general = deferred(), releaseGeneral = deferred();
   let refreshes = 0, roleRuns = 0;
@@ -4395,7 +4470,7 @@ test("automatic role waiters resume after admitted facts even when another refre
     releaseRefresh.resolve();
     await general.promise;
     await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(refreshes, 1, "the second refresh must still be queued behind general work");
+    assert.equal(refreshes, 2, "the next refresh must not queue behind general role work");
     assert.equal(roleRuns, 1, "existing role waiters must use the now fully admitted facts");
     releaseGeneral.resolve();
     await Promise.all([role, generalRun, nextRefresh, background.initialRefresh]);
