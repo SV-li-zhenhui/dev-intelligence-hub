@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -149,7 +149,12 @@ async function waitForChild(setup) {
 test("Windows pre-aborted execution leaves no cleanup fence", { skip: process.platform !== "win32" }, async (t) => {
   const setup = await fixture(t);
   const controller = new AbortController(); controller.abort();
-  await assert.rejects(setup.runner.run({ ...setup.request, signal: controller.signal }), { code: "SANDBOX_ABORTED" });
+  await assert.rejects(setup.runner.run({ ...setup.request, signal: controller.signal }), error => {
+    assert.equal(error.code, "SANDBOX_ABORTED");
+    assert.deepEqual(error.details, { origin: "windows_fixed_prelaunch", notExecuted: true, cleanupPending: false });
+    return true;
+  });
+  await assert.rejects(lstat(setup.runner.executionDirectory("run-one", "action-one")), { code: "ENOENT" });
   await new WindowsFixedTestRunner(setup.options).cleanup({ executionId: "run-one", actionId: "action-one" });
 });
 

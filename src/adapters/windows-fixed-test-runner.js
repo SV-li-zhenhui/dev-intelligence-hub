@@ -90,7 +90,8 @@ export class WindowsFixedTestRunner {
     if (typeof request.workspaceRevision !== "string" || !/^[a-f0-9]{64}$/u.test(request.workspaceRevision) ||
       typeof request.workspacePath !== "string" || !path.isAbsolute(request.workspacePath) ||
       (request.signal != null && (typeof request.signal.addEventListener !== "function" || typeof request.signal.aborted !== "boolean"))) throw failure("INVALID_SANDBOX_REQUEST", "Windows test request is invalid");
-    if (request.signal?.aborted) throw failure("SANDBOX_ABORTED", "Windows fixed test was cancelled before launch");
+    if (request.signal?.aborted) throw failure("SANDBOX_ABORTED", "Windows fixed test was cancelled before launch",
+      { origin: "windows_fixed_prelaunch", notExecuted: true, cleanupPending: false });
     const profile = this.#profiles.get(request.profileId);
     if (!profile) throw failure("SANDBOX_PROFILE_NOT_FOUND", "Windows test profile was not found");
     const definition = profile.definition;

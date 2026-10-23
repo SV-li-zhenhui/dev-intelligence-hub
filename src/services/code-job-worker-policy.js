@@ -207,11 +207,21 @@ function compactManifestEntry(entry, kind) {
   return result;
 }
 
+function unstartedWindowsProfile(result) {
+  const error = result?.error, details = error?.details;
+  return error?.code === "SANDBOX_ABORTED" && details?.origin === "windows_fixed_prelaunch" &&
+    details.notExecuted === true && details.cleanupPending === false && Object.keys(details).length === 3 &&
+    result.exitCode == null && result.timedOut !== true && !result.stdout && !result.stderr &&
+    result.testSummary == null && result.runtimeIdentity == null;
+}
+
 function compactExecutorResult(action, result) {
   const error = result?.error
     ? {
         code: safeErrorCode(result.error, "ACTION_FAILED"),
         message: cleanText(result.error.message, 2_048),
+        ...(action.type === "run_profile" && unstartedWindowsProfile(result)
+          ? { details: { origin: "windows_fixed_prelaunch", notExecuted: true, cleanupPending: false } } : {}),
       }
     : null;
   if (action.type === "list_files") {
@@ -422,6 +432,9 @@ export function verificationFailure(job) {
     if (entry.actionType !== "run_profile" ||
         entry.workspaceRevision !== job.execution.workspaceRevision) return false;
     const candidate = trustedObservationAction(entry);
+    // An unstarted attempt cannot pass the profile or hide an earlier failure.
+    if (entry.status === "failed" && candidate.expectedWorkspaceRevision === entry.workspaceRevision &&
+        job.grant.requiredProfiles.some(({ id }) => id === candidate.profileId) && unstartedWindowsProfile(entry.detail?.result)) return false;
     if (latestProfiles.has(candidate.profileId)) return false;
     latestProfiles.add(candidate.profileId);
     if (entry.status !== "failed") return false;

@@ -4214,6 +4214,66 @@ test("verify jobs settle a trusted failed profile once with an actionable reason
   }
 });
 
+test("a profile cancelled before launch remains unexecuted and a verify job retries normally", async () => {
+  const initial = job({ grant: grant({ operation: "verify", allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.verify], writablePaths: [] }) });
+  const events = [], store = new FakeJobStore([initial], events), executor = new FakeExecutor(initial, events), calls = [];
+  failFirstProfileRun(executor, { exitCode: null, timedOut: false, stdout: "", stderr: "",
+    error: { code: "SANDBOX_ABORTED", message: "Windows fixed test was cancelled before launch",
+      details: { origin: "windows_fixed_prelaunch", notExecuted: true, cleanupPending: false } } });
+  const worker = new CodeJobWorkerService({ jobStore: store, executor,
+    brainDirectory: brain([{ type: "run_profile" }, { type: "run_profile" }, { type: "complete" }], calls), grantVerifier: verifier(events) });
+  const first = await worker.runCycle();
+  assert.equal(first.outcomes[0].status, "active");
+  assert.equal((await store.getForWorker(initial.jobId)).execution.observations[0].status, "failed");
+  assert.equal((await worker.runCycle()).outcomes[0].status, "active");
+  assert.equal(calls[1].capabilities.requiredProfilesRemaining, 1, "no passing result was invented for the unexecuted profile");
+  assert.equal((await worker.runCycle()).outcomes[0].status, "completed");
+  assert.deepEqual((await store.getForWorker(initial.jobId)).execution.observations.slice(0, 2).map(entry => entry.status), ["failed", "succeeded"]);
+});
+
+test("a durable unstarted profile can retry after restart without masking an earlier executed failure", async t => {
+  for (const earlierFailed of [false, true]) await t.test(String(earlierFailed), async () => {
+    const action = { type: "run_profile", actionId: "unstarted-after-restart", expectedWorkspaceRevision: REVISION_A, profileId: "node-tests" };
+    const observations = earlierFailed ? [observation({ ...action, actionId: "executed-failure" },
+      { status: "failed", result: { exitCode: 1, error: { code: "TESTS_FAILED", message: "checks failed" } } })] : [];
+    observations.push({ ...observation(action, { status: "failed", result: { exitCode: null, timedOut: false, stdout: "", stderr: "",
+      error: { code: "SANDBOX_ABORTED", message: "cancelled before launch",
+        details: { origin: "windows_fixed_prelaunch", notExecuted: true, cleanupPending: false } } } }), turn: observations.length + 1 });
+    const initial = job({ grant: grant({ operation: "verify", allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.verify], writablePaths: [] }),
+      status: "active", revision: 6, execution: { ...job().execution, sessionId: job().jobId, workspaceRevision: REVISION_A,
+        turn: observations.length, observations } });
+    const store = new FakeJobStore([initial]), executor = new FakeExecutor(initial), calls = [];
+    const worker = new CodeJobWorkerService({ jobStore: store, executor,
+      brainDirectory: brain([{ type: "run_profile" }], calls), grantVerifier: verifier([]) });
+    const result = (await worker.runCycle()).outcomes[0];
+    assert.equal(result.status, earlierFailed ? "failed" : "active");
+    assert.equal(calls.length, earlierFailed ? 0 : 1);
+    if (earlierFailed) assert.equal(result.code, "CODE_JOB_VERIFICATION_FAILED");
+  });
+});
+
+test("an interrupted profile with absent or contradictory unexecuted proof remains unknown", async t => {
+  for (const variant of ["legacy-message-only", "cleanup-pending", "extra-proof-field", "exit-code", "output", "runtime-proof"]) {
+    await t.test(variant, async () => {
+      const result = { exitCode: null, timedOut: false, stdout: "", stderr: "", error: { code: "SANDBOX_ABORTED",
+        message: "Windows fixed test was cancelled before launch",
+        details: { origin: "windows_fixed_prelaunch", notExecuted: true, cleanupPending: false } } };
+      if (variant === "legacy-message-only") delete result.error.details;
+      if (variant === "cleanup-pending") result.error.details.cleanupPending = true;
+      if (variant === "extra-proof-field") result.error.details.extra = true;
+      if (variant === "exit-code") result.exitCode = 0;
+      if (variant === "output") result.stdout = "A process ran";
+      if (variant === "runtime-proof") result.runtimeIdentity = { schemaVersion: 2 };
+      const initial = job({ grant: grant({ operation: "verify", allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.verify], writablePaths: [] }) });
+      const store = new FakeJobStore([initial]), executor = new FakeExecutor(initial);
+      failFirstProfileRun(executor, result);
+      const worker = new CodeJobWorkerService({ jobStore: store, executor,
+        brainDirectory: brain([{ type: "run_profile" }]), grantVerifier: verifier([]) });
+      assert.equal((await worker.runCycle()).outcomes[0].code, "CODE_JOB_VERIFICATION_UNKNOWN", variant);
+    });
+  }
+});
+
 test("verify jobs recover a durable failed profile locally before asking the brain again", async () => {
   const action = { type: "run_profile", actionId: "failed-profile-before-restart", expectedWorkspaceRevision: REVISION_A, profileId: "node-tests" };
   const initial = job({

@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { DockerSandboxError } from "../src/adapters/docker-test-sandbox.js";
-import { WindowsFixedTestRunner } from "../src/adapters/windows-fixed-test-runner.js";
+import { WindowsFixedTestRunner, WindowsTestRunnerError } from "../src/adapters/windows-fixed-test-runner.js";
 import { ConfiguredTestRunner } from "../src/adapters/configured-test-runner.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
@@ -1121,6 +1121,42 @@ test("schema v1 migration rejects a legacy identity whose digest no longer match
     recovered.executor.recover(),
     hasCode("EXECUTOR_STATE_INVALID"),
   );
+});
+
+test("only a trusted Windows prelaunch abort preserves unexecuted proof in the executor receipt", async t => {
+  for (const trusted of [true, false]) await t.test(String(trusted), async t => {
+    const details = { origin: "windows_fixed_prelaunch", notExecuted: true, cleanupPending: false };
+    const error = trusted
+      ? new WindowsTestRunnerError("SANDBOX_ABORTED", "Windows fixed test was cancelled before launch", details)
+      : new DockerSandboxError("SANDBOX_ABORTED", "Other runner was interrupted", details);
+    const setup = await fixture(t, { sandbox: new FakeSandbox({ results: [error] }) });
+    const { executor } = setup.createExecutor();
+    await executor.recover();
+    const session = await executor.start(startRequest());
+    const response = await executor.perform(actionRequest(session, { type: "run_profile", actionId: "unstarted-test", profileId: "node-tests" }));
+    assert.equal(response.action.status, "failed");
+    assert.equal(response.session.status, "active");
+    assert.equal(response.result.exitCode ?? null, null);
+    assert.equal(response.result.error.details?.notExecuted, trusted ? true : undefined);
+    assert.equal(response.result.error.details?.origin, trusted ? "windows_fixed_prelaunch" : undefined);
+    const restarted = setup.createExecutor().executor;
+    await restarted.recover();
+    assert.deepEqual((await restarted.getActionResult({ sessionId: session.id, actionId: response.action.id })).result, response.result);
+    if (trusted) {
+      const valid = await setup.innerStore.read("code-executor-state");
+      for (const variant of ["wrong-source", "cleanup", "false-proof", "extra-field", "write-action", "changed-workspace"]) {
+        const changed = structuredClone(valid), stored = changed.sessions[session.id].actions.at(-1);
+        if (variant === "wrong-source") stored.error.details.origin = "other";
+        if (variant === "cleanup") stored.error.details.cleanupPending = true;
+        if (variant === "false-proof") stored.error.details.notExecuted = false;
+        if (variant === "extra-field") stored.error.details.extra = true;
+        if (variant === "write-action") stored.type = "write_text";
+        if (variant === "changed-workspace") stored.workspaceRevisionAfter = "f".repeat(64);
+        await setup.innerStore.write("code-executor-state", changed);
+        await assert.rejects(setup.createExecutor().executor.recover(), error => error.code === "EXECUTOR_STATE_INVALID", variant);
+      }
+    }
+  });
 });
 
 test("writes, tests, and completion stay bound to an exact workspace revision", async (t) => {

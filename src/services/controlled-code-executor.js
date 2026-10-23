@@ -253,6 +253,10 @@ function isRecordedError(value, { nullable = true } = {}) {
     return false;
   }
   if (!Object.hasOwn(value, "details")) return true;
+  if (Object.hasOwn(value.details ?? {}, "origin") || Object.hasOwn(value.details ?? {}, "notExecuted")) {
+    return value.code === "SANDBOX_ABORTED" && hasExactKeys(value.details, ["origin", "notExecuted", "cleanupPending"]) &&
+      value.details.origin === "windows_fixed_prelaunch" && value.details.notExecuted === true && value.details.cleanupPending === false;
+  }
   if (!hasOnlyKeys(value.details, ERROR_DETAIL_KEYS)) return false;
   return Object.entries(value.details).every(([key, entry]) => {
     if (["cleanupPending", "truncated"].includes(key)) {
@@ -358,6 +362,8 @@ function validateAction(sessionId, action, attemptCount) {
   ) {
     invalidState();
   }
+  if (action.error?.details?.notExecuted === true && (action.type !== "run_profile" || action.status !== "failed" ||
+      action.workspaceRevisionAfter !== action.workspaceRevisionBefore)) invalidState();
   for (const [kind, reference] of Object.entries(action.outputArtifacts)) {
     if (
       !ARTIFACT_KINDS.has(kind) ||
@@ -1139,6 +1145,11 @@ function safeRecordedError(error, fallbackCode = "ACTION_FAILED") {
     }
   }
   if (Object.keys(details).length) recorded.details = details;
+  if (error instanceof WindowsTestRunnerError && error.code === "SANDBOX_ABORTED" &&
+      error.details?.origin === "windows_fixed_prelaunch" && error.details.notExecuted === true && error.details.cleanupPending === false &&
+      Object.keys(error.details).length === 3) {
+    recorded.details = { ...details, origin: "windows_fixed_prelaunch", notExecuted: true };
+  }
   return recorded;
 }
 
