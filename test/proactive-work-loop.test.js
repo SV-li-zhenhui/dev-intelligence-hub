@@ -2063,6 +2063,82 @@ test("host PR fact preparation failures retry without spending a model decision"
   assert.equal(ledger.items[0].attempt, 1);
 });
 
+test("host fact preparation failure leaves the next healthy specialist a work slot", async () => {
+  const time = controlledClock();
+  const sources = [workItem(468, { type: "role", id: "developer" }), workItem(469, { type: "role", id: "developer" })];
+  const ledger = new FakeLedger({ source: sources, time });
+  const decisions = [];
+  const loop = createLoop({ ledger, time,
+    directory: new FakeRoleDirectory({ developer: worker({ roleId: "developer", decide: async ({ item }) => {
+      decisions.push(item.itemId); return completeDecision();
+    } }) }),
+    roleContextAssembler: { async assemble({ item, roleId }) {
+      if (item.itemId === sources[0].itemId) throw new RoleContextAssemblerError("ROLE_CONTEXT_PR_FACT_UNAVAILABLE", "facts are unavailable", 503);
+      return contextPacket(item, roleId);
+    } }, orchestratorService: { async execute() {} },
+  });
+  const result = await loop.runCycle({ roleId: "developer", workLimit: 1 });
+  assert.equal(result.retried, 1);
+  assert.equal(result.staged, 1);
+  assert.equal(result.workAttempts, 1);
+  assert.deepEqual(decisions, [sources[1].itemId]);
+  assert.equal(ledger.items[0].attempt, 0);
+  assert.equal(ledger.items[0].status, "retry_wait");
+  assert.equal(ledger.calls.claim.length, 2);
+});
+
+test("context-only retries retain a bounded scan while later healthy work remains reachable", async () => {
+  const time = controlledClock();
+  const sources = Array.from({ length: 8 }, (_, index) => workItem(480 + index, { type: "role", id: "developer" }));
+  const ledger = new FakeLedger({ source: sources, time });
+  const decisions = [];
+  const loop = createLoop({ ledger, time,
+    directory: new FakeRoleDirectory({ developer: worker({ roleId: "developer", decide: async ({ item }) => {
+      decisions.push(item.itemId); return completeDecision();
+    } }) }),
+    roleContextAssembler: { async assemble({ item, roleId }) {
+      if (item.itemId !== sources[7].itemId) throw new RoleContextAssemblerError("ROLE_CONTEXT_PR_FACT_UNAVAILABLE", "facts are unavailable", 503);
+      return contextPacket(item, roleId);
+    } }, orchestratorService: { async execute() {} },
+  });
+  const first = await loop.runCycle({ roleId: "developer", workLimit: 1 });
+  assert.equal(first.claimed, 4);
+  assert.equal(first.retried, 4);
+  assert.equal(first.workAttempts, 0);
+  assert.deepEqual(decisions, []);
+  const second = await loop.runCycle({ roleId: "developer", workLimit: 1 });
+  assert.equal(second.claimed, 4);
+  assert.equal(second.staged, 1);
+  assert.equal(second.workAttempts, 1);
+  assert.deepEqual(decisions, [sources[7].itemId]);
+  assert.ok(ledger.items.slice(0, 7).every(item => item.status === "retry_wait" && item.attempt === 0));
+});
+
+test("model and untyped context errors retain the work slot even when another task is ready", async () => {
+  for (const fromModel of [false, true]) {
+    const time = controlledClock();
+    const sources = [workItem(490, { type: "role", id: "developer" }), workItem(491, { type: "role", id: "developer" })];
+    const ledger = new FakeLedger({ source: sources, time });
+    let decisions = 0;
+    const loop = createLoop({ ledger, time, maxAttempts: 1,
+      directory: new FakeRoleDirectory({ developer: worker({ roleId: "developer", decide: async () => {
+        decisions += 1;
+        throw new RoleContextAssemblerError("ROLE_CONTEXT_PR_FACT_UNAVAILABLE", "model error", 503);
+      } }) }),
+      roleContextAssembler: { async assemble({ item, roleId }) {
+        if (!fromModel) throw Object.assign(new Error("untyped error"), { code: "ROLE_CONTEXT_PR_FACT_UNAVAILABLE", statusCode: 503 });
+        return contextPacket(item, roleId);
+      } }, orchestratorService: { async execute() {} },
+    });
+    const result = await loop.runCycle({ roleId: "developer", workLimit: 1 });
+    assert.equal(result.workAttempts, 1);
+    assert.equal(result.claimed, 1);
+    assert.equal(result.blocked, 1);
+    assert.equal(decisions, fromModel ? 1 : 0);
+    assert.equal(ledger.items[1].attempt, 0);
+  }
+});
+
 test("PR fact error codes cannot refund a failed model decision or an untyped preparation failure", async (t) => {
   for (const fromModel of [false, true]) await t.test(`from model: ${fromModel}`, async () => {
     const time = controlledClock(), ledger = new FakeLedger({ source: [workItem(469, { type: "role", id: "developer" })], time });

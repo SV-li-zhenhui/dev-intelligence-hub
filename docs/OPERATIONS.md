@@ -956,6 +956,12 @@ a refresh starts during admission. Cancelled fact waiters release their slot;
 already admitted work remains owned until it settles. Manual mode keeps its
 ordered background queue.
 
+An initial specialist context timeout or typed unavailable PR-facts response
+schedules the same durable infrastructure retry without using a model-work slot.
+The cycle can then admit another ready task, even with `workLimit: 1`. Availability
+checks and claims remain bounded; an error after the model started or an untyped
+lookalike still consumes its normal work slot.
+
 ## Automatic work continuations
 
 In automatic mode, schema 2 of `work-continuations.json` records the source task,

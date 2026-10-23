@@ -1247,6 +1247,10 @@ export class ProactiveWorkLoop {
           const outcome = this.roleContextAssembler === null || resolution.orchestrator
             ? await this.#decideAndStage(claim.item, resolution, options)
             : await this.#processSpecialist(claim.item, resolution, options);
+          // A host context failure has not made a decision. Keep its durable
+          // retry and bounded availability/claim scan, but leave work capacity
+          // for another eligible item in this cycle.
+          if (outcome.status === "retry_scheduled" && outcome.decisionSkipped === true) workAttempts -= 1;
           outcomes.push({ itemId: item.itemId, ...outcome });
           if (
             resolution.orchestrator &&
@@ -2306,6 +2310,8 @@ export class ProactiveWorkLoop {
           ? reasons.exhausted
           : reasons.retry,
     };
+    const retryOutcome = { status: "retry_scheduled", workerId: actorId, code,
+      ...(contextTimeout || unavailablePrFacts ? { decisionSkipped: true } : {}) };
     try {
       throwIfLoopAborted(options.signal);
       if (!restoreAttempt && attempt >= this.maxAttempts) {
@@ -2332,7 +2338,7 @@ export class ProactiveWorkLoop {
         ).toISOString(),
       });
       throwIfLoopAborted(options.signal);
-      return { status: "retry_scheduled", workerId: actorId, code };
+      return retryOutcome;
     } catch {
       throwIfLoopAborted(options.signal);
       const observed = await this.#observeItem(
@@ -2345,7 +2351,7 @@ export class ProactiveWorkLoop {
         return { status: "blocked", workerId: actorId, code };
       }
       if (observed?.status === "retry_wait") {
-        return { status: "retry_scheduled", workerId: actorId, code };
+        return retryOutcome;
       }
       return {
         status: observed ? "failure_state_unchanged" : "failure_uncertain",
