@@ -1411,6 +1411,16 @@ export async function createApplication({
           store,
           assignmentSource: workflowRouting,
           operationQueue: new OperationQueue(),
+          hostContextRecoveryReader: Object.freeze({
+            async read({ itemId }) {
+              const config = (await configurationRuntime?.reader?.readActive())?.configuration;
+              const role = await codeAuthorizationRoleRegistry?.get("orchestrator")?.roleView();
+              if (config?.githubActions?.enabled !== true || config.githubActions.automaticOwnPrRepair !== true ||
+                  config.workCoordination?.enabled !== true || role?.enabled !== true || role.paused === true) return null;
+              try { return { actorAccountId: config.githubActions.actorAccountId, run: await taskRuns.get("work-item", itemId) }; }
+              catch (error) { if (error?.code === "TASK_RUN_NOT_FOUND") return null; throw error; }
+            },
+          }),
           confirmationSettlementReader: Object.freeze({
             read: (input) => confirmationRuntime?.confirmationSettlementReader?.read(input),
           }),

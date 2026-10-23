@@ -1622,6 +1622,7 @@ test("enabled work coordination composes private runtimes into frozen applicatio
       calls.ledger = options;
       assert.equal(await options.confirmationSettlementReader.read({ confirmationId: "before-runtime" }), undefined);
       assert.equal(await options.obsoleteCodeJobSettler.settle({}), null);
+      assert.equal(await options.hostContextRecoveryReader.read({ itemId: "before-runtime" }), null);
       return ledgerRuntime;
     },
     dailyWorkLedgerViewFactory: ({ ledger, activeWindowDays }) => {
@@ -1803,6 +1804,8 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   assert.equal("confirmationSettlementReader" in application, false);
   assert.equal(Object.isFrozen(calls.ledger.obsoleteCodeJobSettler), true);
   assert.equal("obsoleteCodeJobSettler" in application, false);
+  assert.equal(Object.isFrozen(calls.ledger.hostContextRecoveryReader), true);
+  assert.equal("hostContextRecoveryReader" in application, false);
   assert.notStrictEqual(calls.ownerWorkRetry.ledger, ledgerRuntime);
   assert.deepEqual(Object.keys(calls.ownerWorkRetry.ledger).sort(), [
     "readItemForReconciliation",

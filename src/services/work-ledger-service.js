@@ -1,4 +1,5 @@
 import { scheduler } from "node:timers/promises";
+import { hostContextRecoveryCandidate, planHostContextRecovery, hostContextRetirement } from "./work-ledger-host-context-recovery.js";
 import { automaticRoleHandoffCandidate } from "./work-ledger-role-handoff.js";
 import { completedConflictInspectionRecoveryProof } from "./work-ledger-inspection-continuation.js";
 import { automaticReviewWorkAdmission } from "../domain/automatic-review-policy.js";
@@ -600,6 +601,7 @@ export class WorkLedgerService {
     candidateProcessor = createLocalWorkLedgerCandidateProcessor(),
     confirmationSettlementReader = null,
     obsoleteCodeJobSettler = null,
+    hostContextRecoveryReader = null,
   } = {}) {
     if (
       !store ||
@@ -633,6 +635,9 @@ export class WorkLedgerService {
     if (obsoleteCodeJobSettler !== null && typeof obsoleteCodeJobSettler?.settle !== "function") {
       throw new TypeError("obsoleteCodeJobSettler must provide settle");
     }
+    if (hostContextRecoveryReader !== null && typeof hostContextRecoveryReader?.read !== "function") {
+      throw new TypeError("hostContextRecoveryReader must provide read");
+    }
     if (
       !candidateProcessor ||
       typeof candidateProcessor.prepare !== "function" ||
@@ -654,6 +659,7 @@ export class WorkLedgerService {
     this.candidateProcessor = candidateProcessor;
     this.confirmationSettlementReader = confirmationSettlementReader;
     this.obsoleteCodeJobSettler = obsoleteCodeJobSettler;
+    this.hostContextRecoveryReader = hostContextRecoveryReader;
     this.limits = normalizeWorkLedgerLimits(limits);
     this.state = emptyWorkLedgerState();
     this.durableContentVersion = undefined;
@@ -1179,7 +1185,7 @@ export class WorkLedgerService {
     const state = await this.#readAttentionAuthorityState();
     const item = state.items.find((candidate) => candidate.itemId === input.producer.workItemId);
     const intent = state.outbox.find((candidate) => candidate.intentId === input.requestKey);
-    const maintenance = systemMaintenanceRetirement(intent);
+    const maintenance = systemMaintenanceRetirement(intent) ?? hostContextRetirement(intent);
     if (item && intent?.itemId === item.itemId && intent.requestedBy.roleId === input.producer.roleId && maintenance !== null) {
       return { status: "retry_wait", workItemRevision: maintenance.workItemRevision, reason: maintenance.reason };
     }
@@ -1669,7 +1675,28 @@ export class WorkLedgerService {
   }
 
   async retrySystemMaintenanceQuestions(input = {}) {
-    return this.#executeCommand(planSystemMaintenanceRetry, input);
+    const result = await this.#executeCommand(planSystemMaintenanceRetry, input);
+    if (!this.hostContextRecoveryReader || result.retried >= input.limit) return result;
+    // Called while the inbox holds its pending-question mutation lease. Read
+    // task-run controls outside the ledger writer, then revalidate durable CAS.
+    const captured = await this.#writeTransaction(() => {
+      const pending = new Set(input.requestKeys);
+      const candidates = [];
+      for (const item of this.state.items) {
+        if (!pending.has(item.activeIntentId)) continue;
+        const candidate = hostContextRecoveryCandidate(this.state, item);
+        if (candidate) candidates.push({ itemId: item.itemId, snapshotDigest: candidate.snapshotDigest });
+        if (candidates.length >= input.limit - result.retried) break;
+      }
+      return candidates;
+    });
+    for (const candidate of captured) {
+      const control = await this.hostContextRecoveryReader.read({ itemId: candidate.itemId });
+      const recovered = await this.#admitNewWork(() => this.#executeCommand(
+        context => planHostContextRecovery({ ...context, captured: candidate, control }), {}));
+      result.retried += recovered.retried;
+    }
+    return result;
   }
 
   async applyProposalBatch(input = {}) {

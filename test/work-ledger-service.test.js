@@ -4,7 +4,9 @@ import { EventEmitter } from "node:events";
 import test from "node:test";
 import { automaticRoleHandoffCandidate } from "../src/services/work-ledger-role-handoff.js";
 import { unstartedDeliveryContractFailure } from "../src/services/work-ledger-delivery-failure.js";
+import { hostContextRecoveryCandidate, planHostContextRecovery } from "../src/services/work-ledger-host-context-recovery.js";
 import { createWorkflowRoutingRuntime } from "../src/workflow-routing-runtime.js";
+import { createWorkLedgerRuntime } from "../src/work-ledger-runtime.js";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -1825,6 +1827,7 @@ async function createFixture({
   postCommitYield,
   candidateProcessor,
   confirmationSettlementReader,
+  hostContextRecoveryReader,
 } = {}) {
   const service = new WorkLedgerService({
     store,
@@ -1837,6 +1840,7 @@ async function createFixture({
     ...(postCommitYield === undefined ? {} : { postCommitYield }),
     ...(candidateProcessor === undefined ? {} : { candidateProcessor }),
     ...(confirmationSettlementReader === undefined ? {} : { confirmationSettlementReader }),
+    ...(hostContextRecoveryReader === undefined ? {} : { hostContextRecoveryReader }),
   });
   await service.recover();
   return { service, source, store, lease, time };
@@ -12798,6 +12802,181 @@ test("a historical unbound verification failure reaches its waiting orchestrator
     if (variant === "duplicate") boxes.push(clone(box));
     assert.equal(unstartedDeliveryContractFailure(candidate, boxes), null, variant);
   }
+});
+
+function missingHostContextIntent(child) {
+  return { schemaVersion: 1, type: "ask_user", summary: "补齐未知阻塞的宿主上下文",
+    reason: `子任务 revision ${child.revision} 的 ledgerStatus 为 blocked，但 blockingCondition 为 null，且没有提案处理结果、失败码或活动执行信息。原交付已退回，当前没有待验收交付。现有只读工具未提供任务详情查询能力，无法可靠确定恢复路径；不能猜测基础设施故障、取消已有修复任务、重复修改或宣告 CI 修复成功。`,
+    question: `请补充开发子任务 ${child.itemId} 的宿主阻塞原因及最新补充验证提案处理结果引用，注明是否存在活动执行；如有失败，请提供错误码和恢复状态。本次仅补齐缺失状态，不请求重新授权常规修复或发布。`,
+    choices: [{ id: "supply-blocking-context", label: "补齐阻塞上下文",
+      description: "提供宿主记录的阻塞原因和验证提案状态，保留原修复包及任务历史，再按证据继续。" }] };
+}
+
+async function pendingHostContextFixture() {
+  const record = ownerRequestedPrAssignment(1, { gitFacts: { ...prGitFacts(PR_HEAD_A),
+    workType: "general", nextAction: "fix_ci", suggestedCapability: "development", expectedHeadRefOid: PR_HEAD_A } });
+  record.assignment.target = { type: "role", id: "orchestrator" };
+  let control;
+  const fixture = await createFixture({ records: [record], hostContextRecoveryReader: { read: async () => clone(control) } });
+  await fixture.service.intake();
+  let [parent] = (await fixture.service.listItems()).items;
+  const command = prGraphChildCommand(parent, (await fixture.service.getSummary()).revision);
+  command.command.acceptanceContract.expectedDeliverables = [{ deliverableId: "ci-fix-package", kind: "change-package", description: "保留修复包", required: true }];
+  const created = await fixture.service.createGraphChild(command);
+  let child = (await fixture.service.listItems()).items.find(item => item.itemId === created.taskId);
+  child = await fixture.service.claim({ itemId: child.itemId, expectedRevision: child.revision, workerId: "employee-developer", leaseDurationMs: 30_000 });
+  const failed = await fixture.service.stageIntent({ itemId: child.itemId, expectedRevision: child.revision, leaseId: child.leaseId,
+    actorId: "employee-developer", roleId: "developer", intent: codeActionIntent({ operation: "verify" }) });
+  const dispatch = await fixture.service.claimIntent({ intentId: failed.outbox.intentId, expectedRevision: failed.outbox.revision,
+    dispatcherId: "work-intent-dispatcher", leaseDurationMs: 30_000 });
+  await fixture.service.ackIntent({ intentId: dispatch.intentId, expectedRevision: dispatch.revision, dispatchLeaseId: dispatch.dispatchLeaseId,
+    itemExpectedRevision: failed.item.revision, actorId: "work-intent-dispatcher", outcome: "failed", nextStatus: "blocked", details: { code: "policy-binding-invalid" } });
+  child = (await fixture.service.listItems()).items.find(item => item.itemId === child.itemId);
+  parent = (await fixture.service.listItems()).items.find(item => item.itemId === parent.itemId);
+  control = { actorAccountId: "SV-li-zhenhui", run: { kind: "work-item", taskId: parent.itemId, roleId: "orchestrator", active: false,
+    mode: "active", pendingCommand: null, phase: "completed", receipt: { taskId: parent.itemId, kind: "work-item", roleId: "orchestrator",
+      taskRevision: parent.revision, registeredAt: fixture.time.clock(), modelStartedAt: fixture.time.clock(), finishedAt: fixture.time.clock(), phase: "completed", stopConfirmed: true } } };
+  // Configuration and GitHub projections can spell the same login with different case.
+  control.actorAccountId = prExecutionBinding(parent).gitTarget.sourceAccountId.toUpperCase();
+  const { summary, reason, question, choices } = missingHostContextIntent(child);
+  const staged = await fixture.service.stageGraphEscalation({ authority: { actorId: "employee-orchestrator", scopeRootTaskId: parent.itemId },
+    command: { taskId: parent.itemId, expectedTaskRevision: parent.revision, expectedGraphRevision: (await fixture.service.getSummary()).revision,
+      summary, reason, question, choices } });
+  let ask = await fixture.service.claimIntent({ intentId: staged.outbox.intentId, expectedRevision: staged.outbox.revision,
+    dispatcherId: "work-intent-dispatcher", leaseDurationMs: 30_000 });
+  ask = await fixture.service.bindIntent({ intentId: ask.intentId, expectedRevision: ask.revision, dispatchLeaseId: ask.dispatchLeaseId,
+    dispatcherId: "work-intent-dispatcher",
+    itemExpectedRevision: staged.item.revision, boundIntent: boundAttentionIntent(staged.item, ask) });
+  const request = normalizeAttentionRequest({ requestKey: ask.intentId, type: "ask_user",
+    producer: { roleId: "orchestrator", workItemId: parent.itemId }, question, choices, context: [] });
+  const attention = createAttentionItem(request, 1, fixture.time.clock());
+  await fixture.service.ackIntent({ intentId: ask.intentId, expectedRevision: ask.revision, dispatchLeaseId: ask.dispatchLeaseId,
+    itemExpectedRevision: staged.item.revision, actorId: "work-intent-dispatcher", outcome: "delivered", nextStatus: "waiting_user",
+    details: { questionRef: attention.requestId } });
+  return { ...fixture, parentId: parent.itemId, childId: child.itemId, askId: ask.intentId, control, request, attention,
+    retry: () => fixture.service.retrySystemMaintenanceQuestions({ limit: 10, requestKeys: [ask.intentId] }) };
+}
+
+test("new host facts retire only the obsolete question and give its parent one normal decision", async () => {
+  const fixture = await pendingHostContextFixture();
+  const runtime = await createWorkLedgerRuntime({ store: fixture.store, assignmentSource: fixture.source, clock: fixture.time.clock,
+    createGuard: () => ({ acquire: async () => {}, run: fn => fixture.lease.run(fn), close: async () => {} }),
+    createCandidateProcessor: createLocalWorkLedgerCandidateProcessor, hostContextRecoveryReader: { read: async () => fixture.control } });
+  const inboxStore = new MemoryStore();
+  const inbox = new AttentionInbox({ store: inboxStore, exclusiveLease: new ExclusiveLease(), authority: runtime, clock: fixture.time.clock });
+  await inbox.recover();
+  await inbox.create(fixture.request);
+  const before = clone(fixture.store.stored());
+  assert.equal((await inbox.retrySystemQuestions()).retried, 1);
+  assert.deepEqual(await inbox.archiveRetired(), { archived: 1 });
+  assert.equal(inboxStore.stored("attention-inbox").items[0].result, null);
+  assert.equal(inboxStore.stored("attention-inbox").items[0].question, fixture.request.question);
+  assert.equal((await inbox.readOutbox()).items.length, 0);
+  await runtime.close();
+  const after = fixture.store.stored();
+  const parent = after.items.find(item => item.itemId === fixture.parentId);
+  const oldParent = before.items.find(item => item.itemId === fixture.parentId);
+  assert.equal(parent.status, "retry_wait");
+  assert.equal(parent.activeIntentId, null);
+  assert.equal(parent.attempt, oldParent.attempt);
+  assert.deepEqual(parent.decisionContext, oldParent.decisionContext);
+  assert.deepEqual(after.items.find(item => item.itemId === fixture.childId), before.items.find(item => item.itemId === fixture.childId));
+  const proof = after.outbox.find(entry => entry.intentId === fixture.askId).outcome.details.hostContextRetirement;
+  assert.equal(proof.reason, "host_context_facts_recovered");
+  assert.equal(proof.failure.downstreamCreated, false);
+  assert.equal(proof.failure.code, "delivery-evidence-incompatible");
+  const restarted = await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time,
+    hostContextRecoveryReader: { read: async () => fixture.control } });
+  assert.deepEqual(await restarted.service.readAttentionRequestRetirement({ requestKey: fixture.askId,
+    producer: { roleId: "orchestrator", workItemId: fixture.parentId } }),
+    { status: "retry_wait", workItemRevision: parent.revision, reason: "host_context_facts_recovered" });
+  const late = resolveAttentionItem(fixture.attention, { type: "choice", choiceId: "supply-blocking-context" }, 2, fixture.time.clock(), 1).outbox;
+  const savedParent = clone(parent);
+  await restarted.service.applyAttentionBatch({ items: [late], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+  assert.deepEqual(restarted.store.stored().items.find(item => item.itemId === parent.itemId), savedParent);
+  // A new ask/failure intent ID with the same input and contract cannot consume another retry.
+  const duplicateState = clone(after);
+  const duplicateParent = duplicateState.items.find(item => item.itemId === parent.itemId);
+  Object.assign(duplicateParent, oldParent);
+  const duplicateAsk = clone(before.outbox.find(entry => entry.intentId === fixture.askId));
+  duplicateAsk.intentId = `work-intent-${"f".repeat(64)}`;
+  duplicateParent.activeIntentId = duplicateAsk.intentId;
+  duplicateState.outbox.push(duplicateAsk);
+  duplicateState.outbox.find(entry => entry.itemId === fixture.childId).intentId = `work-intent-${"e".repeat(64)}`;
+  assert.equal(hostContextRecoveryCandidate(duplicateState, duplicateParent), null);
+});
+
+test("host fact recovery preserves owner controls, unanswered real questions and unproven state", async t => {
+  for (const variant of ["disabled", "paused", "pending", "active", "unknown-stop", "wrong-receipt", "no-receipt", "future-receipt",
+    "wrong-actor", "real-question", "multiple-choices", "wrong-revision", "wrong-child", "bound-child", "backlog", "answered", "unsealed",
+    "owner-blocked", "unknown-child", "changed-root"]) {
+    await t.test(variant, async () => {
+      const fixture = await pendingHostContextFixture();
+      const state = clone(fixture.store.stored());
+      const original = hostContextRecoveryCandidate(state, state.items.find(item => item.itemId === fixture.parentId));
+      const captured = { itemId: fixture.parentId, snapshotDigest: original.snapshotDigest };
+      const ask = state.outbox.find(entry => entry.intentId === fixture.askId);
+      const child = state.items.find(item => item.itemId === fixture.childId);
+      if (variant === "disabled") fixture.control.actorAccountId = null;
+      if (variant === "paused") fixture.control.run.mode = "paused";
+      if (variant === "pending") fixture.control.run.pendingCommand = { type: "pause" };
+      if (variant === "active") fixture.control.run.active = true;
+      if (variant === "unknown-stop") fixture.control.run.receipt.stopConfirmed = false;
+      if (variant === "wrong-receipt") fixture.control.run.receipt.taskRevision++;
+      if (variant === "no-receipt") fixture.control.run.receipt = null;
+      if (variant === "future-receipt") fixture.control.run.receipt.finishedAt = "2027-01-01T00:00:00.000Z";
+      if (variant === "wrong-actor") fixture.control.actorAccountId = "someone-else";
+      if (variant === "real-question") ask.intent.question = "是否改变验收口径？";
+      if (variant === "multiple-choices") ask.intent.choices.push({ id: "yes", label: "继续", description: "需要决策" });
+      if (variant === "wrong-revision") child.revision++;
+      if (variant === "wrong-child") child.graph.parentItemId = "work-item-" + "e".repeat(64);
+      if (variant === "bound-child") state.outbox.find(entry => entry.itemId === child.itemId).dispatchBinding = {};
+      if (variant === "backlog") state.attentionHighWatermark++;
+      if (variant === "answered") ask.outcome.details.resultAttestation = {};
+      if (variant === "unsealed") ask.dispatchBinding = null;
+      if (variant === "owner-blocked") state.items.find(item => item.itemId === fixture.parentId).status = "blocked";
+      if (variant === "unknown-child") state.outbox.find(entry => entry.itemId === child.itemId).status = "unknown";
+      if (variant === "changed-root") state.items.find(item => item.itemId === fixture.parentId).revision++;
+      const before = clone(state);
+      assert.deepEqual(planHostContextRecovery({ state, captured, control: fixture.control, clock: fixture.time.clock }),
+        { write: false, result: { retried: 0 } });
+      assert.deepEqual(state, before);
+    });
+  }
+});
+
+test("host context retirement commits before archive and a recorded owner rejection wins", async t => {
+  for (const reject of [false, true]) await t.test(reject ? "owner rejection" : "durable failure and restart", async () => {
+    const fixture = await pendingHostContextFixture();
+    const store = new MemoryStore();
+    const options = { store, exclusiveLease: new ExclusiveLease(), authority: fixture.service, clock: fixture.time.clock };
+    let inbox = new AttentionInbox(options);
+    await inbox.recover();
+    const attention = await inbox.create(fixture.request);
+    if (reject) {
+      await inbox.reject({ requestId: attention.requestId, expectedRevision: attention.revision,
+        contentDigest: attention.contentDigest, answer: { type: "reject", reason: "先暂停" } });
+      assert.equal((await inbox.retrySystemQuestions()).retried, 0);
+      assert.equal((await inbox.archiveRetired()).archived, 0);
+      const batch = await inbox.readOutbox();
+      await fixture.service.applyAttentionBatch(batch);
+      assert.equal(fixture.store.stored().items.find(item => item.itemId === fixture.parentId).status, "blocked");
+      assert.equal((await fixture.retry()).retried, 0);
+    } else {
+      fixture.store.failNextWrite();
+      await assert.rejects(inbox.retrySystemQuestions(), error => error.cause?.message === "durable write unavailable");
+      assert.equal((await inbox.archiveRetired()).archived, 0);
+      assert.equal(store.stored("attention-inbox").items[0].status, "pending");
+      assert.equal((await inbox.retrySystemQuestions()).retried, 1);
+      // Simulate losing the process between the ledger commit and inbox archive.
+      inbox = new AttentionInbox(options);
+      await inbox.recover();
+      assert.equal((await inbox.archiveRetired()).archived, 1);
+      assert.equal(store.stored("attention-inbox").items[0].result, null);
+      assert.equal((await inbox.readOutbox()).items.length, 0);
+      assert.equal((await inbox.archiveRetired()).archived, 0);
+    }
+  });
 });
 
 function handoffIntent(overrides = {}) {
