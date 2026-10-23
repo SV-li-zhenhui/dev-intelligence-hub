@@ -1,4 +1,5 @@
 import { scheduler } from "node:timers/promises";
+import { triageRetirementCandidate, planTriageRetirement } from './work-ledger-triage-retirement.js';
 import { indexRecordedDecisionFailures, decisionFailureParentIds } from './work-ledger-decision-failure.js';
 import { ciMaterialRecoveryCandidate, ciMaterialRetirement, planCiMaterialRecovery } from "./work-ledger-ci-material-recovery.js";
 import { hostContextRecoveryCandidate, planHostContextRecovery, hostContextRetirement, hasPendingHostContextRecovery } from "./work-ledger-host-context-recovery.js";
@@ -1685,6 +1686,9 @@ export class WorkLedgerService {
   async retrySystemMaintenanceQuestions(input = {}) {
     const result = await this.#executeCommand(planSystemMaintenanceRetry, input);
     if (!this.hostContextRecoveryReader || result.retried >= input.limit) return result;
+    const retired = await this.#retireSupersededTriageQuestions(input, input.limit - result.retried);
+    if (retired > 0) result.retired = retired;
+    if (result.retried + retired >= input.limit) return result;
     // Called while the inbox holds its pending-question mutation lease. Read
     // task-run controls outside the ledger writer, then revalidate durable CAS.
     const captured = await this.#writeTransaction(() => {
@@ -1699,7 +1703,7 @@ export class WorkLedgerService {
           ...(candidate.reviewDiagnostics ? { reviewDiagnostics: true, confirmationIds: candidate.confirmationIds } : {}),
           ...(candidate.decisionOwner ? { controlItemId: candidate.decisionOwner.itemId, childItemId: item.itemId }
             : candidate.guardedChildItemId ? { childItemId: candidate.guardedChildItemId } : {}) });
-        if (candidates.length >= input.limit - result.retried) break;
+        if (candidates.length >= input.limit - result.retried - retired) break;
       }
       return candidates;
     });
@@ -1721,6 +1725,33 @@ export class WorkLedgerService {
       result.retried += recovered.retried;
     }
     return result;
+  }
+
+  async #retireSupersededTriageQuestions(input, limit) {
+    const reader = this.hostContextRecoveryReader;
+    if (input.requestKeys.length === 0 || typeof reader.readTriageRetirement !== 'function' || typeof reader.withStoppedRuns !== 'function') return 0;
+    const captured = await this.#writeTransaction(() => {
+      if (this.state.attentionCursor < this.state.attentionHighWatermark) return [];
+      const pending = new Set(input.requestKeys), candidates = [];
+      for (const item of this.state.items) {
+        if (!pending.has(item.activeIntentId)) continue;
+        const candidate = triageRetirementCandidate(this.state, item);
+        if (candidate) candidates.push({ itemId: item.itemId, childItemId: candidate.child.itemId,
+          snapshotDigest: candidate.snapshotDigest, inputBinding: candidate.inputBinding,
+          confirmationIds: candidate.failure.confirmationIds });
+        if (candidates.length >= limit) break;
+      }
+      return candidates;
+    });
+    let retired = 0;
+    for (const candidate of captured) {
+      const control = await reader.readTriageRetirement(candidate);
+      if (!control) continue;
+      const guarded = await this.#admitNewWork(() => reader.withStoppedRuns(control, () =>
+        this.#executeCommand(context => planTriageRetirement({ ...context, captured: candidate, control }), {})));
+      if (guarded.executed) retired += guarded.result.retired;
+    }
+    return retired;
   }
 
   async applyProposalBatch(input = {}) {

@@ -1,4 +1,6 @@
 import { digestValue } from "../src/domain/code-executor-contract.js";
+import { createPrTriageWorkRequest, ownerWorkRequestDigest } from '../src/domain/owner-work-request.js';
+import { triageRetirementCandidate, matchRetiredTriageSource, publishedTriageReview, planTriageRetirement, automaticTriageRetirement } from '../src/services/work-ledger-triage-retirement.js';
 import { createCiRepairEvidence } from "../src/domain/ci-repair-evidence.js";
 import { isDeepStrictEqual } from "node:util";
 import { ciMaterialRecoveryCandidate, planCiMaterialRecovery, hasPendingCiMaterialRecovery } from "../src/services/work-ledger-ci-material-recovery.js";
@@ -1330,7 +1332,7 @@ import { MemoryProjector } from "../src/services/memory-projector.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
 import { createCodeJobGrant, CODE_JOB_ACTIONS_BY_OPERATION } from "../src/domain/code-job-contract.js";
 import { createCodeActionProposalConfirmationPlan } from "../src/domain/code-action-proposal-confirmation.js";
-import { normalizeConfirmationPlan } from "../src/domain/confirmation-contract.js";
+import { normalizeConfirmationPlan, normalizeConfirmationState } from "../src/domain/confirmation-contract.js";
 import { createGitHubReviewProposalConfirmationPlan } from "../src/domain/github-review-proposal-confirmation.js";
 import { reviewDiagnosticState } from "../src/services/work-ledger-review-diagnostic.js";
 import { isChangedReviewConfirmationDecision, reviewConfirmationSettlementIds } from "../src/services/work-ledger-review-confirmation-settlement.js";
@@ -18525,7 +18527,7 @@ test('the same delivery failure and contract cannot consume another host recover
   assert.equal(hostContextRecoveryCandidate(before, before.items.find(item => item.itemId === f.rootId)), null);
 });
 
-async function pendingReviewDiagnosticFixture() {
+async function pendingReviewDiagnosticFixture({ sourceRecord } = {}) {
   let control, queue;
   const reads = [];
   const reader = {
@@ -18536,7 +18538,7 @@ async function pendingReviewDiagnosticFixture() {
     },
     async withStoppedRuns(_control, operation) { return { executed: true, result: await operation() }; },
   };
-  const record = ownerRequestedPrAssignment(1, { gitFacts: { ...prGitFacts(PR_HEAD_A), workType: 'general',
+  const record = sourceRecord ?? ownerRequestedPrAssignment(1, { gitFacts: { ...prGitFacts(PR_HEAD_A), workType: 'general',
     state: 'open', nextAction: 'rereview', suggestedCapability: 'pr-review', expectedHeadRefOid: PR_HEAD_A } });
   record.assignment.target = { type: 'role', id: 'orchestrator' };
   const f = await createFixture({ records: [record], hostContextRecoveryReader: reader });
@@ -18590,8 +18592,201 @@ async function pendingReviewDiagnosticFixture() {
   const attention = createAttentionItem(request, 1, f.time.clock());
   await f.service.ackIntent({ intentId: ask.intentId, expectedRevision: ask.revision, dispatchLeaseId: ask.dispatchLeaseId,
     itemExpectedRevision: staged.item.revision, actorId: 'work-intent-dispatcher', outcome: 'delivered', nextStatus: 'waiting_user', details: { questionRef: attention.requestId } });
-  return { ...f, rootId: root.itemId, childId: child.itemId, askId: ask.intentId, request, attention, queue, control, reads };
+  return { ...f, rootId: root.itemId, childId: child.itemId, askId: ask.intentId, request, attention, queue, control, reads, reader };
 }
+
+async function obsoleteTriageReviewFixture() {
+  const jobId = 'pr-work-obsolete-review';
+  const gitFacts = { ...prGitFacts(PR_HEAD_A), workType: 'general', state: 'open', nextAction: 'rereview',
+    suggestedCapability: 'pr-review', expectedHeadRefOid: PR_HEAD_A };
+  const base = ownerRequestedPrAssignment(1, { gitFacts });
+  const ownerRequest = createPrTriageWorkRequest({ requestKey: jobId, targetRoleId: 'pr-engineer',
+    repository: base.event.subject.repository, number: base.event.subject.number, nextAction: 'rereview', expectedHeadRefOid: PR_HEAD_A });
+  const record = ownerRequestedPrAssignment(1, { gitFacts, sourceScopeId: `owner-request:${ownerRequest.requestId}` });
+  const f = await pendingReviewDiagnosticFixture({ sourceRecord: record });
+  const child = await f.service.readItemForReconciliation({ itemId: f.childId });
+  const ids = reviewConfirmationSettlementIds(child, new Map(f.store.stored().outbox.map(box => [box.intentId, box])));
+  const stale = (await Promise.all(ids.map(confirmationId => f.queue.readSettlement({ confirmationId })))).find(Boolean);
+  const priorPlan = normalizeConfirmationPlan(Object.fromEntries(['id', 'kind', 'requestedBy', 'actor', 'target', 'action', 'display']
+    .map(key => [key, key === 'id' ? `confirmation-github-review-${'9'.repeat(64)}` : clone(stale.item[key])])));
+  const publishedAt = '2026-08-02T00:31:00.000Z';
+  const published = { ...clone(stale.item), ...priorPlan, status: 'completed', createdAt: '2026-08-02T00:30:00.000Z', updatedAt: publishedAt,
+    execution: { requestId: `auto-review-v1-${'a'.repeat(48)}`, attempt: 1, startedAt: publishedAt, outcome: 'applied' },
+    receipt: { id: '12345', url: `https://github.com/${base.event.subject.repository}/pull/${base.event.subject.number}`, createdAt: publishedAt },
+    failure: null, rejection: null, invalidation: null };
+  normalizeConfirmationState({ schemaVersion: 1, revision: stale.queueRevision, items: [published] });
+  const extra = {
+    ownerRecord: { phase: 'intaken', workItemId: f.rootId, event: record.event, requestId: ownerRequest.requestId,
+      request: ownerRequest, requestDigest: ownerWorkRequestDigest(ownerRequest), createdAt: record.event.occurredAt, recordDigest: 'b'.repeat(64) },
+    triageJob: { id: jobId, status: 'superseded', workType: 'triage_plan', targetRoleId: 'pr-engineer', relation: 'review_requested',
+      handoffWorkItemId: f.rootId, repo: base.event.subject.repository, number: base.event.subject.number,
+      headRefOid: PR_HEAD_A, nextAction: 'rereview', createdAt: '2026-08-02T01:00:00.000Z', completedAt: '2026-08-02T01:11:00.000Z' },
+    observedAt: f.time.clock(), incomingFacts: { kind: 'pull_request', state: 'open', isDraft: false, author: 'another-author',
+      assignees: ['another-reviewer'], incomingReviewFactsAvailable: true, headRefOid: PR_HEAD_A,
+      myLatestPublishedReviewCommitOid: PR_HEAD_A, myLatestPublishedReviewAt: publishedAt,
+      myLatestPublishedReviewState: { APPROVE: 'APPROVED', REQUEST_CHANGES: 'CHANGES_REQUESTED', COMMENT: 'COMMENTED' }[published.display.payload.action.reviewEvent] },
+    publishedReviews: [{ queueRevision: stale.queueRevision, item: published }],
+  };
+  f.reader.readTriageRetirement = async input => ({ ...await f.reader.readReviewDiagnostics(input), ...clone(extra) });
+  return { ...f, extra };
+}
+
+test('superseded automatic Review triage retires its redundant graph and unanswered question without replaying a Review', async () => {
+  const f = await obsoleteTriageReviewFixture();
+  const before = await f.service.readItemForReconciliation({ itemId: f.childId });
+  const rootBefore = await f.service.readItemForReconciliation({ itemId: f.rootId });
+  const candidate = triageRetirementCandidate(f.store.stored(), rootBefore);
+  assert.ok(candidate, 'a quiet Review graph with an unanswered question is eligible for provenance checks');
+  assert.ok(matchRetiredTriageSource({ itemId: f.rootId, inputBinding: candidate.inputBinding }, f.extra.ownerRecord, f.extra.triageJob));
+  assert.ok(publishedTriageReview(f.extra.publishedReviews[0], candidate.inputBinding, f.control.actorAccountId,
+    f.extra.incomingFacts, f.extra.ownerRecord.createdAt), 'the earlier automatic Review must have a well-formed matching receipt');
+  const inbox = new AttentionInbox({ store: new MemoryStore(), exclusiveLease: new ExclusiveLease(), authority: f.service, clock: f.time.clock });
+  await inbox.recover(); await inbox.create(f.request);
+  assert.deepEqual(await inbox.retrySystemQuestions(), { retried: 0, retired: 1 });
+  const parent = await f.service.readItemForReconciliation({ itemId: f.rootId });
+  const child = await f.service.readItemForReconciliation({ itemId: f.childId });
+  assert.equal(parent.status, 'cancelled');
+  assert.equal(child.status, 'cancelled');
+  assert.equal(child.attempt, before.attempt);
+  assert.deepEqual(child.decisionContext, before.decisionContext);
+  assert.deepEqual(child.graph.deliveries, before.graph.deliveries);
+  assert.equal(parent.activeIntentId, null);
+  const retiredBox = f.store.stored().outbox.find(box => box.intentId === f.askId);
+  assert.ok(automaticTriageRetirement(retiredBox));
+  for (const variant of ['digest', 'source-digest', 'question', 'status', 'binding', 'accessor']) {
+    const box = clone(retiredBox), proof = box.outcome.details.automaticTriageRetirement;
+    let getterCalls = 0;
+    if (variant === 'digest') proof.digest = 'f'.repeat(64);
+    if (variant === 'source-digest') proof.sourceDigest = 'invalid';
+    if (variant === 'question') proof.questionRef = `attention-${'f'.repeat(64)}`;
+    if (variant === 'status') box.status = 'failed';
+    if (variant === 'binding') box.sourceBinding.inputDigest = 'f'.repeat(64);
+    if (variant === 'accessor') Object.defineProperty(proof, 'digest', { enumerable: true, get() { getterCalls++; return 'f'.repeat(64); } });
+    assert.equal(automaticTriageRetirement(box), null, variant);
+    assert.equal(getterCalls, 0);
+  }
+  assert.deepEqual(await inbox.archiveRetired(), { archived: 1 });
+  assert.equal((await inbox.readOutbox()).items.length, 0);
+  assert.deepEqual(await inbox.retrySystemQuestions(), { retried: 0 });
+  const late = resolveAttentionItem(f.attention, { type: 'choice', choiceId: 'provide-stale-diagnostics' }, 2, f.time.clock(), 1).outbox;
+  await f.service.applyAttentionBatch({ items: [late], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+  assert.deepEqual(await f.service.readItemForReconciliation({ itemId: f.rootId }), parent);
+  assert.deepEqual(await f.service.readItemForReconciliation({ itemId: f.childId }), child);
+});
+
+test('automatic triage retirement preserves explicit requests, current ownership, holds, effects and publication provenance', async t => {
+  const f = await obsoleteTriageReviewFixture();
+  const root = await f.service.readItemForReconciliation({ itemId: f.rootId });
+  const candidate = triageRetirementCandidate(f.store.stored(), root);
+  const captured = { itemId: f.rootId, snapshotDigest: candidate.snapshotDigest };
+  const original = await f.reader.readTriageRetirement({ itemId: f.rootId, childItemId: f.childId,
+    inputBinding: candidate.inputBinding, confirmationIds: candidate.failure.confirmationIds });
+  const variants = ['manual-request', 'request-digest', 'job-not-superseded', 'different-handoff', 'different-job-head',
+    'live-assignee', 'missing-assignees', 'malformed-assignees', 'new-live-head', 'missing-live-review', 'dismissed-review',
+    'manual-publication', 'later-publication', 'missing-publication', 'duplicate-publication', 'wrong-actor',
+    'stale-facts', 'future-facts', 'paused-parent', 'paused-child', 'inactive-source', 'changed-root',
+    'active-root-run', 'paused-root-run', 'unconfirmed-child', 'unknown-proposal', 'active-intent', 'earlier-owner-answer', 'executed-stale-review', 'rejected-review'];
+  for (const variant of variants) {
+    await t.test(variant, () => {
+      const state = clone(f.store.stored()), control = clone(original);
+      const parent = state.items.find(item => item.itemId === f.rootId), child = state.items.find(item => item.itemId === f.childId);
+      if (variant === 'manual-request') { control.ownerRecord.request.description += '\nExplicit additional review'; control.ownerRecord.requestDigest = ownerWorkRequestDigest(control.ownerRecord.request); }
+      if (variant === 'request-digest') control.ownerRecord.requestDigest = 'f'.repeat(64);
+      if (variant === 'job-not-superseded') control.triageJob.status = 'ready';
+      if (variant === 'different-handoff') control.triageJob.handoffWorkItemId = 'another-root';
+      if (variant === 'different-job-head') control.triageJob.headRefOid = PR_HEAD_B;
+      if (variant === 'live-assignee') control.incomingFacts.assignees = [control.actorAccountId];
+      if (variant === 'missing-assignees') delete control.incomingFacts.assignees;
+      if (variant === 'malformed-assignees') control.incomingFacts.assignees = [null];
+      if (variant === 'new-live-head') control.incomingFacts.headRefOid = PR_HEAD_B;
+      if (variant === 'missing-live-review') control.incomingFacts.myLatestPublishedReviewCommitOid = '';
+      if (variant === 'dismissed-review') control.incomingFacts.myLatestPublishedReviewState = 'DISMISSED';
+      if (variant === 'manual-publication') control.publishedReviews[0].item.execution.requestId = 'manual-review-request';
+      if (variant === 'later-publication') {
+        control.publishedReviews[0].item.receipt.createdAt = f.time.clock();
+        control.incomingFacts.myLatestPublishedReviewAt = f.time.clock();
+      }
+      if (variant === 'missing-publication') control.publishedReviews = [];
+      if (variant === 'duplicate-publication') control.publishedReviews.push(clone(control.publishedReviews[0]));
+      if (variant === 'wrong-actor') control.actorAccountId = 'another-actor';
+      if (variant === 'stale-facts') control.observedAt = new Date(Date.parse(f.time.clock()) - 120001).toISOString();
+      if (variant === 'future-facts') control.observedAt = new Date(Date.parse(f.time.clock()) + 1).toISOString();
+      if (variant === 'paused-parent') parent.status = 'paused';
+      if (variant === 'paused-child') child.status = 'paused';
+      if (variant === 'inactive-source') parent.source.scope.active = false;
+      if (variant === 'changed-root') parent.revision++;
+      if (variant === 'active-root-run') control.run.active = true;
+      if (variant === 'paused-root-run') control.run.mode = 'paused';
+      if (variant === 'unconfirmed-child') control.childRun.receipt.stopConfirmed = false;
+      if (variant === 'unknown-proposal') state.outbox.find(box => box.itemId === f.childId).status = 'unknown';
+      if (variant === 'active-intent') child.activeIntentId = 'unsettled-intent';
+      if (variant === 'earlier-owner-answer') {
+        const earlier = clone(state.outbox.find(box => box.intentId === f.askId));
+        earlier.intentId = `work-intent-${'f'.repeat(64)}`;
+        earlier.outcome.details.resultAttestation = { kind: 'attention_result' };
+        state.outbox.push(earlier);
+      }
+      if (variant === 'executed-stale-review') control.confirmations.find(Boolean).item.execution = { requestId: 'unknown-execution', attempt: 1, startedAt: f.time.clock(), outcome: 'unknown' };
+      if (variant === 'rejected-review') control.confirmations.find(Boolean).item.status = 'rejected';
+      const before = clone(state);
+      assert.deepEqual(planTriageRetirement({ state, captured, control, clock: f.time.clock }), { write: false, result: { retired: 0 } });
+      assert.deepEqual(state, before);
+    });
+  }
+});
+
+test('a changed task-run guard leaves automatic triage retirement and ordinary recovery untouched', async () => {
+  const f = await obsoleteTriageReviewFixture();
+  f.reader.withStoppedRuns = async () => ({ executed: false });
+  const before = clone(f.store.stored());
+  const inbox = new AttentionInbox({ store: new MemoryStore(), exclusiveLease: new ExclusiveLease(), authority: f.service, clock: f.time.clock });
+  await inbox.recover(); await inbox.create(f.request);
+  assert.deepEqual(await inbox.retrySystemQuestions(), { retried: 0 });
+  assert.deepEqual(f.store.stored(), before);
+});
+
+test('an answered triage question stays on the normal answer path and is never automatically retired', async () => {
+  const f = await obsoleteTriageReviewFixture();
+  const inbox = new AttentionInbox({ store: new MemoryStore(), exclusiveLease: new ExclusiveLease(), authority: f.service, clock: f.time.clock });
+  await inbox.recover(); await inbox.create(f.request);
+  const question = await inbox.next();
+  await inbox.answer({ requestId: question.requestId, expectedRevision: question.revision, contentDigest: question.contentDigest,
+    answer: { type: 'choice', choiceId: 'provide-stale-diagnostics' } });
+  const before = clone(f.store.stored());
+  assert.deepEqual(await inbox.retrySystemQuestions(), { retried: 0 });
+  assert.deepEqual(f.store.stored(), before);
+  assert.equal((await inbox.readOutbox()).items.length, 1);
+});
+
+test('automatic triage retirement fingerprints complete legal contract histories without truncating its CAS', async () => {
+  const f = await obsoleteTriageReviewFixture(), state = clone(f.store.stored());
+  for (const item of state.items.filter(item => [f.rootId, f.childId].includes(item.itemId))) {
+    item.revision += 31;
+    for (let revision = 2; revision <= 32; revision++) item.graph.acceptanceContracts.push({ revision,
+      acceptanceCriteria: Array.from({ length: 64 }, (_, index) => ({ criterionId: `criterion-${String(index).padStart(2, '0')}`, description: 'Historical criterion' })),
+      expectedDeliverables: Array.from({ length: 64 }, (_, index) => ({ deliverableId: `report-${String(index).padStart(2, '0')}`,
+        kind: 'text-report', description: 'Optional historical report', required: false })), recordedAt: item.updatedAt });
+  }
+  state.revision += 62;
+  const staged = state.timeline.find(entry => entry.itemId === f.rootId && entry.type === 'intent_staged');
+  staged.details.workItemRevision += 31;
+  const { timelineId, contentDigest, ...content } = staged;
+  staged.contentDigest = ledgerDigest(content); staged.timelineId = `work-timeline-${staged.contentDigest}`;
+  f.control.run.receipt.taskRevision += 31;
+  state.graphMemoryProjection = migrateWorkGraphMemoryProjection(state.items, state.revision, normalizeWorkLedgerLimits());
+  const legal = normalizeWorkLedgerPersistedState(state), root = legal.items.find(item => item.itemId === f.rootId);
+  const candidate = triageRetirementCandidate(legal, root);
+  assert.ok(candidate);
+  const captured = { itemId: f.rootId, snapshotDigest: candidate.snapshotDigest };
+  const control = await f.reader.readTriageRetirement({ itemId: f.rootId, childItemId: f.childId,
+    inputBinding: candidate.inputBinding, confirmationIds: candidate.failure.confirmationIds });
+  const result = planTriageRetirement({ state: legal, captured, control, clock: f.time.clock });
+  assert.equal(result.result.retired, 1);
+  assert.equal(result.patch.items.find(item => item.itemId === f.childId).graph.acceptanceContracts.length, 32);
+  const changed = clone(legal);
+  changed.items.find(item => item.itemId === f.childId).graph.acceptanceContracts[20].acceptanceCriteria[40].description = 'Changed historical evidence';
+  assert.deepEqual(planTriageRetirement({ state: changed, captured, control, clock: f.time.clock }), { write: false, result: { retired: 0 } });
+});
 
 test('recorded Review revocation supplies host diagnostics and archives the old question without publishing or accepting a Review', async () => {
   const f = await pendingReviewDiagnosticFixture();

@@ -24,6 +24,7 @@ import { moveWorkItem } from "./work-ledger-transitions.js";
 import { isSettledIssueReason } from "./work-ledger-issue-lifecycle.js";
 import { automaticBrainRetryCode } from "./brain-failure-policy.js";
 import { hostContextRetirement } from "./work-ledger-host-context-recovery.js";
+import { automaticTriageRetirement } from './work-ledger-triage-retirement.js';
 import { ciMaterialRetirement } from "./work-ledger-ci-material-recovery.js";
 import {
   boundedLedgerString,
@@ -438,7 +439,7 @@ function requireBoundAskUser(state, entry) {
     (candidate) => candidate.intentId === entry.requestKey,
   );
   const outcome = outbox?.outcome;
-  const maintenanceRetirement = systemMaintenanceRetirement(outbox) ?? hostContextRetirement(outbox) ?? ciMaterialRetirement(outbox);
+  const maintenanceRetirement = automaticTriageRetirement(outbox) ?? systemMaintenanceRetirement(outbox) ?? hostContextRetirement(outbox) ?? ciMaterialRetirement(outbox);
   const waitingForResult =
     item.status === "waiting_user" && item.activeIntentId === outbox?.intentId;
   const durablyQuarantined =

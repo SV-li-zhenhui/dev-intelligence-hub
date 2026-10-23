@@ -108,6 +108,9 @@ import { createWorkLedgerRuntime } from "./work-ledger-runtime.js";
 import { createWorkProposalRuntime } from "./work-proposal-runtime.js";
 import { createWorkflowRoutingRuntime } from "./workflow-routing-runtime.js";
 import { createPrTriageWorkRequest } from "./domain/owner-work-request.js";
+import { matchRetiredTriageSource } from './services/work-ledger-triage-retirement.js';
+import { normalizeOwnerWorkRequestState } from './services/owner-work-request-state.js';
+import { isAutomaticReviewExecution } from './domain/automatic-review-policy.js';
 import { DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS } from "./domain/prioritizer.js";
 import { createPullRequestExecutionBinding, samePullRequestExecutionBinding } from "./domain/pull-request-execution-binding.js";
 import { AutomaticReviewScopeExitReader } from "./services/automatic-review-scope-exit-reader.js";
@@ -1445,6 +1448,32 @@ export async function createApplication({
           try { return { actorAccountId: config.githubActions.actorAccountId, confirmations,
             run: await taskRuns.get("work-item", itemId), childRun: await taskRuns.get("work-item", childItemId) }; }
           catch (error) { if (error?.code === "TASK_RUN_NOT_FOUND") return null; throw error; }
+        },
+        async readTriageRetirement(input) {
+          const [employeeState, ownerState] = await Promise.all([
+            store.read('pr-employee-state', null), store.read('owner-work-requests-v1', null),
+          ]);
+          if (!ownerState || !Array.isArray(employeeState?.jobs)) return null;
+          const record = normalizeOwnerWorkRequestState(ownerState).records.find(row => row.workItemId === input.itemId);
+          const jobs = employeeState.jobs.filter(job => job?.handoffWorkItemId === input.itemId &&
+            matchRetiredTriageSource(input, record, job));
+          if (jobs.length !== 1) return null;
+          const control = await hostContextRecoveryReader.readReviewDiagnostics(input);
+          if (!control || control.actorAccountId.toLowerCase() !== input.inputBinding.gitTarget.sourceAccountId.toLowerCase() ||
+              typeof github.readIncomingReviewRequest !== 'function') return null;
+          let incomingFacts;
+          try { incomingFacts = await github.readIncomingReviewRequest({ repository: input.inputBinding.repository,
+            number: input.inputBinding.pullRequestNumber, account: control.actorAccountId }); }
+          catch { return null; }
+          const queue = await store.read('confirmation-queue', null);
+          if (!Array.isArray(queue?.items) || !Number.isSafeInteger(queue.revision)) return null;
+          const publishedReviews = queue.items.filter(item => item?.status === 'completed' && isAutomaticReviewExecution(item) &&
+            item.display?.payload?.target?.resourceId === `${input.inputBinding.repository}#${input.inputBinding.pullRequestNumber}` &&
+            item.display.payload.target.version === input.inputBinding.headRefOid);
+          if (publishedReviews.length === 0 || publishedReviews.length > 4) return null;
+          return { ...control, ownerRecord: record, triageJob: jobs[0], incomingFacts,
+            observedAt: new Date(workCoordinationDependencies.clock?.() ?? Date.now()).toISOString(),
+            publishedReviews: publishedReviews.map(item => ({ queueRevision: queue.revision, item })) };
         },
       });
       workLedgerRuntime = trackRuntime(
