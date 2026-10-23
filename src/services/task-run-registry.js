@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { types as utilTypes } from "node:util";
+import { isDeepStrictEqual, types as utilTypes } from "node:util";
 import { OperationQueue } from "../lib/operation-queue.js";
 import { withTaskExecution } from '../lib/task-execution-context.js';
 import {TaskRunExecutionReceipts,executionReceiptView} from './task-run-execution-receipts.js';
@@ -462,16 +462,46 @@ export class TaskRunRegistry {
   }
 
   async get(kind, taskId) {
-    const key = identity(kind, taskId);
+    identity(kind, taskId);
     return this.#queue.enqueue(async () => {
       const state = await this.#readState();
-      const run = this.#active.get(key);
-      const record = findRecord(state, key) ?? (run && defaultRecord(run));
-      const receipt=this.#receipts ? (await this.#receipts.list()).findLast(entry=>entry.kind===kind && entry.taskId===taskId) : null;
-      if(!run && receipt && (!record || record.mode==='active' && record.pendingCommand===null))return executionReceiptView(receipt);
-      if (!record) throw registryError("TASK_RUN_NOT_FOUND", "运行任务不存在", 404);
-      return runView(record, run);
+      return this.#view(state, kind, taskId, this.#receipts ? await this.#receipts.list() : []);
     });
+  }
+
+  // Hold the same boundary as registration and owner controls until the ledger
+  // commit ends. The callback must not call this registry (lock order: runs → ledger).
+  async withStoppedRuns(expected, operation) {
+    if (typeof operation !== "function") throw invalidInput();
+    const runs = denseArray(expected, 2, invalidInput());
+    if (runs.length === 0) throw invalidInput();
+    for (const run of runs) {
+      plainKeys(run, invalidInput());
+      if (run.kind !== "work-item") throw invalidInput();
+      identity(run.kind, run.taskId);
+    }
+    if (new Set(runs.map(run => run.taskId)).size !== runs.length) throw invalidInput();
+    return this.#queue.enqueue(async () => {
+      const state = await this.#readState(), receipts = this.#receipts ? await this.#receipts.list() : [];
+      for (const expectedRun of runs) {
+        let current;
+        try { current = this.#view(state, expectedRun.kind, expectedRun.taskId, receipts); }
+        catch (error) { if (error.code === "TASK_RUN_NOT_FOUND") return { executed: false }; throw error; }
+        if (current.active !== false || current.mode !== "active" || current.pendingCommand !== null ||
+            current.stopUnconfirmed === true || current.phase !== "completed" || current.receipt?.stopConfirmed !== true ||
+            !isDeepStrictEqual(current, expectedRun)) return { executed: false };
+      }
+      return { executed: true, result: await operation() };
+    });
+  }
+
+  #view(state, kind, taskId, receipts) {
+    const key = identity(kind, taskId), run = this.#active.get(key);
+    const record = findRecord(state, key) ?? (run && defaultRecord(run));
+    const receipt = receipts.findLast(entry => entry.kind === kind && entry.taskId === taskId);
+    if (!run && receipt && (!record || record.mode === "active" && record.pendingCommand === null)) return executionReceiptView(receipt);
+    if (!record) throw registryError("TASK_RUN_NOT_FOUND", "运行任务不存在", 404);
+    return runView(record, run);
   }
 
   async control(kind, taskId, input) {

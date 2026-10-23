@@ -1412,12 +1412,18 @@ export async function createApplication({
           assignmentSource: workflowRouting,
           operationQueue: new OperationQueue(),
           hostContextRecoveryReader: Object.freeze({
-            async read({ itemId }) {
+            withStoppedRuns: (control, operation) => taskRuns.withStoppedRuns([control.run, control.childRun], operation),
+            async read({ itemId, childItemId }) {
               const config = (await configurationRuntime?.reader?.readActive())?.configuration;
               const role = await codeAuthorizationRoleRegistry?.get("orchestrator")?.roleView();
               if (config?.githubActions?.enabled !== true || config.githubActions.automaticOwnPrRepair !== true ||
                   config.workCoordination?.enabled !== true || role?.enabled !== true || role.paused === true) return null;
-              try { return { actorAccountId: config.githubActions.actorAccountId, run: await taskRuns.get("work-item", itemId) }; }
+              if (childItemId) {
+                const developer = await codeAuthorizationRoleRegistry?.get("developer")?.roleView();
+                if (developer?.enabled !== true || developer.paused === true) return null;
+              }
+              try { return { actorAccountId: config.githubActions.actorAccountId, run: await taskRuns.get("work-item", itemId),
+                ...(childItemId ? { childRun: await taskRuns.get("work-item", childItemId) } : {}) }; }
               catch (error) { if (error?.code === "TASK_RUN_NOT_FOUND") return null; throw error; }
             },
           }),

@@ -12,6 +12,46 @@ const receipt = (id, overrides = {}) => ({runId:`run-${id}`,kind:'work-item',tas
   registeredAt:'2026-10-15T00:00:00.000Z',modelStartedAt:null,lastActivityAt:'2026-10-15T00:00:00.000Z',finishedAt:null,
   phase:'preparing',stopConfirmed:false,session:null,eventCount:0,outcomeCode:null,...overrides});
 
+test('a stopped-owner commit holds registration until it settles and rejects a later run', async () => {
+  const runs = registry(memoryStore());
+  const root = { ...task, taskId: 'root', roleId: 'orchestrator' }, child = { ...task, taskId: 'child', roleId: 'developer' };
+  for (const owner of [root, child]) await runs.run(owner, async () => currentTaskExecution().reportModelState('running'));
+  const expected = await Promise.all([runs.get('work-item', root.taskId), runs.get('work-item', child.taskId)]);
+  const entered = deferred(), release = deferred(), order = [];
+  const commit = runs.withStoppedRuns(expected, async () => { entered.resolve(); await release.promise; order.push('committed'); return 1; });
+  await entered.promise;
+  let started = false;
+  const next = runs.run(root, async () => { started = true; order.push('registered'); });
+  await new Promise(setImmediate);
+  assert.equal(started, false, 'the queued owner cannot enter between proof validation and persistence');
+  release.resolve();
+  assert.deepEqual(await commit, { executed: true, result: 1 });
+  await next;
+  assert.deepEqual(order, ['committed', 'registered']);
+  let called = false;
+  assert.deepEqual(await runs.withStoppedRuns(expected, async () => { called = true; }), { executed: false });
+  assert.equal(called, false, 'a new run identity invalidates the previously read proof');
+});
+
+test('stopped-owner commit failures release registration and active or owner-held work is rejected', async () => {
+  const runs = registry(memoryStore());
+  await runs.run(task, async () => {});
+  const stopped = await runs.get(task.kind, task.taskId);
+  await assert.rejects(runs.withStoppedRuns([stopped], async () => { throw new Error('durable commit failed'); }), /durable commit failed/);
+  const entered = deferred(), release = deferred();
+  const active = runs.run(task, async () => { entered.resolve(); await release.promise; });
+  await entered.promise;
+  const current = await runs.get(task.kind, task.taskId);
+  let called = false;
+  assert.deepEqual(await runs.withStoppedRuns([current], async () => { called = true; }), { executed: false });
+  await runs.control(task.kind, task.taskId, { command: 'pause', runId: current.runId, expectedRevision: current.revision });
+  const held = await runs.get(task.kind, task.taskId);
+  assert.deepEqual(await runs.withStoppedRuns([held], async () => { called = true; }), { executed: false });
+  assert.equal(called, false);
+  release.resolve();
+  await assert.rejects(active, error => error.code === 'TASK_RUN_PAUSED');
+});
+
 test('a transient receipt write retains its pending update and later flush recovers',async()=>{
   const store=memoryStore();let writes=0;
   const receipts=new TaskRunExecutionReceipts({read:store.read,async write(key,value){

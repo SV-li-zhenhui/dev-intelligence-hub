@@ -1687,15 +1687,22 @@ export class WorkLedgerService {
       for (const item of this.state.items) {
         if (!pending.has(item.activeIntentId)) continue;
         const candidate = hostContextRecoveryCandidate(this.state, item);
-        if (candidate) candidates.push({ itemId: item.itemId, snapshotDigest: candidate.snapshotDigest });
+        if (candidate) candidates.push({ itemId: item.itemId, snapshotDigest: candidate.snapshotDigest,
+          ...(candidate.decisionOwner ? { controlItemId: candidate.decisionOwner.itemId, childItemId: item.itemId } : {}) });
         if (candidates.length >= input.limit - result.retried) break;
       }
       return candidates;
     });
     for (const candidate of captured) {
-      const control = await this.hostContextRecoveryReader.read({ itemId: candidate.itemId });
-      const recovered = await this.#admitNewWork(() => this.#executeCommand(
-        context => planHostContextRecovery({ ...context, captured: candidate, control }), {}));
+      const control = await this.hostContextRecoveryReader.read({ itemId: candidate.controlItemId ?? candidate.itemId,
+        ...(candidate.childItemId ? { childItemId: candidate.childItemId } : {}) });
+      const commit = () => this.#executeCommand(context => planHostContextRecovery({ ...context, captured: candidate, control }), {});
+      const recovered = await this.#admitNewWork(() => {
+        if (!candidate.childItemId) return commit();
+        if (!control || typeof this.hostContextRecoveryReader.withStoppedRuns !== "function") return { retried: 0 };
+        return this.hostContextRecoveryReader.withStoppedRuns(control, commit)
+          .then(guarded => guarded.executed ? guarded.result : { retried: 0 });
+      });
       result.retried += recovered.retried;
     }
     return result;
