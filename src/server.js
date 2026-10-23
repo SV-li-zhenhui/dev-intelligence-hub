@@ -64,6 +64,7 @@ export const DRAIN_PARTICIPANTS = Object.freeze({
   workCoordinationCycle: drainParticipant("workCoordination.runCycle"),
   workContinuation: drainParticipant("workContinuationScheduler.runCycle"),
   localCodeProposalRecovery: drainParticipant("localCodeProposalRecovery.runCycle"),
+  codeJobExecution: drainParticipant("codeJobExecution.runCycle"),
   reviewHandoffRecovery: drainParticipant("reviewHandoffReconciler.runCycle"),
   employeeExecution: drainParticipant(
     "employeeRegistry.runSelected/runAll/run",
@@ -4631,6 +4632,16 @@ export function startApplicationBackgroundWork(
     if (stopped) return Promise.resolve();
     if (application.config.githubActions?.enabled === true &&
         application.config.githubActions.automaticOwnPrRepair === true &&
+        independentEmployeeFactsReady() && typeof application.codeJobExecution?.runCycle === "function") {
+      // Execution owns its full lifetime separately from housekeeping. Fresh
+      // PR facts and completed-job publication must not wait for another model.
+      runCoalescedTracked(coalescedAgencyCycles, "code-job-execution", signal =>
+        runDrainParticipant(DRAIN_PARTICIPANTS.codeJobExecution, () =>
+          application.codeJobExecution.runCycle({ signal })),
+      { rethrow: true }).catch(reportBackgroundError);
+    }
+    if (application.config.githubActions?.enabled === true &&
+        application.config.githubActions.automaticOwnPrRepair === true &&
         independentEmployeeFactsReady() && typeof application.localCodeProposalRecovery?.runCycle === "function") {
       // Existing proposals must be polled even while a native code job owns a
       // long-running employee cycle. The shared runner coalesces concurrent polls.
@@ -4732,7 +4743,7 @@ export function startApplicationBackgroundWork(
     { rethrow: true },
   );
 
-  if (application.workContinuationScheduler || application.localCodeProposalRecovery) {
+  if (application.workContinuationScheduler || application.localCodeProposalRecovery || application.codeJobExecution) {
     timers.push(setIntervalFn(signalWorkContinuations, 10_000));
   }
 

@@ -1109,6 +1109,7 @@ export async function createApplication({
     },
     settleControl:(input) => createTaskRunSettler({ledger:workLedgerRuntime,codeJobReader,codeJobControl})(input)});
   let codeJobWorker = null;
+  let codeJobExecution = null;
   let codeJobMemoryProjector = null;
   let codeJobEvidenceReader = null;
   let codeJobChangePackageDispatcher = null;
@@ -1879,6 +1880,11 @@ export async function createApplication({
         ["runCycle"],
         "codeJobRuntime.worker",
       );
+      if (config.githubActions?.enabled === true && config.githubActions.automaticOwnPrRepair === true) {
+        codeJobExecution = Object.freeze({ runCycle: options => codeJobWorker.runCycle({
+          ...options, limit: coordinationConfig.codeJobLimit ?? 10,
+        }) });
+      }
     }
     if (changePackageActionsEnabled) {
       localExecutors["local.change-package-apply"] = frozenPort(
@@ -2724,7 +2730,7 @@ export async function createApplication({
       });
       const coordinationService = workCoordinationFactory({
         ledger: workLedgerRuntime,
-        codeJobRunner: codeJobWorker,
+        codeJobRunner: codeJobExecution === null ? codeJobWorker : null,
         ...(codeJobRuntime?.pauseRecovery ? { codeJobPauseRecovery: frozenPort(
           codeJobRuntime.pauseRecovery, ["runCycle"], "codeJobRuntime.pauseRecovery",
         ) } : {}),
@@ -3010,6 +3016,7 @@ export async function createApplication({
       taskRuns: coordinationEnabled ? Object.freeze({...createTaskRunView({registry:taskRuns,codeJobReader}),
         control:(...args)=>ordinaryActionAdmissionGate ? ordinaryActionAdmissionGate.run(()=>taskRuns.control(...args)) : taskRuns.control(...args)}) : null,
       codeJobEvidenceReader,
+      codeJobExecution,
       workLedgerView,
       dailyWorkLedgerView,
       workGraphView,

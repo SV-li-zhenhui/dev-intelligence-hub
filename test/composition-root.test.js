@@ -4389,6 +4389,7 @@ test("automatic own PR repair composes internal push with ownership guards and c
       if (scenario.githubTimeoutMs !== undefined) config.githubActions.timeoutMs = scenario.githubTimeoutMs;
       if (scenario.gitTimeoutMs !== undefined) config.codeExecutor.gitTimeoutMs = scenario.gitTimeoutMs;
       config.changePackages = { enabled: true, gitCommand: "C:\\Program Files\\Git\\cmd\\git.exe" };
+      config.workCoordination.codeJobLimit = 9;
       config.workCoordination.policy.configurationChangeRoles = [];
       const calls = {};
       const closeCalls = [];
@@ -4445,6 +4446,7 @@ test("automatic own PR repair composes internal push with ownership guards and c
         }),
         codeJobRuntimeFactory: async (options) => ({
           ...await base.codeJobRuntimeFactory(options),
+          worker: { ...codeJobWorkerPort(), async runCycle(request) { calls.codeWorkerRequest = request; return { processed: 1 }; } },
           pauseRecovery: { async runCycle(value) { calls.pauseRecoveryRequest = value; return { resumed: 1 }; } },
           changePackageDelivery: { async runCycle() {} },
         }),
@@ -4473,6 +4475,13 @@ test("automatic own PR repair composes internal push with ownership guards and c
         },
       });
       try {
+        assert.equal(calls.coordination.codeJobRunner, null, 'housekeeping must not own long automatic code execution');
+        assert.equal(Object.isFrozen(application.codeJobExecution), true);
+        assert.deepEqual(Object.keys(application.codeJobExecution), ['runCycle']);
+        const workerSignal = new AbortController().signal;
+        assert.deepEqual(await application.codeJobExecution.runCycle({ signal: workerSignal }), { processed: 1 });
+        assert.equal(calls.codeWorkerRequest.limit, 9);
+        assert.strictEqual(calls.codeWorkerRequest.signal, workerSignal);
         assert.deepEqual(Object.keys(application.localCodeProposalRecovery), ["runCycle"]);
         assert.deepEqual(Object.keys(application.jenkinsConnection), ['status', 'connect']);
         assert.equal(Object.isFrozen(application.jenkinsConnection), true);

@@ -925,6 +925,13 @@ proposal runner as ordinary coordination and coalesces concurrent polls, so
 pending authorization retries do not wait behind a native code model run.
 The independent poll participates in operational admission and shutdown drain.
 
+Automatic own-PR code execution also uses a separate coalesced 10-second poll
+after facts are admitted. It reuses the controlled worker and configured batch
+limit, with at most two jobs executing concurrently. Housekeeping can reconcile
+results, publish completed repairs and refresh PR facts while another model runs.
+The `codeJobExecution.runCycle` drain participant retains ownership until every
+admitted operation actually settles; maintenance and shutdown still fence work.
+
 ## Automatic work continuations
 
 In automatic mode, schema 2 of `work-continuations.json` records the source task,
