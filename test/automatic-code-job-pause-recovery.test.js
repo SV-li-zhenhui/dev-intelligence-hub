@@ -37,6 +37,35 @@ test('settled provider format pause automatically resumes the same checkpoint on
   assert.equal((await f.create().runCycle()).scanned, 0);
 });
 
+test('a stopped native turn with an incomplete final decision resumes only its exact automatic checkpoint', async () => {
+  const f = fixture();
+  f.job.execution.pause.reason = '等待人工处理（CODE_BRAIN_COMPLETION_NOT_READY）';
+  f.proof.receipt.outcomeCode = 'CODE_BRAIN_COMPLETION_NOT_READY';
+  assert.equal((await f.create().runCycle()).resumed, 1);
+  assert.equal(f.calls.length, 1);
+  assert.equal((await f.create().runCycle()).resumed, 0);
+});
+
+test('native completion recovery rejects mismatched failures, running actions and user holds', async t => {
+  for (const change of [
+    f => { f.proof.receipt.outcomeCode = 'STRUCTURED_PROVIDER_RESPONSE_INVALID'; },
+    f => { f.proof.receipt.stopConfirmed = false; },
+    f => { f.proof.active = true; },
+    f => { f.proof.pendingCommand = 'pause'; },
+    f => { f.job.execution.actionAdmission = {}; },
+    f => { f.job.execution.pendingAction = {}; },
+    f => { f.job.execution.uncertainty = {}; },
+    f => { f.job.execution.pause.reason = '用户暂停'; },
+  ]) await t.test(change.toString(), async () => {
+    const f = fixture();
+    f.job.execution.pause.reason = '等待人工处理（CODE_BRAIN_COMPLETION_NOT_READY）';
+    f.proof.receipt.outcomeCode = 'CODE_BRAIN_COMPLETION_NOT_READY';
+    change(f);
+    assert.equal((await f.create().runCycle()).resumed, 0);
+    assert.equal(f.calls.length, 0);
+  });
+});
+
 function readPauseFixture() {
   const f = fixture();
   const action = { type: 'write_text', actionId: 'write-old', path: 'src/app.js', content: 'old candidate',

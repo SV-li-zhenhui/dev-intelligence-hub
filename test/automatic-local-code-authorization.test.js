@@ -55,6 +55,45 @@ function readRecoveryFixture(sourceKind = null) {
     setSourceEligible: value => { specialized = value; } };
 }
 
+test('native repair protocol recovery uses dedicated CI and Review authority without publishing', async () => {
+  for (const kind of ['ci_repair', 'review_repair']) {
+    const f = readRecoveryFixture(kind);
+    f.job.status = 'paused';
+    f.job.execution.pendingAction = null;
+    f.job.execution.pause = { from: 'active', reason: '等待人工处理（CODE_BRAIN_COMPLETION_NOT_READY）', at: '2026-10-10T03:01:00Z' };
+    f.ports.specialized.canRecoverPausedCodeJob = value => f.ports.specialized.canReplanUnstartedWrite(value);
+    assert.equal(await f.service.canRecoverPausedCodeJob(f.job), true);
+    assert.equal(f.sourceCalls(), 1);
+    assert.equal(f.calls.length, 0);
+  }
+});
+
+test('native CI recovery preserves source authority, owner holds and admitted operations', async t => {
+  for (const [name, change] of [
+    ['disabled', f => { f.config.githubActions.automaticOwnPrRepair = false; }],
+    ['role paused', f => { f.roleState.paused = true; }],
+    ['task paused', f => { f.root.status = 'paused'; }],
+    ['scope left', f => { f.root.source.scope.active = false; }],
+    ['source not current', f => { f.setSourceEligible(false); }],
+    ['source reader missing', f => { delete f.ports.specialized.canRecoverPausedCodeJob; }],
+    ['owner command', f => { f.workControls.set('root', { mode: 'active', pendingCommand: 'pause', stopUnconfirmed: false }); }],
+    ['owner task paused', f => { f.workControls.set('root', { mode: 'paused', pendingCommand: null, stopUnconfirmed: false }); }],
+    ['admitted action', f => { f.job.execution.actionAdmission = {}; }],
+    ['pending action', f => { f.job.execution.pendingAction = {}; }],
+    ['unknown outcome', f => { f.job.execution.uncertainty = {}; }],
+    ['manual job pause', f => { f.job.execution.pause.reason = '用户暂停'; }],
+    ['conflict remains dedicated', f => { f.job.grant.executionSource.kind = 'conflict_preparation'; }],
+  ]) await t.test(name, async () => {
+    const f = readRecoveryFixture('ci_repair');
+    f.job.status = 'paused'; f.job.execution.pendingAction = null;
+    f.job.execution.pause = { from: 'active', reason: '等待人工处理（CODE_BRAIN_COMPLETION_NOT_READY）', at: '2026-10-10T03:01:00Z' };
+    f.ports.specialized.canRecoverPausedCodeJob = value => f.ports.specialized.canReplanUnstartedWrite(value);
+    change(f);
+    assert.equal(await f.service.canRecoverPausedCodeJob(f.job), false);
+    assert.equal(f.calls.length, 0);
+  });
+});
+
 test('unstarted overwrite recovery keeps generic authorization and dedicated repair provenance separate', async () => {
   const generic = readRecoveryFixture();
   assert.equal(await generic.service.canReplanUnstartedWrite(generic.job), true);

@@ -359,6 +359,19 @@ test('CI failure repairs automatically publish a controlled commit and hand off 
   assert.equal(await f.service.shouldRun(f.item), false);
 });
 
+test('native CI and Review continuation requires the exact live repair receipt', async t => {
+  for (const kind of ['review', 'ci']) await t.test(kind, async () => {
+    const f = await fixture({ ci: kind === 'ci' });
+    await f.deliver();
+    const job = { jobId: codeJobIdForGrant(f.grant), grant: clone(f.grant) };
+    assert.equal(await f.service.canRecoverPausedCodeJob(job), true);
+    assert.equal(await f.service.canRecoverPausedCodeJob({ ...job, jobId: 'other-job' }), false);
+    f.revokeGrant();
+    assert.equal(await f.service.canRecoverPausedCodeJob(job), false);
+    assert.equal(f.pushes.length, 0);
+  });
+});
+
 test('unstarted write replanning requires the exact still-working conflict, review or CI repair receipt', async (t) => {
   for (const kind of ['conflict', 'review', 'ci']) await t.test(kind, async () => {
     const f = await fixture({ conflict: kind === 'conflict', ci: kind === 'ci' });

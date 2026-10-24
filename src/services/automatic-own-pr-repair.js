@@ -406,6 +406,11 @@ export class AutomaticOwnPrRepair {
     });
   }
 
+  canRecoverPausedCodeJob(job) {
+    if (!['review_repair', 'ci_repair'].includes(job?.grant?.executionSource?.kind)) return Promise.resolve(false);
+    return this.canReplanUnstartedWrite(job);
+  }
+
   async canReplanUnstartedWrite(job) {
     const grant = job?.grant, source = grant?.executionSource;
     if (source?.kind === 'conflict_preparation') return this.conflictRepair?.canReplanUnstartedWrite(job) ?? false;

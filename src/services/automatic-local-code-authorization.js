@@ -3,6 +3,7 @@ import { OperationQueue } from '../lib/operation-queue.js';
 import { samePullRequestExecutionBinding } from '../domain/pull-request-execution-binding.js';
 import { approveOwnPrAction } from './automatic-own-pr-repair-authorization.js';
 import { pendingOverwriteRecoveryCandidate, stoppedCodeJobRun } from './code-job-read-recovery.js';
+import { recoverableNativePauseCode } from './automatic-code-job-pause-recovery.js';
 
 const sameLogin = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
 const STALE_TARGET = Symbol('stale local code target');
@@ -45,7 +46,12 @@ export class AutomaticLocalCodeAuthorization {
   async canRecoverPausedCodeJob(job) {
     const grant = job?.grant;
     const role = grant?.requestedBy?.roleId;
-    if (!grant?.inputBinding || Object.hasOwn(grant, 'executionSource') || !OPERATIONS[role]?.has(grant.operation)) return false;
+    if (!grant?.inputBinding || !OPERATIONS[role]?.has(grant.operation)) return false;
+    if (Object.hasOwn(grant, 'executionSource')) {
+      if (!['ci_repair', 'review_repair'].includes(grant.executionSource?.kind) || recoverableNativePauseCode(job) === null ||
+          !this.taskRuns?.get || !await this.#sourceAuthorityCurrent(job, 'canRecoverPausedCodeJob')) return false;
+      return this.#workControlsCurrent(job);
+    }
     const current = await this.#current({ requestedBy: grant.requestedBy }, grant);
     return current !== null && current !== STALE_TARGET;
   }
@@ -57,24 +63,7 @@ export class AutomaticLocalCodeAuthorization {
       const current = await this.#current({ requestedBy: grant.requestedBy }, grant);
       if (current === null || current === STALE_TARGET) return false;
     } else {
-      // Source-bearing work keeps its dedicated record and authority checks;
-      // a generic task-status whitelist cannot replace that provenance.
-      if (!['conflict_preparation', 'review_repair', 'ci_repair'].includes(grant.executionSource?.kind)) return false;
-      const config = (await this.configurationReader.readActive())?.configuration;
-      if (config?.githubActions?.enabled !== true || config.githubActions.automaticOwnPrRepair !== true ||
-          !config.trackedRepositories?.includes(binding.repository) ||
-          !sameLogin(binding.gitTarget?.sourceAccountId, config.githubActions.actorAccountId)) return false;
-      const roleState = await this.roleStateReader.read(role);
-      const root = await this.ledger.readItemForReconciliation({ itemId: binding.rootItemId });
-      const task = grant.requestedBy.workItemId === binding.rootItemId ? root :
-        await this.ledger.readItemForReconciliation({ itemId: grant.requestedBy.workItemId });
-      if (roleState?.enabled !== true || roleState.paused !== false || !root || !task ||
-          root.source?.scope?.active !== true || [root, task].some(item =>
-            ['paused', 'cancelled', 'superseded', 'completed'].includes(item.status) ||
-            (item.status === 'blocked' && ['attention_rejected', 'proposal_rejected'].includes(item.statusReason))) ||
-          task.currentTarget?.type !== 'role' || task.currentTarget.id !== role ||
-          typeof this.specialized.canReplanUnstartedWrite !== 'function' ||
-          !await this.specialized.canReplanUnstartedWrite(job)) return false;
+      if (!await this.#sourceAuthorityCurrent(job, 'canReplanUnstartedWrite')) return false;
     }
     const getRun = async (kind, taskId) => {
       try { return await this.taskRuns.get(kind, taskId); }
@@ -83,8 +72,34 @@ export class AutomaticLocalCodeAuthorization {
     const proof = await getRun('code-job', job.jobId);
     const before = job.status === 'paused' ? job.execution.pause?.at : new Date(this.clock()).toISOString();
     if (!stoppedCodeJobRun(proof, job, before)) return false;
+    return this.#workControlsCurrent(job);
+  }
+
+  async #sourceAuthorityCurrent(job, method) {
+    const grant = job.grant, binding = grant.inputBinding, role = grant.requestedBy.roleId;
+    // Dedicated source records remain authoritative for repair continuation.
+    if (role !== 'developer' || !['conflict_preparation', 'review_repair', 'ci_repair'].includes(grant.executionSource?.kind)) return false;
+    const config = (await this.configurationReader.readActive())?.configuration;
+    if (config?.githubActions?.enabled !== true || config.githubActions.automaticOwnPrRepair !== true ||
+        !config.trackedRepositories?.includes(binding.repository) ||
+        !sameLogin(binding.gitTarget?.sourceAccountId, config.githubActions.actorAccountId)) return false;
+    const roleState = await this.roleStateReader.read(role);
+    const root = await this.ledger.readItemForReconciliation({ itemId: binding.rootItemId });
+    const task = grant.requestedBy.workItemId === binding.rootItemId ? root :
+      await this.ledger.readItemForReconciliation({ itemId: grant.requestedBy.workItemId });
+    return roleState?.enabled === true && roleState.paused === false && root && task && root.source?.scope?.active === true &&
+      ![root, task].some(item => ['paused', 'cancelled', 'superseded', 'completed'].includes(item.status) ||
+        (item.status === 'blocked' && ['attention_rejected', 'proposal_rejected'].includes(item.statusReason))) &&
+      task.currentTarget?.type === 'role' && task.currentTarget.id === role &&
+      typeof this.specialized[method] === 'function' && await this.specialized[method](job) === true;
+  }
+
+  async #workControlsCurrent(job) {
+    const grant = job.grant, binding = grant.inputBinding;
     for (const taskId of new Set([grant.requestedBy.workItemId, binding.rootItemId])) {
-      const run = await getRun('work-item', taskId);
+      let run;
+      try { run = await this.taskRuns.get('work-item', taskId); }
+      catch (error) { if (error?.code !== 'TASK_RUN_NOT_FOUND') throw error; }
       if (run && (run.mode !== 'active' || run.pendingCommand !== null || run.stopUnconfirmed === true)) return false;
     }
     return true;

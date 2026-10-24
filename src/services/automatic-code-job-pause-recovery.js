@@ -1,13 +1,13 @@
 import { OperationQueue } from '../lib/operation-queue.js';
 import { hasIncompleteReadPause, stoppedCodeJobRun } from './code-job-read-recovery.js';
 
-const CODE = 'STRUCTURED_PROVIDER_RESPONSE_INVALID';
-const REASON = `等待人工处理（${CODE}）`;
+const NATIVE_PAUSES = new Map(['STRUCTURED_PROVIDER_RESPONSE_INVALID', 'CODE_BRAIN_COMPLETION_NOT_READY']
+  .map(code => [`等待人工处理（${code}）`, code]));
 
-function recoverable(job) {
+export function recoverableNativePauseCode(job) {
   return job?.status === 'paused' && job.execution?.pause?.from === 'active' &&
-    job.execution.pause.reason === REASON && job.execution.pendingAction === null &&
-    job.execution.actionAdmission === null && job.execution.uncertainty === null;
+    job.execution.pendingAction === null && job.execution.actionAdmission === null && job.execution.uncertainty === null
+    ? NATIVE_PAUSES.get(job.execution.pause.reason) ?? null : null;
 }
 
 function stoppedRun(proof, job) {
@@ -16,11 +16,12 @@ function stoppedRun(proof, job) {
   const finished = Date.parse(receipt?.finishedAt);
   const paused = Date.parse(job.execution.pause.at);
   const created = Date.parse(job.createdAt);
-  return proof?.mode === 'active' && proof.active === false && proof.pendingCommand === null &&
+  const code = recoverableNativePauseCode(job);
+  return code !== null && proof?.mode === 'active' && proof.active === false && proof.pendingCommand === null &&
     proof.stopUnconfirmed !== true && typeof proof.runId === 'string' && proof.runId.length > 0 &&
     proof.runId === receipt?.runId && receipt?.kind === 'code-job' && receipt.taskId === job.jobId &&
     receipt.roleId === job.grant.requestedBy.roleId && receipt.phase === 'failed' &&
-    receipt.outcomeCode === CODE && receipt.stopConfirmed === true && receipt.session?.transport === 'app-server' &&
+    receipt.outcomeCode === code && receipt.stopConfirmed === true && receipt.session?.transport === 'app-server' &&
     [started, finished, paused, created].every(Number.isFinite) && created <= started && started <= finished && finished <= paused;
 }
 
@@ -52,7 +53,7 @@ export class AutomaticCodeJobPauseRecovery {
           const job = await this.jobs.getForWorker(candidate.jobId);
           let status = 'waiting';
           const hostReadPause = hasIncompleteReadPause(job) && typeof this.eligibility.canReplanUnstartedWrite === 'function';
-          if (recoverable(job) || hostReadPause) {
+          if (recoverableNativePauseCode(job) !== null || hostReadPause) {
             const stopped = value => hostReadPause ? stoppedCodeJobRun(value, job, job.execution.pause.at) : stoppedRun(value, job);
             const eligible = () => hostReadPause ? this.eligibility.canReplanUnstartedWrite(job) : this.eligibility.canRecover(job);
             const proof = await this.taskRuns.get('code-job', job.jobId);
