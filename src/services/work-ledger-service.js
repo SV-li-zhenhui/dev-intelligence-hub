@@ -21,6 +21,7 @@ import {
 import { isChangedReviewConfirmationDecision, reviewConfirmationSettlementIds,
   createCompletedReviewConfirmationSettlement, hasReviewConfirmationSettlement } from "./work-ledger-review-confirmation-settlement.js";
 import { OperationQueue } from "../lib/operation-queue.js";
+import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import {
   isTrustedPullRequestScopeLifecycleAssignment,
 } from "../domain/pull-request-scope-lifecycle.js";
@@ -1174,17 +1175,26 @@ export class WorkLedgerService {
     );
   }
 
-  async getGraphSnapshot() {
+  async getGraphSnapshot({ signal = null } = {}) {
     this.#assertReady();
-    return this.operationQueue.enqueue(() =>
-      this.exclusiveLease.run(async () => {
+    signal = normalizeAbortSignal(signal);
+    const assertActive = () => {
+      if (signal?.aborted) throw signal.reason ?? new DOMException("Graph read was aborted", "AbortError");
+    };
+    assertActive();
+    return this.operationQueue.enqueue(() => {
+      assertActive();
+      return this.exclusiveLease.run(async () => {
+        assertActive();
         // Graph reads are also used to reconcile uncertain writes. Refresh
         // from durable state so an applied write with a lost ACK is visible in
         // the same recovery cycle rather than only after another mutation.
-        this.state = await this.#readDurableState();
+        const state = await this.#readDurableState();
+        assertActive();
+        this.state = state;
         return this.#currentGraphSnapshot();
-      }),
-    );
+      });
+    });
   }
 
   async readAttentionRequestRetirement(input = {}) {

@@ -219,7 +219,7 @@ export async function createWorkLedgerRuntime({
     });
     const runtime = {
       graphReader: Object.freeze({
-        getSnapshot: () => admit(() => graphReader.getSnapshot()),
+        getSnapshot: (options) => admit(() => graphReader.getSnapshot(options)),
       }),
       graphBrowserReader: Object.freeze({
         getSnapshot: () =>

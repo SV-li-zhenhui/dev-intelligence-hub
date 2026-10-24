@@ -164,6 +164,18 @@ function graphChildCommand(parent, graphRevision) {
   };
 }
 
+test("runtime graph reads preserve context cancellation through both graph facades", async () => {
+  const runtime = await createWorkLedgerRuntime({ store: new MemoryStore(), assignmentSource: emptySource(),
+    createGuard: guardFactory([]) });
+  const controller = new AbortController();
+  const reason = new Error("role context expired");
+  controller.abort(reason);
+  try {
+    await assert.rejects(runtime.graphReader.getSnapshot({ signal: controller.signal }), error => error === reason);
+    assert.ok((await runtime.graphReader.getSnapshot()).graph);
+  } finally { await runtime.close(); }
+});
+
 test("runtime owns one named process guard and exposes least-authority graph ports", async () => {
   const events = [];
   const runtime = await createWorkLedgerRuntime({

@@ -2008,6 +2008,62 @@ async function createFixture({
   return { service, source, store, lease, time };
 }
 
+test("expired queued graph contexts skip durable reads and leave the next live read available", async () => {
+  const fixture = await createFixture();
+  let reads = 0;
+  const originalRead = fixture.store.read.bind(fixture.store);
+  fixture.store.read = async (...args) => { reads++; return originalRead(...args); };
+  const entered = deferred(), release = deferred();
+  const blocker = fixture.service.operationQueue.enqueue(async () => { entered.resolve(); await release.promise; });
+  await entered.promise;
+  const controller = new AbortController();
+  const reason = new Error("role context expired while queued");
+  const cancelled = Array.from({ length: 5 }, () => fixture.service.getGraphSnapshot({ signal: controller.signal }));
+  const outcomes = Promise.allSettled(cancelled);
+  controller.abort(reason);
+  release.resolve();
+  await blocker;
+  const results = await outcomes;
+  assert.ok(results.every(result => result.status === "rejected" && result.reason === reason));
+  assert.equal(reads, 0, "expired contexts must not consume the durable read queue");
+  assert.ok((await fixture.service.getGraphSnapshot()).graph);
+  assert.equal(reads, 1);
+});
+
+test("graph cancellation is rechecked after waiting for the exclusive lease and after an in-flight read", async (t) => {
+  await t.test("lease wait", async () => {
+    const fixture = await createFixture();
+    const entered = deferred(), release = deferred();
+    const blocker = fixture.lease.run(async () => { entered.resolve(); await release.promise; });
+    await entered.promise;
+    let reads = 0;
+    fixture.store.read = async () => { reads++; assert.fail("cancelled lease waiter must not read"); };
+    const controller = new AbortController(), reason = new Error("expired during lease wait");
+    const result = fixture.service.getGraphSnapshot({ signal: controller.signal });
+    const rejected = assert.rejects(result, error => error === reason);
+    controller.abort(reason);
+    release.resolve();
+    await blocker;
+    await rejected;
+    assert.equal(reads, 0);
+  });
+  await t.test("read in flight", async () => {
+    const fixture = await createFixture();
+    const entered = deferred(), release = deferred();
+    const originalRead = fixture.store.read.bind(fixture.store);
+    const cache = fixture.service.graphSnapshotCache;
+    fixture.store.read = async (...args) => { entered.resolve(); await release.promise; return originalRead(...args); };
+    const controller = new AbortController(), reason = new Error("expired during durable read");
+    const result = fixture.service.getGraphSnapshot({ signal: controller.signal });
+    const rejected = assert.rejects(result, error => error === reason);
+    await entered.promise;
+    controller.abort(reason);
+    release.resolve();
+    await rejected;
+    assert.equal(fixture.service.graphSnapshotCache, cache);
+  });
+});
+
 test("task timeline filtering preserves an older recovery record amid unrelated activity", async () => {
   const fixture = await createFixture({ records: [assignment(1)] });
   await fixture.service.intake();
