@@ -68,6 +68,21 @@ test('native repair protocol recovery uses dedicated CI and Review authority wit
   }
 });
 
+test('conflict queue recovery still requires the exact dedicated source and current work controls', async () => {
+  const f = readRecoveryFixture('conflict_preparation');
+  f.job.status = 'paused'; f.job.execution.pendingAction = null;
+  f.job.execution.pause = { from: 'active', reason: '等待人工处理（STRUCTURED_PROVIDER_QUEUE_TIMEOUT）', at: '2026-10-10T03:01:00Z' };
+  f.ports.specialized.canRecoverPausedCodeJob = value => f.ports.specialized.canReplanUnstartedWrite(value);
+  assert.equal(await f.service.canRecoverPausedCodeJob(f.job), true);
+  assert.equal(f.sourceCalls(), 1);
+  assert.equal(f.calls.length, 0);
+  f.setSourceEligible(false);
+  assert.equal(await f.service.canRecoverPausedCodeJob(f.job), false);
+  f.setSourceEligible(true);
+  f.workControls.set('root', { mode: 'paused', pendingCommand: null, stopUnconfirmed: false });
+  assert.equal(await f.service.canRecoverPausedCodeJob(f.job), false);
+});
+
 test('native CI recovery preserves source authority, owner holds and admitted operations', async t => {
   for (const [name, change] of [
     ['disabled', f => { f.config.githubActions.automaticOwnPrRepair = false; }],

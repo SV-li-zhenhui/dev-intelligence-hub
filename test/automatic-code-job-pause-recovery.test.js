@@ -37,6 +37,44 @@ test('settled provider format pause automatically resumes the same checkpoint on
   assert.equal((await f.create().runCycle()).scanned, 0);
 });
 
+function queuedPauseFixture() {
+  const f = fixture();
+  f.job.execution.pause.reason = '等待人工处理（STRUCTURED_PROVIDER_QUEUE_TIMEOUT）';
+  Object.assign(f.proof, { kind: 'code-job', taskId: f.job.jobId, roleId: 'developer' });
+  Object.assign(f.proof.receipt, { outcomeCode: 'STRUCTURED_PROVIDER_QUEUE_TIMEOUT',
+    registeredAt: '2026-10-10T03:00:10Z', modelStartedAt: null, session: null, eventCount: 0 });
+  return f;
+}
+
+test('automatic queue timeout recovery resumes the existing job without inventing a model session', async () => {
+  const f = queuedPauseFixture(), before = structuredClone(f.proof);
+  assert.equal((await f.create().runCycle()).resumed, 1);
+  assert.deepEqual(f.calls, [{ jobId: 'job-1', expectedRevision: 12 }]);
+  assert.deepEqual(f.proof, before);
+  assert.equal((await f.create().runCycle()).scanned, 0);
+});
+
+for (const [name, change] of [
+  ['model started', f => { f.proof.receipt.modelStartedAt = '2026-10-10T03:00:30Z'; }],
+  ['native session exists', f => { f.proof.receipt.session = { transport: 'app-server' }; }],
+  ['native event exists', f => { f.proof.receipt.eventCount = 1; }],
+  ['missing stop proof', f => { f.proof.receipt.stopConfirmed = false; }],
+  ['other run', f => { f.proof.receipt.runId = 'other'; }],
+  ['other task', f => { f.proof.taskId = 'other'; }],
+  ['other role', f => { f.proof.roleId = 'tester'; }],
+  ['registered before job', f => { f.proof.receipt.registeredAt = '2026-10-09T03:00:00Z'; }],
+  ['finished after pause', f => { f.proof.receipt.finishedAt = '2026-10-10T03:02:00Z'; }],
+  ['owner pause', f => { f.proof.mode = 'paused'; }],
+  ['owner command', f => { f.proof.pendingCommand = 'pause'; }],
+  ['pending action', f => { f.job.execution.pendingAction = {}; }],
+  ['unknown action', f => { f.job.execution.uncertainty = {}; }],
+  ['source revoked', f => { f.setEligible(false); }],
+]) test(`queue timeout recovery preserves ${name}`, async () => {
+  const f = queuedPauseFixture(); change(f);
+  assert.equal((await f.create().runCycle()).resumed, 0);
+  assert.equal(f.calls.length, 0);
+});
+
 test('a stopped native turn with an incomplete final decision resumes only its exact automatic checkpoint', async () => {
   const f = fixture();
   f.job.execution.pause.reason = '等待人工处理（CODE_BRAIN_COMPLETION_NOT_READY）';

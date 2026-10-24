@@ -8,6 +8,8 @@ import { normalizePullRequestExecutionBinding, samePullRequestExecutionBinding }
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
 import { createPullRequestExternalActionConfirmationPlan } from "../domain/pull-request-external-action.js";
 import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
+import { recoverableNativePauseCode } from './automatic-code-job-pause-recovery.js';
+import { MODEL_QUEUE_TIMEOUT } from './code-job-protocol-recovery.js';
 import { isOwnerRequestedCiRepairEvent } from "./ci-repair-context-reader.js";
 import { AutomaticOwnPrVerificationRecovery } from './automatic-own-pr-verification-recovery.js';
 import { approveOwnPrAction, repairCommitMatchesJob, planOwnPrPushRetry, retryOwnPrPush, validateOwnPrPushRetry } from "./automatic-own-pr-repair-authorization.js";
@@ -407,7 +409,9 @@ export class AutomaticOwnPrRepair {
   }
 
   canRecoverPausedCodeJob(job) {
-    if (!['review_repair', 'ci_repair'].includes(job?.grant?.executionSource?.kind)) return Promise.resolve(false);
+    const kind = job?.grant?.executionSource?.kind;
+    if (!['review_repair', 'ci_repair'].includes(kind) &&
+        !(kind === 'conflict_preparation' && recoverableNativePauseCode(job) === MODEL_QUEUE_TIMEOUT)) return Promise.resolve(false);
     return this.canReplanUnstartedWrite(job);
   }
 

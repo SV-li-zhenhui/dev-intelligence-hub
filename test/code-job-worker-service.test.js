@@ -1130,7 +1130,7 @@ test("settled native timeout continues the same checkpoint after restart without
   assert.equal(fixture.executor.calls.filter(({ method, value }) => method === "perform" && value.action.type === "run_profile").length, 1);
 });
 
-async function continuousTimeoutFixture(initialDecide, { timeoutCode = "STRUCTURED_PROVIDER_TIMEOUT" } = {}) {
+async function continuousTimeoutFixture(initialDecide, { timeoutCode = "STRUCTURED_PROVIDER_TIMEOUT", startModel = true } = {}) {
   let now = Date.parse("2026-08-02T08:00:00.000Z");
   const clock = () => new Date(now);
   const storage = new IntegrationMemoryStore();
@@ -1163,7 +1163,7 @@ async function continuousTimeoutFixture(initialDecide, { timeoutCode = "STRUCTUR
     restartJobs() { return new CodeJobStore(storeOptions); },
     setDecide(value) { decide = value; },
     nativeTimeout({ stopConfirmed = true, sessionStatus = "interrupted" } = {}) {
-      currentTaskExecution().reportSession({ transport: "app-server", threadId: "native-thread", turnId: "native-turn", status: sessionStatus });
+      if (startModel) currentTaskExecution().reportSession({ transport: "app-server", threadId: "native-thread", turnId: "native-turn", status: sessionStatus });
       if (stopConfirmed) currentTaskExecution().confirmStopped();
       return Object.assign(new Error("native inactivity deadline"), { code: timeoutCode });
     },
@@ -1171,7 +1171,7 @@ async function continuousTimeoutFixture(initialDecide, { timeoutCode = "STRUCTUR
       return new CodeJobWorkerService({ jobStore: jobs, executor, taskRuns: registry, grantVerifier: verifier([]), clock,
         brainDirectory: { describe: () => ({ supportsCodeExecution: true, supportsCodeReading: true }),
           async decide(input) {
-            currentTaskExecution().reportSession({ transport: "app-server", threadId: "native-thread", turnId: "native-turn", status: "running" });
+            if (startModel) currentTaskExecution().reportSession({ transport: "app-server", threadId: "native-thread", turnId: "native-turn", status: "running" });
             return decide(input);
           } }, ...overrides });
     },
@@ -1195,6 +1195,37 @@ test("protocol retry feedback requires this job's stopped native receipt and pre
     { session: null }, { outcomeCode: "STRUCTURED_PROVIDER_CLEANUP_FAILED" }]) {
     assert.equal(codeProtocolRecoveryFor(job, { ...run, receipt: { ...run.receipt, ...change } }), null);
   }
+});
+
+test("a confirmed unstarted model queue timeout retries the same job without an operator pause", async () => {
+  let attempts = 0;
+  const f = await continuousTimeoutFixture(async () => { attempts++; throw f.nativeTimeout(); },
+    { timeoutCode: 'STRUCTURED_PROVIDER_QUEUE_TIMEOUT', startModel: false });
+  const worker = f.worker();
+  const outcome = (await worker.runCycle()).outcomes[0];
+  assert.equal(outcome.status, 'retry');
+  assert.equal(outcome.code, 'STRUCTURED_PROVIDER_QUEUE_TIMEOUT');
+  const current = await f.jobs.getForWorker(f.durableJob.jobId);
+  assert.equal(current.status, 'active');
+  assert.equal(current.execution.pause, null);
+  assert.equal(current.execution.turn, 0);
+  assert.equal(f.executor.calls.some(call => call.method === 'perform'), false);
+  assert.equal((await worker.runCycle()).outcomes[0].code, 'CODE_JOB_MAINTENANCE_BACKOFF');
+  assert.equal(attempts, 1, 'backoff must not invoke another model');
+  const receipt = (await f.registry.get('code-job', current.jobId)).receipt;
+  assert.equal(receipt.stopConfirmed, true);
+  assert.equal(receipt.session, null);
+  assert.equal(receipt.modelStartedAt, null);
+  f.advance(61_000);
+  assert.equal((await worker.runCycle()).outcomes[0].status, 'retry');
+  assert.equal(attempts, 2);
+});
+
+for (const startModel of [false, true]) test(`queue timeout requires a confirmed unstarted reservation: modelStarted=${startModel}`, async () => {
+  const f = await continuousTimeoutFixture(async () => { throw f.nativeTimeout({ stopConfirmed: startModel }); },
+    { timeoutCode: 'STRUCTURED_PROVIDER_QUEUE_TIMEOUT', startModel });
+  assert.equal((await f.worker().runCycle()).outcomes[0].status, 'paused');
+  assert.equal((await f.jobs.getForWorker(f.durableJob.jobId)).status, 'paused');
 });
 
 test("a restarted continuous worker carries the stopped protocol failure into its fresh model request", async () => {

@@ -99,6 +99,21 @@ function verificationRecoveryFixture() {
   return { s, row, raw, job, detail, proof, boxes, transitions, timeline, objectSync, codeJobReader, settledVerificationReader };
 }
 
+test('conflict queue timeout recovery delegates only to its dedicated current conflict record', async () => {
+  const f = setup(); let current = true, calls = 0;
+  f.service.conflictRepair = { async canReplanUnstartedWrite(job) { calls++; assert.equal(job.jobId, 'queued-conflict'); return current; } };
+  const job = { jobId: 'queued-conflict', status: 'paused', grant: { executionSource: { kind: 'conflict_preparation' } },
+    execution: { pendingAction: null, actionAdmission: null, uncertainty: null,
+      pause: { from: 'active', reason: '等待人工处理（STRUCTURED_PROVIDER_QUEUE_TIMEOUT）' } } };
+  assert.equal(await f.service.canRecoverPausedCodeJob(job), true);
+  assert.equal(calls, 1);
+  current = false;
+  assert.equal(await f.service.canRecoverPausedCodeJob(job), false);
+  job.execution.pause.reason = '等待人工处理（STRUCTURED_PROVIDER_RESPONSE_INVALID）';
+  assert.equal(await f.service.canRecoverPausedCodeJob(job), false);
+  assert.equal(calls, 2, 'protocol recovery cannot bypass its existing dedicated policy');
+});
+
 test('disabled inline recovery leaves the dedicated recovery continuation responsible', async () => {
   const f = verificationRecoveryFixture();
   let evidenceReads = 0;

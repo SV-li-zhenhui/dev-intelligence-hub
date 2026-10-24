@@ -2,6 +2,22 @@ const CODES = new Set([
   "STRUCTURED_PROVIDER_RESPONSE_INVALID", "CODE_BRAIN_COMPLETION_NOT_READY", "CODE_BRAIN_RESPONSE_INVALID",
 ]);
 
+export const MODEL_QUEUE_TIMEOUT = 'STRUCTURED_PROVIDER_QUEUE_TIMEOUT';
+
+// Positive host stop evidence for a reservation that never admitted a model.
+// Empty session metadata alone cannot authorize an automatic retry.
+export function stoppedCodeJobQueueTimeout(job, run) {
+  const receipt = run?.receipt;
+  const times = [job?.createdAt, receipt?.registeredAt, receipt?.finishedAt].map(Date.parse);
+  return run?.active === false && run.mode === 'active' && run.pendingCommand === null && run.stopUnconfirmed !== true &&
+    run.kind === 'code-job' && run.taskId === job.jobId && run.roleId === job.grant.requestedBy.roleId &&
+    typeof run.runId === 'string' && run.runId.length > 0 && receipt?.runId === run.runId &&
+    receipt.kind === 'code-job' && receipt.taskId === job.jobId && receipt.roleId === run.roleId &&
+    receipt.phase === 'failed' && receipt.outcomeCode === MODEL_QUEUE_TIMEOUT && receipt.stopConfirmed === true &&
+    receipt.modelStartedAt === null && receipt.session === null && receipt.eventCount === 0 &&
+    times.every(Number.isFinite) && times[0] <= times[1] && times[1] <= times[2];
+}
+
 export function isCodeProtocolRecoveryCode(code) { return CODES.has(code); }
 
 // Advisory feedback only: the next invocation still owns a new capability and

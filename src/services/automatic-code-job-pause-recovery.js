@@ -1,7 +1,8 @@
 import { OperationQueue } from '../lib/operation-queue.js';
 import { hasIncompleteReadPause, stoppedCodeJobRun } from './code-job-read-recovery.js';
+import { MODEL_QUEUE_TIMEOUT, stoppedCodeJobQueueTimeout } from './code-job-protocol-recovery.js';
 
-const NATIVE_PAUSES = new Map(['STRUCTURED_PROVIDER_RESPONSE_INVALID', 'CODE_BRAIN_COMPLETION_NOT_READY']
+const NATIVE_PAUSES = new Map(['STRUCTURED_PROVIDER_RESPONSE_INVALID', 'CODE_BRAIN_COMPLETION_NOT_READY', MODEL_QUEUE_TIMEOUT]
   .map(code => [`等待人工处理（${code}）`, code]));
 
 export function recoverableNativePauseCode(job) {
@@ -17,6 +18,8 @@ function stoppedRun(proof, job) {
   const paused = Date.parse(job.execution.pause.at);
   const created = Date.parse(job.createdAt);
   const code = recoverableNativePauseCode(job);
+  if (code === MODEL_QUEUE_TIMEOUT) return stoppedCodeJobQueueTimeout(job, proof) &&
+    Number.isFinite(paused) && finished <= paused;
   return code !== null && proof?.mode === 'active' && proof.active === false && proof.pendingCommand === null &&
     proof.stopUnconfirmed !== true && typeof proof.runId === 'string' && proof.runId.length > 0 &&
     proof.runId === receipt?.runId && receipt?.kind === 'code-job' && receipt.taskId === job.jobId &&
