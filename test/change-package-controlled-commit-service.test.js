@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 
 import { createChangePackage } from "../src/domain/change-package-contract.js";
-import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { normalizeChangePackageControlledCommitRequest } from "../src/domain/change-package-controlled-commit.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import {
   createControlledCommitEvidence,
@@ -250,6 +251,34 @@ function fixture({ behavior, store = new MemoryStore() } = {}) {
     request: requestFor(executionSource, sealedPackage.manifest),
     evidence,
   };
+}
+
+for (const existingIntent of [false, true]) {
+  test(`empty repair packages neither create a commit intent nor prevent restart (${existingIntent})`, async () => {
+    const executionSource = createReviewRepairCodeExecutionSource({ inputBinding: source().inputBinding, writablePaths: ["src"] });
+    const manifest = createChangePackage({ job: { id: "code-job-empty", revision: 1, recordDigest: "e".repeat(64) },
+      proposal: { id: "proposal-empty", contentDigest: "f".repeat(64) }, grant: { digest: "0".repeat(64) },
+      workspace: { id: "workspace-empty", sourceRevision: "d".repeat(64), workspaceRevision: "d".repeat(64) },
+      passedProfiles: [profile("d".repeat(64))], created: [], modified: [], deleted: [] }).manifest;
+    const request = requestFor(executionSource, manifest);
+    const store = new MemoryStore();
+    if (existingIntent) store.value = { schemaVersion: 1, revision: 1,
+      deliveries: [{ request, status: "intent", evidenceId: null, receipt: null }] };
+    const original = structuredClone(store.value);
+    let lookups = 0;
+    const service = new ChangePackageControlledCommitService({ store,
+      packageReader: { async get() { return manifest; }, async readFile() { assert.fail("no blobs to read"); } },
+      controlledCommitBuilder: { async find() { lookups++; createControlledCommitMessage({ executionSource, manifest }); },
+        async create() { assert.fail("no empty commit"); }, async verify() { assert.fail("no evidence exists"); } },
+      exclusiveLease: { async run(fn) { return fn(); } } });
+    assert.deepEqual(await service.recover(), existingIntent ? {
+      deliveries: 1, committed: 0, pending: 1,
+      emptyChangeDeliveryIds: [normalizeChangePackageControlledCommitRequest(request).deliveryId],
+    } : { deliveries: 0, committed: 0, pending: 0 });
+    await assert.rejects(service.delivery().deliver(request), { code: "CONTROLLED_COMMIT_DELIVERY_NO_CHANGES" });
+    assert.equal(lookups, 0);
+    assert.deepEqual(store.value, original);
+  });
 }
 
 test("delivery loads sealed blobs internally, verifies evidence, and reuses its durable receipt", async () => {

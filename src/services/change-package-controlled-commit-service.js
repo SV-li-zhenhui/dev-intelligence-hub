@@ -7,6 +7,7 @@ import {
   sameChangePackageControlledCommitReceipt,
 } from "../domain/change-package-controlled-commit.js";
 import { normalizeChangePackageManifest } from "../domain/change-package-contract.js";
+import { isHeadRepairExecutionSource } from "../domain/code-execution-source.js";
 import { digestValue } from "../domain/code-executor-contract.js";
 import {
   normalizeControlledCommitEvidence,
@@ -19,6 +20,11 @@ const STATE_KEY = CHANGE_PACKAGE_CONTROLLED_COMMIT_STATE_KEY;
 const MAX_DELIVERIES = 1_000;
 const EVIDENCE_ID = /^controlled-git-commit-[a-f0-9]{64}$/u;
 const STATUSES = new Set(["intent", "evidence", "committed"]);
+
+function isEmptyRepairPackage(request, manifest) {
+  return isHeadRepairExecutionSource(request.executionSource) &&
+    manifest.changes.created.length === 0 && manifest.changes.modified.length === 0 && manifest.changes.deleted.length === 0;
+}
 
 export class ChangePackageControlledCommitServiceError extends Error {
   constructor(code, message, { cause } = {}) {
@@ -288,12 +294,20 @@ export class ChangePackageControlledCommitService {
           let committed = 0;
           let pending = 0;
           const stalePreparationDeliveryIds = [];
+          const emptyChangeDeliveryIds = [];
           for (const original of [...this.#state.deliveries]) {
             const request = normalizeChangePackageControlledCommitRequest(
               original.request,
             );
             const manifest = await this.#loadManifest(request);
             const record = findRecord(this.#state, request.deliveryId);
+            // Empty repair packages cannot produce a controlled commit. Retain
+            // historical unexecuted intents without blocking unrelated startup.
+            if (record.status === "intent" && isEmptyRepairPackage(request, manifest)) {
+              emptyChangeDeliveryIds.push(request.deliveryId);
+              pending += 1;
+              continue;
+            }
             let recovered;
             try {
               recovered = record.status === "committed" && this.#builder.readSealed
@@ -314,6 +328,7 @@ export class ChangePackageControlledCommitService {
             deliveries: this.#state.deliveries.length,
             committed,
             pending,
+            ...(emptyChangeDeliveryIds.length > 0 ? { emptyChangeDeliveryIds: Object.freeze(emptyChangeDeliveryIds) } : {}),
             ...(stalePreparationDeliveryIds.length > 0
               ? { stalePreparationDeliveryIds: Object.freeze(stalePreparationDeliveryIds) }
               : {}),
@@ -339,6 +354,9 @@ export class ChangePackageControlledCommitService {
     }
     return this.#run(async () => {
       const manifest = await this.#loadManifest(request);
+      if (isEmptyRepairPackage(request, manifest)) {
+        throw serviceError("CONTROLLED_COMMIT_DELIVERY_NO_CHANGES", "代码包没有实际变更，不能创建修复提交");
+      }
       let record = findRecord(this.#state, request.deliveryId);
       if (record !== null && !sameValue(record.request, requestProjection(request))) {
         throw serviceError(
