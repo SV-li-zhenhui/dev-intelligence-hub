@@ -68,6 +68,7 @@ import {
 } from "./services/configured-workforce.js";
 import { CodeJobMemoryProjector } from "./services/code-job-memory-projector.js";
 import { ObsoleteCodeJobSettler } from "./services/obsolete-code-job-settler.js";
+import { githubEntitySessionKey } from "./lib/session-key.js";
 import { CodeJobEvidenceReader } from "./services/code-job-evidence-reader.js";
 import { ChangePackageApplicationResultReconciler } from "./services/change-package-application-result-reconciler.js";
 import { MemoryProjector } from "./services/memory-projector.js";
@@ -1699,6 +1700,7 @@ export async function createApplication({
           },
         });
     let activeCodeJobOptions = null;
+    let codeJobNativeExecution = null;
     if (localCodeExecutionEnabled) {
       let codeJobBrainDirectory;
       if (versionedConfiguration) {
@@ -1758,6 +1760,15 @@ export async function createApplication({
         });
       }
       codeJobBrainDirectory = trackRuntime(codeJobBrainDirectory);
+      if (typeof codeJobBrainDirectory.withEntityQuiescence === "function") {
+        codeJobNativeExecution = Object.freeze({ withEntityQuiescence: (grant, operation) => {
+          if (!Number.isSafeInteger(grant.subject?.number) ||
+              grant.inputBinding?.pullRequestNumber !== grant.subject.number) return { executed: false };
+          return codeJobBrainDirectory.withEntityQuiescence({ roleId: grant.requestedBy.roleId,
+            brainDigest: grant.brainDigest, entityKey: githubEntitySessionKey({ kind: "pull_request",
+              repository: grant.repository, number: grant.subject.number }) }, operation);
+        } });
+      }
       activeCodeJobOptions = {
         ...(ownPrRepairEnabled ? {
           reviewRepairContextReader: new ReviewRepairContextReader({
@@ -1880,6 +1891,12 @@ export async function createApplication({
       obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader, codeJobControl, taskRuns,
         ...(typeof codeExecutorRuntime?.executor?.view === "function" ? {
           codeExecutorReader: frozenPort(codeExecutorRuntime.executor, ["view"], "obsolete code executor stop reader"),
+        } : {}),
+        ...(codeJobNativeExecution !== null &&
+            typeof codeExecutorRuntime?.executor?.view === "function" &&
+            typeof codeExecutorRuntime.executor.reconcileCancellation === "function" ? {
+          nativeExecution: codeJobNativeExecution,
+          codeExecutorControl: frozenPort(codeExecutorRuntime.executor, ["reconcileCancellation"], "obsolete executor cleanup"),
         } : {}) });
       if (codeJobChangePackageDeliveryEnabled) {
         codeJobEvidenceReader = frozenPort(

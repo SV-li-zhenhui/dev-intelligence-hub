@@ -5806,6 +5806,81 @@ test("a started authority-fenced job releases the next PR generation only after 
   assert.deepEqual(await fixture.jobs.get(fixture.job.jobId), fixture.job);
 });
 
+async function restoredAuthorityFenceFixture({ denied = false, cleanupFailure = false, changeControl = false, corruptProof = false } = {}) {
+  const fixture = await stoppedStartedFenceFixture();
+  fixture.run.runId = fixture.run.receipt.runId = "restored-preflight";
+  fixture.run.receipt.stopConfirmed = false;
+  fixture.run.receipt.session = null;
+  fixture.run.receipt.outcomeCode = 'INVALID_CODE_JOB_AUTHORITY';
+  fixture.session.status = fixture.session.attempt.status = "active";
+  fixture.session.sourceRevision = "3".repeat(64);
+  let cleanups = 0, held = false;
+  fixture.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({
+    codeJobReader: fixture.jobs,
+    codeJobControl: { cancel: async () => assert.fail("the original fenced result must survive") },
+    taskRuns: { get: async () => structuredClone(fixture.run) },
+    codeExecutorReader: { view: async () => structuredClone(fixture.session) },
+    nativeExecution: { withEntityQuiescence: async (grant, operation) => {
+      assert.equal(grant.grantDigest, fixture.job.grantDigest);
+      if (denied) return { executed: false };
+      held = true;
+      try { return { executed: true, result: await operation() }; } finally { held = false; }
+    } },
+    codeExecutorControl: { reconcileCancellation: async request => {
+      assert.equal(held, true, "native exclusion must remain held through cleanup");
+      cleanups++;
+      assert.equal(request.sessionId, fixture.job.jobId);
+      assert.equal(request.expectedWorkspaceRevision, fixture.session.workspaceRevision);
+      assert.deepEqual(request.inputBinding, fixture.job.inputBinding);
+      assert.equal(request.expectedAction, null);
+      if (cleanupFailure && cleanups === 1) {
+        fixture.session.status = fixture.session.attempt.status = "cancelling";
+        fixture.session.revision++;
+        throw Object.assign(new Error("cleanup pending"), { code: "WORKSPACE_DISPOSAL_PENDING" });
+      }
+      fixture.session.status = fixture.session.attempt.status = "cancelled";
+      fixture.session.revision++;
+      if (changeControl) fixture.run.mode = "paused";
+      const proof = { schemaVersion: 1, kind: "controlled_execution_cancelled", sessionId: request.sessionId,
+        cancellationDigest: request.cancellationDigest, sourceRevision: fixture.session.sourceRevision,
+        trustedWorkspaceRevision: fixture.session.workspaceRevision, actionResolution: null,
+        sandboxCleanupConfirmed: true, discardedAttempts: [{ attemptNumber: 1, executionId: "discarded-attempt", disposition: "discarded" }],
+        settledAt: fixture.job.updatedAt };
+      return { status: "settled", session: structuredClone(fixture.session), proof: { ...proof,
+        proofDigest: corruptProof ? "0".repeat(64) : digestValue(proof) } };
+    } },
+  });
+  return { ...fixture, cleanups: () => cleanups };
+}
+
+test("a restored authority failure before model launch automatically cleans up and releases the new PR generation", async () => {
+  const fixture = await restoredAuthorityFenceFixture();
+  assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, true);
+  assert.equal(fixture.cleanups(), 1);
+  assert.deepEqual(await fixture.jobs.get(fixture.job.jobId), fixture.job);
+  assert.equal(fixture.run.receipt.stopConfirmed, false, "historical native receipts must not be rewritten");
+  assert.equal((await fixture.service.readItemForReconciliation({ itemId: fixture.item.itemId })).source.pendingRevision, null);
+});
+
+for (const variant of ["denied", "cleanupFailure", "changeControl", "corruptProof"]) {
+  test(`restored authority settlement retains the source fence on ${variant}`, async () => {
+    const fixture = await restoredAuthorityFenceFixture({ [variant]: true });
+    const result = await fixture.service.reconcilePullRequestSource(fixture.command).catch(() => ({ applied: false }));
+    assert.equal(result.applied, false);
+    assert.equal(fixture.cleanups(), variant === "denied" ? 0 : 1);
+    assert.deepEqual(await fixture.jobs.get(fixture.job.jobId), fixture.job);
+  });
+}
+
+test("restored authority cleanup resumes its same cancelling executor after transient workspace disposal failure", async () => {
+  const fixture = await restoredAuthorityFenceFixture({ cleanupFailure: true });
+  await fixture.service.reconcilePullRequestSource(fixture.command).catch(() => {});
+  assert.equal(fixture.session.status, 'cancelling');
+  assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, true);
+  assert.equal(fixture.cleanups(), 2);
+  assert.deepEqual(await fixture.jobs.get(fixture.job.jobId), fixture.job);
+});
+
 test("a host-rejected write is retained as unexecuted evidence during stopped fence settlement", async () => {
   const fixture = await stoppedStartedFenceFixture({ unexecutedWrite: true });
   const detail = await fixture.jobs.getDetail({ jobId: fixture.job.jobId, limit: 20 });

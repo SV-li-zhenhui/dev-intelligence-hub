@@ -28,6 +28,11 @@ const WINDOWS_WRAPPER_PATH = fileURLToPath(
 const TEST_CONSTRUCTION_TOKEN = Object.freeze({});
 const REAPED_FAILURE_OUTPUT = new WeakMap();
 const PROCESS_NOT_STARTED = new WeakSet();
+const PRODUCTION_RUNNERS = new WeakSet();
+
+export function isProductionSupervisedProcessRunner(value) {
+  return PRODUCTION_RUNNERS.has(value) && value.run === SupervisedProcessRunner.prototype.run;
+}
 
 // Only the runner can certify that execution failed before a spawn attempt.
 // Error codes and caller-created error objects cannot carry this authority.
@@ -481,6 +486,7 @@ export class SupervisedProcessRunner {
     this.#windowsWrapperPath = platform === "win32"
       ? processCommand(windowsWrapperPath)
       : null;
+    if (constructionToken !== TEST_CONSTRUCTION_TOKEN) PRODUCTION_RUNNERS.add(this);
     Object.freeze(this);
   }
 

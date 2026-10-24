@@ -31,6 +31,37 @@ const options = { id: "native-test", cliKind: "codex-cli", credentialMode: "code
 const success = (stdout = "") => ({ exitCode: 0, signal: null, stdout, stderr: "", stdoutBytes: Buffer.from(stdout), stderrBytes: Buffer.alloc(0) });
 const gate = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
 
+test("native entity quiescence uses the launch journal and holds exclusion without clearing unrelated unknown work", async t => {
+  const f = await fixture(t);
+  const provider = createNativeCodexBrainProvider(options, { ...f.dependencies, maxConcurrentTurns: 2, allowConcurrentNativeHome: true });
+  await mkdir(f.runtime);
+  const entityKey = githubEntitySessionKey({ kind: "pull_request", repository: "owner/repo", number: 42 });
+  const prefix = `active-${nativeCodexDigest(nativeCodexHomeIdentity(f.home))}`;
+  const invocation = `invocation-${randomUUID()}`;
+  await mkdir(path.join(f.runtime, invocation));
+  const marker = path.join(f.runtime, `${prefix}-${randomUUID()}.json`);
+  const unrelated = { schemaVersion: 2, invocation, createdAt: Date.now(), entity: nativeCodexDigest("pr:other") };
+  await writeFile(marker, JSON.stringify(unrelated));
+  const result = await provider.withEntityQuiescence({ entityKey }, async () => {
+    await assert.rejects(provider.withAdmission({ entityKey }, () => assert.fail("same entity entered")), { code: "STRUCTURED_PROVIDER_BUSY" });
+    return "settled";
+  });
+  assert.deepEqual(result, { executed: true, result: "settled" });
+  assert.deepEqual(JSON.parse(await readFile(marker, "utf8")), unrelated);
+  await writeFile(marker, JSON.stringify({ ...unrelated, entity: nativeCodexDigest(entityKey) }));
+  assert.deepEqual(await provider.withEntityQuiescence({ entityKey }, () => assert.fail("unresolved launch entered")), { executed: false });
+  await writeFile(marker, "invalid launch journal");
+  assert.deepEqual(await provider.withEntityQuiescence({ entityKey }, () => assert.fail("malformed journal entered")), { executed: false });
+  await provider.close();
+});
+
+test("custom process runners cannot certify native entity quiescence", async t => {
+  const f = await fixture(t), provider = f.create();
+  await mkdir(f.runtime);
+  assert.deepEqual(await provider.withEntityQuiescence({ entityKey: "pr:42" }, () => assert.fail("uncertified runner")), { executed: false });
+  await provider.close();
+});
+
 for(const sharedSessionScope of [true,false])test(`employee admission and direct code jobs serialize one PR with session scopes ${sharedSessionScope?'equal':'isolated'}`,async t=>{
   const f=await fixture(t),entered=gate(),finish=gate(),otherEntered=gate(),starts=[];
   const provider=f.create(async call=>{

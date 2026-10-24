@@ -538,6 +538,14 @@ export class CodeJobBrainDirectory {
     );
   }
 
+  async withEntityQuiescence({ roleId, entityKey, signal = null }, operation) {
+    this.#assertOpen();
+    this.describe(roleId);
+    return typeof this.#router.withEntityQuiescence === 'function'
+      ? this.#router.withEntityQuiescence(this.#taskBrains.get(roleId), { entityKey, signal }, operation)
+      : { executed: false };
+  }
+
   describe(roleId) {
     if (typeof roleId !== "string" || !SAFE_ROLE_ID.test(roleId)) {
       throw new TypeError("code brain roleId is invalid");

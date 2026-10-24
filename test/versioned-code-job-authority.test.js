@@ -551,6 +551,29 @@ test("code reading description follows the active and historically sealed brain"
     "new-local-model", "new-local-model", context.startup.employees.roles.developer.taskBrain.model]);
 });
 
+test("obsolete execution quiescence follows the historically sealed brain without admitting stale code execution", async () => {
+  const calls = [];
+  const context = fixture({ brainDirectoryFactory: ({ roles }) => ({
+    async decide() { assert.fail('cleanup must never dispatch a model'); },
+    describe() { return { supportsCodeExecution: true }; },
+    async withEntityQuiescence(input, operation) {
+      calls.push({ model: roles.developer.taskBrain.model, ...input });
+      return { executed: true, result: await operation() };
+    },
+  }) });
+  const grant = (await context.authority.create(proposal(context.startup))).grant;
+  const changed = structuredClone(context.startup);
+  changed.employees.roles.developer.taskBrain.model = 'new-model';
+  context.activate(changed);
+  const result = await context.authority.withEntityQuiescence({ roleId: 'developer', brainDigest: grant.brainDigest,
+    entityKey: 'github:pull_request:acme/repo#42' }, () => 'cleanup');
+  assert.deepEqual(result, { executed: true, result: 'cleanup' });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].model, context.startup.employees.roles.developer.taskBrain.model);
+  assert.equal(calls[0].entityKey, 'github:pull_request:acme/repo#42');
+  await context.authority.close();
+});
+
 test("continuous cancellation signal passes through versioned admission without serialization", async () => {
   let seen;
   const context = fixture({ brainDirectoryFactory: () => ({

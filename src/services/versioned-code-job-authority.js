@@ -927,6 +927,23 @@ export class VersionedCodeJobAuthority {
     return result;
   }
 
+  async withEntityQuiescence({ roleId, brainDigest, entityKey, signal = null }, operation) {
+    this.#assertOpen();
+    await this.describe(roleId, brainDigest);
+    const current = await this.#current();
+    const context = current.brainDigests.get(roleId) === brainDigest
+      ? current : this.#brainCandidateContext(current, roleId, brainDigest);
+    if (!context) return { executed: false };
+    const directory = this.#directory(context);
+    const quiescence = optionalMethod(directory, 'withEntityQuiescence');
+    return quiescence ? quiescence({ roleId, entityKey, signal }, async () => {
+      this.#assertOpen();
+      const latest = await this.#current();
+      if (latest.roleAuthorityDigest(roleId) !== context.roleAuthorityDigest(roleId)) return null;
+      return operation();
+    }) : { executed: false };
+  }
+
   async decide(value, authorization) {
     this.#assertOpen();
     const { beforeGenerate, brainDigest, signal } = decisionAuthorization(authorization);

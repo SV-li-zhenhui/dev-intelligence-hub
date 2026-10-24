@@ -19,6 +19,18 @@ const BRAIN = Object.freeze({
   }),
 });
 
+test("quiescence requires a provider witness and canonicalizes the same PR identity as generation", async () => {
+  const unsupported = new BrainRouter({ providers: [provider()] });
+  assert.deepEqual(await unsupported.withEntityQuiescence(BRAIN, { entityKey: 'github:pull_request:Owner/Repo#42' },
+    () => assert.fail('unsupported provider cannot certify a stop')), { executed: false });
+  const router = new BrainRouter({ providers: [provider({ async withEntityQuiescence(request, operation) {
+    assert.equal(request.entityKey, 'github:pull_request:owner/repo#42');
+    return { executed: true, result: await operation() };
+  } })] });
+  assert.deepEqual(await router.withEntityQuiescence(BRAIN, { entityKey: 'github:pull_request:Owner/Repo#42' },
+    () => 'host-cleanup'), { executed: true, result: 'host-cleanup' });
+});
+
 test("BrainRouter shares scheduling identity across authorization scopes without merging sessions", async () => {
   const calls = [], reservations = [];
   const router = new BrainRouter({ providers: [provider({ supportsEntitySessions: true,

@@ -7,7 +7,7 @@ import path from "node:path";
 import { projectRoot } from "../lib/config.js";
 import { KnownCliLocator } from "../lib/known-cli-locator.js";
 import { PRODUCTION_PRIVATE_DIRECTORY_MANAGER } from "../lib/private-directory-manager.js";
-import { SupervisedProcessRunner, didSupervisedProcessNotStart, readReapedProcessFailureOutput } from "../lib/supervised-process-runner.js";
+import { SupervisedProcessRunner, isProductionSupervisedProcessRunner, didSupervisedProcessNotStart, readReapedProcessFailureOutput } from "../lib/supervised-process-runner.js";
 import { CodexAppServerRunner, didAppServerNotStart, didAppServerNotStartModel, didAppServerReap, readAppServerFailureOutput } from '../lib/codex-app-server-runner.js';
 import { normalizeStructuredBrainRequest, readStructuredBrainGenerateInput } from "../lib/structured-brain-request.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
@@ -240,6 +240,8 @@ export class NativeCodexBrainProvider {
     this.#state = HOMES.get(key);
     if (!this.#state) HOMES.set(key, this.#state = createNativeModelAdmission(capacity));
     if (this.#state.capacity !== capacity) throw new TypeError('Native home admission capacity differs between providers');
+    this.#state.launchJournalCertified = this.#state.launchJournalCertified !== false &&
+      isProductionSupervisedProcessRunner(this.#dependencies.processRunner) && dependencies.appServerRunner === undefined;
     this.#sessions = dependencies.nativeSessionStore ?? new CodexNativeSessionStore({ root: path.join(this.#root, "sessions"), nativeHome: this.#nativeHome });
   }
 
@@ -442,6 +444,33 @@ export class NativeCodexBrainProvider {
     this.#operations.add(queued);
     try { return await queued; }
     finally { waiting.close(); this.#controllers.delete(waiting); this.#operations.delete(queued); }
+  }
+
+  async withEntityQuiescence({ entityKey, signal = null } = {}, operation) {
+    if (typeof operation !== "function") throw new TypeError("Native quiescence operation is invalid");
+    if (!this.#state.launchJournalCertified) return { executed: false };
+    let entered = false;
+    const attempt = this.withAdmission({ entityKey, signal }, async () => {
+      const settled = await this.#state.preparation.enqueue(async () => {
+        const entries = await readUnknownNativeInvocations({ root: this.#root,
+          prefix: `active-${nativeCodexDigest(nativeCodexHomeIdentity(this.#nativeHome))}`,
+          clock: this.#dependencies.clock, signal });
+        return entries !== null && !entries.some(entry => entry.entity === nativeCodexDigest(entityKey));
+      });
+      if (!settled || this.#closed || !this.#state.launchJournalCertified) return { executed: false };
+      signal?.throwIfAborted();
+      // Every built-in launch journals before spawning and retains its marker
+      // until tree supervision settles. Entity admission stays held while host
+      // actions drain; this does not rewrite any historical execution receipt.
+      entered = true;
+      return { executed: true, result: await operation() };
+    });
+    this.#operations.add(attempt);
+    try { return await attempt; }
+    catch (error) {
+      if (!entered && ["STRUCTURED_PROVIDER_BUSY", "STRUCTURED_PROVIDER_REAP_FAILED"].includes(error?.code)) return { executed: false };
+      throw error;
+    } finally { this.#operations.delete(attempt); }
   }
 
   async generate(rawRequest) {

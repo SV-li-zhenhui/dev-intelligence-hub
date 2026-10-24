@@ -1,6 +1,7 @@
 import { normalizeCodeJobGrant } from "../domain/code-job-contract.js";
 import { normalizeCodeJobConfirmationResult } from "./code-job-confirmation-result.js";
 import { isDeepStrictEqual } from "node:util";
+import { digestValue } from "../domain/code-executor-contract.js";
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "fenced"]);
 const CANCELLATION_REASON = "PR source superseded";
@@ -27,7 +28,7 @@ function stoppedNativeRun(job, run) {
     receipt.session?.transport === "app-server" && Number.isFinite(finishedAt);
 }
 
-function stoppedExecutor(job, session, observations) {
+function stoppedExecutor(job, session, observations, statuses = ["interrupted", "failed", "cancelled"]) {
   const lastAction = Array.isArray(session?.actions) ? session.actions.at(-1) : null;
   if (!Array.isArray(session?.actions) || !Array.isArray(observations) || observations.length !== job.observationCount) return false;
   const observed = new Map(observations.map(entry => [entry.actionId, entry]));
@@ -45,8 +46,7 @@ function stoppedExecutor(job, session, observations) {
   return session?.id === job.jobId && session.workspaceId === job.workspaceId &&
     isDeepStrictEqual(session.requestedBy, job.requestedBy) && isDeepStrictEqual(session.inputBinding, job.inputBinding) &&
     isDeepStrictEqual(session.executionSource ?? null, job.executionSource ?? null) &&
-    ["interrupted", "failed", "cancelled"].includes(session.status) &&
-    ["interrupted", "failed", "cancelled"].includes(session.attempt?.status) && session.cleanupPending === false &&
+    statuses.includes(session.status) && statuses.includes(session.attempt?.status) && session.cleanupPending === false &&
     session.actions.length > 0 && job.turn === job.observationCount &&
     session.actions.every(action => ["succeeded", "failed"].includes(action.status)) &&
     /^[a-f0-9]{64}$/.test(session.workspaceRevision ?? "") && lastAction.workspaceRevisionAfter === session.workspaceRevision;
@@ -62,8 +62,11 @@ export class ObsoleteCodeJobSettler {
   #getDetail;
   #getRun;
   #viewSession;
+  #nativeExecution;
+  #cleanupExecutor;
 
-  constructor({ codeJobReader, codeJobControl, taskRuns = null, codeExecutorReader = null } = {}) {
+  constructor({ codeJobReader, codeJobControl, taskRuns = null, codeExecutorReader = null,
+    nativeExecution = null, codeExecutorControl = null } = {}) {
     if (typeof codeJobReader?.get !== "function" || typeof codeJobControl?.cancel !== "function") {
       throw new TypeError("Obsolete code job settlement requires reader and cancellation ports");
     }
@@ -75,6 +78,10 @@ export class ObsoleteCodeJobSettler {
         (codeExecutorReader !== null && typeof codeExecutorReader?.view !== "function")) throw new TypeError("Invalid obsolete code job stop reader");
     this.#getRun = taskRuns?.get.bind(taskRuns) ?? null;
     this.#viewSession = codeExecutorReader?.view.bind(codeExecutorReader) ?? null;
+    if ((nativeExecution !== null && typeof nativeExecution?.withEntityQuiescence !== 'function') ||
+        (codeExecutorControl !== null && typeof codeExecutorControl?.reconcileCancellation !== 'function')) throw new TypeError('Invalid obsolete execution cleanup ports');
+    this.#nativeExecution = nativeExecution;
+    this.#cleanupExecutor = codeExecutorControl?.reconcileCancellation.bind(codeExecutorControl) ?? null;
   }
 
   async settle({ grant: value, receipt }, { admitCancellation = admitImmediately } = {}) {
@@ -82,6 +89,9 @@ export class ObsoleteCodeJobSettler {
     const grant = normalizeCodeJobGrant(value);
     const read = () => this.read({ grant, receipt });
     const job = await read();
+    if (job?.status === 'fenced' && !hasSettledCodeJobAuthorityFence(job)) {
+      return this.#settleAuthorityFence(job, grant, receipt, admitCancellation);
+    }
     if (job === null || TERMINAL_STATUSES.has(job.status) || job.status === "cancelling") return job;
     // Cancellation uses the same stop/action reconciliation as owner controls.
     // A pending or unknown stop is never treated as a terminal settlement.
@@ -90,6 +100,57 @@ export class ObsoleteCodeJobSettler {
     }));
     await admitted.operation;
     return read();
+  }
+
+  async #settleAuthorityFence(job, grant, receipt, admitCancellation) {
+    if (!this.#nativeExecution || !this.#cleanupExecutor || !this.#getRun || !this.#viewSession || !this.#getDetail ||
+        job.turn === 0 || job.pendingActionType !== null || job.uncertainty !== null) return job;
+    const run = await this.#readRun(job.jobId);
+    const eligible = value => value?.active === false && value.mode === 'active' && value.pendingCommand === null &&
+      value.stopUnconfirmed !== true && value.kind === 'code-job' && value.taskId === job.jobId &&
+      value.roleId === job.requestedBy.roleId && value.receipt?.runId === value.runId &&
+      value.receipt.kind === 'code-job' && value.receipt.taskId === job.jobId && value.receipt.roleId === value.roleId &&
+      value.receipt.phase === 'failed' && Number.isFinite(Date.parse(value.receipt.finishedAt)) &&
+      (value.receipt.outcomeCode === 'INVALID_CODE_JOB_AUTHORITY' || stoppedNativeRun(job, value));
+    if (!eligible(run)) return job;
+    const admitted = await admitCancellation(() => this.#nativeExecution.withEntityQuiescence(grant, async () => {
+      const currentJob = normalizeCodeJobConfirmationResult(await this.#get(job.jobId), grant, receipt);
+      if (!isDeepStrictEqual(job, currentJob) || !isDeepStrictEqual(run, await this.#readRun(job.jobId))) return job;
+      const observations = await this.#fencedHistory(job, grant, receipt);
+      if (observations === null) return job;
+      const session = await this.#readSession(job.jobId);
+      if (!stoppedExecutor(job, session, observations, ['active', 'interrupted', 'failed', 'cancelling', 'cancelled'])) return job;
+      // Projection checkpoints may advance the job revision while disposal is
+      // retried. Bind cleanup to the immutable fence and workspace instead.
+      const cancellationDigest = digestValue({ schemaVersion: 1, kind: 'obsolete_authority_fence',
+        jobId: job.jobId, grantDigest: job.grantDigest, terminalResult: job.terminalResult,
+        workspaceRevision: session.workspaceRevision });
+      const response = await this.#cleanupExecutor({ sessionId: job.jobId, inputBinding: structuredClone(job.inputBinding),
+        ...(job.executionSource ? { executionSource: structuredClone(job.executionSource) } : {}),
+        cancellationDigest, expectedWorkspaceRevision: session.workspaceRevision, expectedAction: null });
+      const proof = response?.proof;
+      if (!proof || response.status !== 'settled') return job;
+      const { proofDigest, ...content } = proof;
+      if (proofDigest !== digestValue(content) || proof.schemaVersion !== 1 || proof.kind !== 'controlled_execution_cancelled' ||
+          proof.sessionId !== job.jobId || proof.cancellationDigest !== cancellationDigest ||
+          proof.sourceRevision !== session.sourceRevision || proof.trustedWorkspaceRevision !== session.workspaceRevision ||
+          proof.actionResolution !== null || proof.sandboxCleanupConfirmed !== true || !Number.isFinite(Date.parse(proof.settledAt)) ||
+          !Array.isArray(proof.discardedAttempts) || proof.discardedAttempts.length !== session.attempt.number ||
+          proof.discardedAttempts.some((attempt, index) => attempt.attemptNumber !== index + 1 || attempt.disposition !== 'discarded' ||
+            typeof attempt.executionId !== 'string' || !attempt.executionId) ||
+          new Set(proof.discardedAttempts.map(attempt => attempt.executionId)).size !== proof.discardedAttempts.length ||
+          !stoppedExecutor(job, response.session, observations, ['cancelled'])) return job;
+      const [latestJob, latestRun, latestSession] = await Promise.all([
+        this.#get(job.jobId), this.#readRun(job.jobId), this.#readSession(job.jobId),
+      ]);
+      if (isDeepStrictEqual(job, normalizeCodeJobConfirmationResult(latestJob, grant, receipt)) &&
+          isDeepStrictEqual(run, latestRun) && isDeepStrictEqual(response.session, latestSession)) {
+        stoppedAuthorityFences.set(job, structuredClone(job));
+      }
+      return job;
+    }));
+    await admitted.operation;
+    return job;
   }
 
   async #fencedHistory(job, grant, receipt) {

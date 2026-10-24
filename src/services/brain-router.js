@@ -150,6 +150,8 @@ function normalizeProvider(value) {
   );
   const availability = value.checkAvailability;
   const admission = value.withAdmission;
+  const quiescence = value.withEntityQuiescence;
+  if (quiescence !== undefined && typeof quiescence !== 'function') throw new TypeError('brain provider quiescence is invalid');
   if (admission !== undefined && typeof admission !== 'function') throw new TypeError('brain provider admission is invalid');
   if (
     attemptDescriptor &&
@@ -190,6 +192,7 @@ function normalizeProvider(value) {
       : {}),
     generate: value.generate.bind(value),
     ...(admission ? {withAdmission:admission.bind(value)} : {}),
+    ...(quiescence ? {withEntityQuiescence:quiescence.bind(value)} : {}),
     ...(availability
       ? { checkAvailability: availability.bind(value) }
       : {}),
@@ -355,6 +358,16 @@ export class BrainRouter {
     if (typeof waitForCapacity !== 'boolean') throw new TypeError('admission wait option is invalid');
     return provider.withAdmission ? provider.withAdmission({entityKey:normalizeAdmissionEntityKey(entityKey),signal:requestSignal,
       ...(waitForCapacity ? {waitForCapacity:true} : {})},operation) : operation();
+  }
+
+  async withEntityQuiescence(brainValue, { entityKey, signal = null } = {}, operation) {
+    const brain = normalizeBrainConfig(brainValue), provider = this.#provider(brain.provider);
+    const requestSignal = normalizeAbortSignal(signal);
+    requestSignal?.throwIfAborted();
+    if (typeof operation !== 'function') throw new TypeError('quiescence operation is invalid');
+    return provider.withEntityQuiescence
+      ? provider.withEntityQuiescence({ entityKey: normalizeAdmissionEntityKey(entityKey), signal: requestSignal }, operation)
+      : { executed: false };
   }
 
   describe(brainValue) {

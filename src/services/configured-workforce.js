@@ -338,6 +338,8 @@ function providerWithBoundary(provider, remote, lifecycle, sessionIsolationKey =
   }
   const availability = provider.checkAvailability;
   const admission=provider.withAdmission;
+  const quiescence=provider.withEntityQuiescence;
+  if(quiescence!==undefined && typeof quiescence!=='function')throw new TypeError('brain provider quiescence is invalid');
   if(admission!==undefined && typeof admission!=='function')throw new TypeError('brain provider admission is invalid');
   if (
     attemptDescriptor &&
@@ -378,6 +380,7 @@ function providerWithBoundary(provider, remote, lifecycle, sessionIsolationKey =
     ...(codeExecutionDescriptor?.value === true ? { supportsCodeExecution: true } : {}),
     generate: provider.generate.bind(provider),
     ...(admission ? {withAdmission:admission.bind(provider)} : {}),
+    ...(quiescence ? {withEntityQuiescence:quiescence.bind(provider)} : {}),
     ...(availability
       ? { checkAvailability: availability.bind(provider) }
       : {}),
@@ -507,6 +510,7 @@ function configuredBrainRouter(
       generate: router.generate.bind(router),
       checkAvailability: router.checkAvailability.bind(router),
       withAdmission:router.withAdmission.bind(router),
+      withEntityQuiescence:router.withEntityQuiescence.bind(router),
       describe: router.describe.bind(router),
       close: lifecycle.close,
     });
