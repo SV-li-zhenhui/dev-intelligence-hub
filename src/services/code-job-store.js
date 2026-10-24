@@ -479,7 +479,7 @@ function normalizeArchive(value, error) {
 }
 
 function normalizeJobs(value, limits, error) {
-  return denseArray(value, limits.maximumJobs, error).map((entry) => {
+  return denseArray(value, limits.maximumJobs + limits.maximumArchivedJobs, error).map((entry) => {
     try {
       return normalizeCodeJob(entry);
     } catch {
@@ -1090,7 +1090,7 @@ function normalizeLegacyState(value, limits, error) {
     changePackageDelivery: emptyChangePackageDelivery(),
     jobs,
   };
-  if (Buffer.byteLength(JSON.stringify(state), "utf8") > limits.maximumStateBytes) {
+  if (stateExceedsLimits(state, limits) && !retainedHistoryBudgetAllows(state, limits)) {
     throw error;
   }
   return state;
@@ -1247,7 +1247,7 @@ function normalizeStateValue(value, limits) {
     changePackageDelivery,
     jobs: ordered,
   };
-  if (Buffer.byteLength(JSON.stringify(state), "utf8") > limits.maximumStateBytes) {
+  if (stateExceedsLimits(state, limits) && !retainedHistoryBudgetAllows(state, limits)) {
     throw error;
   }
   return state;
@@ -2691,12 +2691,12 @@ function prepareArchiveEntry(state, archive, job, revision, limits) {
   return { archive: nextArchive, tombstone, indexes, manifest };
 }
 
-function isStateRetentionEligible(state, job) {
+function isStateRetentionEligible(state, job, pendingJobIds = null) {
   return (
     isRetentionEligibleCodeJob(job) &&
-    !state.changePackageDelivery.pending.some(
-      (event) => event.job.id === job.jobId,
-    )
+    !(pendingJobIds === null
+      ? state.changePackageDelivery.pending.some(event => event.job.id === job.jobId)
+      : pendingJobIds.has(job.jobId))
   );
 }
 
@@ -2750,6 +2750,27 @@ function stateExceedsLimits(state, limits, requiredHeadroomBytes = 0) {
     Buffer.byteLength(JSON.stringify(state), "utf8") >
       limits.maximumStateBytes - requiredHeadroomBytes
   );
+}
+
+// Prefix compaction remains preferred. If an owner-held or unfinished job pins
+// that prefix, already-projectable terminal history may use the historical
+// budget without consuming the space reserved for live action receipts.
+function retainedHistoryBudgetAllows(state, limits, requiredHeadroomBytes = 0) {
+  let liveBytes = Buffer.byteLength(JSON.stringify(state), 'utf8');
+  let liveJobs = state.jobs.length;
+  let historyBytes = state.archive.storageBytes;
+  let historyJobs = state.archive.jobCount;
+  const pendingJobIds = new Set(state.changePackageDelivery.pending.map(event => event.job.id));
+  for (const job of state.jobs) {
+    if (!isStateRetentionEligible(state, job, pendingJobIds)) continue;
+    const bytes = Buffer.byteLength(JSON.stringify(job), 'utf8');
+    liveBytes -= bytes;
+    liveJobs--;
+    historyBytes += bytes;
+    historyJobs++;
+  }
+  return liveJobs <= limits.maximumJobs && liveBytes + requiredHeadroomBytes <= limits.maximumStateBytes &&
+    historyJobs <= limits.maximumArchivedJobs && historyBytes <= limits.maximumArchiveBytes;
 }
 
 function normalizeRunnableOptions(value = {}) {
@@ -4678,6 +4699,7 @@ export class CodeJobStore {
         limits: this.limits,
       });
       if (compacted.archived === 0) {
+        if (retainedHistoryBudgetAllows(candidate, this.limits, requiredHeadroomBytes)) break;
         if (stateExceedsLimits(candidate, this.limits, 0)) {
           throw capacityExceeded();
         }

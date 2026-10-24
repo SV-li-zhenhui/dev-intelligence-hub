@@ -3858,6 +3858,66 @@ test("action admission reserves enough durable space for its later observation e
   );
 });
 
+async function pinnedHistoryFixture({ projected = true } = {}) {
+  const f = await readyStore();
+  const first = (await f.jobs.createApprovedJob(approval())).job;
+  const paused = (await f.jobs.pause({ jobId: first.jobId, expectedRevision: first.revision, reason: 'owner hold' })).job;
+  const create = index => f.jobs.createApprovedJob(approval({ confirmationId: `confirmation-history-${index}`,
+    displayedPayloadDigest: String(index).repeat(64), approvalBindingDigest: String(index + 3).repeat(64),
+    requestId: `request-history-${index}`, grant: grant({ proposalId: `proposal-history-${index}`,
+      contentDigest: String(index).repeat(64), requestedBy: { roleId: 'developer', workItemId: `work-history-${index}` },
+      source: { assignmentId: `assignment-history-${index}`, eventId: `event-history-${index}` } }) }));
+  const history = (await create(2)).job;
+  await f.jobs.fail({ jobId: history.jobId, expectedRevision: history.revision,
+    result: { code: 'HISTORICAL_FAILURE', detail: 'x'.repeat(96 * 1024) } });
+  if (projected) for (const event of (await f.jobs.readMemoryProjectionBatch({ limit: 100 })).items) {
+    await f.jobs.acknowledgeMemoryProjection(memoryAcknowledgement(event));
+  }
+  const third = (await create(3)).job;
+  const starting = (await f.jobs.claimStarting({ jobId: third.jobId, expectedRevision: third.revision })).job;
+  const active = (await f.jobs.activate({ jobId: third.jobId, expectedRevision: starting.revision, workspaceRevision: '4'.repeat(64) })).job;
+  const prepared = (await f.jobs.prepareAction({ jobId: third.jobId, expectedRevision: active.revision,
+    action: { type: 'read_text', actionId: 'read-after-pinned-history', path: 'src/app.js', expectedWorkspaceRevision: '4'.repeat(64) } })).job;
+  return { ...f, paused, prepared, historyId: history.jobId };
+}
+
+test('a user-held prefix cannot let projected terminal history consume active action headroom', async () => {
+  const f = await pinnedHistoryFixture(), before = structuredClone(f.store.value);
+  const maximumStateBytes = Buffer.byteLength(JSON.stringify(before), 'utf8') + 250 * 1024;
+  const limits = { maximumStateBytes, maximumJobs: 2 };
+  const constrained = await readyStore({ store: f.store, time: f.time, limits });
+  const pending = f.prepared.execution.pendingAction;
+  const admitted = await constrained.jobs.admitAction({ jobId: f.prepared.jobId, expectedRevision: f.prepared.revision,
+    actionId: pending.actionId, actionDigest: pending.actionDigest });
+  assert.equal(admitted.status, 'applied');
+  assert.deepEqual(await constrained.jobs.getForWorker(f.paused.jobId), f.paused);
+  assert.deepEqual(await constrained.jobs.getForWorker(f.historyId), before.jobs.find(job => job.jobId === f.historyId));
+  const recovered = await readyStore({ store: f.store, time: f.time, limits });
+  assert.equal((await recovered.jobs.getForWorker(f.prepared.jobId)).execution.actionAdmission.actionId, pending.actionId);
+  assert.equal(f.store.value.archive.throughSequence, 0);
+});
+
+test('restart accepts bounded retained history above the live byte budget without rewriting it', async () => {
+  const f = await pinnedHistoryFixture(), before = structuredClone(f.store.value);
+  const limits = { maximumStateBytes: Buffer.byteLength(JSON.stringify(before), 'utf8') - 50 * 1024 };
+  const recovered = await readyStore({ store: f.store, time: f.time, limits });
+  assert.deepEqual(await recovered.jobs.getForWorker(f.historyId), before.jobs.find(job => job.jobId === f.historyId));
+  assert.deepEqual(f.store.value, before);
+  await assert.rejects(readyStore({ store: f.store, time: f.time, limits: { ...limits, maximumArchiveBytes: 1 } }),
+    { code: 'CODE_JOB_STATE_CORRUPTED' });
+});
+
+for (const projected of [false, true]) test(`pinned history cannot bypass unprojected work or exhausted historical storage: projected=${projected}`, async () => {
+  const f = await pinnedHistoryFixture({ projected });
+  const limits = { maximumStateBytes: Buffer.byteLength(JSON.stringify(f.store.value), 'utf8') + 250 * 1024,
+    ...(projected ? { maximumArchiveBytes: 1 } : {}) };
+  const constrained = await readyStore({ store: f.store, time: f.time, limits });
+  const pending = f.prepared.execution.pendingAction;
+  await assert.rejects(constrained.jobs.admitAction({ jobId: f.prepared.jobId, expectedRevision: f.prepared.revision,
+    actionId: pending.actionId, actionDigest: pending.actionDigest }), { code: 'CODE_JOB_RETENTION_BLOCKED' });
+  assert.equal((await constrained.jobs.getForWorker(f.prepared.jobId)).execution.actionAdmission, null);
+});
+
 test("memory projection receipt is exact, CAS-bound, and idempotent after acknowledgement loss", async () => {
   const { jobs, store } = await readyStore();
   const created = await jobs.createApprovedJob(approval());
