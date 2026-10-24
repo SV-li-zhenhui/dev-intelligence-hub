@@ -10,6 +10,12 @@ const FALLBACK_CODES = new Set([
   "STRUCTURED_PROVIDER_RESPONSE_INVALID", "STRUCTURED_PROVIDER_RESPONSE_TOO_LARGE",
   "STRUCTURED_PROVIDER_OUTPUT_LIMIT",
 ]);
+const CAPACITY_CODES = new Set(["STRUCTURED_PROVIDER_BUSY", "STRUCTURED_PROVIDER_QUEUE_TIMEOUT"]);
+const MODEL_FAILURE_CODES = new Set(["STRUCTURED_PROVIDER_RESPONSE_INVALID", "STRUCTURED_PROVIDER_RESPONSE_TOO_LARGE", "STRUCTURED_PROVIDER_OUTPUT_LIMIT"]);
+
+function transportFailure(error, provider) {
+  return provider === "ollama" && error?.code === undefined && error?.message === "Ollama employee transport request failed";
+}
 
 export class RoutedPrEmployeeReviewer {
   #failureReceipts = new WeakMap();
@@ -46,20 +52,30 @@ export class RoutedPrEmployeeReviewer {
     const abort = () => controller.abort(signal.reason);
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
-    const timer = setTimeout(() => {
-      timedOut = true;
-      controller.abort(Object.assign(new Error("PR employee primary model timed out"), { code: "PR_EMPLOYEE_PRIMARY_TIMEOUT" }));
-    }, this.timeoutMs);
+    let timer;
     let fallbackReason;
     try {
-      const response = await this.router.generate({ brain: this.brain, messages, schema,
-        dataClasses: ["requirements", "code"], sessionKey, admissionEntityKey: sessionKey, signal: controller.signal });
+      const generate = () => {
+        controller.signal.throwIfAborted();
+        timer = setTimeout(() => {
+          timedOut = true;
+          controller.abort(Object.assign(new Error("PR employee primary model timed out"), { code: "PR_EMPLOYEE_PRIMARY_TIMEOUT" }));
+        }, this.timeoutMs);
+        return this.router.generate({ brain: this.brain, messages, schema,
+          dataClasses: ["requirements", "code"], sessionKey, admissionEntityKey: sessionKey, signal: controller.signal });
+      };
+      const response = await (typeof this.router.withAdmission === "function"
+        ? this.router.withAdmission(this.brain, { entityKey: sessionKey, signal: controller.signal }, generate) : generate());
       signal?.throwIfAborted();
       if (timedOut) fallbackReason = "PR_EMPLOYEE_PRIMARY_TIMEOUT";
       else return { analysis: parsePrEmployeeResult(response, context), brain: { provider: this.provider, model: this.model } };
     } catch (error) {
       this.#failureReceipts.delete(error);
       signal?.throwIfAborted();
+      if (CAPACITY_CODES.has(error?.code)) {
+        this.#failureReceipts.set(error, { brain: { provider: this.provider, model: this.model }, modelFailure: false, infrastructureFailure: true });
+        throw error;
+      }
       if (error instanceof InvalidEmployeeResultError) fallbackReason = "PR_EMPLOYEE_RESULT_INVALID";
       else if (FALLBACK_CODES.has(error?.code)) fallbackReason = error.code;
       else if (timedOut && ["STRUCTURED_PROVIDER_CANCELLED", "BRAIN_REQUEST_CANCELLED", "PR_EMPLOYEE_PRIMARY_TIMEOUT"].includes(error?.code)) {
@@ -80,10 +96,12 @@ export class RoutedPrEmployeeReviewer {
       this.#failureReceipts.delete(error);
       signal?.throwIfAborted();
       if (error !== null && (typeof error === "object" || typeof error === "function")) {
-        this.#failureReceipts.set(error, { brain, modelFailure:
-          error instanceof InvalidEmployeeResultError || FALLBACK_CODES.has(error?.code) ||
-          (brain.provider === "ollama" && error.code === undefined &&
-            error.message === "Ollama employee transport request failed") });
+        const knownFailure = error instanceof InvalidEmployeeResultError || FALLBACK_CODES.has(error?.code) || transportFailure(error, brain.provider);
+        const modelFailure = knownFailure && (fallbackReason === "PR_EMPLOYEE_RESULT_INVALID" || MODEL_FAILURE_CODES.has(fallbackReason) ||
+          error instanceof InvalidEmployeeResultError || MODEL_FAILURE_CODES.has(error?.code));
+        const infrastructureFailure = !modelFailure && (transportFailure(error, brain.provider) ||
+          (FALLBACK_CODES.has(error?.code) && !MODEL_FAILURE_CODES.has(error.code)));
+        this.#failureReceipts.set(error, { brain, modelFailure, ...(infrastructureFailure ? { infrastructureFailure: true } : {}) });
       }
       throw error;
     }

@@ -287,6 +287,38 @@ function routedTriageReviewer({ primary, fallback } = {}) {
   });
 }
 
+for (const reason of ["PR_EMPLOYEE_PRIMARY_TIMEOUT", "STRUCTURED_PROVIDER_PROCESS_FAILED"]) test(`a current PR blocked by ${reason} and backup transport failure recovers without consuming review budget`, async () => {
+  const item = pullRequest();
+  const initial = exhaustedOllamaState(item, {
+    brain: { provider: "ollama", model: "qwen3.5:9b", fallbackFrom: { provider: "codex-login-cli", model: "gpt-5.6-luna", reason } },
+    analysisAttemptBudget: { provider: "codex-login-cli", model: "gpt-5.6-luna", attemptOffset: 0 },
+    analysisFailure: { phase: "analysis", code: "PR_EMPLOYEE_JOB_FAILED", modelFailure: true },
+  });
+  const store = new MemoryStore({ snapshot: snapshot([item]), "pr-employee-state": initial });
+  let busy = true, fallbackCalls = 0; const handoffs = [];
+  const reviewer = routedTriageReviewer({ primary: async () => {
+    if (busy) throw Object.assign(new Error("capacity occupied"), { code: "STRUCTURED_PROVIDER_BUSY" });
+    return JSON.stringify(reviewResult({ workType: "triage_plan", reviewVerdict: "none", reviewBody: "", requiresApproval: false }));
+  }, fallback: async () => { fallbackCalls++; assert.fail("capacity waiting cannot trigger fallback"); } });
+  const options = { store, reviewer, config: { triageOnly: true }, github: { async loadReviewContext() { return { ...item }; } },
+    triageHandoff: durableTriageHandoff(request => handoffs.push(request)) };
+  await createService(options).tick();
+  const waiting = (await store.read("pr-employee-state")).jobs[0];
+  assert.equal(waiting.id, initial.jobs[0].id);
+  assert.equal(waiting.fingerprint, initial.jobs[0].fingerprint);
+  assert.equal(waiting.status, "retry_wait");
+  assert.equal(waiting.attempts, 4);
+  assert.equal(waiting.analysisAttemptBudget.attemptOffset, 2, "refund only the last proven legacy infrastructure failure and the new busy admission");
+  assert.equal(waiting.analysisFailure.infrastructureFailure, true);
+  busy = false;
+  await createService({ ...options, now: "2026-07-31T10:03:00.000Z" }).tick();
+  assert.equal((await store.read("pr-employee-state")).jobs[0].status, "ready");
+  assert.equal(handoffs.length, 1);
+  assert.equal(fallbackCalls, 0);
+  await createService({ ...options, now: "2026-07-31T10:04:00.000Z" }).tick();
+  assert.equal(handoffs.length, 1);
+});
+
 test("primary model activation recovers one exhausted Ollama job without replacing requests or completed triage", async () => {
   const item = pullRequest();
   const completedItem = pullRequest({ id: "github:pr:acme/repo#43", number: 43, headRefOid: HEAD_43 });
@@ -319,7 +351,7 @@ test("primary model activation recovers one exhausted Ollama job without replaci
   assert.deepEqual((await store.read("pr-employee-state")).jobs, after.jobs);
 });
 
-test("failed primary and backup consume the new model budget once and persist actual failure attribution across restart", async () => {
+test("primary and backup infrastructure failures retain attribution and back off without exhausting the model budget", async () => {
   const item = pullRequest();
   const store = new MemoryStore({ snapshot: snapshot([item]), "pr-employee-state": exhaustedOllamaState(item) });
   let primaryCalls = 0; let fallbackCalls = 0;
@@ -332,16 +364,19 @@ test("failed primary and backup consume the new model budget once and persist ac
   for (const now of ["2026-07-31T10:01:00.000Z", "2026-07-31T10:03:00.000Z", "2026-07-31T10:10:00.000Z"]) {
     await createService({ ...options, now }).tick();
   }
-  const blocked = (await store.read("pr-employee-state")).jobs[0];
-  assert.equal(blocked.status, "blocked");
-  assert.equal(blocked.attempts, 6);
-  assert.equal(blocked.error, "Ollama employee transport request failed");
-  assert.deepEqual(blocked.brain, { provider: "ollama", model: "qwen3.5:9b", fallbackFrom: {
+  const waiting = (await store.read("pr-employee-state")).jobs[0];
+  assert.equal(waiting.status, "retry_wait");
+  assert.equal(waiting.attempts, 4);
+  assert.equal(waiting.error, "Ollama employee transport request failed");
+  assert.deepEqual(waiting.brain, { provider: "ollama", model: "qwen3.5:9b", fallbackFrom: {
     provider: "codex-login-cli", model: "gpt-5.6-luna", reason: "STRUCTURED_PROVIDER_PROCESS_FAILED" } });
-  assert.deepEqual(blocked.analysisAttemptBudget, { provider: "codex-login-cli", model: "gpt-5.6-luna", attemptOffset: 3 });
+  assert.deepEqual(waiting.analysisAttemptBudget, { provider: "codex-login-cli", model: "gpt-5.6-luna", attemptOffset: 4 });
   await createService({ ...options, now: "2026-08-01T10:01:00.000Z" }).tick();
-  assert.deepEqual([primaryCalls, fallbackCalls], [3, 3]);
-  assert.deepEqual((await store.read("pr-employee-state")).jobs[0], blocked);
+  assert.deepEqual([primaryCalls, fallbackCalls], [2, 2]);
+  const retried = (await store.read("pr-employee-state")).jobs[0];
+  assert.equal(retried.status, "retry_wait");
+  assert.equal(retried.attempts, 5);
+  assert.equal(retried.analysisAttemptBudget.attemptOffset, 5);
 });
 
 for (const [receiptName, failureReceipt] of [
@@ -369,15 +404,15 @@ for (const [receiptName, failureReceipt] of [
     assert.equal(first.fingerprint, initial.jobs[0].fingerprint);
     assert.equal(first.status, "retry_wait");
     assert.equal(first.attempts, 3);
-    assert.deepEqual(first.analysisAttemptBudget, { provider: "codex-login-cli", model: "gpt-5.6-luna", attemptOffset: 2 });
+    assert.deepEqual(first.analysisAttemptBudget, { provider: "codex-login-cli", model: "gpt-5.6-luna", attemptOffset: 3 });
     for (const now of ["2026-07-31T10:05:00.000Z", "2026-07-31T10:11:00.000Z", "2026-08-01T10:01:00.000Z"]) {
       await createService({ ...options, now }).tick();
     }
     const blocked = (await store.read("pr-employee-state")).jobs[0];
-    assert.equal(blocked.status, "blocked");
-    assert.equal(blocked.attempts, 5);
-    assert.equal(blocked.analysisAttemptBudget.attemptOffset, 2);
-    assert.deepEqual([primaryCalls, fallbackCalls], [3, 3]);
+    assert.equal(blocked.status, "retry_wait");
+    assert.equal(blocked.attempts, 4);
+    assert.equal(blocked.analysisAttemptBudget.attemptOffset, 4);
+    assert.deepEqual([primaryCalls, fallbackCalls], [2, 2]);
   });
 }
 
@@ -388,7 +423,7 @@ for (const [name, changes] of [
   ["same primary after fallback", { brain: { provider: "ollama", model: "qwen3.5:9b", fallbackFrom: {
     provider: "codex-login-cli", model: "gpt-5.6-luna", reason: "STRUCTURED_PROVIDER_PROCESS_FAILED" } } }],
 ]) {
-  test(`a due ${name} retry does not get an extra budget through model binding`, async () => {
+  test(`a due ${name} retry retains earlier charges while the new infrastructure failure stays retryable`, async () => {
     const item = pullRequest();
     const initial = exhaustedOllamaState(item, { status: "retry_wait", attempts: 2, nextAttemptAt: "2026-07-31T10:00:00.000Z", ...changes });
     const store = new MemoryStore({ snapshot: snapshot([item]), "pr-employee-state": initial });
@@ -399,11 +434,11 @@ for (const [name, changes] of [
       triageHandoff: durableTriageHandoff() };
     await createService(options).tick();
     const blocked = (await store.read("pr-employee-state")).jobs[0];
-    assert.equal(blocked.status, "blocked");
+    assert.equal(blocked.status, "retry_wait");
     assert.equal(blocked.attempts, 3);
-    assert.equal(blocked.analysisAttemptBudget.attemptOffset, 0);
+    assert.equal(blocked.analysisAttemptBudget.attemptOffset, 1);
     await createService({ ...options, now: "2026-08-01T10:01:00.000Z" }).tick();
-    assert.equal(primaryCalls, 1);
+    assert.equal(primaryCalls, 2);
   });
 }
 
@@ -419,8 +454,8 @@ for (const [name, jobChanges, snapshotChanges, stateChanges] of [
   ["cleanup failure", { analysisFailure: { phase: "analysis", code: "STRUCTURED_PROVIDER_REAP_FAILED", modelFailure: false } }],
   ["authorization failure", { analysisFailure: { phase: "analysis", code: "REMOTE_DATA_NOT_AUTHORIZED", modelFailure: false } }],
   ["maintenance failure", { analysisFailure: { phase: "analysis", code: "RUNTIME_RESTART_REQUIRED", modelFailure: false } }],
-  ["same requested primary after backup failure", { brain: { provider: "ollama", model: "qwen3.5:9b",
-    fallbackFrom: { provider: "codex-login-cli", model: "gpt-5.6-luna", reason: "STRUCTURED_PROVIDER_PROCESS_FAILED" } } }],
+  ["genuine invalid result after backup transport failure", { brain: { provider: "ollama", model: "qwen3.5:9b",
+    fallbackFrom: { provider: "codex-login-cli", model: "gpt-5.6-luna", reason: "PR_EMPLOYEE_RESULT_INVALID" } } }],
   ["invalid budget offset", { analysisAttemptBudget: { provider: "ollama", model: "qwen3.5:9b", attemptOffset: 4 } }],
   ["paused job", { status: "paused" }],
   ["dismissed job", { status: "dismissed" }],

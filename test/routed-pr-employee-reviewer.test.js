@@ -33,7 +33,47 @@ test("Codex primary uses the requested model and original result contract withou
   assert.equal(run.fallbackCalls(), 0);
 });
 
-for (const code of ["STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE", "STRUCTURED_PROVIDER_PROCESS_FAILED", "STRUCTURED_PROVIDER_TIMEOUT", "STRUCTURED_PROVIDER_QUEUE_TIMEOUT", "STRUCTURED_PROVIDER_RESPONSE_INVALID"]) {
+test("busy primary admission waits without invoking a fallback or charging model failure", async () => {
+  const busy = fail("STRUCTURED_PROVIDER_BUSY");
+  const run = setup(async () => assert.fail("busy admission must not dispatch a model"), { router: {
+    async withAdmission(_brain, options) { assert.equal(options.entityKey, "github:pull_request:acme/repo#42"); throw busy; },
+    async generate() { assert.fail("busy admission must not dispatch a model"); },
+  } });
+  await assert.rejects(run.reviewer.analyze(input), error => error === busy);
+  assert.equal(run.fallbackCalls(), 0);
+  assert.deepEqual(run.reviewer.getFailureReceipt(busy), {
+    brain: { provider: primaryBrain.provider, model: primaryBrain.model }, modelFailure: false, infrastructureFailure: true,
+  });
+});
+
+test("primary execution deadline starts after admission preparation", async () => {
+  let admissions = 0;
+  const run = setup(async () => assert.fail("use the admitted router"), { timeoutMs: 10, router: {
+    async withAdmission(_brain, { signal }, operation) {
+      admissions++;
+      await new Promise(resolve => setTimeout(resolve, 25));
+      assert.equal(signal?.aborted ?? false, false);
+      return operation();
+    },
+    async generate({ signal }) { assert.equal(signal.aborted, false); return JSON.stringify(result); },
+  } });
+  assert.deepEqual((await run.reviewer.analyzeWithReceipt(input)).analysis, result);
+  assert.equal(admissions, 1);
+  assert.equal(run.fallbackCalls(), 0);
+});
+
+test("cancellation during admission preparation never dispatches primary or backup", async () => {
+  const controller = new AbortController(), reason = new Error("Owner stopped waiting");
+  const run = setup(async () => assert.fail("use the admitted router"), { router: {
+    async withAdmission(_brain, _options, operation) { controller.abort(reason); return operation(); },
+    async generate() { assert.fail("cancelled admission cannot start primary"); },
+  } });
+  await assert.rejects(run.reviewer.analyze(input, { signal: controller.signal }), error => error === reason);
+  assert.equal(run.fallbackCalls(), 0);
+  assert.equal(run.reviewer.getFailureReceipt(reason), null);
+});
+
+for (const code of ["STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE", "STRUCTURED_PROVIDER_PROCESS_FAILED", "STRUCTURED_PROVIDER_TIMEOUT", "STRUCTURED_PROVIDER_RESPONSE_INVALID"]) {
   test(`ended primary ${code} falls back once and records the actual model`, async () => {
     const run = setup(async () => { throw fail(code); });
     const received = await run.reviewer.analyzeWithReceipt(input);
@@ -43,6 +83,14 @@ for (const code of ["STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE", "STRUCTURED_PR
     assert.equal(run.fallbackCalls(), 1);
   });
 }
+
+test("a primary queue timeout is infrastructure waiting and never invokes a fallback", async () => {
+  const timeout = fail("STRUCTURED_PROVIDER_QUEUE_TIMEOUT");
+  const run = setup(async () => { throw timeout; });
+  await assert.rejects(run.reviewer.analyze(input), error => error === timeout);
+  assert.equal(run.fallbackCalls(), 0);
+  assert.equal(run.reviewer.getFailureReceipt(timeout).infrastructureFailure, true);
+});
 
 for (const code of ["STRUCTURED_PROVIDER_REAP_FAILED", "STRUCTURED_PROVIDER_CLEANUP_FAILED", "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED", "RUNTIME_RESTART_REQUIRED", "REMOTE_DATA_NOT_AUTHORIZED", "PR_REVIEW_READ_HEAD_CHANGED", "STRUCTURED_PROVIDER_CANCELLED", "UNKNOWN_ERROR"]) {
   test(`${code} never opens a fallback model request`, async () => {
@@ -126,11 +174,22 @@ test("failed fallback receipt cannot be forged by error properties or modified a
     { fallback: { provider: "ollama", model: "qwen3.5:9b", async analyze() { throw error; } } });
   await assert.rejects(run.reviewer.analyze(input), (caught) => caught === error);
   const receipt = run.reviewer.getFailureReceipt(error);
-  assert.equal(receipt.modelFailure, true);
+  assert.equal(receipt.modelFailure, false);
+  assert.equal(receipt.infrastructureFailure, true);
   receipt.brain.provider = "mutated";
   assert.equal(run.reviewer.getFailureReceipt(error).brain.provider, "ollama");
   const other = setup(async () => JSON.stringify(result));
   assert.equal(other.reviewer.getFailureReceipt(error), null);
+});
+
+test("an invalid primary result still charges a model attempt when fallback transport is unavailable", async () => {
+  const error = new Error("Ollama employee transport request failed");
+  const run = setup(async () => "invalid JSON", { fallback: {
+    provider: "ollama", model: "qwen3.5:9b", async analyze() { throw error; },
+  } });
+  await assert.rejects(run.reviewer.analyze(input), caught => caught === error);
+  assert.equal(run.reviewer.getFailureReceipt(error).modelFailure, true);
+  assert.equal(run.reviewer.getFailureReceipt(error).infrastructureFailure, undefined);
 });
 
 test("cancellation during fallback preserves the owner reason without a failure receipt", async () => {

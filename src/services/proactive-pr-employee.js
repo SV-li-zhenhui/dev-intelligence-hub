@@ -235,17 +235,53 @@ function isLegacyOllamaTransportFailure(job) {
     job.error === "Ollama employee transport request failed";
 }
 
+const INFRASTRUCTURE_FALLBACK_REASONS = new Set([
+  "PR_EMPLOYEE_PRIMARY_TIMEOUT", "STRUCTURED_PROVIDER_BUSY", "STRUCTURED_PROVIDER_QUEUE_TIMEOUT",
+  "STRUCTURED_PROVIDER_UNAVAILABLE", "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE",
+  "STRUCTURED_PROVIDER_PROCESS_FAILED", "STRUCTURED_PROVIDER_PROCESS_EXITED", "STRUCTURED_PROVIDER_TIMEOUT",
+]);
+
+function hasRecoverableAnalysisIdentity(job, brain) {
+  return Boolean(brain && ["blocked", "retry_wait"].includes(job.status) &&
+    !job.confirmationId && !job.confirmationFailure && !job.confirmationIntent && !job.handoffWorkItemId &&
+    !job.completedAt && !job.decision && !job.leaseUntil &&
+    Number.isSafeInteger(job.attempts) && job.attempts >= 1 && job.attempts < Number.MAX_SAFE_INTEGER &&
+    hasValidAnalysisAttemptBudget(job));
+}
+
+function knownAnalysisTransportFailure(job) {
+  const failure = job.analysisFailure;
+  return job.brain?.provider === "ollama" && job.error === "Ollama employee transport request failed" &&
+    (failure === undefined ? isLegacyOllamaTransportFailure(job) : failure.phase === "analysis" && failure.code === "PR_EMPLOYEE_JOB_FAILED") &&
+    (!job.brain.fallbackFrom || INFRASTRUCTURE_FALLBACK_REASONS.has(job.brain.fallbackFrom.reason));
+}
+
+function recordedInfrastructureFailure(job) {
+  const failure = job.analysisFailure;
+  return failure?.phase === "analysis" && failure.infrastructureFailure === true && failure.modelFailure === false &&
+    (INFRASTRUCTURE_FALLBACK_REASONS.has(failure.code) || knownAnalysisTransportFailure(job));
+}
+
 function canRebindAnalysisModel(job, brain) {
-  if (!brain || !["blocked", "retry_wait"].includes(job.status) ||
-      job.confirmationId || job.confirmationFailure || job.confirmationIntent || job.handoffWorkItemId ||
-      job.completedAt || job.decision || job.leaseUntil ||
-      !Number.isSafeInteger(job.attempts) || job.attempts < 1 || job.attempts >= Number.MAX_SAFE_INTEGER) return false;
+  if (!hasRecoverableAnalysisIdentity(job, brain)) return false;
   const failure = job.analysisFailure;
   if (failure === undefined ? !isLegacyOllamaTransportFailure(job)
-    : failure?.phase !== "analysis" || failure.modelFailure !== true) return false;
-  if (!hasValidAnalysisAttemptBudget(job)) return false;
+    : failure?.phase !== "analysis" || (failure.modelFailure !== true && !recordedInfrastructureFailure(job))) return false;
   const previousBrain = brainIdentity(job.analysisAttemptBudget ?? job.brain?.fallbackFrom ?? job.brain);
   return Boolean(previousBrain && !sameBrain(previousBrain, brain));
+}
+
+function recoverInfrastructureAnalysis(job, brain, runAt) {
+  if (!isAnalysisBlocked(job) || !hasRecoverableAnalysisIdentity(job, brain)) return null;
+  if (!knownAnalysisTransportFailure(job) && !recordedInfrastructureFailure(job)) return null;
+  const previousBrain = brainIdentity(job.analysisAttemptBudget ?? job.brain?.fallbackFrom ?? job.brain);
+  if (!sameBrain(previousBrain, brain)) return null;
+  // Only the last persisted failure is proven infrastructure-related. Refund
+  // that one attempt; retain all earlier charges and the complete job history.
+  const offset = (job.analysisAttemptBudget?.attemptOffset ?? 0) + 1;
+  if (offset > job.attempts) return null;
+  return { ...job, status: "queued", error: "", startedAt: null, leaseUntil: null, nextAttemptAt: null,
+    analysisAttemptBudget: { ...brain, attemptOffset: offset }, infrastructureRetryRequestedAt: runAt, updatedAt: runAt };
 }
 
 function recoverForChangedAnalysisModel(job, brain, runAt) {
@@ -1358,7 +1394,7 @@ export class ProactivePrEmployeeService {
       if (!jobMatchesCurrentCandidate(job, current, this.config.policyVersion) ||
           job.repo !== current.repo || job.number !== current.number ||
           job.fingerprint !== jobFingerprint(current, this.config.policyVersion)) return job;
-      return recoverForChangedAnalysisModel(job, requestedBrain, runAt) ?? job;
+      return recoverForChangedAnalysisModel(job, requestedBrain, runAt) ?? recoverInfrastructureAnalysis(job, requestedBrain, runAt) ?? job;
     });
     if (recoveredJobs.some((job, index) => job !== state.jobs[index])) {
       state = await runAdmittedOperation(this.#admitAction,
@@ -1654,24 +1690,27 @@ export class ProactivePrEmployeeService {
       }
       const failedAt = this.clock().toISOString();
       const attempts = state.jobs[index].attempts || 1;
-      const modelAttempts = attempts - (budget?.attemptOffset ?? 0);
-      const blocked = modelAttempts >= this.config.maxAttempts;
-      const retryIndex = Math.min(
-        modelAttempts - 1,
-        this.config.retryMinutes.length - 1,
-      );
-      const retryMinutes = this.config.retryMinutes[retryIndex] || 1;
       const failureReceipt = failurePhase === "analysis" && typeof this.reviewer?.getFailureReceipt === "function"
         ? this.reviewer.getFailureReceipt(error) : null;
       const failureBrain = failureReceipt?.brain ?? attemptBrain;
       const legacyTransportFailure = failureBrain?.provider === "ollama" &&
         error?.code === undefined && error?.message === "Ollama employee transport request failed";
+      const infrastructureFailure = failurePhase === "analysis" && (failureReceipt?.infrastructureFailure === true ||
+        (failureReceipt === null && legacyTransportFailure));
+      const nextBudget = infrastructureFailure && budget ? { ...budget, attemptOffset: budget.attemptOffset + 1 } : budget;
+      const modelAttempts = attempts - (nextBudget?.attemptOffset ?? 0);
+      const blocked = !infrastructureFailure && modelAttempts >= this.config.maxAttempts;
+      const retryIndex = infrastructureFailure && ["STRUCTURED_PROVIDER_BUSY", "STRUCTURED_PROVIDER_QUEUE_TIMEOUT"].includes(error?.code)
+        ? 0 : Math.min((infrastructureFailure ? attempts : modelAttempts) - 1, this.config.retryMinutes.length - 1);
+      const retryMinutes = this.config.retryMinutes[retryIndex] || 1;
       state.jobs[index] = {
         ...state.jobs[index],
         status: blocked ? "blocked" : "retry_wait",
         brain: { ...failureBrain },
         analysisFailure: { phase: failurePhase, code: stableFailureCode(error),
-          modelFailure: failurePhase === "analysis" && (failureReceipt?.modelFailure ?? legacyTransportFailure) },
+          modelFailure: failurePhase === "analysis" && (failureReceipt?.modelFailure ?? false),
+          ...(infrastructureFailure ? { infrastructureFailure: true } : {}) },
+        ...(nextBudget ? { analysisAttemptBudget: nextBudget } : {}),
         error: error.message || String(error),
         updatedAt: failedAt,
         leaseUntil: null,
