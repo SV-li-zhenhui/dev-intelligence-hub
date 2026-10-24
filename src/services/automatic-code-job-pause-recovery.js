@@ -1,14 +1,15 @@
 import { OperationQueue } from '../lib/operation-queue.js';
 import { hasIncompleteReadPause, stoppedCodeJobRun } from './code-job-read-recovery.js';
-import { MODEL_QUEUE_TIMEOUT, stoppedCodeJobQueueTimeout } from './code-job-protocol-recovery.js';
+import { hasUnadmittedProtocolRead, MODEL_QUEUE_TIMEOUT, stoppedCodeJobQueueTimeout } from './code-job-protocol-recovery.js';
 
 const NATIVE_PAUSES = new Map(['STRUCTURED_PROVIDER_RESPONSE_INVALID', 'CODE_BRAIN_COMPLETION_NOT_READY', MODEL_QUEUE_TIMEOUT]
   .map(code => [`等待人工处理（${code}）`, code]));
 
 export function recoverableNativePauseCode(job) {
+  const code = NATIVE_PAUSES.get(job?.execution?.pause?.reason) ?? null;
   return job?.status === 'paused' && job.execution?.pause?.from === 'active' &&
-    job.execution.pendingAction === null && job.execution.actionAdmission === null && job.execution.uncertainty === null
-    ? NATIVE_PAUSES.get(job.execution.pause.reason) ?? null : null;
+    (job.execution.pendingAction === null || (code === 'STRUCTURED_PROVIDER_RESPONSE_INVALID' && hasUnadmittedProtocolRead(job))) &&
+    job.execution.actionAdmission === null && job.execution.uncertainty === null ? code : null;
 }
 
 function stoppedRun(proof, job) {

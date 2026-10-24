@@ -68,6 +68,19 @@ test('native repair protocol recovery uses dedicated CI and Review authority wit
   }
 });
 
+test('conflict protocol recovery uses its dedicated source with a prepared unadmitted read', async () => {
+  const f = readRecoveryFixture('conflict_preparation');
+  const action = { type: 'read_text', actionId: 'pending-read', path: 'src/app.js', expectedWorkspaceRevision: f.job.execution.workspaceRevision };
+  f.job.status = 'paused';
+  f.job.execution.pendingAction = { turn: 2, actionId: action.actionId, actionDigest: digestValue(action), action };
+  f.job.execution.pause = { from: 'active', reason: '等待人工处理（STRUCTURED_PROVIDER_RESPONSE_INVALID）', at: '2026-10-10T03:01:00Z' };
+  f.ports.specialized.canRecoverPausedCodeJob = value => f.ports.specialized.canReplanUnstartedWrite(value);
+  assert.equal(await f.service.canRecoverPausedCodeJob(f.job), true);
+  f.setSourceEligible(false);
+  assert.equal(await f.service.canRecoverPausedCodeJob(f.job), false);
+  assert.equal(f.calls.length, 0);
+});
+
 test('conflict queue recovery still requires the exact dedicated source and current work controls', async () => {
   const f = readRecoveryFixture('conflict_preparation');
   f.job.status = 'paused'; f.job.execution.pendingAction = null;
@@ -97,7 +110,6 @@ test('native CI recovery preserves source authority, owner holds and admitted op
     ['pending action', f => { f.job.execution.pendingAction = {}; }],
     ['unknown outcome', f => { f.job.execution.uncertainty = {}; }],
     ['manual job pause', f => { f.job.execution.pause.reason = '用户暂停'; }],
-    ['conflict remains dedicated', f => { f.job.grant.executionSource.kind = 'conflict_preparation'; }],
   ]) await t.test(name, async () => {
     const f = readRecoveryFixture('ci_repair');
     f.job.status = 'paused'; f.job.execution.pendingAction = null;

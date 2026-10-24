@@ -111,7 +111,9 @@ test('conflict queue timeout recovery delegates only to its dedicated current co
   assert.equal(await f.service.canRecoverPausedCodeJob(job), false);
   job.execution.pause.reason = '等待人工处理（STRUCTURED_PROVIDER_RESPONSE_INVALID）';
   assert.equal(await f.service.canRecoverPausedCodeJob(job), false);
-  assert.equal(calls, 2, 'protocol recovery cannot bypass its existing dedicated policy');
+  assert.equal(calls, 3, 'protocol recovery must also check the current conflict record');
+  current = true;
+  assert.equal(await f.service.canRecoverPausedCodeJob(job), true);
 });
 
 test('disabled inline recovery leaves the dedicated recovery continuation responsible', async () => {

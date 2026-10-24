@@ -4,7 +4,6 @@ import { samePullRequestExecutionBinding } from '../domain/pull-request-executio
 import { approveOwnPrAction } from './automatic-own-pr-repair-authorization.js';
 import { pendingOverwriteRecoveryCandidate, stoppedCodeJobRun } from './code-job-read-recovery.js';
 import { recoverableNativePauseCode } from './automatic-code-job-pause-recovery.js';
-import { MODEL_QUEUE_TIMEOUT } from './code-job-protocol-recovery.js';
 
 const sameLogin = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
 const STALE_TARGET = Symbol('stale local code target');
@@ -50,8 +49,7 @@ export class AutomaticLocalCodeAuthorization {
     if (!grant?.inputBinding || !OPERATIONS[role]?.has(grant.operation)) return false;
     if (Object.hasOwn(grant, 'executionSource')) {
       const code = recoverableNativePauseCode(job);
-      const supported = ['ci_repair', 'review_repair'].includes(grant.executionSource?.kind) ||
-        (grant.executionSource?.kind === 'conflict_preparation' && code === MODEL_QUEUE_TIMEOUT);
+      const supported = ['ci_repair', 'review_repair', 'conflict_preparation'].includes(grant.executionSource?.kind);
       if (!supported || code === null ||
           !this.taskRuns?.get || !await this.#sourceAuthorityCurrent(job, 'canRecoverPausedCodeJob')) return false;
       return this.#workControlsCurrent(job);

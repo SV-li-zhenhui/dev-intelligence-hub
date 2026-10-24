@@ -1,8 +1,25 @@
+import { digestValue, normalizeActionRequest } from '../domain/code-executor-contract.js';
+
 const CODES = new Set([
   "STRUCTURED_PROVIDER_RESPONSE_INVALID", "CODE_BRAIN_COMPLETION_NOT_READY", "CODE_BRAIN_RESPONSE_INVALID",
 ]);
 
 export const MODEL_QUEUE_TIMEOUT = 'STRUCTURED_PROVIDER_QUEUE_TIMEOUT';
+
+// A prepared read has no executor owner until admission. Keep its durable ID:
+// the normal worker must reconcile it before deciding whether to execute it.
+export function hasUnadmittedProtocolRead(job) {
+  const execution = job?.execution, pending = execution?.pendingAction, action = pending?.action;
+  if (execution?.actionAdmission !== null || execution.uncertainty !== null ||
+      !['read_text', 'list_files', 'search_text'].includes(action?.type) ||
+      !job.grant?.allowedActions?.includes(action.type) ||
+      pending.turn !== execution.turn + 1 || pending.actionId !== action.actionId ||
+      action.expectedWorkspaceRevision !== execution.workspaceRevision) return false;
+  try {
+    normalizeActionRequest({ sessionId: job.jobId, action });
+    return pending.actionDigest === digestValue(action);
+  } catch { return false; }
+}
 
 // Positive host stop evidence for a reservation that never admitted a model.
 // Empty session metadata alone cannot authorize an automatic retry.

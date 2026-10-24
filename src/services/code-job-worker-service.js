@@ -4,7 +4,7 @@ import { beginCodeReadSession, createCodeReadContext, hasCompleteCodeRead } from
 import { createCodeExecutionContext, closeCodeExecutionContext, revokeCodeExecutionContext } from "../lib/code-execution-context.js";
 import { normalizeStructuredCodeActionDecision } from "../domain/structured-code-action-contract.js";
 import { TaskRunControlError } from './task-run-registry.js';
-import { codeProtocolRecoveryFor, MODEL_QUEUE_TIMEOUT, stoppedCodeJobQueueTimeout } from './code-job-protocol-recovery.js';
+import { codeProtocolRecoveryFor, hasUnadmittedProtocolRead, MODEL_QUEUE_TIMEOUT, stoppedCodeJobQueueTimeout } from './code-job-protocol-recovery.js';
 import { brainFailureOwnerAttention } from "./brain-failure-policy.js";
 import { currentTaskExecution } from '../lib/task-execution-context.js';
 import { normalizeCodeSourceEdits, applyCodeSourceEdits } from '../lib/code-source-edits.js';
@@ -1994,8 +1994,10 @@ export class CodeJobWorkerService {
     const stoppedQueueWait = code === MODEL_QUEUE_TIMEOUT && current?.status === 'active' && this.#taskRuns?.get &&
       current.execution.pendingAction === null && current.execution.actionAdmission === null && current.execution.uncertainty === null &&
       stoppedCodeJobQueueTimeout(current, await this.#taskRuns.get('code-job', jobId));
+    const stoppedPreparedRead = code === 'STRUCTURED_PROVIDER_RESPONSE_INVALID' && hasUnadmittedProtocolRead(current) &&
+      this.#taskRuns?.get && codeProtocolRecoveryFor(current, await this.#taskRuns.get('code-job', jobId)) === code;
     if ((brainFailureOwnerAttention(code) !== null || code === "STRUCTURED_PROVIDER_RESPONSE_INVALID" || stoppedQueueWait) && current?.status === "active" &&
-        current.execution.pendingAction === null && current.execution.actionAdmission === null) {
+        (current.execution.pendingAction === null || stoppedPreparedRead) && current.execution.actionAdmission === null) {
       const now = new Date(this.#clock()).getTime();
       if (!Number.isFinite(now)) throw workerError("CODE_JOB_CLOCK_INVALID", "Code job worker clock is invalid");
       if (this.#maintenanceRetryNotBefore.size >= 1_024) {

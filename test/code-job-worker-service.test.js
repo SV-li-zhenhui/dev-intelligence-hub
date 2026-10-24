@@ -1228,6 +1228,26 @@ for (const startModel of [false, true]) test(`queue timeout requires a confirmed
   assert.equal((await f.jobs.getForWorker(f.durableJob.jobId)).status, 'paused');
 });
 
+test("provider format failure before read admission keeps the checkpoint runnable and reconciles the read once", async () => {
+  const f = await continuousTimeoutFixture(async () => {
+    const job = await f.jobs.getForWorker(f.durableJob.jobId);
+    await f.jobs.prepareAction({ jobId: job.jobId, expectedRevision: job.revision,
+      action: { type: 'read_text', actionId: 'pending-protocol-read', path: 'src/app.js',
+        expectedWorkspaceRevision: job.execution.workspaceRevision } });
+    throw f.nativeTimeout();
+  }, { timeoutCode: 'STRUCTURED_PROVIDER_RESPONSE_INVALID' });
+  assert.equal((await f.worker().runCycle()).outcomes[0].status, 'retry');
+  const pending = (await f.jobs.getForWorker(f.durableJob.jobId)).execution.pendingAction;
+  assert.equal(pending.actionId, 'pending-protocol-read');
+  f.advance(61_000);
+  await f.worker().runCycle();
+  const current = await f.jobs.getForWorker(f.durableJob.jobId);
+  assert.equal(current.status, 'active');
+  assert.equal(current.execution.pendingAction, null);
+  assert.equal(current.execution.turn, 1);
+  assert.equal(f.executor.calls.filter(call => call.method === 'perform' && call.value.action.actionId === pending.actionId).length, 1);
+});
+
 test("a restarted continuous worker carries the stopped protocol failure into its fresh model request", async () => {
   const fixture = await continuousTimeoutFixture(async () => { throw fixture.nativeTimeout(); },
     { timeoutCode: "STRUCTURED_PROVIDER_RESPONSE_INVALID" });

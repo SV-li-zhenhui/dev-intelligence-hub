@@ -37,6 +37,38 @@ test('settled provider format pause automatically resumes the same checkpoint on
   assert.equal((await f.create().runCycle()).scanned, 0);
 });
 
+function preparedReadFixture() {
+  const f = fixture();
+  const action = { type: 'read_text', actionId: 'pending-read', path: 'src/app.js', expectedWorkspaceRevision: 'a'.repeat(64) };
+  f.job.grant.allowedActions = ['read_text'];
+  Object.assign(f.job.execution, { turn: 45, workspaceRevision: action.expectedWorkspaceRevision,
+    pendingAction: { turn: 46, actionId: action.actionId, actionDigest: digestValue(action), action } });
+  return f;
+}
+
+test('stopped protocol failure resumes a prepared read without clearing or replaying its checkpoint', async () => {
+  const f = preparedReadFixture(), pending = structuredClone(f.job.execution.pendingAction);
+  assert.equal((await f.create().runCycle()).resumed, 1);
+  assert.deepEqual(f.job.execution.pendingAction, pending);
+  assert.equal((await f.create().runCycle()).scanned, 0);
+});
+
+for (const [name, change] of [
+  ['admitted read', f => { f.job.execution.actionAdmission = {}; }],
+  ['uncertain read', f => { f.job.execution.uncertainty = {}; }],
+  ['wrong digest', f => { f.job.execution.pendingAction.actionDigest = 'b'.repeat(64); }],
+  ['wrong turn', f => { f.job.execution.pendingAction.turn++; }],
+  ['wrong workspace', f => { f.job.execution.workspaceRevision = 'b'.repeat(64); }],
+  ['action not allowed', f => { f.job.grant.allowedActions = []; }],
+  ['missing stop', f => { f.proof.receipt.stopConfirmed = false; }],
+  ['owner hold', f => { f.proof.pendingCommand = 'pause'; }],
+  ['pending write', f => { f.job.execution.pendingAction.action.type = 'write_text'; }],
+]) test(`protocol read recovery preserves ${name}`, async () => {
+  const f = preparedReadFixture(); change(f);
+  assert.equal((await f.create().runCycle()).resumed, 0);
+  assert.equal(f.calls.length, 0);
+});
+
 function queuedPauseFixture() {
   const f = fixture();
   f.job.execution.pause.reason = '等待人工处理（STRUCTURED_PROVIDER_QUEUE_TIMEOUT）';
