@@ -4000,12 +4000,20 @@ export class ControlledGitService {
         "Code Job materialization lease 发生变化",
       );
     }
-    for (const boundary of directoryBoundaries) {
-      await this.#assertDirectoryBoundary(
-        boundary,
-        "CONTROLLED_GIT_TARGET_CHANGED",
-        "Code Job target parent 在 materialization 期间发生变化",
+    // Parent checks only read metadata. Bound their I/O and settle every check
+    // before returning or allowing failure cleanup to touch the workspace.
+    for (let index = 0; index < directoryBoundaries.length; index += 4) {
+      const results = await Promise.allSettled(
+        directoryBoundaries.slice(index, index + 4).map((boundary) =>
+          this.#assertDirectoryBoundary(
+            boundary,
+            "CONTROLLED_GIT_TARGET_CHANGED",
+            "Code Job target parent 在 materialization 期间发生变化",
+          ),
+        ),
       );
+      const failed = results.find((result) => result.status === "rejected");
+      if (failed) throw failed.reason;
     }
   }
 

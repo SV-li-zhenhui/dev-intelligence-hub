@@ -603,6 +603,31 @@ test("materializes fixed-label conflict evidence into a new empty code-job targe
   );
 });
 
+test("materializes nested parent batches with complete ordered file evidence", async (t) => {
+  const paths = Array.from({ length: 32 }, (_, index) =>
+    `files/group${String(index).padStart(2, "0")}/nested/deeper/value.txt`,
+  );
+  const setup = await fixture(t, {
+    treeOutput: Buffer.from(
+      paths.map((name) => `100644 blob ${README}\t${name}\0`).join("") +
+      `100644 blob ${RESULT_CONFLICT}\tsrc/value.js\0`,
+    ),
+  });
+  const service = setup.createService();
+  const prepared = await service.inspectConflict(inspectionRequest(setup));
+  const targetRoot = path.join(setup.root, "nested-target");
+  await mkdir(targetRoot);
+  const receipt = await service.materializeForCodeJob({
+    preparationId: prepared.preparationId,
+    targetRoot,
+  });
+  assert.deepEqual(receipt.files.map((entry) => entry.path), [...paths, "src/value.js"]);
+  for (const name of paths) {
+    assert.equal(await readFile(path.join(targetRoot, name), "utf8"), "# Example\n");
+  }
+  assert.deepEqual((await readdir(targetRoot)).sort(), ["files", "src"]);
+});
+
 test("never reports materialization success after a target-root swap or junction replacement", async (t) => {
   const treeRecords = [];
   for (let index = 0; index < 256; index += 1) {
