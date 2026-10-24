@@ -3,7 +3,7 @@ const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 const sameLogin = (left, right) => typeof left === "string" && typeof right === "string" && left.toLowerCase() === right.toLowerCase();
 const assignmentProofs = new WeakMap();
 
-function hasLaterIncomingAssignment(item, account, now) {
+export function hasLaterIncomingAssignment(item, account, now) {
   if (item.incomingReviewFactsAvailable !== true || !sameLogin(item.reviewRecipient, account) ||
       !LOGIN.test(item.reviewReceivedFrom || "") || sameLogin(item.reviewReceivedFrom, account) ||
       item.reviewReceivedVia !== "assignee" || !item.reviewRequestEventId) return false;
@@ -75,7 +75,7 @@ export function automaticReviewWorkAdmission(root, inputRevision = root?.source?
   const event = source.current?.event;
   if (!event?.source || source.identity?.provider !== event.source.provider || source.identity?.scopeId !== event.source.scopeId) return null;
   const orchestratedReview = event.payload?.workType === "general" &&
-    source.identity.targetRoleId === "orchestrator" && ["review", "rereview"].includes(event.payload.nextAction) &&
+    source.identity.targetRoleId === "orchestrator" && ["review", "rereview", "complete_review"].includes(event.payload.nextAction) &&
     event.payload.suggestedCapability === "pr-review" &&
     /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(source.current.headRefOid || "") &&
     event.payload.expectedHeadRefOid === source.current.headRefOid && event.payload.headRefOid === source.current.headRefOid;

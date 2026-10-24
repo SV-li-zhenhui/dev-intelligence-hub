@@ -1,3 +1,5 @@
+import { hasLaterIncomingAssignment } from "./automatic-review-policy.js";
+
 const DAY = 86_400_000;
 
 export const ACTION_STATES = Object.freeze({
@@ -32,7 +34,7 @@ function hasUnreviewedHead(item, reviewCommitOid) {
   );
 }
 
-function assessAssignedReview(item) {
+function assessAssignedReview(item, now) {
   if (item.isDraft) {
     return assessment(
       ACTION_STATES.WAITING_OTHER,
@@ -58,6 +60,12 @@ function assessAssignedReview(item) {
       "wait_ci",
       "等待检查完成后再审核",
     );
+  }
+
+  if (item.myLatestPublishedReviewCommitOid === item.headRefOid &&
+      hasLaterIncomingAssignment(item, item.currentUser, now)) {
+    return assessment(ACTION_STATES.ACTION_NOW, "me", "rereview",
+      "上轮审核后收到新的分配，需要完成本轮复审");
   }
 
   let reviewState = item.myReviewState;
@@ -312,7 +320,7 @@ export function assessPullRequestResponsibility(
   }
 
   if (item.relation === "review_requested") {
-    const result = assessAssignedReview(item);
+    const result = assessAssignedReview(item, now);
     if (result.actionState === ACTION_STATES.ACTION_NOW && ["FAILURE", "ERROR"].includes(item.ciStatus)) {
       result.actionReasons.push("检查失败，需在 Review 中核查原因并提醒作者");
     }

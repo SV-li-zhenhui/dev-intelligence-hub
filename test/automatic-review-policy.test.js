@@ -153,6 +153,15 @@ test("a Head-bound orchestrated rereview grants continuation while other general
   assert.equal(automaticReviewWorkAdmission(root), null);
 });
 
+test("a Head-bound orchestrated review completion has publication admission", () => {
+  const root = admittedRoot({ provider: "local-owner", workType: "general", facts: {
+    nextAction: "complete_review", suggestedCapability: "pr-review", expectedHeadRefOid: item.headRefOid,
+  } });
+  root.source.identity.targetRoleId = "orchestrator";
+  root.source.current.headRefOid = item.headRefOid;
+  assert.deepEqual(automaticReviewWorkAdmission(root), { kind: "owner_requested", admittedAt: root.createdAt });
+});
+
 test('a current orchestrated initial Review grants the same automatic publication admission as rereview', () => {
   const root = admittedRoot({ provider: 'local-owner', workType: 'general', facts: {
     nextAction: 'review', suggestedCapability: 'pr-review', expectedHeadRefOid: item.headRefOid,

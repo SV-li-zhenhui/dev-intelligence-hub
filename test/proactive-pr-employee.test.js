@@ -6,6 +6,7 @@ import { OllamaPrEmployeeReviewer } from "../src/adapters/ollama-pr-employee-rev
 import { RoutedPrEmployeeReviewer } from "../src/adapters/routed-pr-employee-reviewer.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { ProactivePrEmployeeService } from "../src/services/proactive-pr-employee.js";
+import { assessPullRequestResponsibility } from "../src/domain/pr-responsibility.js";
 
 const HEAD_42 = "b".repeat(40);
 const HEAD_43 = "c".repeat(40);
@@ -1024,6 +1025,33 @@ test("a lost running-claim acknowledgement waits for one lease recovery", async 
   assert.equal(recovered.jobs[0].attempts, 2);
   assert.equal(recovered.jobs[0].brain.model, "restarted-model");
   assert.equal(recoveredBrainCalls, 1);
+});
+
+test("a reassigned same-Head review automatically gets a new handoff after report-only triage", async () => {
+  const item = pullRequest({ nextAction: "complete_review", currentUser: "runtime-user", assignees: ["runtime-user"], isDraft: false, ciStatus: "NONE",
+    incomingReviewFactsAvailable: true, reviewRecipient: "runtime-user", reviewReceivedFrom: "someone-else",
+    reviewReceivedVia: "assignee", reviewRequestEventId: "assign-again", reviewReceivedAt: "2026-07-31T09:00:00Z",
+    myReviewState: "COMMENTED", myReviewCommitOid: HEAD_42, myLatestPublishedReviewState: "COMMENTED",
+    myLatestPublishedReviewCommitOid: HEAD_42, myLatestPublishedReviewAt: "2026-07-30T10:00:00Z" });
+  const store = new MemoryStore({ snapshot: snapshot([item]) });
+  const handoffs = [];
+  const service = createService({ store, config: { triageOnly: true, automaticReviewPolicy: { enabled: true, account: "runtime-user" } },
+    github: { async loadReviewContext() { return { ...item }; }, async readIncomingReviewRequest() { return { ...item }; } },
+    reviewer: { provider: "ollama", model: "triage-model", async analyze() {
+      return reviewResult({ workType: "triage_plan", reviewVerdict: "none", reviewBody: "", requiresApproval: false });
+    } },
+    triageHandoff: durableTriageHandoff(input => handoffs.push(input)) });
+  await service.tick();
+  assert.equal(handoffs.length, 1);
+  Object.assign(item, assessPullRequestResponsibility(item, { now: "2026-07-31T10:01:00Z" }));
+  await store.write("snapshot", snapshot([item]));
+  await service.tick();
+  assert.equal(handoffs.length, 2);
+  assert.equal(handoffs[1].nextAction, "rereview");
+  assert.equal(handoffs[1].expectedHeadRefOid, handoffs[0].expectedHeadRefOid);
+  assert.notEqual(handoffs[1].requestKey, handoffs[0].requestKey);
+  await service.tick();
+  assert.equal(handoffs.length, 2);
 });
 
 test("a same-head action change is superseded before context reaches the brain", async () => {

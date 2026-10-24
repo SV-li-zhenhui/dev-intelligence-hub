@@ -71,6 +71,21 @@ test("a Comment on the current Head reports unfinished review instead of an unre
   assert.match(result.actionReasons[0], /当前提交已复审评论/);
 });
 
+test("a later incoming Assign starts a new review round even when the Head did not change", () => {
+  for (const state of ["COMMENTED", "APPROVED", "CHANGES_REQUESTED"]) {
+    const facts = { relation: "review_requested", author: "contributor", myReviewState: state, myReviewCommitOid: "head-2",
+      myLatestPublishedReviewState: state, myLatestPublishedReviewCommitOid: "head-2",
+      myLatestPublishedReviewAt: "2026-07-30T10:00:00Z", incomingReviewFactsAvailable: true,
+      reviewRecipient: currentUser, reviewReceivedFrom: "contributor", reviewReceivedVia: "assignee",
+      reviewRequestEventId: "assign-again", reviewReceivedAt: "2026-07-31T08:00:00Z" };
+    assert.equal(assess(facts).nextAction, "rereview");
+    for (const patch of [{ reviewReceivedAt: "2026-07-30T09:00:00Z" }, { reviewReceivedAt: "2026-07-31T10:00:00Z" },
+      { reviewReceivedFrom: currentUser }, { incomingReviewFactsAvailable: false }, { reviewRequestEventId: null }]) {
+      assert.notEqual(assess({ ...facts, ...patch }).nextAction, "rereview");
+    }
+  }
+});
+
 test("a later Comment cannot undo a decisive verdict on the same Head", () => {
   for (const state of ["APPROVED", "CHANGES_REQUESTED"]) {
     const result = assess({ relation: "review_requested", author: "contributor",
