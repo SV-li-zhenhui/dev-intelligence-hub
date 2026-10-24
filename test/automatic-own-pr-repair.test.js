@@ -5,6 +5,8 @@ import { ciRepairSource } from './support/ci-repair-fixture.js';
 import { readonlyVerificationFixture } from './support/readonly-verification-fixture.js';
 import { FailedCodeJobContextReader, VERIFICATION_RECOVERY_ACTOR, VERIFICATION_RECOVERY_REASON } from '../src/services/failed-code-job-context-reader.js';
 import { AutomaticOwnPrVerificationRecovery } from '../src/services/automatic-own-pr-verification-recovery.js';
+import { planWorkItemTransition } from '../src/services/work-ledger-item-commands.js';
+import { encodeVerificationRecoveryEvidence } from '../src/domain/verification-recovery-evidence.js';
 
 const binding = {
   schemaVersion: 2, kind: "pull_request", repository: "acme/repo", pullRequestNumber: 42,
@@ -78,9 +80,11 @@ function verificationRecoveryFixture() {
       async listTimeline() { return { items: structuredClone(timeline), nextCursor: null }; },
       async listOutbox() { return { items: structuredClone(boxes), nextCursor: null }; },
       async readItemForReconciliation() { return structuredClone(row); },
-      async transition(request) { transitions.push(request); Object.assign(row, { status: request.toStatus, revision: row.revision + 1 });
-        timeline.push({ itemId: row.itemId, sequence: timeline.length + 1, type: 'transitioned', actorId: request.actorId,
-          at: '2026-08-02T06:02:00.000Z', details: { ...request, context: request.details } }); } } });
+      async transition(request) {
+        const planned = planWorkItemTransition({ state: { items: [row] }, input: request, clock: () => '2026-08-02T06:02:00.000Z' });
+        transitions.push(request); Object.assign(row, planned.result);
+        timeline.push({ ...planned.timelineEvents[0], sequence: timeline.length + 1 });
+      } } });
   row = { itemId: binding.rootItemId, kind: 'source_root', status: 'blocked', statusReason: 'proposal_failed', revision: 4,
     currentTarget: { type: 'role', id: 'developer' }, ownerId: null, leaseId: null, leaseUntil: null, activeIntentId: null,
     sourceQuarantine: null, graph: { deliveries: [] }, event: s.event, createdAt: raw.createdAt,
@@ -115,6 +119,9 @@ test('settled readonly verification failure gets one fresh automatic decision wi
   assert.equal(result.verificationRecovery?.requeued ?? 0, 1, JSON.stringify(result));
   assert.equal(transitions.length, 1);
   assert.equal(transitions[0].toStatus, 'queued');
+  assert.deepEqual(Object.keys(transitions[0].details), ['code', 'downstreamRef', 'evidenceRefs']);
+  assert.equal(row.statusReason, VERIFICATION_RECOVERY_REASON);
+  assert.equal(timeline.at(-1).details.context.evidenceRefs.length, 6);
   assert.deepEqual(job, before, 'recovery cannot rewrite the failed job or claim its tests passed');
   assert.equal(s.calls.length, 0, 'recovery cannot approve or replay the old task');
   const contextReader = new FailedCodeJobContextReader({ codeJobReader, ledger: s.service.ledger });
@@ -122,6 +129,7 @@ test('settled readonly verification failure gets one fresh automatic decision wi
   assert.equal(context.automaticRecovery.reason, VERIFICATION_RECOVERY_REASON);
   assert.equal(context.ownerRetry, null);
   row.status = 'blocked';
+  row.statusReason = 'proposal_failed';
   const restarted = new AutomaticOwnPrVerificationRecovery({ ledger: s.service.ledger, codeJobReader,
     settledVerificationReader, objectSync, current: async () => ({ config: s.configuration }) });
   await restarted.runCycle();
@@ -161,7 +169,9 @@ for (const [scenario, mutate] of [
   ['proof-during-sync', f => { f.objectSync.prepare = async () => { f.proof.profileConfigDigest = '9'.repeat(64); }; }],
   ['prior-recovery-other-job', f => { f.timeline.push({ itemId: f.row.itemId, sequence: 2, type: 'transitioned',
     actorId: VERIFICATION_RECOVERY_ACTOR, details: { reason: VERIFICATION_RECOVERY_REASON,
-      context: { headRefOid: binding.headRefOid, downstreamRef: 'different-job' } } }); }],
+      context: { evidenceRefs: encodeVerificationRecoveryEvidence({ ...f.proof, headRefOid: binding.headRefOid }), downstreamRef: 'different-job' } } }); }],
+  ['malformed-recovery-marker', f => { f.timeline.push({ itemId: f.row.itemId, sequence: 2, type: 'transitioned',
+    actorId: VERIFICATION_RECOVERY_ACTOR, details: { reason: VERIFICATION_RECOVERY_REASON, context: {} } }); }],
 ]) {
   test(`settled verification recovery preserves ${scenario}`, async () => {
     const f = verificationRecoveryFixture(); mutate(f);

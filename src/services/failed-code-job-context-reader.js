@@ -1,6 +1,7 @@
 import { normalizeCodeJobBrowserProjection } from "../domain/code-job-browser-projection.js";
 import { CODE_BRAIN_ACTION_TYPES } from "../domain/structured-code-action-contract.js";
 import { CODE_JOB_ACTIONS_BY_OPERATION } from '../domain/code-job-contract.js';
+import { decodeVerificationRecoveryEvidence } from '../domain/verification-recovery-evidence.js';
 import {
   normalizePullRequestExecutionBinding,
   samePullRequestExecutionBinding,
@@ -116,19 +117,15 @@ export class FailedCodeJobContextReader {
     const failureCode = detail.terminalDetail?.code;
     const historyComplete = detail.historyAvailable === true && detail.nextCursor === null &&
       observedActions.length === job.observationCount;
+    const recoveryEvidence = decodeVerificationRecoveryEvidence(retry?.details.context?.evidenceRefs);
     const recovery = retry?.actorId === VERIFICATION_RECOVERY_ACTOR && retry.details.reason === VERIFICATION_RECOVERY_REASON &&
       job.operation === 'verify' && job.writablePaths.length === 0 && failureCode === AUTOMATIC_VERIFICATION_FAILURE &&
       historyComplete && observedActions.every(action => READONLY_ACTIONS.has(action.actionType)) &&
-      retry.details.context.headRefOid === expectedBinding.headRefOid &&
-      /^[a-z0-9][a-z0-9-]{0,63}$/u.test(retry.details.context.actionId ?? '') &&
-      /^[a-z0-9][a-z0-9-]{0,63}$/u.test(retry.details.context.executionId ?? '') &&
-      job.requiredProfiles.includes(retry.details.context.profileId) &&
-      /^[a-f0-9]{64}$/u.test(retry.details.context.profileConfigDigest ?? '') &&
-      /^[a-f0-9]{64}$/u.test(retry.details.context.workspaceRevision ?? '') ? {
+      recoveryEvidence?.headRefOid === expectedBinding.headRefOid && job.requiredProfiles.includes(recoveryEvidence.profileId) ? {
         at: retry.at, reason: VERIFICATION_RECOVERY_REASON, failureCode, jobId,
-        actionId: retry.details.context.actionId, executionId: retry.details.context.executionId,
-        profileId: retry.details.context.profileId, profileConfigDigest: retry.details.context.profileConfigDigest,
-        workspaceRevision: retry.details.context.workspaceRevision,
+        actionId: recoveryEvidence.actionId, executionId: recoveryEvidence.executionId,
+        profileId: recoveryEvidence.profileId, profileConfigDigest: recoveryEvidence.profileConfigDigest,
+        workspaceRevision: recoveryEvidence.workspaceRevision,
       } : null;
     return {
       jobId, status: job.status, operation: job.operation,

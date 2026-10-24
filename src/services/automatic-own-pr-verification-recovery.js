@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { OperationQueue } from '../lib/operation-queue.js';
 import { normalizeCodeJobBrowserProjection } from '../domain/code-job-browser-projection.js';
 import { CODE_JOB_ACTIONS_BY_OPERATION } from '../domain/code-job-contract.js';
+import { encodeVerificationRecoveryEvidence, decodeVerificationRecoveryEvidence } from '../domain/verification-recovery-evidence.js';
 import { samePullRequestExecutionBinding } from '../domain/pull-request-execution-binding.js';
 import { currentWorkItemInputBinding } from './work-ledger-pr-source.js';
 import { FailedCodeJobContextReader, VERIFICATION_RECOVERY_REASON, VERIFICATION_RECOVERY_ACTOR,
@@ -93,8 +94,12 @@ export class AutomaticOwnPrVerificationRecovery {
         creation.details.workKey !== job.inputBinding.workKey ||
         history.some((entry, index) => entry.itemId !== item.itemId || !Number.isSafeInteger(entry.sequence) ||
           (index > 0 && entry.sequence <= history[index - 1].sequence)) ||
-        history.some(entry => entry.actorId === VERIFICATION_RECOVERY_ACTOR && entry.type === 'transitioned' &&
-          entry.details.reason === VERIFICATION_RECOVERY_REASON && entry.details.context?.headRefOid === job.inputBinding.headRefOid)) return false;
+        history.some(entry => {
+          if (entry.actorId !== VERIFICATION_RECOVERY_ACTOR || entry.type !== 'transitioned' ||
+              entry.details.reason !== VERIFICATION_RECOVERY_REASON) return false;
+          const evidence = decodeVerificationRecoveryEvidence(entry.details.context?.evidenceRefs);
+          return evidence === null || evidence.headRefOid === job.inputBinding.headRefOid;
+        })) return false;
     let currentFailure = false;
     for (const box of boxes.filter(entry => entry.sourceBinding?.headRefOid === job.inputBinding.headRefOid)) {
       if (box.itemId !== item.itemId || box.status !== 'delivered' || box.outcome?.status !== 'delivered' ||
@@ -136,9 +141,8 @@ export class AutomaticOwnPrVerificationRecovery {
         !await this.#canRecover(latest, job)) return false;
     await this.ledger.transition({ itemId: item.itemId, expectedRevision: item.revision, leaseId: null,
       actorId: VERIFICATION_RECOVERY_ACTOR, toStatus: 'queued', reason: VERIFICATION_RECOVERY_REASON,
-      details: { code: FAILURE, downstreamRef: jobId, headRefOid: inputBinding.headRefOid,
-        actionId: proof.actionId, executionId: proof.executionId, profileId: proof.profileId,
-        profileConfigDigest: proof.profileConfigDigest, workspaceRevision: proof.workspaceRevision } });
+      details: { code: FAILURE, downstreamRef: jobId,
+        evidenceRefs: encodeVerificationRecoveryEvidence({ ...proof, headRefOid: inputBinding.headRefOid }) } });
     return true;
   }
 }

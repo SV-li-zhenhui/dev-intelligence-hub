@@ -5,6 +5,7 @@ import { projectNormalizedCodeJobForBrowser } from "../src/domain/code-job-brows
 import { FailedCodeJobContextReader, VERIFICATION_RECOVERY_ACTOR, VERIFICATION_RECOVERY_REASON,
   AUTOMATIC_VERIFICATION_FAILURE } from "../src/services/failed-code-job-context-reader.js";
 import { AutomaticOwnPrInspectionRecovery } from "../src/services/automatic-own-pr-inspection-recovery.js";
+import { encodeVerificationRecoveryEvidence } from '../src/domain/verification-recovery-evidence.js';
 
 function fixture({ operation = "modify", failureCode = "GIT_SNAPSHOT_TIMEOUT", actions = ["read_text", "search_text", "read_text"] } = {}) {
   const itemId = "work-item-repair";
@@ -73,27 +74,35 @@ function automaticRetry(f) {
 }
 
 test('verification recovery context requires exact settled readonly failure metadata', async t => {
-  for (const scenario of ['valid', 'head', 'action', 'execution', 'profile', 'fingerprint', 'workspace', 'history', 'write', 'failure']) {
+  for (const scenario of ['valid', 'reordered', 'head', 'action', 'execution', 'profile', 'fingerprint', 'workspace',
+    'duplicate', 'missing', 'extra', 'unknown-reference', 'history', 'write', 'failure']) {
     await t.test(scenario, async () => {
       const f = fixture({ operation: 'verify', failureCode: AUTOMATIC_VERIFICATION_FAILURE, actions: ['read_text', 'run_profile'] });
       f.retry.actorId = VERIFICATION_RECOVERY_ACTOR;
       f.retry.details.reason = VERIFICATION_RECOVERY_REASON;
       f.retry.details.context = { downstreamRef: f.detail.job.jobId, code: AUTOMATIC_VERIFICATION_FAILURE,
-        headRefOid: f.input.inputBinding.headRefOid, actionId: 'action-profile', executionId: 'attempt-one', profileId: 'tests',
-        profileConfigDigest: 'b'.repeat(64), workspaceRevision: '7'.repeat(64) };
+        evidenceRefs: encodeVerificationRecoveryEvidence({ headRefOid: f.input.inputBinding.headRefOid,
+          actionId: 'action-profile', executionId: 'attempt-one', profileId: 'tests',
+          profileConfigDigest: 'b'.repeat(64), workspaceRevision: '7'.repeat(64) }) };
       const context = f.retry.details.context;
-      if (scenario === 'head') context.headRefOid = '9'.repeat(40);
-      if (scenario === 'action') context.actionId = '../action';
-      if (scenario === 'execution') context.executionId = '../attempt';
-      if (scenario === 'profile') context.profileId = 'other';
-      if (scenario === 'fingerprint') context.profileConfigDigest = 'invalid';
-      if (scenario === 'workspace') context.workspaceRevision = 'invalid';
+      const replace = (prefix, value) => { context.evidenceRefs = context.evidenceRefs.map(ref => ref.startsWith(prefix) ? `${prefix}${value}` : ref); };
+      if (scenario === 'head') replace('head:', '9'.repeat(40));
+      if (scenario === 'action') replace('action:', '../action');
+      if (scenario === 'execution') replace('execution:', '../attempt');
+      if (scenario === 'profile') replace('profile:', 'other');
+      if (scenario === 'fingerprint') replace('profile-config:', 'invalid');
+      if (scenario === 'workspace') replace('workspace:', 'invalid');
+      if (scenario === 'reordered') context.evidenceRefs.reverse();
+      if (scenario === 'duplicate') context.evidenceRefs[1] = context.evidenceRefs[0];
+      if (scenario === 'missing') context.evidenceRefs.pop();
+      if (scenario === 'extra') context.evidenceRefs.push('note:untrusted');
+      if (scenario === 'unknown-reference') context.evidenceRefs[1] = 'note:untrusted';
       if (scenario === 'history') f.detail.historyAvailable = false;
       if (scenario === 'write') f.detail.observations[0].actionType = 'write_text';
       if (scenario === 'failure') f.detail.terminalDetail.code = 'SANDBOX_ABORTED';
       const result = await f.reader.read(f.input);
       assert.equal(result.ownerRetry, null);
-      if (scenario === 'valid') assert.equal(result.automaticRecovery.jobId, f.detail.job.jobId);
+      if (['valid', 'reordered'].includes(scenario)) assert.equal(result.automaticRecovery.jobId, f.detail.job.jobId);
       else assert.equal(result.automaticRecovery, null);
     });
   }
