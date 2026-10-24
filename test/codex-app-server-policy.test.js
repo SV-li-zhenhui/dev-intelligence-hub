@@ -35,7 +35,9 @@ test('code-job policy exposes only host execution tools in a separate namespace'
     execution:{url:'http://127.0.0.1:1234/code-execution/token'},agentConfigPath:'D:/private/role.toml'};
   const result=threadConfiguration({mcp_servers:{pr_review:{url:'private'}},agents:{enabled:true,default:{config_file:'unsafe'}}},options);
   assert.equal(result.mcp_servers.pr_review.enabled,false);
-  assert.deepEqual(result.mcp_servers[options.namespace].enabled_tools,['perform_action','read_source','get_state']);
+  const expectedTools=['perform_action','read_source','edit_source','get_state','read_conflict_source'];
+  assert.deepEqual(result.mcp_servers[options.namespace].enabled_tools,expectedTools);
+  assert.deepEqual(Object.keys(result.mcp_servers[options.namespace].tools),expectedTools);
   assert.equal(result.mcp_servers[options.namespace].tool_timeout_sec,2460, 'native MCP must outlast the bounded fixed profile and its host receipt');
   assert.equal(result.agents.enabled,false);
   assert.throws(()=>threadConfiguration({}, {...options,reader:{url:'private'}}),{code:'STRUCTURED_PROVIDER_UNAVAILABLE'});

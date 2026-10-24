@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import test from "node:test";
@@ -21,6 +21,8 @@ import {CodeJobBrainDirectory} from '../src/services/code-job-brain-directory.js
 import {githubEntitySessionKey} from '../src/lib/session-key.js';
 import { startCodeExecutionTurn } from '../src/lib/code-execution-watchdog.js';
 import { ContainedStdioProcess } from '../src/lib/contained-stdio-process.js';
+import { preparePrEmployeeAnalysis } from '../src/adapters/ollama-pr-employee-reviewer.js';
+import { NATIVE_ADVISORY_INSTRUCTION } from '../src/lib/codex-app-server-policy.js';
 
 const schema = { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false };
 const request = (overrides = {}) => ({ model: "gpt-6.1-sol", reasoningEffort: "high", messages: [{ role: "user", content: "PRIVATE_TASK_INPUT" }], schema, ...overrides });
@@ -1206,6 +1208,68 @@ test("uncertain reap preserves the owned invocation and persistent marker and fe
   await assert.rejects(provider.close(), { code: "STRUCTURED_PROVIDER_REAP_FAILED" });
   assert.equal(f.calls.length, 1);
 });
+
+test("an unconfirmed native invocation retains its entity and capacity slot without blocking unrelated PRs", async (t) => {
+  const f = await fixture(t);
+  let first = true;
+  const provider = f.create(async call => {
+    if (first) { first = false; throw error("STRUCTURED_PROVIDER_REAP_FAILED"); }
+    return call.args[0] === "login" ? success("Logged in using ChatGPT") : result(call);
+  }, {}, { maxConcurrentTurns: 2, allowConcurrentNativeHome: true });
+  const held = "github:pull_request:owner/repo#42";
+  await assert.rejects(provider.generate(request({ admissionEntityKey: held })), { code: "STRUCTURED_PROVIDER_REAP_FAILED" });
+  const retained = (await readdir(f.runtime)).find(name => name.startsWith("invocation-"));
+  await provider.checkAvailability();
+  await assert.rejects(provider.withAdmission({ entityKey: held }, () => assert.fail("the unknown entity remains fenced")), { code: "STRUCTURED_PROVIDER_BUSY" });
+  const controller = new AbortController();
+  const heldWaiter = assert.rejects(provider.withAdmission({ entityKey: held, waitForCapacity: true, signal: controller.signal }, () => assert.fail("unknown entity waiter cannot start")), { code: "STRUCTURED_PROVIDER_CANCELLED" });
+  try {
+    await provider.withAdmission({ entityKey: "github:pull_request:owner/repo#43" }, async () => {});
+  } finally { controller.abort(); await heldWaiter; }
+  assert.deepEqual(JSON.parse(await provider.generate(request({ admissionEntityKey: "github:pull_request:owner/repo#43" }))), { ok: true });
+  const entries = await readdir(f.runtime);
+  assert.ok(entries.includes(retained));
+  assert.equal(entries.filter(name => name.startsWith("active-")).length, 1, "unknown stop evidence remains intact");
+  const release = gate(), entered = gate();
+  const remaining = provider.withAdmission({ entityKey: "github:pull_request:owner/repo#43" }, async () => { entered.resolve(); await release.promise; });
+  await entered.promise;
+  await assert.rejects(provider.withAdmission({ entityKey: "github:pull_request:owner/repo#44" }, () => assert.fail("unknown invocation still consumes a slot")), { code: "STRUCTURED_PROVIDER_BUSY" });
+  release.resolve(); await remaining;
+  await provider.close();
+});
+
+for (const variant of ["valid", "wrong-schema", "wrong-entity", "non-triage", "capacity-exhausted"]) {
+  test(`legacy triage marker keeps a durable entity reservation after restart: ${variant}`, async t => {
+    const f = await fixture(t);
+    await mkdir(f.runtime);
+    const count = variant === "capacity-exhausted" ? 2 : 1;
+    for (let index = 0; index < count; index++) {
+      const invocation = `invocation-${randomUUID()}`;
+      const directory = path.join(f.runtime, invocation); await mkdir(directory);
+      const input = { id: "github:pr:owner/repo#42", repo: "owner/repo", number: 42, workMode: variant === "non-triage" ? "owner" : "triage" };
+      const wire = preparePrEmployeeAnalysis(input);
+      if (variant === "wrong-schema") wire.schema = schema;
+      if (variant === "wrong-entity") { const context = JSON.parse(wire.messages[1].content); context.id = "github:pr:other/repo#42"; wire.messages[1].content = JSON.stringify(context); }
+      await writeFile(path.join(directory, "task.json"), JSON.stringify({ instruction: NATIVE_ADVISORY_INSTRUCTION, messages: wire.messages, schema: wire.schema }));
+      await writeFile(path.join(f.runtime, `active-${nativeCodexDigest(nativeCodexHomeIdentity(f.home))}-${randomUUID()}.json`), JSON.stringify({ schemaVersion: 1, invocation, createdAt: Date.now() }));
+    }
+    const provider = f.create(call => call.args[0] === "login" ? success("Logged in using ChatGPT") : result(call), {}, { maxConcurrentTurns: 2, allowConcurrentNativeHome: true });
+    await assert.rejects(provider.checkAvailability(), { code: "STRUCTURED_PROVIDER_REAP_FAILED" });
+    if (variant !== "valid") {
+      await assert.rejects(provider.checkAvailability(), { code: "STRUCTURED_PROVIDER_REAP_FAILED" });
+      assert.equal(f.calls.length, 0);
+      await assert.rejects(provider.close(), { code: "STRUCTURED_PROVIDER_REAP_FAILED" });
+      return;
+    }
+    await provider.checkAvailability();
+    await provider.checkAvailability();
+    assert.equal((await provider.readStatus()).state, "available");
+    await assert.rejects(provider.withAdmission({ entityKey: "github:pull_request:owner/repo#42" }, () => assert.fail("the legacy entity is held")), { code: "STRUCTURED_PROVIDER_BUSY" });
+    assert.deepEqual(JSON.parse(await provider.generate(request({ admissionEntityKey: "github:pull_request:owner/repo#43" }))), { ok: true });
+    assert.equal((await readdir(f.runtime)).filter(name => name.startsWith("active-")).length, 1);
+    await provider.close();
+  });
+}
 
 test("a retained process marker from an earlier service lifetime prevents a duplicate launch", async (t) => {
   const f = await fixture(t);

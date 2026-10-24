@@ -5,7 +5,21 @@ const reservations = new AsyncLocalStorage();
 const problem = code => Object.assign(new Error(code), {code, statusCode:503});
 
 export function createNativeModelAdmission(capacity = 1) {
-  return {capacity, active:new Set(), queue:[], blocked:false, lastStatus:null, markers:new Set(),preparation:new OperationQueue()};
+  return {capacity, active:new Set(), queue:[], blocked:false, lastStatus:null, markers:new Set(), unknownInvocations:new Map(), preparation:new OperationQueue()};
+}
+
+export function retainUnknownNativeInvocations(state, entries) {
+  if (state.capacity <= 1 || [...state.active].some(token => !token.unknown)) return false;
+  if (entries.some(entry => state.unknownInvocations.has(entry.file) && state.unknownInvocations.get(entry.file).entity !== entry.entity)) return false;
+  const additions = entries.filter(entry => !state.unknownInvocations.has(entry.file));
+  if (state.active.size + additions.length >= state.capacity) return false;
+  for (const entry of additions) {
+    const token = { entity: entry.entity, exclusive: false, unknown: true };
+    state.active.add(token);
+    state.unknownInvocations.set(entry.file, token);
+    state.markers.add(entry.file);
+  }
+  return entries.length > 0;
 }
 
 function fits(state, entity, exclusive) {
@@ -55,7 +69,9 @@ export function currentNativeAdmission(state) {
 export async function withNativeAdmission(state, entity, signal, operation, {waitForCapacity = false} = {}) {
   signal?.throwIfAborted();
   if (state.blocked) throw problem('STRUCTURED_PROVIDER_REAP_FAILED');
-  if (!waitForCapacity && (state.queue.length || !fits(state, entity, false))) throw problem('STRUCTURED_PROVIDER_BUSY');
+  const queuedCompetitor = state.queue.some(entry => entry.exclusive ||
+    ![...state.unknownInvocations.values()].some(token => token.entity === entry.entity));
+  if (!waitForCapacity && (queuedCompetitor || !fits(state, entity, false))) throw problem('STRUCTURED_PROVIDER_BUSY');
   const token = waitForCapacity ? await acquireNativeAdmission(state, entity, signal) : reserve(state, entity, false);
   return reservations.run(token, async () => {
     try { signal?.throwIfAborted(); return await operation(); }
