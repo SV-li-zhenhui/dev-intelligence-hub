@@ -51,7 +51,7 @@ function scopeLifecycleAssignment(sequence, event) {
 async function fixture({ outcome = "applied", transformPlan = (plan) => plan, downstream = false,
   followupScope = "followup", followupHead = HEAD, leaveScope = false, leaveScopeAfterResult = false,
   ignoredReentry = false, ownerFollowup = false, neverEnqueued = false, revokedUnexecuted = false,
-  leaveScopeAfterFollowup = false } = {}) {
+  leaveScopeAfterFollowup = false, legacyStaleResult = false } = {}) {
   const store = new MemoryStore();
   let currentTime = NOW;
   const records = [assignment(1)];
@@ -113,7 +113,8 @@ async function fixture({ outcome = "applied", transformPlan = (plan) => plan, do
   };
   if (leaveScope) await leaveAutomaticScope();
   const result = createWorkProposalResult({ proposal, sequence: 1, at: NOW, downstreamRef: downstream ? plan.id : null,
-    transition: { status: "stale", summary: "Authority left scope before receipt recovery", evidence: downstream
+    transition: { status: "stale", summary: legacyStaleResult ? "GitHub Review 提案已失效" : "Authority left scope before receipt recovery", evidence: legacyStaleResult
+      ? [`confirmation:${plan.id}`] : downstream
       ? [`confirmation:${plan.id}`, "authorization_changed", `old_confirmation_status:${revokedUnexecuted ? "stale" : "completed"}`]
       : ["authorization_changed", `proposal:${proposal.proposalId}`] } });
   await service.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
@@ -205,6 +206,63 @@ for (const variant of ["recover", "confirmation-exists", "reader-unavailable", "
     }
   });
 }
+
+for (const legacyStaleResult of [false, true]) {
+  test(`automatic cycles recover an enqueued Review revoked before execution (${legacyStaleResult ? "legacy" : "current"})`, async () => {
+    const f = await fixture({ downstream: true, revokedUnexecuted: true, followupScope: null, legacyStaleResult });
+    const loop = new ProactiveWorkLoop({ ledger: f.service, clock: () => new Date(NOW),
+      automaticReviewPolicy: { enabled: true, account: "review-account" },
+      roleDirectory: { async resolve() { return { roleId: "pr-engineer", workerId: "review-worker", enabled: false, paused: false }; } },
+      roleContextAssembler: { async assemble() { return { context: { code: { pullRequest: { reviewMaterial: {} } } } }; } },
+      orchestratorService: { async execute() { assert.fail("unexpected orchestration"); } } });
+    await loop.runCycle({ roleId: "pr-engineer" });
+    const queued = await f.service.readItemForReconciliation({ itemId: f.proposal.requestedBy.workItemId });
+    assert.equal(queued.status, "queued");
+    assert.equal(f.executions, 0);
+    assert.deepEqual((await f.service.listOutbox()).items[0], f.staleHistory);
+    assert.equal((await f.queue.get(f.plan.id)).status, "stale");
+    await f.service.transition({ itemId: queued.itemId, expectedRevision: queued.revision, actorId: "work-ledger-system",
+      leaseId: null, toStatus: "blocked", reason: "proposal_stale" });
+    await f.restart();
+    const blocked = await f.service.readItemForReconciliation({ itemId: queued.itemId });
+    assert.equal(await f.service.recoverUnstartedReviewProposal({ itemId: blocked.itemId, expectedRevision: blocked.revision }), false);
+  });
+}
+
+for (const outcome of ["applied", "unknown", "absent"]) {
+  test(`same-Head Review recovery cannot repeat an execution (${outcome})`, async () => {
+    const f = await fixture({ outcome, downstream: true, followupScope: null });
+    const item = await f.service.readItemForReconciliation({ itemId: f.proposal.requestedBy.workItemId });
+    assert.equal(await f.service.recoverUnstartedReviewProposal({ itemId: item.itemId, expectedRevision: item.revision }), false);
+    assert.equal(f.executions, 1);
+    assert.deepEqual((await f.service.listOutbox()).items[0], f.staleHistory);
+  });
+}
+
+test("revoked Review recovery preserves an explicit user pause", async () => {
+  const f = await fixture({ downstream: true, revokedUnexecuted: true, followupScope: null });
+  const item = await f.service.readItemForReconciliation({ itemId: f.proposal.requestedBy.workItemId });
+  await f.service.pauseGraphTask({ authority: { actorId: "owner", scopeRootTaskId: item.itemId },
+    command: { taskId: item.itemId, expectedTaskRevision: item.revision,
+      expectedGraphRevision: (await f.service.getSummary()).revision, reason: "owner_paused" } });
+  const paused = await f.service.readItemForReconciliation({ itemId: item.itemId });
+  assert.equal(await f.service.recoverUnstartedReviewProposal({ itemId: paused.itemId, expectedRevision: paused.revision }), false);
+  assert.equal((await f.service.readItemForReconciliation({ itemId: paused.itemId })).status, "paused");
+  assert.equal(f.executions, 0);
+});
+
+test("automatic recovery skips material preparation for an already executed Review", async () => {
+  const f = await fixture({ downstream: true, followupScope: null });
+  let assemblies = 0;
+  const loop = new ProactiveWorkLoop({ ledger: f.service, clock: () => new Date(NOW),
+    automaticReviewPolicy: { enabled: true, account: "review-account" },
+    roleDirectory: { async resolve() { return { roleId: "pr-engineer", workerId: "review-worker", enabled: false, paused: false }; } },
+    roleContextAssembler: { async assemble() { assemblies++; return { context: { code: { pullRequest: { reviewMaterial: {} } } } }; } },
+    orchestratorService: { async execute() { assert.fail("unexpected orchestration"); } } });
+  await loop.runCycle({ roleId: "pr-engineer" });
+  assert.equal(assemblies, 0);
+  assert.equal(f.executions, 1);
+});
 
 for (const enabled of [true, false]) {
   test(`normal automatic work cycles recover proven pre-enqueue Review failures only when enabled (${enabled})`, async () => {

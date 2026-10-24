@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { automaticReviewEligibility, automaticReviewContinuationEligibility, automaticTestingOwner } from "../domain/automatic-review-policy.js";
+import { automaticReviewEligibility, automaticReviewContinuationEligibility, automaticTestingOwner,
+  createAutomaticReviewAssignmentProof } from "../domain/automatic-review-policy.js";
 
 // Only the composition root receives this port. Model output cannot grant
 // automatic publication, choose arbitrary assignees, or execute other actions.
@@ -74,7 +75,7 @@ export class AutomaticReviewPublisher {
       expectedQueueRevision: item.queueRevision, expectedItemRevision: item.itemRevision,
       displayedPayloadDigest: item.displayedPayloadDigest, approvalBindingDigest: item.approvalBindingDigest,
       ...(reviewHandoff ? { reviewHandoff } : {}),
-    });
+    }, createAutomaticReviewAssignmentProof(item, facts, this.clock()));
   }
 
   async verify(envelope) {

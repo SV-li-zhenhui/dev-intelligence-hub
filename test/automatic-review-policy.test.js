@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { automaticReviewEligibility, automaticReviewContinuationEligibility, automaticReviewWorkAdmission, automaticTestingOwner } from "../src/domain/automatic-review-policy.js";
+import { automaticReviewEligibility, automaticReviewContinuationEligibility, automaticReviewWorkAdmission, automaticTestingOwner,
+  createAutomaticReviewAssignmentProof, automaticReviewAssignmentSupersedes } from "../src/domain/automatic-review-policy.js";
 
 const now = "2026-10-09T10:00:00.000Z";
 const item = {
@@ -47,6 +48,43 @@ test("failed checks remain eligible for evidence-based automatic Review", () => 
 test("a published Review consumes its assignment until a later Assign arrives", () => {
   assert.equal(automaticReviewEligibility({ ...item, myLatestPublishedReviewAt: "2026-10-09T09:30:00Z" }, "reviewer", now), "ASSIGNMENT_ALREADY_REVIEWED");
   assert.equal(automaticReviewEligibility({ ...item, myLatestPublishedReviewAt: "2026-10-09T09:30:00Z", reviewReceivedAt: "2026-10-09T09:45:00Z" }, "reviewer", now), null);
+});
+
+test("a later incoming Assign reopens the same Head exactly until that Assign is reviewed", () => {
+  for (const state of ["COMMENTED", "APPROVED", "CHANGES_REQUESTED"]) {
+    const facts = { ...item, assignees: ["reviewer"], myReviewState: state, myReviewCommitOid: item.headRefOid,
+      myLatestPublishedReviewState: state, myLatestPublishedReviewCommitOid: item.headRefOid,
+      myLatestPublishedReviewAt: "2026-10-09T09:30:00Z", reviewReceivedAt: "2026-10-09T09:45:00Z" };
+    assert.equal(automaticReviewEligibility(facts, "reviewer", now), null);
+    assert.equal(automaticReviewEligibility({ ...facts, myLatestPublishedReviewAt: "2026-10-09T09:50:00Z" },
+      "reviewer", now), "HEAD_ALREADY_REVIEWED");
+    for (const patch of [{ incomingReviewFactsAvailable: false }, { reviewRecipient: "other" },
+      { reviewReceivedFrom: "reviewer" }, { reviewRequestEventId: null }, { reviewReceivedVia: "reviewer" },
+      { reviewReceivedAt: "2026-10-09T10:01:00Z" }, { myLatestPublishedReviewAt: null }]) {
+      assert.equal(automaticReviewEligibility({ ...facts, ...patch }, "reviewer", now), "HEAD_ALREADY_REVIEWED");
+    }
+  }
+});
+
+test("later-Assign publication proof is bound, cannot be serialized and never settles unknown execution", () => {
+  const target = { resourceId: "acme/repo#42", version: item.headRefOid };
+  const next = { id: "review-next", kind: "github.work-proposal-review", actor: { accountId: "reviewer" },
+    target, approvalBindingDigest: "c".repeat(64) };
+  const previous = { status: "completed", actor: next.actor, target, receipt: { createdAt: "2026-10-09T09:30:00Z" } };
+  const facts = { ...item, assignees: ["reviewer"], myLatestPublishedReviewCommitOid: item.headRefOid,
+    myLatestPublishedReviewAt: previous.receipt.createdAt, reviewReceivedAt: "2026-10-09T09:45:00Z" };
+  const proof = createAutomaticReviewAssignmentProof(next, facts, now);
+  assert.equal(automaticReviewAssignmentSupersedes(previous, next, proof), true);
+  for (const forged of [{}, structuredClone(proof), JSON.parse(JSON.stringify(proof)), null]) {
+    assert.equal(automaticReviewAssignmentSupersedes(previous, next, forged), false);
+  }
+  for (const changed of [{ ...next, id: "other" }, { ...next, approvalBindingDigest: "d".repeat(64) }]) {
+    assert.equal(automaticReviewAssignmentSupersedes(previous, changed, proof), false);
+  }
+  for (const changed of [{ ...previous, status: "executing" }, { ...previous, status: "failed", failure: { outcome: "unknown" } },
+    { ...previous, receipt: { createdAt: "2026-10-09T09:50:00Z" } }]) {
+    assert.equal(automaticReviewAssignmentSupersedes(changed, next, proof), false);
+  }
 });
 test("testing routing uses explicit product evidence and configured owners only", () => {
   const owners = { qt: ["qt-tester"], bs: ["bs-tester"] };

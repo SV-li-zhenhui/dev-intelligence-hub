@@ -40,6 +40,15 @@ test("automatic publication retires duplicate same-Head reviews and positively r
   }
 });
 
+test("a same-Head Review for a later incoming Assign publishes instead of revoking authorization", async () => {
+  const { publisher, item, calls, invalidations } = fixture({ event: "COMMENT", invalidator: true,
+    facts: { assignees: ["me"], myLatestPublishedReviewCommitOid: head,
+      myLatestPublishedReviewState: "COMMENTED", myLatestPublishedReviewAt: "2026-10-09T08:00:00Z" } });
+  assert.equal((await publisher.publish(item)).status, "completed");
+  assert.equal(calls.length, 1);
+  assert.equal(invalidations.length, 0);
+});
+
 test("unavailable assignment evidence and an expired legacy intake window do not revoke a Review", async () => {
   for (const facts of [{ headRefOid: "", incomingReviewFactsAvailable: false },
     { author: "" }, { assignees: [], incomingReviewFactsAvailable: false },

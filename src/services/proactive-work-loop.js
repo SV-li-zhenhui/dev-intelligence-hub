@@ -803,6 +803,8 @@ export class ProactiveWorkLoop {
     this.listTimeline = optionalPortMethod(ledger, "listTimeline", "ledger.listTimeline");
     this.recoverUnstartedReviewProposal = optionalPortMethod(ledger,
       "recoverUnstartedReviewProposal", "ledger.recoverUnstartedReviewProposal");
+    this.canRecoverUnstartedReviewProposal = optionalPortMethod(ledger,
+      "canRecoverUnstartedReviewProposal", "ledger.canRecoverUnstartedReviewProposal");
     this.verifyPullRequestExecutionBinding = optionalPortMethod(
       ledger, "verifyPullRequestExecutionBinding", "ledger.verifyPullRequestExecutionBinding",
     );
@@ -2085,8 +2087,10 @@ export class ProactiveWorkLoop {
     this.reviewRecoveryCursor = result.nextCursor ?? null;
     throwIfLoopAborted(options.signal);
     for (const item of result.items.filter(item => item.statusReason === "proposal_stale" &&
-        item.decisionContext?.value?.kind === "github_review_proposal" && item.decisionContext.value.downstreamRef === null)) {
+        item.decisionContext?.value?.kind === "github_review_proposal")) {
       try {
+        if (this.canRecoverUnstartedReviewProposal !== null &&
+            !await this.canRecoverUnstartedReviewProposal({ itemId: item.itemId, expectedRevision: item.revision })) continue;
         const binding = currentWorkItemExecutionBinding(item);
         if (binding?.schemaVersion !== 2) continue;
         await this.verifyPullRequestExecutionBinding(binding);

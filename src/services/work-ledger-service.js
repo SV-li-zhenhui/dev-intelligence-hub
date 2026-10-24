@@ -1573,25 +1573,45 @@ export class WorkLedgerService {
     return this.#executeCommand(planWorkItemTransition, input);
   }
 
-  async recoverUnstartedReviewProposal({ itemId, expectedRevision }) {
-    if (!this.confirmationSettlementReader) return false;
+  async #prepareUnstartedReviewRecovery({ itemId, expectedRevision }) {
+    if (!this.confirmationSettlementReader) return null;
     const item = await this.readItemForReconciliation({ itemId });
     const eligible = candidate => candidate?.revision === expectedRevision && candidate.kind === "source_root" &&
       candidate.status === "blocked" && candidate.statusReason === "proposal_stale" &&
       candidate.currentTarget?.id === "pr-engineer" && candidate.ownerId === null && candidate.leaseId === null &&
-      candidate.activeIntentId === null && candidate.sourceQuarantine === null &&
-      candidate.decisionContext?.value?.downstreamRef === null && candidate.graph.deliveries.length === 0;
-    if (!eligible(item)) return false;
+      candidate.activeIntentId === null && candidate.sourceQuarantine === null && candidate.graph.deliveries.length === 0;
+    if (!eligible(item)) return null;
     const outboxes = new Map(this.state.outbox.filter(entry => entry.itemId === itemId).map(entry => [entry.intentId, cloneLedgerValue(entry)]));
     if (![...outboxes.values()].some(entry => entry.outcome?.details?.downstreamRef === item.decisionContext.referenceId &&
-        entry.updatedAt === item.updatedAt)) return false;
+        entry.updatedAt === item.updatedAt)) return null;
     const ids = reviewConfirmationSettlementIds(item, outboxes);
-    if (ids.length === 0) return false;
+    if (ids.length === 0) return null;
     const confirmations = [];
     for (const confirmationId of ids) confirmations.push(await this.confirmationSettlementReader.read({ confirmationId }));
-    if (confirmations.some(value => value !== null)) return false;
+    // A revoked row is as settled as absence only when publication never began.
+    // The settlement proof below still binds every historical identity and row.
+    if (confirmations.some(value => value !== null && (
+      value?.item?.status !== "stale" || value.item.execution !== null || value.item.failure !== null ||
+      value.item.receipt !== null || value.item.rejection !== null ||
+      value.item.invalidation?.reason !== "authorization_changed"
+    ))) return null;
     const proof = createCompletedReviewConfirmationSettlement(item, outboxes, confirmations);
-    if (proof === null) return false;
+    if (proof === null) return null;
+    const timeline = this.state.timeline.filter(entry => entry.itemId === itemId);
+    if (timeline[0]?.type !== "pr_source_created" || timeline[0].at !== item.createdAt ||
+        timeline.some(entry => entry.details.reason === "review_authority_context_recovered") ||
+        this.state.items.some(candidate => candidate.graph?.parentItemId === itemId)) return null;
+    return { item, proof, eligible };
+  }
+
+  async canRecoverUnstartedReviewProposal(input) {
+    return await this.#prepareUnstartedReviewRecovery(input) !== null;
+  }
+
+  async recoverUnstartedReviewProposal({ itemId, expectedRevision }) {
+    const prepared = await this.#prepareUnstartedReviewRecovery({ itemId, expectedRevision });
+    if (prepared === null) return false;
+    const { item, proof, eligible } = prepared;
     return this.#admitNewWork(() => this.#writeTransaction(async () => {
       const current = this.state.items.find(candidate => candidate.itemId === itemId);
       const currentOutboxes = new Map(this.state.outbox.filter(entry => entry.itemId === itemId).map(entry => [entry.intentId, entry]));

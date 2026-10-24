@@ -20,7 +20,7 @@ import {
 } from "../domain/attention-deferred-contract.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 import { createReviewHandoff, normalizeReviewHandoff, reviewHandoffWorkRequest } from "../domain/review-handoff.js";
-import { isAutomaticReviewExecution } from "../domain/automatic-review-policy.js";
+import { isAutomaticReviewExecution, automaticReviewAssignmentSupersedes } from "../domain/automatic-review-policy.js";
 
 export const CONFIRMATION_QUEUE_STATE_KEY = "confirmation-queue";
 const STATE_KEY = CONFIRMATION_QUEUE_STATE_KEY;
@@ -179,13 +179,13 @@ function requiresRecovery(item) {
     (item.status === "failed" && item.failure?.outcome === "unknown");
 }
 
-function blocksAutomaticReview(previous, item) {
+function blocksAutomaticReview(previous, item, assignmentProof) {
   if (previous.id === item.id || previous.action.type !== "pull_request_review" ||
       previous.actor.accountId.toLowerCase() !== item.actor.accountId.toLowerCase() ||
       previous.target.resourceId.toLowerCase() !== item.target.resourceId.toLowerCase() ||
       previous.target.version !== item.target.version) return false;
   return previous.failure?.outcome === "unknown" || previous.status === "executing" ||
-    (previous.status === "completed" && (isAutomaticReviewExecution(previous) ||
+    (previous.status === "completed" && !automaticReviewAssignmentSupersedes(previous, item, assignmentProof) && (isAutomaticReviewExecution(previous) ||
       ["APPROVE", "REQUEST_CHANGES"].includes(previous.action.reviewEvent)));
 }
 
@@ -920,11 +920,11 @@ export class ConfirmationQueue {
     );
   }
 
-  async approve(id, input) {
+  async approve(id, input, assignmentProof = null) {
     this.#assertReady();
     const request = normalizeConfirmationRequest(input);
     return this.#runIdempotent("approve", id, request, () =>
-      this.#approve(id, request),
+      this.#approve(id, request, assignmentProof),
     );
   }
 
@@ -1033,7 +1033,7 @@ export class ConfirmationQueue {
     return promise;
   }
 
-  async #approve(id, request) {
+  async #approve(id, request, assignmentProof) {
     const item = this.#requireItem(id);
     this.#assertBinding(item, request, { revisions: item.status === "pending" });
     this.#assertHandoffBinding(item, request);
@@ -1048,7 +1048,7 @@ export class ConfirmationQueue {
         409,
       );
     }
-    return this.#execute(item, request);
+    return this.#execute(item, request, assignmentProof);
   }
 
   async #retry(id, request) {
@@ -1151,9 +1151,9 @@ export class ConfirmationQueue {
     return this.#projectItem(this.#requireItem(id));
   }
 
-  async #execute(item, request) {
+  async #execute(item, request, assignmentProof = null) {
     if (isAutomaticReviewExecution({ ...item, execution: { requestId: request.requestId } }) &&
-        this.state.items.some((other) => blocksAutomaticReview(other, item))) {
+        this.state.items.some((other) => blocksAutomaticReview(other, item, assignmentProof))) {
       return this.#invalidate(item.id, { requestedBy: item.requestedBy, approvalBindingDigest: item.approvalBindingDigest, reason: "authorization_changed" });
     }
     if (

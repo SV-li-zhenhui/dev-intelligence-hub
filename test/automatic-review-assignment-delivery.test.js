@@ -124,6 +124,31 @@ async function fixture({ reviewEvent = "REQUEST_CHANGES", automatic = true, lega
     async restart() { queue = makeQueue(); await queue.recover(); } };
 }
 
+test("a later Assign on the same Head passes the real queue after an earlier automatic Review", async () => {
+  const store = new MemoryStore();
+  let at = NOW, publications = 0;
+  const facts = { kind: "pull_request", state: "open", isDraft: false, author: "developer", headRefOid: HEAD,
+    assignees: ["review-account"], incomingReviewFactsAvailable: true, reviewRecipient: "review-account",
+    reviewReceivedFrom: "developer", reviewReceivedVia: "assignee", reviewRequestEventId: "assign-first",
+    reviewReceivedAt: "2026-10-15T01:30:00Z" };
+  const queue = new ConfirmationQueue({ store, exclusiveLease: { run: fn => fn() }, clock: () => new Date(at),
+    executor: { async execute() { publications++; return { status: "applied", receipt: { id: `review-${publications}`, createdAt: at } }; },
+      async reconcile() { assert.fail("must not reconcile a completed Review"); } } });
+  await queue.recover();
+  const publisher = new AutomaticReviewPublisher({ enabled: true, assignAfterReview: false, queue,
+    github: { async readIncomingReviewRequest() { return clone(facts); } }, clock: () => new Date(at) });
+  const first = await queue.enqueue(plan("COMMENT"));
+  assert.equal((await publisher.publish(first)).status, "completed");
+  Object.assign(facts, { myLatestPublishedReviewCommitOid: HEAD, myLatestPublishedReviewState: "COMMENTED",
+    myLatestPublishedReviewAt: NOW, reviewRequestEventId: "assign-later", reviewReceivedAt: "2026-10-15T02:05:00Z" });
+  at = "2026-10-15T02:10:00.000Z";
+  const nextPlan = plan("COMMENT"); nextPlan.id = "review-delivery-42-later";
+  const second = await queue.enqueue(nextPlan);
+  assert.equal((await publisher.publish(second)).status, "completed");
+  assert.equal(publications, 2);
+  assert.equal((await queue.get(first.id)).status, "completed");
+});
+
 for (const continuation of ["assigned", "owner_requested", "orchestrated_rereview"]) {
   test(`system ${continuation} continuation publishes failed-CI Review and hands off automatically after restart`, async () => {
     const f = await fixture({ continuation, reviewEvent: "COMMENT" });

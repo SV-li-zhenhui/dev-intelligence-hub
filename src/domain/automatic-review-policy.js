@@ -1,6 +1,40 @@
 const DAY_MS = 86_400_000;
 const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 const sameLogin = (left, right) => typeof left === "string" && typeof right === "string" && left.toLowerCase() === right.toLowerCase();
+const assignmentProofs = new WeakMap();
+
+function hasLaterIncomingAssignment(item, account, now) {
+  if (item.incomingReviewFactsAvailable !== true || !sameLogin(item.reviewRecipient, account) ||
+      !LOGIN.test(item.reviewReceivedFrom || "") || sameLogin(item.reviewReceivedFrom, account) ||
+      item.reviewReceivedVia !== "assignee" || !item.reviewRequestEventId) return false;
+  const received = Date.parse(item.reviewReceivedAt || "");
+  const published = Date.parse(item.myLatestPublishedReviewAt || "");
+  const timestamp = now instanceof Date ? now.getTime() : Date.parse(now);
+  return Number.isFinite(received) && Number.isFinite(published) && Number.isFinite(timestamp) &&
+    received > published && received <= timestamp;
+}
+
+// Only the host publisher supplies this in-memory proof; JSON approval requests
+// cannot authorize another Review after an earlier same-Head publication.
+export function createAutomaticReviewAssignmentProof(item, facts, now) {
+  if (item?.kind !== "github.work-proposal-review" || facts?.headRefOid !== item.target?.version ||
+      automaticReviewEligibility(facts, item.actor?.accountId, now) !== null ||
+      !hasLaterIncomingAssignment(facts, item.actor?.accountId, now)) return null;
+  const proof = Object.freeze({});
+  assignmentProofs.set(proof, { id: item.id, approvalBindingDigest: item.approvalBindingDigest,
+    receivedAt: Date.parse(facts.reviewReceivedAt) });
+  return proof;
+}
+
+export function automaticReviewAssignmentSupersedes(previous, item, proof) {
+  const stored = proof && assignmentProofs.get(proof);
+  const publishedAt = Date.parse(previous.receipt?.createdAt || "");
+  return Boolean(stored && stored.id === item.id && stored.approvalBindingDigest === item.approvalBindingDigest &&
+    previous.status === "completed" && Number.isFinite(publishedAt) && stored.receivedAt > publishedAt &&
+    sameLogin(previous.actor?.accountId, item.actor?.accountId) &&
+    previous.target?.resourceId?.toLowerCase() === item.target?.resourceId?.toLowerCase() &&
+    previous.target?.version === item.target?.version);
+}
 
 // Live assignees authorize standing automatic work. Legacy projections without
 // that list use their original assignment-event admission.
@@ -8,13 +42,14 @@ export function automaticReviewEligibility(item, account, now = new Date()) {
   if (!LOGIN.test(account || "") || item?.kind !== "pull_request") return "INVALID_TARGET";
   if (item.state?.toLowerCase() !== "open" || item.isDraft !== false) return "PR_NOT_READY";
   if (!LOGIN.test(item.author || "") || sameLogin(item.author, account)) return "SELF_AUTHORED";
+  const reassigned = hasLaterIncomingAssignment(item, account, now);
   // Live assignment is sufficient in automatic mode. Older stored projections
   // without an assignee list retain their original admission fallback.
   if (Array.isArray(item.assignees)) {
     if (!item.assignees.some(login => sameLogin(login, account))) return "NO_CURRENT_INCOMING_REQUEST";
     if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(item.headRefOid || "")) return "HEAD_UNKNOWN";
-    if (["APPROVED", "CHANGES_REQUESTED"].includes(item.myReviewState) && item.myReviewCommitOid === item.headRefOid) return "HEAD_ALREADY_REVIEWED";
-    if (item.myLatestPublishedReviewCommitOid === item.headRefOid) return "HEAD_ALREADY_REVIEWED";
+    if (!reassigned && ["APPROVED", "CHANGES_REQUESTED"].includes(item.myReviewState) && item.myReviewCommitOid === item.headRefOid) return "HEAD_ALREADY_REVIEWED";
+    if (!reassigned && item.myLatestPublishedReviewCommitOid === item.headRefOid) return "HEAD_ALREADY_REVIEWED";
     return null;
   }
   if (item.ciStatus && !["NONE", "SUCCESS", "FAILURE", "ERROR"].includes(item.ciStatus)) return "CI_NOT_READY";
@@ -25,7 +60,7 @@ export function automaticReviewEligibility(item, account, now = new Date()) {
   const timestamp = now instanceof Date ? now.getTime() : Date.parse(now);
   if (!Number.isFinite(received) || !Number.isFinite(timestamp) || received > timestamp || timestamp - received > DAY_MS) return "OUTSIDE_RECEIVED_WINDOW";
   if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(item.headRefOid || "")) return "HEAD_UNKNOWN";
-  if (["APPROVED", "CHANGES_REQUESTED"].includes(item.myReviewState) && item.myReviewCommitOid === item.headRefOid) return "HEAD_ALREADY_REVIEWED";
+  if (!reassigned && ["APPROVED", "CHANGES_REQUESTED"].includes(item.myReviewState) && item.myReviewCommitOid === item.headRefOid) return "HEAD_ALREADY_REVIEWED";
   const published = Date.parse(item.myLatestPublishedReviewAt || "");
   if (Number.isFinite(published) && published >= received) return "ASSIGNMENT_ALREADY_REVIEWED";
   return null;
