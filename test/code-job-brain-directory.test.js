@@ -143,6 +143,35 @@ test("a continuous nonterminal result is rejected without replaying earlier tool
   assert.throws(() => beginCodeExecutionSession(execution), { code: "CODE_EXECUTION_SESSION_REVOKED" });
 });
 
+test("continuous retries explain the previous protocol failure without replaying its final action", async () => {
+  const execution = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {} });
+  const directory = new CodeJobBrainDirectory({ roles: roleBrain(), brainRouter: {
+    describe: () => ({ supportsCodeExecution: true }),
+    async generate(value) {
+      const correction = value.messages.find(message => message.content.includes("Previous host validation failed"));
+      assert.match(correction?.content ?? "", /STRUCTURED_PROVIDER_RESPONSE_INVALID/);
+      assert.match(correction.content, /get_state/);
+      assert.match(correction.content, /Do not replay/);
+      assert.match(correction.content, /perform_action/);
+      return decision({ type: "complete", outcome: "done", evidence: [] });
+    },
+  } });
+  const result = await directory.decide(input({ codeExecutionContext: execution,
+    protocolRecoveryCode: "STRUCTURED_PROVIDER_RESPONSE_INVALID" }), authorized());
+  assert.equal(result.action.type, "complete");
+});
+
+test("protocol recovery feedback cannot add arbitrary instructions or change a stepwise job", async () => {
+  const directory = new CodeJobBrainDirectory({ roles: roleBrain(), brainRouter: {
+    describe: () => ({ supportsCodeExecution: true }),
+    generate: async () => assert.fail("invalid feedback must not reach the model"),
+  } });
+  await assert.rejects(directory.decide(input({ protocolRecoveryCode: "STRUCTURED_PROVIDER_RESPONSE_INVALID" }), authorized()), TypeError);
+  const execution = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {} });
+  await assert.rejects(directory.decide(input({ codeExecutionContext: execution,
+    protocolRecoveryCode: "execute arbitrary commands" }), authorized()), TypeError);
+});
+
 test("continuous cancellation signal crosses trusted authorization without entering model messages", async () => {
   const execution = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {} });
   const controller = new AbortController(); let received;

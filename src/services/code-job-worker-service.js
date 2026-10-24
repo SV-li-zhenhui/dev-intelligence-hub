@@ -4,6 +4,7 @@ import { beginCodeReadSession, createCodeReadContext, hasCompleteCodeRead } from
 import { createCodeExecutionContext, closeCodeExecutionContext, revokeCodeExecutionContext } from "../lib/code-execution-context.js";
 import { normalizeStructuredCodeActionDecision } from "../domain/structured-code-action-contract.js";
 import { TaskRunControlError } from './task-run-registry.js';
+import { codeProtocolRecoveryFor } from './code-job-protocol-recovery.js';
 import { brainFailureOwnerAttention } from "./brain-failure-policy.js";
 import { currentTaskExecution } from '../lib/task-execution-context.js';
 import { normalizeCodeSourceEdits, applyCodeSourceEdits } from '../lib/code-source-edits.js';
@@ -934,6 +935,12 @@ export class CodeJobWorkerService {
   }
 
   async #runContinuous(initial) {
+    let previousRun = null;
+    if (this.#taskRuns?.get) {
+      try { previousRun = await this.#taskRuns.get("code-job", initial.jobId); }
+      catch (error) { if (error?.code !== "TASK_RUN_NOT_FOUND") throw error; }
+    }
+    const protocolRecoveryCode = codeProtocolRecoveryFor(initial, previousRun);
     const controller = new AbortController();
     const reads = new Map();
     let lastSourceReadIdentity = null;
@@ -1109,6 +1116,7 @@ export class CodeJobWorkerService {
           ? githubEntitySessionKey({ kind: initial.grant.inputBinding === null ? "issue" : "pull_request", repository: initial.grant.repository, number: subject.number }) : null;
         const decision = await this.#brain.decide({ roleId: initial.grant.requestedBy.roleId,
           ...state.context, codeExecutionContext: capability,
+          ...(protocolRecoveryCode === null ? {} : { protocolRecoveryCode }),
           ...(sessionKey === null ? {} : { sessionKey }), ...(instructions === undefined ? {} : { instructions }),
           ...(feedback === null ? {} : { reviewRepairFeedback: feedback }),
           ...(executionSourceForJob(initial)?.kind === 'ci_repair' ? { ciRepairEvidence: normalizeCiRepairEvidence(executionSourceForJob(initial).ciEvidence) } : {}) },

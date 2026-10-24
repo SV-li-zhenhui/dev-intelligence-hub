@@ -1,0 +1,23 @@
+const CODES = new Set([
+  "STRUCTURED_PROVIDER_RESPONSE_INVALID", "CODE_BRAIN_COMPLETION_NOT_READY", "CODE_BRAIN_RESPONSE_INVALID",
+]);
+
+export function isCodeProtocolRecoveryCode(code) { return CODES.has(code); }
+
+// Advisory feedback only: the next invocation still owns a new capability and
+// validates all actions against its current durable checkpoint.
+export function codeProtocolRecoveryFor(job, run) {
+  const receipt = run?.receipt;
+  if (run?.active !== false || run.mode !== "active" || run.pendingCommand !== null || run.stopUnconfirmed === true ||
+      run.kind !== "code-job" || run.taskId !== job.jobId || run.roleId !== job.grant.requestedBy.roleId ||
+      receipt?.kind !== "code-job" || receipt.taskId !== job.jobId || receipt.roleId !== run.roleId ||
+      receipt.runId !== run.runId || receipt.phase !== "failed" || !receipt.finishedAt || receipt.stopConfirmed !== true ||
+      receipt.session?.transport !== "app-server" || !CODES.has(receipt.outcomeCode)) return null;
+  return receipt.outcomeCode;
+}
+
+export function codeProtocolRecoveryMessages(code) {
+  if (code === undefined) return [];
+  if (!CODES.has(code)) throw new TypeError("protocolRecoveryCode is invalid");
+  return [{ role: "system", content: `Previous host validation failed (${code}). This is a fresh continuous invocation, not a request to repeat its final answer. Call get_state and inspect the current checkpoint. Do not replay actions from the previous response or earlier tools. Use perform_action for allowed nonterminal actions such as read_text, write_text and run_profile; these are not final answers. Use read_source for full audited source pages. Return a final complete decision only after current reads and required checks are satisfied. A rejected final response is not evidence that its suggested action executed.` }];
+}

@@ -24,6 +24,7 @@ import { createTaskRunSettler } from '../src/services/work-ledger-run-control.js
 import { currentTaskExecution } from '../src/lib/task-execution-context.js';
 import { PreparationAbortedError } from '../src/lib/preparation-cancellation.js';
 import { AutomaticCodeJobPauseRecovery } from '../src/services/automatic-code-job-pause-recovery.js';
+import { codeProtocolRecoveryFor } from '../src/services/code-job-protocol-recovery.js';
 import { incompleteReadPauseReason } from '../src/services/code-job-read-recovery.js';
 import { assertPreparedWriteRead, bindTrustedAction, modelObservation, observationDetail, verificationFailure } from "../src/services/code-job-worker-policy.js";
 
@@ -1176,6 +1177,46 @@ async function continuousTimeoutFixture(initialDecide, { timeoutCode = "STRUCTUR
     },
   };
 }
+
+test("protocol retry feedback requires this job's stopped native receipt and preserves owner controls", () => {
+  const job = { jobId: "job-1", grant: { requestedBy: { roleId: "developer" } } };
+  const run = { kind: "code-job", taskId: "job-1", roleId: "developer", runId: "run-1", active: false,
+    mode: "active", pendingCommand: null, receipt: { kind: "code-job", taskId: "job-1", roleId: "developer",
+      runId: "run-1", phase: "failed", finishedAt: "2026-10-24T03:41:36Z", stopConfirmed: true,
+      session: { transport: "app-server" }, outcomeCode: "STRUCTURED_PROVIDER_RESPONSE_INVALID" } };
+  for (const code of ["STRUCTURED_PROVIDER_RESPONSE_INVALID", "CODE_BRAIN_COMPLETION_NOT_READY", "CODE_BRAIN_RESPONSE_INVALID"]) {
+    assert.equal(codeProtocolRecoveryFor(job, { ...run, receipt: { ...run.receipt, outcomeCode: code } }), code);
+  }
+  for (const change of [{ active: true }, { mode: "paused" }, { pendingCommand: "pause" }, { stopUnconfirmed: true },
+    { taskId: "other" }, { roleId: "tester" }, { runId: "old-run" }]) {
+    assert.equal(codeProtocolRecoveryFor(job, { ...run, ...change }), null);
+  }
+  for (const change of [{ stopConfirmed: false }, { finishedAt: null }, { phase: "running" }, { taskId: "other" },
+    { session: null }, { outcomeCode: "STRUCTURED_PROVIDER_CLEANUP_FAILED" }]) {
+    assert.equal(codeProtocolRecoveryFor(job, { ...run, receipt: { ...run.receipt, ...change } }), null);
+  }
+});
+
+test("a restarted continuous worker carries the stopped protocol failure into its fresh model request", async () => {
+  const fixture = await continuousTimeoutFixture(async () => { throw fixture.nativeTimeout(); },
+    { timeoutCode: "STRUCTURED_PROVIDER_RESPONSE_INVALID" });
+  assert.equal((await fixture.worker().runCycle()).outcomes[0].status, "retry");
+  const prior = await fixture.registry.get("code-job", fixture.durableJob.jobId);
+  assert.equal(prior.receipt.stopConfirmed, true);
+  fixture.advance(120_000);
+  fixture.setDecide(async input => {
+    assert.equal(input.protocolRecoveryCode, "STRUCTURED_PROVIDER_RESPONSE_INVALID");
+    const tools = beginCodeExecutionSession(input.codeExecutionContext);
+    await tools.invoke("get_state", {});
+    await tools.invoke("read_source", { path: "src/app.js", offset: 0 });
+    await tools.invoke("perform_action", { decision: continuousDecision({ type: "run_profile" }) });
+    await tools.close();
+    return continuousDecision({ type: "complete", outcome: "fresh checkpoint", evidence: [] });
+  });
+  const resumed = await fixture.worker().runCycle();
+  assert.equal(resumed.outcomes[0].status, "completed", JSON.stringify(resumed));
+  assert.equal(fixture.executor.calls.filter(call => call.value?.action?.type === "read_text").length, 1);
+});
 
 test("confirmed native idle timeout continues even when the last session label is still running", async () => {
   const fixture = await continuousTimeoutFixture(async () => {

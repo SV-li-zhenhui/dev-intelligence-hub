@@ -15,6 +15,7 @@ import { normalizeReviewRepairFeedbackContext, reviewRepairMessages } from "./re
 import { normalizeCiRepairEvidence } from '../domain/ci-repair-evidence.js';
 import { ciRepairMessages } from './ci-repair-context-reader.js';
 import { taskInstructionMessages } from '../lib/task-execution-context.js';
+import { codeProtocolRecoveryMessages, isCodeProtocolRecoveryCode } from './code-job-protocol-recovery.js';
 import { createConfiguredBrainRouter } from "./configured-workforce.js";
 
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
@@ -251,6 +252,7 @@ function normalizeDecisionInput(value) {
   const hasInstructions = value !== null && typeof value === 'object' && Object.hasOwn(value,'instructions');
   const hasCodeReadContext = value !== null && typeof value === "object" && Object.hasOwn(value, "codeReadContext");
   const hasCodeExecutionContext = value !== null && typeof value === "object" && Object.hasOwn(value, "codeExecutionContext");
+  const hasProtocolRecoveryCode = value !== null && typeof value === "object" && Object.hasOwn(value, "protocolRecoveryCode");
   const input = exactData(
     value,
     [
@@ -261,6 +263,7 @@ function normalizeDecisionInput(value) {
       ...(hasInstructions ? ['instructions'] : []),
       ...(hasCodeReadContext ? ["codeReadContext"] : []),
       ...(hasCodeExecutionContext ? ["codeExecutionContext"] : []),
+      ...(hasProtocolRecoveryCode ? ["protocolRecoveryCode"] : []),
       "task",
       "capabilities",
       "turn",
@@ -281,6 +284,9 @@ function normalizeDecisionInput(value) {
   if (hasCodeExecutionContext && (!isCodeExecutionContext(input.codeExecutionContext) || hasCodeReadContext)) {
     throw new TypeError("codeExecutionContext is invalid");
   }
+  if (hasProtocolRecoveryCode && (!hasCodeExecutionContext || !isCodeProtocolRecoveryCode(input.protocolRecoveryCode))) {
+    throw new TypeError("protocolRecoveryCode is invalid");
+  }
   const context = packCodeJobBrainContext({
     task: normalizeTask(input.task),
     capabilities: normalizeCapabilities(input.capabilities),
@@ -293,6 +299,7 @@ function normalizeDecisionInput(value) {
     roleId: input.roleId,
     context,
     instructions: hasInstructions ? value.instructions : undefined,
+    ...(hasProtocolRecoveryCode ? { protocolRecoveryCode: input.protocolRecoveryCode } : {}),
     ...(hasCodeReadContext ? { codeReadContext: input.codeReadContext } : {}),
     ...(hasCodeExecutionContext ? { codeExecutionContext: input.codeExecutionContext } : {}),
     ...(hasReviewRepairFeedback ? { reviewRepairFeedback: normalizeReviewRepairFeedbackContext(input.reviewRepairFeedback) } : {}),
@@ -408,7 +415,7 @@ export class CodeJobBrainDirectory {
 
   async decide(value, authorization) {
     this.#assertOpen();
-    const { roleId, context, sessionKey, reviewRepairFeedback, ciRepairEvidence, instructions, codeReadContext, codeExecutionContext } = normalizeDecisionInput(value);
+    const { roleId, context, sessionKey, reviewRepairFeedback, ciRepairEvidence, instructions, codeReadContext, codeExecutionContext, protocolRecoveryCode } = normalizeDecisionInput(value);
     const { beforeGenerate, admitGenerate, signal } =
       requireDecisionAuthorization(authorization);
     if (!this.#taskBrains.has(roleId)) {
@@ -435,6 +442,7 @@ export class CodeJobBrainDirectory {
       ...reviewRepairMessages(reviewRepairFeedback),
       ...ciRepairMessages(ciRepairEvidence),
       ...taskInstructionMessages(instructions),
+      ...codeProtocolRecoveryMessages(protocolRecoveryCode),
     ];
     const maximumAttempts = codeExecutionContext !== undefined || isSingleAttemptBrain(this.#router, brain) ? 1 : 2;
     for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
