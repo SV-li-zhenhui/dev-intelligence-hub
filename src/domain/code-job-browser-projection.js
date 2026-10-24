@@ -411,6 +411,9 @@ export function projectCodeJobObservationForBrowser(observation) {
     detailDigest: observation.detailDigest,
     detail: {
       schemaVersion: observation.detail?.schemaVersion ?? 1,
+      ...(observation.actionType === "write_text" && observation.status === "failed" &&
+          observation.detail?.origin === "host_pre_execution_rejection" && observation.detail.notExecuted === true
+        ? { origin: "host_pre_execution_rejection", notExecuted: true } : {}),
       executor: projectedExecutor(observation.detail?.executor),
       result: projectedObservationResult(observation),
     },

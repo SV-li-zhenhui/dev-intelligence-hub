@@ -1491,7 +1491,7 @@ import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
 import { CodeJobStore } from "../src/services/code-job-store.js";
 import { CodeJobApprovalExecutor } from "../src/services/code-job-approval-executor.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
-import { ObsoleteCodeJobSettler, hasUnstartedCodeJobAuthorityFence } from "../src/services/obsolete-code-job-settler.js";
+import { ObsoleteCodeJobSettler, hasUnstartedCodeJobAuthorityFence, hasSettledCodeJobAuthorityFence } from "../src/services/obsolete-code-job-settler.js";
 import {
   createLocalWorkLedgerCandidateProcessor,
   createWorkerWorkLedgerCandidateProcessor,
@@ -5758,6 +5758,129 @@ test("an admitted old-Head job keeps the next Head fenced until cancellation is 
     assert.notEqual(root.source.pendingRevision, null);
   }
   assert.equal(cancellations, 1);
+});
+
+async function stoppedStartedFenceFixture({ unexecutedWrite = false } = {}) {
+  const fixture = await revokedCodeConfirmationFixture({ createdJob: true });
+  let job = (await fixture.jobs.list()).items[0];
+  await fixture.jobs.resume({ jobId: job.jobId, expectedRevision: job.revision });
+  job = await fixture.jobs.get(job.jobId);
+  let result = await fixture.jobs.claimStarting({ jobId: job.jobId, expectedRevision: job.revision });
+  result = await fixture.jobs.activate({ jobId: job.jobId, expectedRevision: result.job.revision, workspaceRevision: "4".repeat(64) });
+  result = await fixture.jobs.prepareAction({ jobId: job.jobId, expectedRevision: result.job.revision,
+    action: { type: "read_text", actionId: "old-read", path: "src/app.js", expectedWorkspaceRevision: "4".repeat(64) } });
+  result = await fixture.jobs.recordObservation({ jobId: job.jobId, expectedRevision: result.job.revision,
+    actionId: "old-read", status: "succeeded", workspaceRevision: "4".repeat(64), detail: { path: "src/app.js", content: "old" } });
+  if (unexecutedWrite) {
+    result = await fixture.jobs.prepareAction({ jobId: job.jobId, expectedRevision: result.job.revision,
+      action: { type: "write_text", actionId: "rejected-write", path: "src/app.js", content: "never written",
+        expectedSha256: "5".repeat(64), expectedWorkspaceRevision: "4".repeat(64) } });
+    result = await fixture.jobs.recordObservation({ jobId: job.jobId, expectedRevision: result.job.revision,
+      actionId: "rejected-write", status: "failed", workspaceRevision: "4".repeat(64),
+      detail: { schemaVersion: 1, origin: "host_pre_execution_rejection", notExecuted: true,
+        result: { bytes: 0, error: { code: "CODE_ARTIFACT_READ_INCOMPLETE", message: "Rejected before admission" } } } });
+  }
+  await fixture.jobs.fence({ jobId: job.jobId, expectedRevision: result.job.revision, result: { code: "INVALID_CODE_JOB_AUTHORITY" } });
+  job = await fixture.jobs.get(job.jobId);
+  const run = { kind: "code-job", taskId: job.jobId, roleId: job.requestedBy.roleId, runId: "stopped-native",
+    active: false, mode: "active", pendingCommand: null, receipt: { kind: "code-job", taskId: job.jobId,
+      roleId: job.requestedBy.roleId, runId: "stopped-native", phase: "failed", stopConfirmed: true,
+      finishedAt: job.updatedAt, session: { transport: "app-server" } } };
+  const session = { id: job.jobId, workspaceId: job.workspaceId, requestedBy: structuredClone(job.requestedBy),
+    inputBinding: structuredClone(job.inputBinding), executionSource: structuredClone(job.executionSource), status: "interrupted", revision: 1,
+    workspaceRevision: "4".repeat(64), attempt: { number: 1, status: "interrupted" }, cleanupPending: false,
+    actions: [{ id: "old-read", type: "read_text", status: "succeeded", workspaceRevisionAfter: "4".repeat(64) }], updatedAt: job.updatedAt };
+  fixture.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader: fixture.jobs,
+    codeJobControl: { cancel: async () => assert.fail("a settled terminal fence must not be rewritten") },
+    taskRuns: { get: async () => structuredClone(run) }, codeExecutorReader: { view: async () => structuredClone(session) } });
+  return { ...fixture, job, run, session };
+}
+
+test("a started authority-fenced job releases the next PR generation only after native and executor settlement", async () => {
+  const fixture = await stoppedStartedFenceFixture();
+  assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, true);
+  const root = await fixture.service.readItemForReconciliation({ itemId: fixture.item.itemId });
+  assert.equal(root.source.current.headRefOid, PR_HEAD_B);
+  assert.equal(root.source.pendingRevision, null);
+  assert.equal(root.status, "queued");
+  assert.deepEqual(await fixture.jobs.get(fixture.job.jobId), fixture.job);
+});
+
+test("a host-rejected write is retained as unexecuted evidence during stopped fence settlement", async () => {
+  const fixture = await stoppedStartedFenceFixture({ unexecutedWrite: true });
+  const detail = await fixture.jobs.getDetail({ jobId: fixture.job.jobId, limit: 20 });
+  assert.equal(detail.observations[1].detail.notExecuted, true);
+  assert.equal(detail.observations[1].detail.origin, "host_pre_execution_rejection");
+  assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, true);
+  assert.deepEqual(await fixture.jobs.get(fixture.job.jobId), fixture.job);
+});
+
+test("a native stop and executor drain completed after authority fencing can settle the old generation", async () => {
+  const fixture = await stoppedStartedFenceFixture();
+  fixture.time.advance(5_000);
+  fixture.run.receipt.finishedAt = fixture.time.clock();
+  fixture.session.updatedAt = fixture.time.clock();
+  assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, true);
+  assert.deepEqual(await fixture.jobs.get(fixture.job.jobId), fixture.job);
+});
+
+test("started fence proof cannot be copied or minted across changing host controls", async () => {
+  const fixture = await stoppedStartedFenceFixture();
+  const stored = await fixture.jobs.getForWorker(fixture.job.jobId);
+  const marked = await fixture.service.obsoleteCodeJobSettler.read({ grant: stored.grant, receipt: fixture.snapshot.item.receipt });
+  assert.equal(hasSettledCodeJobAuthorityFence(marked), true);
+  assert.equal(hasSettledCodeJobAuthorityFence(structuredClone(marked)), false);
+  marked.revision++;
+  assert.equal(hasSettledCodeJobAuthorityFence(marked), false);
+  let reads = 0;
+  fixture.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader: fixture.jobs,
+    codeJobControl: { cancel: async () => assert.fail("terminal result must remain unchanged") },
+    taskRuns: { get: async () => { const view = structuredClone(fixture.run); if (++reads > 1) view.mode = "paused"; return view; } },
+    codeExecutorReader: { view: async () => structuredClone(fixture.session) } });
+  assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, false);
+});
+
+test("missing host nonexecution metadata cannot settle an unmatched historical action", async () => {
+  const fixture = await stoppedStartedFenceFixture({ unexecutedWrite: true });
+  fixture.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({
+    codeJobReader: { get: id => fixture.jobs.get(id), getDetail: async input => {
+      const detail = await fixture.jobs.getDetail(input);
+      for (const observation of detail.observations) delete observation.detail.notExecuted;
+      return detail;
+    } },
+    codeJobControl: { cancel: async () => assert.fail("uncertain history must remain fenced") },
+    taskRuns: { get: async () => structuredClone(fixture.run) }, codeExecutorReader: { view: async () => structuredClone(fixture.session) } });
+  assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, false);
+});
+
+test("missing stop evidence preserves the fence without failing unrelated reconciliation", async (t) => {
+  for (const missing of ["native", "executor"]) await t.test(missing, async () => {
+    const fixture = await stoppedStartedFenceFixture();
+    fixture.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader: fixture.jobs,
+      codeJobControl: { cancel: async () => assert.fail("missing evidence cannot rewrite a fence") },
+      taskRuns: { get: async () => { if (missing === "native") throw Object.assign(new Error("missing"), { code: "TASK_RUN_NOT_FOUND" }); return structuredClone(fixture.run); } },
+      codeExecutorReader: { view: async () => { if (missing === "executor") throw Object.assign(new Error("missing"), { code: "SESSION_NOT_FOUND" }); return structuredClone(fixture.session); } } });
+    assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, false);
+  });
+});
+
+test("started fence settlement preserves controls, unsettled actions and exact executor identity", async (t) => {
+  for (const [name, alter] of [
+    ["unconfirmed native stop", f => { f.run.receipt.stopConfirmed = false; }],
+    ["live native run", f => { f.run.active = true; }],
+    ["owner pause", f => { f.run.mode = "paused"; }],
+    ["pending owner control", f => { f.run.pendingCommand = "pause"; }],
+    ["preparation still running", f => { f.session.status = "preparing"; }],
+    ["unsettled action", f => { f.session.actions[0].status = "interrupted"; }],
+    ["cleanup pending", f => { f.session.cleanupPending = true; }],
+    ["different executor binding", f => { f.session.inputBinding.headRefOid = "f".repeat(40); }],
+    ["different workspace version", f => { f.session.workspaceRevision = "f".repeat(64); }],
+  ]) await t.test(name, async () => {
+    const fixture = await stoppedStartedFenceFixture();
+    alter(fixture);
+    assert.equal((await fixture.service.reconcilePullRequestSource(fixture.command)).applied, false);
+    assert.deepEqual(await fixture.jobs.get(fixture.job.jobId), fixture.job);
+  });
 });
 
 test("stale PR source reconciliation commands cannot cancel an old code job", async () => {

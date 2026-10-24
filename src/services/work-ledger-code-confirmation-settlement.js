@@ -12,7 +12,7 @@ import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js"
 import { currentWorkItemInputBinding } from "./work-ledger-pr-source.js";
 import { ledgerDigest } from "./work-ledger-values.js";
 import { normalizeCodeJobConfirmationResult } from "./code-job-confirmation-result.js";
-import { hasUnstartedCodeJobAuthorityFence } from "./obsolete-code-job-settler.js";
+import { hasSettledCodeJobAuthorityFence } from "./obsolete-code-job-settler.js";
 import { codeJobIdForGrant } from "../domain/code-job-contract.js";
 
 // Only server-side confirmation reads can mint these ephemeral capabilities.
@@ -143,7 +143,7 @@ export function createCompletedCodeConfirmationSettlement(item, outboxById, snap
   if (completed === null || value == null) return null;
   try {
     const job = normalizeCodeJobConfirmationResult(value, completed.grant, completed.receipt);
-    if ((!["completed", "failed", "cancelled"].includes(job.status) && !hasUnstartedCodeJobAuthorityFence(value)) ||
+    if ((!["completed", "failed", "cancelled"].includes(job.status) && !hasSettledCodeJobAuthorityFence(value)) ||
       job.terminalResult?.kind !== job.status || job.pendingActionType !== null || job.uncertainty !== null) return null;
     return createSettlement(item, completed.outbox);
   } catch {

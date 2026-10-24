@@ -1877,7 +1877,10 @@ export async function createApplication({
         ["pause", "resume", "cancel"],
         "codeJobRuntime.control",
       );
-      obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader, codeJobControl });
+      obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader, codeJobControl, taskRuns,
+        ...(typeof codeExecutorRuntime?.executor?.view === "function" ? {
+          codeExecutorReader: frozenPort(codeExecutorRuntime.executor, ["view"], "obsolete code executor stop reader"),
+        } : {}) });
       if (codeJobChangePackageDeliveryEnabled) {
         codeJobEvidenceReader = frozenPort(
           codeJobEvidenceReaderFactory({
