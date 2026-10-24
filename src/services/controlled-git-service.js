@@ -1939,7 +1939,8 @@ export class ControlledGitService {
           createdFiles.push({ path: target, stats: initialStats, content });
           await handle.writeFile(content);
           await handle.chmod(0o644);
-          await handle.sync();
+          // This scratch copy is rebuilt from sealed evidence after restart;
+          // readback below verifies it without flushing every file to disk.
           const finalStats = await handle.stat();
           if (
             !finalStats.isFile() ||
