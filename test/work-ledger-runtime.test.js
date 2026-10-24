@@ -185,6 +185,7 @@ test("runtime owns one named process guard and exposes least-authority graph por
     "listTimeline",
     "listOutbox",
     "readItemForReconciliation",
+    "canRecoverUnstartedReviewProposal",
     "readAutomaticRoleHandoffCandidates",
     "verifyPullRequestExecutionBindings",
     "reconcilePullRequestSourceBatch",
@@ -206,6 +207,9 @@ test("runtime owns one named process guard and exposes least-authority graph por
   }
   assert.equal(Object.isFrozen(runtime.graphReader), true);
   assert.deepEqual(await runtime.readAutomaticRoleHandoffCandidates({ events: [] }), []);
+  const beforeReviewPreflight = await runtime.getSummary();
+  assert.equal(await runtime.canRecoverUnstartedReviewProposal({ itemId: "unused", expectedRevision: 1 }), false);
+  assert.deepEqual(await runtime.getSummary(), beforeReviewPreflight);
   assert.equal(Object.isFrozen(runtime.graphBrowserReader), true);
   assert.equal(Object.isFrozen(runtime.graphPlanner), true);
   assert.equal(Object.isFrozen(runtime.scopedGraphPlannerFactory), true);
