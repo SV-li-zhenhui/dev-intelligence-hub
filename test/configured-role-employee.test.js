@@ -1544,6 +1544,53 @@ test("a configured role exposes a bounded work-cycle outcome summary", async () 
   assert.equal(JSON.stringify(view).includes("private-item"), false);
 });
 
+test('a role exposes automatic verification recovery failures even when its work scan is empty', async () => {
+  const employee = new ConfiguredRoleEmployee({ definition: definition('developer'), permissions: permissions('complete'),
+    brain: brain(), decisionEngine: fakeDecisionEngine('developer'), store: new MemoryStore(),
+    onRun: async () => ({ stages: {
+      work: { ok: true, result: { scanned: 0, workAttempts: 0, outcomes: [] } },
+      own_pr_material_recovery: { ok: true, result: { verificationRecovery: {
+        scanned: 1, requeued: 0, failed: 1, lastFailure: 'OWN_PR_REPAIR_OBJECT_PREFLIGHT_FAILED',
+      } } },
+    } }),
+  });
+  await employee.run({ trigger: 'scheduled' });
+  assert.equal((await employee.roleView()).lastRun.summary,
+    '扫描 0 项，尝试 0 项；验证准备恢复：扫描 1 项，入队 0 项，失败 1 项（OWN_PR_REPAIR_OBJECT_PREFLIGHT_FAILED）');
+});
+
+test('verification recovery summaries remain bounded and omit unsafe diagnostic data', async t => {
+  for (const scenario of ['zero', 'requeued', 'unsafe-code', 'malformed-count', 'accessor', 'long-work-summary']) await t.test(scenario, async () => {
+    const store = new MemoryStore(), recovery = { scanned: 1, requeued: 0, failed: 0, privateTarget: 'private-recovery-target' };
+    let getters = 0;
+    if (scenario === 'zero') recovery.scanned = 0;
+    if (scenario === 'requeued') recovery.requeued = 1;
+    if (scenario === 'unsafe-code') recovery.lastFailure = 'token=private-recovery-target\nunsafe';
+    if (scenario === 'malformed-count') recovery.scanned = -1;
+    if (scenario === 'accessor') Object.defineProperty(recovery, 'lastFailure', { enumerable: true, get() { getters++; throw new Error('must not read'); } });
+    if (scenario === 'long-work-summary') recovery.lastFailure = 'X'.repeat(128);
+    const options = { definition: definition('developer'), permissions: permissions('complete'), brain: brain(),
+      decisionEngine: fakeDecisionEngine('developer'), store,
+      onRun: async () => ({ stages: {
+        work: { ok: true, result: { scanned: 1, workAttempts: 1,
+          outcomes: scenario === 'long-work-summary' ? Array.from({ length: 8 }, (_, index) => ({ status: `outcome_${index}`, code: 'Y'.repeat(128) })) : [] } },
+        own_pr_material_recovery: { ok: true, result: { verificationRecovery: recovery } },
+      } }),
+    };
+    const employee = new ConfiguredRoleEmployee(options);
+    await employee.run({ trigger: 'scheduled' });
+    const view = await employee.roleView(), summary = view.lastRun.summary;
+    assert.equal(getters, 0);
+    assert.ok(Buffer.byteLength(summary, 'utf8') <= 512);
+    assert.equal(summary.includes('private-recovery-target'), false);
+    assert.equal(summary.includes('验证准备恢复'), !['malformed-count', 'accessor'].includes(scenario));
+    if (scenario === 'zero') assert.ok(summary.includes('验证准备恢复：扫描 0 项'));
+    if (scenario === 'requeued') assert.ok(summary.includes('入队 1 项'));
+    if (scenario === 'long-work-summary') assert.ok(summary.endsWith(`（${'X'.repeat(128)}）`));
+    assert.equal((await new ConfiguredRoleEmployee(options).roleView()).lastRun.summary, summary);
+  });
+});
+
 test("an employee run forwards its shutdown signal and performs no state write after abort", async () => {
   const store = new MemoryStore();
   const started = deferred();

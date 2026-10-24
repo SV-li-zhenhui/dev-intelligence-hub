@@ -93,12 +93,24 @@ function safeRunSummary(value) {
   return value;
 }
 
+function verificationRecoverySummary(stages) {
+  const stage = stages && dataObject(stages.own_pr_material_recovery);
+  const result = stage?.ok === true && dataObject(stage.result);
+  const recovery = result && dataObject(result.verificationRecovery);
+  if (!recovery || ['scanned', 'requeued', 'failed'].some(key =>
+    !Number.isSafeInteger(recovery[key]) || recovery[key] < 0)) return '';
+  const code = typeof recovery.lastFailure === 'string' && /^[A-Z][A-Z0-9_]{0,127}$/.test(recovery.lastFailure)
+    ? `（${recovery.lastFailure}）` : '';
+  return `；验证准备恢复：扫描 ${recovery.scanned} 项，入队 ${recovery.requeued} 项，失败 ${recovery.failed} 项${code}`;
+}
+
 function runSummary(value) {
   const result = dataObject(value);
   const stages = result && dataObject(result.stages);
   const workStage = stages && dataObject(stages.work);
   const work = workStage?.ok === true && dataObject(workStage.result);
-  if (!work) return "本轮未执行岗位任务扫描";
+  const recovery = verificationRecoverySummary(stages);
+  if (!work) return `本轮未执行岗位任务扫描${recovery}`;
   const scanned = Number.isSafeInteger(work.scanned) && work.scanned >= 0
     ? work.scanned
     : 0;
@@ -131,9 +143,11 @@ function runSummary(value) {
       return `${status} ${aggregate.count}${codes ? `（${codes}）` : ""}`;
     })
     .join("、");
-  return `扫描 ${scanned} 项，尝试 ${attempts} 项${
+  const prefix = `扫描 ${scanned} 项，尝试 ${attempts} 项`;
+  const summary = `${prefix}${
     statuses ? `：${statuses}` : ""
-  }`;
+  }${recovery}`;
+  return recovery && Buffer.byteLength(summary, 'utf8') > 512 ? `${prefix}${recovery}` : summary;
 }
 
 function stableErrorCode(error) {
