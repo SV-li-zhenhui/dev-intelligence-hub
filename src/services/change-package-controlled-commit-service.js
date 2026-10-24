@@ -6,7 +6,7 @@ import {
   normalizeChangePackageControlledCommitRequest,
   sameChangePackageControlledCommitReceipt,
 } from "../domain/change-package-controlled-commit.js";
-import { normalizeChangePackageManifest } from "../domain/change-package-contract.js";
+import { normalizeChangePackageManifest, hasChangePackageChanges } from "../domain/change-package-contract.js";
 import { isHeadRepairExecutionSource } from "../domain/code-execution-source.js";
 import { digestValue } from "../domain/code-executor-contract.js";
 import {
@@ -22,8 +22,7 @@ const EVIDENCE_ID = /^controlled-git-commit-[a-f0-9]{64}$/u;
 const STATUSES = new Set(["intent", "evidence", "committed"]);
 
 function isEmptyRepairPackage(request, manifest) {
-  return isHeadRepairExecutionSource(request.executionSource) &&
-    manifest.changes.created.length === 0 && manifest.changes.modified.length === 0 && manifest.changes.deleted.length === 0;
+  return isHeadRepairExecutionSource(request.executionSource) && !hasChangePackageChanges(manifest);
 }
 
 export class ChangePackageControlledCommitServiceError extends Error {

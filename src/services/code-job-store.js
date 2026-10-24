@@ -38,9 +38,10 @@ import {
   normalizeCodeJobChangePackageEvent,
   reconstructCodeJobChangePackageEventForRecovery,
 } from "../domain/code-job-change-package-event.js";
-import { sameCodeExecutionSource } from "../domain/code-execution-source.js";
+import { sameCodeExecutionSource, isHeadRepairExecutionSource } from "../domain/code-execution-source.js";
 import {
   normalizeChangePackageManifest,
+  hasChangePackageChanges,
 } from "../domain/change-package-contract.js";
 import { normalizeChangePackageControlledCommitReceipt } from "../domain/change-package-controlled-commit.js";
 import { normalizeMemoryRecord } from "../domain/memory-record.js";
@@ -735,6 +736,8 @@ function normalizeChangePackageAcknowledgement(value, error, {
   const hasControlledCommit = value !== null &&
     (typeof value === "object" || typeof value === "function") &&
     Object.hasOwn(value, "controlledCommit");
+  const hasNoChanges = value !== null &&
+    (typeof value === "object" || typeof value === "function") && Object.hasOwn(value, "noChanges");
   const keys = [
     "sequence",
     "eventId",
@@ -744,9 +747,11 @@ function normalizeChangePackageAcknowledgement(value, error, {
     "packageId",
     "packageDigest",
     ...(hasControlledCommit ? ["controlledCommit"] : []),
+    ...(hasNoChanges ? ["noChanges"] : []),
     ...(delivered ? ["deliveredAt"] : []),
   ];
   assertExactKeys(value, keys, error);
+  if (hasNoChanges && (value.noChanges !== true || hasControlledCommit)) throw error;
   const eventDigest = normalizeSha256(value.eventDigest, error);
   const packageDigest = normalizeSha256(value.packageDigest, error);
   if (
@@ -767,6 +772,7 @@ function normalizeChangePackageAcknowledgement(value, error, {
     sourceRecordDigest: normalizeSha256(value.sourceRecordDigest, error),
     packageId: value.packageId,
     packageDigest,
+    ...(hasNoChanges ? { noChanges: true } : {}),
     ...(hasControlledCommit
       ? {
           controlledCommit: (() => {
@@ -1596,6 +1602,7 @@ function deliveryReceiptForBrowser(entry) {
         packageId: entry.receipt.packageId,
         packageDigest: entry.receipt.packageDigest,
         deliveredAt: entry.receipt.deliveredAt,
+        ...(entry.receipt.noChanges === true ? { noChanges: true } : {}),
         ...(entry.receipt.controlledCommit === undefined
           ? {}
           : {
@@ -1688,6 +1695,9 @@ function pendingChangePackageAcknowledgement(
     request.jobId === event.job.id &&
     request.sourceRecordDigest === event.job.recordDigest;
   if (!baseMatches) return false;
+  if (request.noChanges === true) {
+    return event.schemaVersion === 3 && isHeadRepairExecutionSource(event.executionSource) && request.controlledCommit === undefined;
+  }
   if (event.schemaVersion === 2) {
     return allowLegacy && request.controlledCommit === undefined;
   }
@@ -4264,7 +4274,9 @@ export class CodeJobStore {
       manifest.workspace.id !== job.grant.workspaceId ||
       manifest.workspace.workspaceRevision !==
         event.exportRequest.expectedWorkspaceRevision ||
-      !sameValue(profileBindings, job.grant.requiredProfiles)
+      !sameValue(profileBindings, job.grant.requiredProfiles) ||
+      (request.noChanges === true && (hasChangePackageChanges(manifest) ||
+        manifest.workspace.sourceRevision !== manifest.workspace.workspaceRevision || !isHeadRepairExecutionSource(event.executionSource)))
     ) {
       throw changePackageBindingConflict();
     }

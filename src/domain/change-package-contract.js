@@ -398,6 +398,10 @@ function deepFreeze(value) {
   return Object.freeze(value);
 }
 
+export function hasChangePackageChanges(manifest) {
+  return manifest.changes.created.length > 0 || manifest.changes.modified.length > 0 || manifest.changes.deleted.length > 0;
+}
+
 export function createChangePackage(value, { limits: limitsValue = {} } = {}) {
   const limits = normalizeChangePackageLimits(limitsValue);
   exactObject(value, [

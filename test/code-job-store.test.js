@@ -8,7 +8,7 @@ import {
   normalizeCodeJob,
 } from "../src/domain/code-job-contract.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
-import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import { createChangePackage } from "../src/domain/change-package-contract.js";
 import { createCodeJobChangePackageEvent } from "../src/domain/code-job-change-package-event.js";
@@ -2876,6 +2876,50 @@ test("schema v3 conflict package delivery is self-contained, recoverable, and id
     batch,
   );
 });
+
+test("an unchanged head repair records package-only delivery without a commit and survives restart", async () => {
+  const { inputBinding, subject } = conflictGrant();
+  const repair = grant({ schemaVersion: 3, inputBinding, subject, operation: "modify",
+    executionSource: createReviewRepairCodeExecutionSource({ inputBinding, writablePaths: ["src"] }),
+    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify], writablePaths: ["src"] });
+  let manifest;
+  const fixture = await completedDeliveryFixture({ jobApproval: approval({ grant: repair }),
+    changePackageReader: { async get() { return structuredClone(manifest); } } });
+  const [event] = (await fixture.jobs.readChangePackageDeliveryBatch({ limit: 1 })).items;
+  const revision = event.exportRequest.expectedWorkspaceRevision;
+  manifest = changePackageForEvent(event, { workspace: { id: "widgets-local", sourceRevision: revision, workspaceRevision: revision } });
+  const request = changePackageAcknowledgement(event, manifest, { noChanges: true });
+  assert.throws(() => fixture.jobs.acknowledgeChangePackageDelivery({ ...request, noChanges: false }), { code: "INVALID_CODE_JOB_MUTATION" });
+  assert.throws(() => fixture.jobs.acknowledgeChangePackageDelivery({ ...request, controlledCommit: {} }), { code: "INVALID_CODE_JOB_MUTATION" });
+  assert.equal((await fixture.jobs.acknowledgeChangePackageDelivery(request)).status, "applied");
+  const detail = await fixture.jobs.getDetail({ jobId: fixture.completed.job.jobId });
+  assert.equal(detail.changePackage.receipt.noChanges, true);
+  assert.equal(detail.changePackage.receipt.controlledCommit, undefined);
+  const recovered = await readyStore({ store: fixture.store,
+    changePackageReader: { async get() { return structuredClone(manifest); } } });
+  assert.equal((await recovered.jobs.acknowledgeChangePackageDelivery(request)).status, "already");
+});
+
+for (const variation of ["changed", "revision", "conflict"]) {
+  test(`package-only delivery cannot waive commit proof for ${variation}`, async () => {
+    const conflict = conflictGrant();
+    const repair = variation === "conflict" ? conflict : grant({ schemaVersion: 3, inputBinding: conflict.inputBinding,
+      subject: conflict.subject, operation: "modify", allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify], writablePaths: ["src"],
+      executionSource: createReviewRepairCodeExecutionSource({ inputBinding: conflict.inputBinding, writablePaths: ["src"] }) });
+    let manifest;
+    const fixture = await completedDeliveryFixture({ jobApproval: approval({ grant: repair }),
+      changePackageReader: { async get() { return structuredClone(manifest); } } });
+    const [event] = (await fixture.jobs.readChangePackageDeliveryBatch({ limit: 1 })).items;
+    const revision = event.exportRequest.expectedWorkspaceRevision;
+    manifest = changePackageForEvent(event, {
+      workspace: { id: "widgets-local", sourceRevision: variation === "revision" ? "3".repeat(64) : revision, workspaceRevision: revision },
+      ...(variation === "changed" ? { created: [{ path: "src/new.js", content: Buffer.from("changed\n") }] } : {}),
+    });
+    await assert.rejects(fixture.jobs.acknowledgeChangePackageDelivery(changePackageAcknowledgement(event, manifest, { noChanges: true })),
+      { code: "CODE_JOB_CHANGE_PACKAGE_BINDING_CONFLICT" });
+    assert.equal((await fixture.jobs.readChangePackageDeliveryBatch()).cursor, 0);
+  });
+}
 
 test("schema v3 delivery requires and retains exact controlled commit evidence", async () => {
   let manifest;
