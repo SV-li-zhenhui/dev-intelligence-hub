@@ -3208,6 +3208,34 @@ test("an already admitted automatic failed-CI Review is still claimed after its 
   assert.equal((await loop.runCycle()).claimed, 1);
 });
 
+test('one orchestrator context deadline does not abort later work or consume its decision attempt', async () => {
+  const time = controlledClock(), first = workItem(401, { type: 'role', id: 'orchestrator' }),
+    second = workItem(402, { type: 'role', id: 'orchestrator' });
+  const ledger = new FakeLedger({ source: [first, second], time });
+  let firstSignal; const decisions = [], executions = [];
+  const loop = createLoop({ ledger, time, resolveTimeoutMs: 1_000, decideTimeoutMs: 1_000, leaseDurationMs: 13_000,
+    directory: new FakeRoleDirectory({ orchestrator: worker({ roleId: 'orchestrator',
+      decide: async ({ item }) => { decisions.push(item.itemId); return orchestrationDecision(item); } }) }),
+    roleContextAssembler: { async assemble({ item, roleId, signal }) {
+      if (item.itemId === first.itemId) {
+        firstSignal = signal;
+        return new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+      }
+      return contextPacket(item, roleId);
+    } },
+    orchestratorService: { async execute({ item }) { executions.push(item.itemId); return { applied: true }; } },
+  });
+  const result = await loop.runCycle({ roleId: 'orchestrator' });
+  assert.equal(firstSignal.aborted, true);
+  assert.deepEqual(result.outcomes.map(({ status }) => status), ['decision_deferred', 'orchestrated']);
+  assert.equal(result.outcomes[0].code, 'ROLE_CONTEXT_TIMEOUT');
+  assert.deepEqual(decisions, [second.itemId]);
+  assert.deepEqual(executions, [second.itemId]);
+  assert.equal(ledger.calls.claim.length, 0);
+  assert.equal(ledger.calls.scheduleRetry.length, 0);
+  assert.equal(ledger.items.find(item => item.itemId === first.itemId).attempt, first.attempt);
+});
+
 test("root context contention defers one item and continues the cycle", async (t) => {
   for (const failurePoint of ["assemble", "execute"]) {
     await t.test(failurePoint, async () => {
