@@ -1,5 +1,6 @@
 import { normalizeCodeJobBrowserProjection } from "../domain/code-job-browser-projection.js";
 import { CODE_BRAIN_ACTION_TYPES } from "../domain/structured-code-action-contract.js";
+import { CODE_JOB_ACTIONS_BY_OPERATION } from '../domain/code-job-contract.js';
 import {
   normalizePullRequestExecutionBinding,
   samePullRequestExecutionBinding,
@@ -9,9 +10,13 @@ import { roleContextError } from "./role-context-error.js";
 const JOB_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const FAILURE_CODE = /^[A-Z][A-Z0-9_]{0,127}$/;
 const ACTION_TYPES = new Set(CODE_BRAIN_ACTION_TYPES);
+const READONLY_ACTIONS = new Set(CODE_JOB_ACTIONS_BY_OPERATION.verify);
 export const AUTOMATIC_INSPECTION_FAILURES = Object.freeze([
   "GIT_HEAD_UNAVAILABLE", "GIT_SNAPSHOT_TIMEOUT",
 ]);
+export const VERIFICATION_RECOVERY_REASON = 'automatic_verification_preparation_settled';
+export const VERIFICATION_RECOVERY_ACTOR = 'automatic-own-pr-verification-recovery';
+export const AUTOMATIC_VERIFICATION_FAILURE = 'CODE_JOB_VERIFICATION_ENVIRONMENT_UNAVAILABLE';
 
 function portMethod(port, method) {
   let owner = port;
@@ -59,7 +64,9 @@ export class FailedCodeJobContextReader {
         entry.type === "transitioned" && (entry.actorId === "owner:local" ||
           (entry.actorId === "automatic-own-pr-inspection-recovery" &&
             entry.details?.reason === "automatic_inspection_objects_ready" &&
-            AUTOMATIC_INSPECTION_FAILURES.includes(entry.details.context?.code))) &&
+            AUTOMATIC_INSPECTION_FAILURES.includes(entry.details.context?.code)) ||
+          (entry.actorId === VERIFICATION_RECOVERY_ACTOR && entry.details?.reason === VERIFICATION_RECOVERY_REASON &&
+            entry.details.context?.code === AUTOMATIC_VERIFICATION_FAILURE)) &&
         entry.details?.toStatus === "queued" &&
         entry.details.context?.downstreamRef === jobId &&
         Date.parse(entry.at) > Date.parse(observedAfter));
@@ -109,6 +116,20 @@ export class FailedCodeJobContextReader {
     const failureCode = detail.terminalDetail?.code;
     const historyComplete = detail.historyAvailable === true && detail.nextCursor === null &&
       observedActions.length === job.observationCount;
+    const recovery = retry?.actorId === VERIFICATION_RECOVERY_ACTOR && retry.details.reason === VERIFICATION_RECOVERY_REASON &&
+      job.operation === 'verify' && job.writablePaths.length === 0 && failureCode === AUTOMATIC_VERIFICATION_FAILURE &&
+      historyComplete && observedActions.every(action => READONLY_ACTIONS.has(action.actionType)) &&
+      retry.details.context.headRefOid === expectedBinding.headRefOid &&
+      /^[a-z0-9][a-z0-9-]{0,63}$/u.test(retry.details.context.actionId ?? '') &&
+      /^[a-z0-9][a-z0-9-]{0,63}$/u.test(retry.details.context.executionId ?? '') &&
+      job.requiredProfiles.includes(retry.details.context.profileId) &&
+      /^[a-f0-9]{64}$/u.test(retry.details.context.profileConfigDigest ?? '') &&
+      /^[a-f0-9]{64}$/u.test(retry.details.context.workspaceRevision ?? '') ? {
+        at: retry.at, reason: VERIFICATION_RECOVERY_REASON, failureCode, jobId,
+        actionId: retry.details.context.actionId, executionId: retry.details.context.executionId,
+        profileId: retry.details.context.profileId, profileConfigDigest: retry.details.context.profileConfigDigest,
+        workspaceRevision: retry.details.context.workspaceRevision,
+      } : null;
     return {
       jobId, status: job.status, operation: job.operation,
       failureCode: typeof failureCode === "string" && FAILURE_CODE.test(failureCode) ? failureCode : null,
@@ -126,7 +147,7 @@ export class FailedCodeJobContextReader {
         retry.details.context.code === failureCode &&
         historyComplete && job.observationCount === 0 ? {
           at: retry.at, reason: "automatic_inspection_objects_ready", failureCode, jobId,
-        } : null,
+        } : recovery,
     };
   }
 }

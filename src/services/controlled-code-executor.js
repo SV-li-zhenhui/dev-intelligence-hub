@@ -989,7 +989,7 @@ function normalizeProfileConfiguration(
   return byWorkspace;
 }
 
-function attemptExecutionId(sessionId, number) {
+export function attemptExecutionId(sessionId, number) {
   const digest = digestValue({ number, sessionId }).slice(0, 24);
   return `attempt-${digest}`;
 }

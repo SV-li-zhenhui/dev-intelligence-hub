@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { cp, lstat, mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, open, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -35,6 +35,32 @@ function assertRequest(value, required, optional = []) {
 function descendant(root, candidate) {
   const relative = path.relative(root, candidate);
   return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+function sameRecoveryPath(left, right) {
+  const normalize = value => process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value);
+  return normalize(left) === normalize(right);
+}
+function sameRecoveryIdentity(left, right) {
+  return ['dev', 'ino', 'mode', 'nlink'].every(key => left[key] === right[key]);
+}
+async function readRecoveryJson(directory, name) {
+  const target = path.join(directory, name);
+  const initial = await lstat(target);
+  if (!initial.isFile() || initial.isSymbolicLink() || initial.nlink !== 1 || initial.size > 65_536 ||
+      !sameRecoveryPath(await realpath(target), target)) throw new Error('Untrusted recovery metadata');
+  const stable = stats => sameRecoveryIdentity(initial, stats) &&
+    ['size', 'mtimeMs', 'ctimeMs'].every(key => initial[key] === stats[key]);
+  const handle = await open(target, 'r');
+  try {
+    if (!stable(await handle.stat())) throw new Error('Changed recovery metadata');
+    const buffer = Buffer.alloc(65_537);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (bytesRead !== initial.size || !stable(await handle.stat()) || !stable(await lstat(target)) ||
+        !sameRecoveryPath(await realpath(target), target)) throw new Error('Changed recovery metadata');
+    return JSON.parse(buffer.subarray(0, bytesRead).toString('utf8'));
+  } finally {
+    await handle.close();
+  }
 }
 async function noLinks(directory) {
   if ((await lstat(directory)).isSymbolicLink()) throw failure("INVALID_SANDBOX_REQUEST", "Windows test paths cannot contain links");
@@ -82,6 +108,39 @@ export class WindowsFixedTestRunner {
       throw failure("INVALID_SANDBOX_REQUEST", "Windows execution identity is invalid");
     }
     return path.join(this.runRoot, digestValue({ executionId, actionId }));
+  }
+  async readSettledPreparationFailure(request) {
+    assertRequest(request, ['profileId', 'executionId', 'actionId']);
+    const profile = this.#profiles.get(request.profileId);
+    if (process.platform !== 'win32' || profile?.definition.kind !== 'windows-test') return null;
+    const directory = this.executionDirectory(request.executionId, request.actionId);
+    if (this.#active.has(directory)) return null;
+    try {
+      const rootStats = await lstat(this.runRoot), directoryStats = await lstat(directory);
+      if (!rootStats.isDirectory() || rootStats.isSymbolicLink() || !directoryStats.isDirectory() || directoryStats.isSymbolicLink() ||
+          !sameRecoveryPath(await realpath(this.runRoot), this.runRoot) || !sameRecoveryPath(await realpath(directory), directory)) return null;
+      const reads = await Promise.allSettled(['lease.json', 'pending.json', 'cleanup.json', 'result.json'].map(name => readRecoveryJson(directory, name)));
+      if (reads.some(result => result.status !== 'fulfilled')) return null;
+      const [lease, pending, cleanup, result] = reads.map(read => read.value);
+      const matches = value => value?.executionId === request.executionId && value.actionId === request.actionId;
+      if (!matches(lease) || lease.schemaVersion !== 1 || lease.state !== 'starting' || lease.runtimeIdentity != null ||
+          !Number.isSafeInteger(lease.launcher?.pid) || lease.launcher.pid < 1 ||
+          !/^\d+$/u.test(lease.launcher.processStartTimeUtcTicks ?? '') || !/^[a-f0-9]{64}$/u.test(lease.launcher.executableSha256 ?? '') ||
+          !/^dih\.test\.[a-f0-9]{32}$/u.test(lease.appContainerName ?? '') ||
+          !matches(pending) || pending.appContainerName !== lease.appContainerName || !matches(cleanup) ||
+          cleanup.stopConfirmed !== true || cleanup.dataRemoved !== true || cleanup.profileRemoved !== true ||
+          result?.error?.code !== 'SANDBOX_START_FAILED' || result.error.message !== 'Windows test preparation was interrupted' ||
+          Object.hasOwn(result, 'runtimeIdentity') || Object.hasOwn(result, 'exitCode')) return null;
+      try { await lstat(path.join(directory, 'data')); return null; }
+      catch (error) { if (error.code !== 'ENOENT') return null; }
+      if (this.#active.has(directory) || !sameRecoveryIdentity(rootStats, await lstat(this.runRoot)) ||
+          !sameRecoveryIdentity(directoryStats, await lstat(directory)) ||
+          !sameRecoveryPath(await realpath(directory), directory)) return null;
+      return Object.freeze({ executionId: request.executionId, actionId: request.actionId, profileId: request.profileId,
+        profileConfigDigest: profile.fingerprint, reason: 'preparation_interrupted_cleanup_confirmed' });
+    } catch {
+      return null;
+    }
   }
   #environment(directory) {
     return { SystemRoot: this.systemRoot, WINDIR: this.systemRoot, PATH: path.join(this.systemRoot, "System32"),

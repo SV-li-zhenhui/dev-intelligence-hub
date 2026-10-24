@@ -39,6 +39,8 @@ test("Windows-only production composition needs no Docker service or configurati
   const runtime = await createCodeExecutorRuntime(config, { sourceBaseRoot: value.sourceBaseRoot, runtimeRoot: value.runtimeRoot, store: value.store });
   assert.equal(runtime.sandbox.dockerRunner, null);
   assert.match(runtime.sandbox.getProfileFingerprint("native"), /^[a-f0-9]{64}$/);
+  assert.equal(typeof runtime.settledVerificationReader.read, 'function');
+  assert.equal(await runtime.settledVerificationReader.read({ jobId: 'missing', job: {} }), null);
 });
 
 async function fixture(t) {

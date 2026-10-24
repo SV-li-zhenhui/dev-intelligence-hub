@@ -2120,6 +2120,9 @@ export async function createApplication({
       const ownPrRepairDependencies = {
         configurationReader: configurationRuntime.reader, store, ledger: workLedgerRuntime,
         ciRepairContextReader,
+        ...(codeExecutorRuntime.settledVerificationReader ? {
+          settledVerificationReader: frozenPort(codeExecutorRuntime.settledVerificationReader, ['read'], 'settled verification recovery reader'),
+        } : {}),
         confirmationSettlementReader: confirmationRuntime.confirmationSettlementReader,
         github, confirmations: Object.freeze({ ...confirmationRuntime.producerQueue, ...confirmationRuntime.queue }), codeJobReader,
         controlledCommitReader: codeExecutorRuntime.controlledCommitBuilder,

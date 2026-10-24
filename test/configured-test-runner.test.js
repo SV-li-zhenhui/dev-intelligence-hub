@@ -29,6 +29,17 @@ test("configured runner dispatches fixed profiles and fingerprints by their trus
   await assert.rejects(setup.runner.run({ profileId: "unknown" }), { code: "SANDBOX_PROFILE_NOT_FOUND" });
 });
 
+test("settled preparation reads delegate only to the configured native runner", async t => {
+  const setup = await fixture(t), request = { profileId: 'native', executionId: 'run', actionId: 'action' };
+  assert.equal(await setup.runner.readSettledPreparationFailure(request), null);
+  setup.windowsRunner.readSettledPreparationFailure = async value => { setup.calls.push(value); return { settled: true }; };
+  assert.deepEqual(await setup.runner.readSettledPreparationFailure(request), { settled: true });
+  for (const profileId of ['docker', 'script', 'unknown']) {
+    assert.equal(await setup.runner.readSettledPreparationFailure({ ...request, profileId }), null);
+  }
+  assert.deepEqual(setup.calls, [request]);
+});
+
 test("durable Windows execution cleanup never depends on an offline Docker daemon", async (t) => {
   const setup = await fixture(t);
   const request = { executionId: "run", actionId: "action" };

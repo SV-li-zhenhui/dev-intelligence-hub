@@ -9,6 +9,7 @@ import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js"
 import { createPullRequestExternalActionConfirmationPlan } from "../domain/pull-request-external-action.js";
 import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
 import { isOwnerRequestedCiRepairEvent } from "./ci-repair-context-reader.js";
+import { AutomaticOwnPrVerificationRecovery } from './automatic-own-pr-verification-recovery.js';
 import { approveOwnPrAction, repairCommitMatchesJob, planOwnPrPushRetry, retryOwnPrPush, validateOwnPrPushRetry } from "./automatic-own-pr-repair-authorization.js";
 import { normalizeOwnerWorkRequest } from "../domain/owner-work-request.js";
 import { internalRepairReviewRequestId, normalizeInternalReviewMetadata } from "../domain/internal-repair-review.js";
@@ -125,7 +126,8 @@ export class AutomaticOwnPrRepair {
 
   constructor({ configurationReader, store, ledger, github, confirmations,
     codeJobReader = null, controlledCommitReader = null, objectSync = null, grantVerifier, ownerWorkRequests = null,
-    historicalRepairFeedbackReader = null, historicalControlledCommitReader = null, ciRepairContextReader = null, conflictRepair = null, clock = () => new Date() }) {
+    historicalRepairFeedbackReader = null, historicalControlledCommitReader = null, ciRepairContextReader = null, conflictRepair = null,
+    settledVerificationReader = null, clock = () => new Date() }) {
     if (typeof grantVerifier?.verify !== "function") throw new TypeError("Automatic own PR repair requires current grant verification");
     this.configurationReader = configurationReader;
     this.store = store;
@@ -142,6 +144,12 @@ export class AutomaticOwnPrRepair {
     this.clock = clock;
     this.conflictRepair = conflictRepair;
     this.ciRepairContextReader = ciRepairContextReader;
+    this.verificationRecovery = objectSync && settledVerificationReader &&
+      ['listItems', 'listTimeline', 'listOutbox', 'transition'].every(method => typeof ledger[method] === 'function') &&
+      typeof codeJobReader?.get === 'function' && typeof codeJobReader.getDetail === 'function' &&
+      typeof github.readPullRequestLocalWorkFacts === 'function'
+      ? new AutomaticOwnPrVerificationRecovery({ ledger, codeJobReader, settledVerificationReader, objectSync,
+        current: binding => this.#verificationCurrent(binding) }) : null;
   }
 
   async recover() {
@@ -268,6 +276,15 @@ export class AutomaticOwnPrRepair {
         facts.reviewFeedbackDigest !== event.payload.reviewFeedbackDigest ||
         this.#feedbackPublished(binding.repository, binding.pullRequestNumber, facts)) return null;
     return { config, facts, feedbackDigest: facts.reviewFeedbackDigest, sourceKind: 'review_repair' };
+  }
+
+  async #verificationCurrent(binding) {
+    const current = await this.#current(binding);
+    if (!current || !sameLogin(binding.gitTarget.sourceAccountId, current.config.githubActions.actorAccountId)) return null;
+    const facts = await this.github.readPullRequestLocalWorkFacts({ repository: binding.repository, number: binding.pullRequestNumber,
+      account: current.config.githubActions.actorAccountId, authorAccountId: current.config.githubActions.actorAccountId });
+    return facts.state === 'open' && facts.isDraft === false && sameLogin(facts.author, current.config.githubActions.actorAccountId) &&
+      facts.headRefOid === binding.headRefOid && facts.baseRefOid === binding.gitTarget.baseRefOid ? current : null;
   }
 
   async prepare({ item, intent, inputBinding, roleId }) {
@@ -414,8 +431,9 @@ export class AutomaticOwnPrRepair {
     return this.#state.repairs.some(row => row.jobId === record.jobId && row.confirmationId === record.confirmationId && row.status === 'working');
   }
 
-  runRecoveryCycle({ limit = 10 } = {}) {
-    return this.conflictRepair?.runRecoveryCycle({ limit }) ?? Promise.resolve({});
+  async runRecoveryCycle({ limit = 10 } = {}) {
+    const result = await (this.conflictRepair?.runRecoveryCycle({ limit }) ?? Promise.resolve({}));
+    return this.verificationRecovery ? { ...result, verificationRecovery: await this.verificationRecovery.runCycle({ limit }) } : result;
   }
 
   runCycle({ limit = 10, includeRecovery = true } = {}) {
@@ -438,6 +456,7 @@ export class AutomaticOwnPrRepair {
         }
       }
       await this.#reconcileReviews(limit, result);
+      if (includeRecovery && this.verificationRecovery) result.verificationRecovery = await this.verificationRecovery.runCycle({ limit });
       if (this.conflictRepair) {
         const conflicts = await this.conflictRepair.runCycle({ limit, includeRecovery });
         for (const key of ["scanned", "published", "failed", "stale"]) result[key] += conflicts[key];

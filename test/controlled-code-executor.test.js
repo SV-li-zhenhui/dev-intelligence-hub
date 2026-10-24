@@ -14,6 +14,9 @@ import test from "node:test";
 import { DockerSandboxError } from "../src/adapters/docker-test-sandbox.js";
 import { WindowsFixedTestRunner, WindowsTestRunnerError } from "../src/adapters/windows-fixed-test-runner.js";
 import { ConfiguredTestRunner } from "../src/adapters/configured-test-runner.js";
+import { SettledVerificationRecoveryReader } from '../src/adapters/settled-verification-recovery-reader.js';
+import { readonlyVerificationFixture } from './support/readonly-verification-fixture.js';
+import { pullRequestExternalActionBinding } from './support/pull-request-external-action-fixture.js';
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
@@ -1140,6 +1143,44 @@ test("schema v1 migration rejects a legacy identity whose digest no longer match
     recovered.executor.recover(),
     hasCode("EXECUTOR_STATE_INVALID"),
   );
+});
+
+test('settled verification reader validates real executor projections and immutable action artifacts after restart', async t => {
+  const sandbox = new FakeSandbox({ results: [new WindowsTestRunnerError('SANDBOX_START_FAILED', 'Windows test preparation was interrupted')] });
+  const setup = await fixture(t, { sandbox });
+  const { job } = readonlyVerificationFixture({ binding: pullRequestExternalActionBinding(), workspaceId: 'dashboard',
+    requiredProfile: { id: 'node-tests', configDigest: sandbox.getProfileFingerprint('node-tests') } });
+  const createBoundBroker = () => new CodeWorkspaceBroker({ scratchRoot: setup.scratchRoot,
+    workspaces: [{ id: 'dashboard', sourceRoot: setup.sourceRoot, writablePaths: ['src'], gitBoundaryDigest: 'f'.repeat(64),
+      gitExecutableIdentity: { gitCommand: path.join(setup.root, 'git.exe'), gitExecutableSha256: 'e'.repeat(64),
+        gitExecutableBytes: 1, gitExecutableMode: 0o755, gitExecutableUid: 0, gitExecutableGid: 0 } }],
+    gitSnapshotter: { async materialize({ targetRoot, headOid }) {
+      const content = await readFile(path.join(setup.sourceRoot, 'src/app.js'));
+      await mkdir(path.join(targetRoot, 'src'), { recursive: true });
+      await writeFile(path.join(targetRoot, 'src/app.js'), content);
+      return { headOid, fileCount: 1, totalBytes: content.length, modes: new Map([['src/app.js', '100644']]),
+        baseline: new Map([['src/app.js', createHash('sha256').update(content).digest('hex')]]) };
+    } } });
+  const { executor } = setup.createExecutor({ broker: createBoundBroker() });
+  await executor.recover();
+  let session = await executor.start(startRequest({ sessionId: job.jobId, requestedBy: job.requestedBy, inputBinding: job.inputBinding }));
+  session = (await executor.perform(actionRequest(session, { type: 'read_text', actionId: 'read-before-profile', path: 'src/app.js' }))).session;
+  const failed = await executor.perform(actionRequest(session, { type: 'run_profile', actionId: 'interrupted-profile', profileId: 'node-tests' }));
+  assert.equal(failed.action.status, 'failed');
+  assert.equal(failed.result.error.code, 'SANDBOX_START_FAILED');
+  const restarted = setup.createExecutor({ broker: createBoundBroker() }).executor;
+  await restarted.recover();
+  const reader = new SettledVerificationRecoveryReader({ executor: restarted,
+    artifacts: { read: ref => setup.journal.readBytes(ref) },
+    sandbox: { async readSettledPreparationFailure(request) { return { ...request,
+      profileConfigDigest: sandbox.getProfileFingerprint(request.profileId), reason: 'preparation_interrupted_cleanup_confirmed' }; } } });
+  const proof = await reader.read({ jobId: job.jobId, job });
+  assert.equal(proof?.jobId, job.jobId);
+  assert.equal(proof.workspaceRevision, failed.session.workspaceRevision);
+  assert.equal(proof.actionId, failed.action.id);
+  assert.equal(sandbox.calls.length, 1, 'reading recovery evidence never re-executes the failed profile');
+  await writeFile(path.join(setup.root, 'execution-artifacts', job.jobId, failed.action.id, 'input.json'), '{}');
+  assert.equal(await reader.read({ jobId: job.jobId, job }), null, 'audit tampering invalidates recovery');
 });
 
 test("only a trusted Windows prelaunch abort preserves unexecuted proof in the executor receipt", async t => {

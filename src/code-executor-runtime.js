@@ -3,6 +3,7 @@ import { types as utilTypes } from "node:util";
 import { DockerTestSandbox } from "./adapters/docker-test-sandbox.js";
 import { WindowsFixedTestRunner } from "./adapters/windows-fixed-test-runner.js";
 import { ConfiguredTestRunner } from "./adapters/configured-test-runner.js";
+import { SettledVerificationRecoveryReader } from './adapters/settled-verification-recovery-reader.js';
 import { isWindowsTestProfile } from "./domain/windows-test-profile.js";
 import { GitObjectSnapshotter } from "./adapters/git-object-snapshotter.js";
 import { createControlledGitRuntimeBundle } from "./controlled-git-runtime.js";
@@ -610,6 +611,8 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
   );
   const completedChangeExporter = createCompletedChangeExporter(executor);
   const auditArtifactReader = createAuditArtifactReader(journal);
+  const settledVerificationReader = typeof sandbox.readSettledPreparationFailure === 'function'
+    ? new SettledVerificationRecoveryReader({ executor, artifacts: auditArtifactReader, sandbox }) : null;
   return Object.freeze({
     broker,
     sandbox,
@@ -619,6 +622,7 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
     changePackageTargets,
     completedChangeExporter,
     auditArtifactReader,
+    settledVerificationReader,
     conflictPreparationVerifier:
       controlledGitRuntime?.verifier ?? null,
     conflictExecutionSourcePreparer:

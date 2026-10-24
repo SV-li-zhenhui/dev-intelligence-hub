@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createCodeJobGrant, createQueuedCodeJob, CODE_JOB_ACTIONS_BY_OPERATION } from "../src/domain/code-job-contract.js";
 import { projectNormalizedCodeJobForBrowser } from "../src/domain/code-job-browser-projection.js";
-import { FailedCodeJobContextReader } from "../src/services/failed-code-job-context-reader.js";
+import { FailedCodeJobContextReader, VERIFICATION_RECOVERY_ACTOR, VERIFICATION_RECOVERY_REASON,
+  AUTOMATIC_VERIFICATION_FAILURE } from "../src/services/failed-code-job-context-reader.js";
 import { AutomaticOwnPrInspectionRecovery } from "../src/services/automatic-own-pr-inspection-recovery.js";
 
 function fixture({ operation = "modify", failureCode = "GIT_SNAPSHOT_TIMEOUT", actions = ["read_text", "search_text", "read_text"] } = {}) {
@@ -70,6 +71,33 @@ function automaticRetry(f) {
   f.retry.details.reason = "automatic_inspection_objects_ready";
   f.retry.details.context = { downstreamRef: f.detail.job.jobId, code: "GIT_HEAD_UNAVAILABLE" };
 }
+
+test('verification recovery context requires exact settled readonly failure metadata', async t => {
+  for (const scenario of ['valid', 'head', 'action', 'execution', 'profile', 'fingerprint', 'workspace', 'history', 'write', 'failure']) {
+    await t.test(scenario, async () => {
+      const f = fixture({ operation: 'verify', failureCode: AUTOMATIC_VERIFICATION_FAILURE, actions: ['read_text', 'run_profile'] });
+      f.retry.actorId = VERIFICATION_RECOVERY_ACTOR;
+      f.retry.details.reason = VERIFICATION_RECOVERY_REASON;
+      f.retry.details.context = { downstreamRef: f.detail.job.jobId, code: AUTOMATIC_VERIFICATION_FAILURE,
+        headRefOid: f.input.inputBinding.headRefOid, actionId: 'action-profile', executionId: 'attempt-one', profileId: 'tests',
+        profileConfigDigest: 'b'.repeat(64), workspaceRevision: '7'.repeat(64) };
+      const context = f.retry.details.context;
+      if (scenario === 'head') context.headRefOid = '9'.repeat(40);
+      if (scenario === 'action') context.actionId = '../action';
+      if (scenario === 'execution') context.executionId = '../attempt';
+      if (scenario === 'profile') context.profileId = 'other';
+      if (scenario === 'fingerprint') context.profileConfigDigest = 'invalid';
+      if (scenario === 'workspace') context.workspaceRevision = 'invalid';
+      if (scenario === 'history') f.detail.historyAvailable = false;
+      if (scenario === 'write') f.detail.observations[0].actionType = 'write_text';
+      if (scenario === 'failure') f.detail.terminalDetail.code = 'SANDBOX_ABORTED';
+      const result = await f.reader.read(f.input);
+      assert.equal(result.ownerRetry, null);
+      if (scenario === 'valid') assert.equal(result.automaticRecovery.jobId, f.detail.job.jobId);
+      else assert.equal(result.automaticRecovery, null);
+    });
+  }
+});
 
 test("developer context identifies the system recovery of its exact zero-action inspection", async () => {
   const f = fixture({ operation: "inspect", failureCode: "GIT_HEAD_UNAVAILABLE", actions: [] });

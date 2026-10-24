@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -36,6 +36,49 @@ async function assertDataRemoved(setup) {
   assert.equal(cleanup.stopConfirmed, true); assert.equal(cleanup.dataRemoved, true); assert.equal(cleanup.profileRemoved, true);
   await readFile(path.join(directory, "result.json"), "utf8");
 }
+
+test('settled interrupted Windows preparation exposes only a matching cleanup proof', { skip: process.platform !== 'win32' }, async t => {
+  const setup = await fixture(t);
+  const { executionId, actionId, profileId } = setup.request;
+  const directory = setup.runner.executionDirectory(executionId, actionId);
+  await mkdir(directory, { recursive: true });
+  const appContainerName = `dih.test.${'a'.repeat(32)}`;
+  const documents = {
+    'lease.json': { schemaVersion: 1, executionId, actionId, state: 'starting', appContainerName,
+      launcher: { pid: 42, processStartTimeUtcTicks: '123456', executableSha256: 'b'.repeat(64) } },
+    'pending.json': { executionId, actionId, appContainerName },
+    'cleanup.json': { executionId, actionId, stopConfirmed: true, dataRemoved: true, profileRemoved: true },
+    'result.json': { error: { code: 'SANDBOX_START_FAILED', message: 'Windows test preparation was interrupted' }, stdout: '', stderr: '' },
+  };
+  for (const [name, value] of Object.entries(documents)) await writeFile(path.join(directory, name), JSON.stringify(value));
+  const request = { executionId, actionId, profileId };
+  const proof = await setup.runner.readSettledPreparationFailure(request);
+  assert.deepEqual(proof, { executionId, actionId, profileId,
+    profileConfigDigest: setup.runner.getProfileFingerprint(profileId), reason: 'preparation_interrupted_cleanup_confirmed' });
+  for (const scenario of ['wrong-action', 'not-stopped', 'data-not-removed', 'profile-not-removed', 'completed', 'other-error', 'data-present', 'oversized']) {
+    await t.test(scenario, async () => {
+      const changed = structuredClone(documents);
+      if (scenario === 'wrong-action') changed['cleanup.json'].actionId = 'another-action';
+      if (scenario === 'not-stopped') changed['cleanup.json'].stopConfirmed = false;
+      if (scenario === 'data-not-removed') changed['cleanup.json'].dataRemoved = false;
+      if (scenario === 'profile-not-removed') changed['cleanup.json'].profileRemoved = false;
+      if (scenario === 'completed') changed['lease.json'].state = 'completed';
+      if (scenario === 'other-error') changed['result.json'].error.code = 'SANDBOX_ABORTED';
+      if (scenario === 'oversized') changed['result.json'].stdout = 'x'.repeat(70_000);
+      if (scenario === 'data-present') await mkdir(path.join(directory, 'data'));
+      for (const [name, value] of Object.entries(changed)) await writeFile(path.join(directory, name), JSON.stringify(value));
+      assert.equal(await setup.runner.readSettledPreparationFailure(request), null);
+      if (scenario === 'data-present') await rm(path.join(directory, 'data'), { recursive: true });
+      for (const [name, value] of Object.entries(documents)) await writeFile(path.join(directory, name), JSON.stringify(value));
+    });
+  }
+  for (const [name, value] of Object.entries(documents)) assert.deepEqual(JSON.parse(await readFile(path.join(directory, name), 'utf8')), value);
+  const metadata = path.join(directory, 'cleanup.json'), alias = path.join(setup.root, 'cleanup-alias.json');
+  await link(metadata, alias);
+  assert.equal(await setup.runner.readSettledPreparationFailure(request), null, 'aliased control metadata is not a cleanup proof');
+  await rm(alias);
+  assert.deepEqual(await setup.runner.readSettledPreparationFailure(request), proof);
+});
 
 test("Windows fixed assets execute real tests in an isolated copy with native identity", { skip: process.platform !== "win32" }, async (t) => {
   const setup = await fixture(t, { source: 'import { writeFileSync } from "node:fs"; if(process.env.GH_TOKEN||process.env.NODE_OPTIONS!=="--preserve-symlinks --preserve-symlinks-main") throw Error("credential leak"); writeFileSync("generated.txt","build output"); import { spawnSync } from "node:child_process"; const r=spawnSync(process.execPath,["--test","--test-isolation=none","--test-reporter=tap","test/value.test.mjs"],{stdio:"inherit",env:process.env}); process.exitCode=r.status??1;' });

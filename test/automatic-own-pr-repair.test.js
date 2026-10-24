@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { AutomaticOwnPrRepair } from "../src/services/automatic-own-pr-repair.js";
 import { ciRepairSource } from './support/ci-repair-fixture.js';
+import { readonlyVerificationFixture } from './support/readonly-verification-fixture.js';
+import { FailedCodeJobContextReader, VERIFICATION_RECOVERY_ACTOR, VERIFICATION_RECOVERY_REASON } from '../src/services/failed-code-job-context-reader.js';
+import { AutomaticOwnPrVerificationRecovery } from '../src/services/automatic-own-pr-verification-recovery.js';
 
 const binding = {
   schemaVersion: 2, kind: "pull_request", repository: "acme/repo", pullRequestNumber: 42,
@@ -13,7 +16,8 @@ const binding = {
     headRepository: "acme/repo", headRefName: "fix/review", headRefOid: "1".repeat(40) },
 };
 
-function setup({ objectSync = null, ciRepairContextReader = null } = {}) {
+function setup({ objectSync = null, ciRepairContextReader = null, codeJobReader = null,
+  settledVerificationReader = null, ledgerOverrides = {} } = {}) {
   const configuration = {
     githubActions: { enabled: true, automaticOwnPrRepair: true, actorAccountId: "me" },
     trackedRepositories: ["acme/repo"],
@@ -33,10 +37,13 @@ function setup({ objectSync = null, ciRepairContextReader = null } = {}) {
     store: { read: async (key, fallback) => structuredClone(saved.get(key) ?? fallback),
       write: async (key, value) => { saved.set(key, structuredClone(value)); } },
     ledger: { readPullRequestExecutionContext: async () => ({ inputBinding: binding, author: "me" }),
-      readItemForReconciliation: async () => ({ event }) },
-    github: { readOwnPullRequestFeedback: async () => structuredClone(facts) },
+      readItemForReconciliation: async () => ({ event }), ...ledgerOverrides },
+    github: { readOwnPullRequestFeedback: async () => structuredClone(facts),
+      readPullRequestLocalWorkFacts: async () => structuredClone({ baseRefOid: binding.gitTarget.baseRefOid, isDraft: false, ...facts }) },
     objectSync,
     ciRepairContextReader,
+    codeJobReader,
+    settledVerificationReader,
     grantVerifier: { async verify(grant) { return grant; } },
     confirmations: { approve: async (id, request) => { calls.push({ id, request }); return { ...item(), status: "completed" }; } },
   });
@@ -50,6 +57,119 @@ function setup({ objectSync = null, ciRepairContextReader = null } = {}) {
     };
   }
   return { service, configuration, facts, event, calls, item, saved };
+}
+
+function verificationRecoveryFixture() {
+  const { raw, job, detail } = readonlyVerificationFixture({ binding });
+  let row;
+  const transitions = [], timeline = [];
+  const proof = { schemaVersion: 1, jobId: job.jobId, grantDigest: job.grantDigest, inputBinding: structuredClone(binding),
+    actionId: 'action-verify-profile', executionId: 'attempt-verify', profileId: 'tests',
+    profileConfigDigest: 'b'.repeat(64), workspaceRevision: raw.execution.workspaceRevision,
+    reason: 'preparation_interrupted_cleanup_confirmed' };
+  const boxes = [{ itemId: binding.rootItemId, sourceBinding: binding, status: 'delivered',
+    intent: { type: 'propose_code_action' }, outcome: { status: 'delivered', details: { downstreamRef: job.proposalId,
+      resultAttestation: { kind: 'proposal_result', payload: { proposalId: job.proposalId, outcome: 'failed' } } } } }];
+  const objectSync = { async prepare() {} };
+  const codeJobReader = { async get() { return structuredClone(job); }, async getDetail() { return structuredClone(detail); } };
+  const settledVerificationReader = { async read({ jobId }) { assert.equal(jobId, job.jobId); return structuredClone(proof); } };
+  const s = setup({ objectSync, codeJobReader, settledVerificationReader,
+    ledgerOverrides: { async listItems() { return { items: row.status === 'blocked' ? [structuredClone(row)] : [], nextCursor: null }; },
+      async listTimeline() { return { items: structuredClone(timeline), nextCursor: null }; },
+      async listOutbox() { return { items: structuredClone(boxes), nextCursor: null }; },
+      async readItemForReconciliation() { return structuredClone(row); },
+      async transition(request) { transitions.push(request); Object.assign(row, { status: request.toStatus, revision: row.revision + 1 });
+        timeline.push({ itemId: row.itemId, sequence: timeline.length + 1, type: 'transitioned', actorId: request.actorId,
+          at: '2026-08-02T06:02:00.000Z', details: { ...request, context: request.details } }); } } });
+  row = { itemId: binding.rootItemId, kind: 'source_root', status: 'blocked', statusReason: 'proposal_failed', revision: 4,
+    currentTarget: { type: 'role', id: 'developer' }, ownerId: null, leaseId: null, leaseUntil: null, activeIntentId: null,
+    sourceQuarantine: null, graph: { deliveries: [] }, event: s.event, createdAt: raw.createdAt,
+    source: { kind: 'pull_request', scope: { kind: 'automatic', active: true }, workKey: binding.workKey,
+      activeRevision: 1, revisions: [{ ...binding, revision: 1 }],
+      current: { event: s.event, headRefOid: binding.headRefOid, eventId: binding.eventId,
+        eventDigest: binding.eventDigest, inputDigest: binding.inputDigest } },
+    decisionContext: { source: 'proposal', outcome: 'failed', referenceId: job.proposalId, observedAt: raw.updatedAt,
+      value: { kind: 'code_action_proposal', evidence: [`code-job:${job.jobId}`, `memory:${job.memoryProjection.recordId}`] } } };
+  timeline.push({ itemId: row.itemId, sequence: 1, type: 'pr_source_created', at: row.createdAt,
+    details: { workKey: binding.workKey, headRefOid: binding.headRefOid, inputRevision: 1 } });
+  return { s, row, raw, job, detail, proof, boxes, transitions, timeline, objectSync, codeJobReader, settledVerificationReader };
+}
+
+test('disabled inline recovery leaves the dedicated recovery continuation responsible', async () => {
+  const f = verificationRecoveryFixture();
+  let evidenceReads = 0;
+  f.settledVerificationReader.read = async () => { evidenceReads += 1; return structuredClone(f.proof); };
+  await f.s.service.recover();
+  assert.equal((await f.s.service.runCycle({ includeRecovery: false })).verificationRecovery, undefined);
+  assert.equal(evidenceReads, 0);
+  assert.equal(f.transitions.length, 0);
+  assert.equal((await f.s.service.runRecoveryCycle()).verificationRecovery.requeued, 1);
+  assert.equal(f.transitions.length, 1);
+});
+
+test('settled readonly verification failure gets one fresh automatic decision without replaying the failed job', async () => {
+  const { s, row, job, transitions, timeline, objectSync, codeJobReader, settledVerificationReader } = verificationRecoveryFixture();
+  const before = structuredClone(job);
+  await s.service.recover();
+  const result = await s.service.runCycle();
+  assert.equal(result.verificationRecovery?.requeued ?? 0, 1, JSON.stringify(result));
+  assert.equal(transitions.length, 1);
+  assert.equal(transitions[0].toStatus, 'queued');
+  assert.deepEqual(job, before, 'recovery cannot rewrite the failed job or claim its tests passed');
+  assert.equal(s.calls.length, 0, 'recovery cannot approve or replay the old task');
+  const contextReader = new FailedCodeJobContextReader({ codeJobReader, ledger: s.service.ledger });
+  const context = await contextReader.read({ itemId: row.itemId, inputBinding: binding, decisionContext: row.decisionContext });
+  assert.equal(context.automaticRecovery.reason, VERIFICATION_RECOVERY_REASON);
+  assert.equal(context.ownerRetry, null);
+  row.status = 'blocked';
+  const restarted = new AutomaticOwnPrVerificationRecovery({ ledger: s.service.ledger, codeJobReader,
+    settledVerificationReader, objectSync, current: async () => ({ config: s.configuration }) });
+  await restarted.runCycle();
+  assert.equal(transitions.length, 1, 'the same Head cannot receive an unbounded recovery loop');
+  assert.equal(timeline.filter(entry => entry.actorId === VERIFICATION_RECOVERY_ACTOR).length, 1);
+});
+
+for (const [scenario, mutate] of [
+  ['paused', f => { f.row.status = 'paused'; }],
+  ['owner-held', f => { f.row.ownerId = 'owner:local'; }],
+  ['active-intent', f => { f.row.activeIntentId = 'another-intent'; }],
+  ['delivered-work', f => { f.row.graph.deliveries.push({}); }],
+  ['quarantine', f => { f.row.sourceQuarantine = {}; }],
+  ['scope-left', f => { f.row.source.scope.active = false; }],
+  ['disabled', f => { f.s.configuration.githubActions.automaticOwnPrRepair = false; }],
+  ['changed-Head', f => { f.s.facts.headRefOid = '9'.repeat(40); }],
+  ['changed-Base', f => { f.s.facts.baseRefOid = '9'.repeat(40); }],
+  ['changed-account', f => { f.s.configuration.githubActions.actorAccountId = 'other'; }],
+  ['changed-source-binding', f => { f.row.source.current.inputDigest = '9'.repeat(64); }],
+  ['modification-job', f => { f.job.operation = 'modify'; }],
+  ['write-history', f => { f.detail.observations[0].actionType = 'write_text'; }],
+  ['incomplete-history', f => { f.detail.historyAvailable = false; }],
+  ['other-failure', f => { f.detail.terminalDetail.code = 'CODE_EXECUTION_UNSETTLED'; }],
+  ['missing-creation', f => { f.timeline.shift(); }],
+  ['pending-effect', f => { f.boxes[0].status = 'dispatching'; }],
+  ['unknown-effect', f => { f.boxes[0].outcome.details.resultAttestation.payload.outcome = 'unknown'; }],
+  ['rejected-effect', f => { f.boxes[0].outcome.details.resultAttestation.payload.outcome = 'rejected'; }],
+  ['missing-attestation', f => { delete f.boxes[0].outcome.details.resultAttestation; }],
+  ['settlement-unavailable', f => { f.settledVerificationReader.read = async () => null; }],
+  ['wrong-proof-grant', f => { f.proof.grantDigest = '9'.repeat(64); }],
+  ['wrong-proof-binding', f => { f.proof.inputBinding.rootItemId = 'different-root'; }],
+  ['invalid-profile-proof', f => { f.proof.profileConfigDigest = 'invalid'; }],
+  ['pause-during-sync', f => { f.objectSync.prepare = async () => { f.row.status = 'paused'; }; }],
+  ['revision-during-sync', f => { f.objectSync.prepare = async () => { f.row.revision += 1; }; }],
+  ['Base-during-sync', f => { f.objectSync.prepare = async () => { f.s.facts.baseRefOid = '9'.repeat(40); }; }],
+  ['unknown-during-sync', f => { f.objectSync.prepare = async () => { f.boxes[0].outcome.details.resultAttestation.payload.outcome = 'unknown'; }; }],
+  ['proof-during-sync', f => { f.objectSync.prepare = async () => { f.proof.profileConfigDigest = '9'.repeat(64); }; }],
+  ['prior-recovery-other-job', f => { f.timeline.push({ itemId: f.row.itemId, sequence: 2, type: 'transitioned',
+    actorId: VERIFICATION_RECOVERY_ACTOR, details: { reason: VERIFICATION_RECOVERY_REASON,
+      context: { headRefOid: binding.headRefOid, downstreamRef: 'different-job' } } }); }],
+]) {
+  test(`settled verification recovery preserves ${scenario}`, async () => {
+    const f = verificationRecoveryFixture(); mutate(f);
+    const before = structuredClone(f.job);
+    await f.s.service.recover(); await f.s.service.runCycle();
+    assert.equal(f.transitions.length, 0);
+    assert.deepEqual(f.job, before);
+  });
 }
 
 test("own review feedback prepares configured Head source and automatically starts its code task", async () => {
