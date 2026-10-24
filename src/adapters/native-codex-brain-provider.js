@@ -20,7 +20,7 @@ import { createCodeJobExecutionMcp } from "./code-job-execution-mcp.js";
 import { closeCodeExecutionContext, revokeCodeExecutionContext } from "../lib/code-execution-context.js";
 import { currentTaskExecution } from "../lib/task-execution-context.js";
 import { createCodeExecutionWatchdog, codeExecutionWatchdogSignal, closeCodeExecutionWatchdog } from '../lib/code-execution-watchdog.js';
-import { acquireNativeAdmission, createNativeModelAdmission, currentNativeAdmission, retainUnknownNativeInvocations, withNativeAdmission } from '../lib/native-model-admission.js';
+import { acquireNativeAdmission, createNativeModelAdmission, currentNativeAdmission, retainUnknownNativeInvocations, withNativeAdmission, withNativeEntityExclusion } from '../lib/native-model-admission.js';
 import { readUnknownNativeInvocations } from './native-codex-marker-identity.js';
 import {createNativeExecLifecycle} from '../lib/native-exec-lifecycle.js';
 import {readNativeModelCapacity} from '../lib/native-model-capacity.js';
@@ -447,10 +447,13 @@ export class NativeCodexBrainProvider {
   }
 
   async withEntityQuiescence({ entityKey, signal = null } = {}, operation) {
+    if (this.#closed) throw failure();
     if (typeof operation !== "function") throw new TypeError("Native quiescence operation is invalid");
+    if (typeof entityKey !== 'string' || !entityKey || Buffer.byteLength(entityKey) > 1024 || /[\u0000-\u001f]/u.test(entityKey)) throw new TypeError('Native quiescence entity is invalid');
+    signal = normalizeAbortSignal(signal);
+    signal?.throwIfAborted();
     if (!this.#state.launchJournalCertified) return { executed: false };
-    let entered = false;
-    const attempt = this.withAdmission({ entityKey, signal }, async () => {
+    const attempt = withNativeEntityExclusion(this.#state, nativeCodexDigest(entityKey), signal, async () => {
       const settled = await this.#state.preparation.enqueue(async () => {
         const entries = await readUnknownNativeInvocations({ root: this.#root,
           prefix: `active-${nativeCodexDigest(nativeCodexHomeIdentity(this.#nativeHome))}`,
@@ -460,17 +463,13 @@ export class NativeCodexBrainProvider {
       if (!settled || this.#closed || !this.#state.launchJournalCertified) return { executed: false };
       signal?.throwIfAborted();
       // Every built-in launch journals before spawning and retains its marker
-      // until tree supervision settles. Entity admission stays held while host
+      // until tree supervision settles. Entity exclusion stays held while host
       // actions drain; this does not rewrite any historical execution receipt.
-      entered = true;
       return { executed: true, result: await operation() };
     });
     this.#operations.add(attempt);
     try { return await attempt; }
-    catch (error) {
-      if (!entered && ["STRUCTURED_PROVIDER_BUSY", "STRUCTURED_PROVIDER_REAP_FAILED"].includes(error?.code)) return { executed: false };
-      throw error;
-    } finally { this.#operations.delete(attempt); }
+    finally { this.#operations.delete(attempt); }
   }
 
   async generate(rawRequest) {

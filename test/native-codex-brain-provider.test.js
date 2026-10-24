@@ -62,6 +62,39 @@ test("custom process runners cannot certify native entity quiescence", async t =
   await provider.close();
 });
 
+test("host cleanup holds the PR exclusion without requiring another model capacity slot", async t => {
+  const f = await fixture(t);
+  const provider = createNativeCodexBrainProvider(options, f.dependencies);
+  await mkdir(f.runtime);
+  const outcome = await provider.withAdmission({ entityKey: 'pr:unrelated' }, () =>
+    provider.withEntityQuiescence({ entityKey: 'pr:stale' }, () => 'host-cleanup'));
+  assert.deepEqual(outcome, { executed: true, result: 'host-cleanup' });
+  assert.equal(f.calls.length, 0);
+  await provider.close();
+});
+
+test("PR cleanup exclusion blocks queued generation for its own entity while allowing unrelated model work", async t => {
+  const f = await fixture(t);
+  const provider = createNativeCodexBrainProvider(options, { ...f.dependencies, maxConcurrentTurns: 2, allowConcurrentNativeHome: true });
+  await mkdir(f.runtime);
+  const entered = gate(), release = gate(), modelEntered = gate();
+  const cleanup = provider.withEntityQuiescence({ entityKey: 'pr:stale' }, async () => {
+    entered.resolve(); await release.promise; return 'settled';
+  });
+  await entered.promise;
+  const queued = provider.withAdmission({ entityKey: 'pr:stale', waitForCapacity: true }, () => modelEntered.resolve());
+  try {
+    await assert.rejects(provider.withAdmission({ entityKey: 'pr:stale' }, () => assert.fail('same PR entered cleanup')), { code: 'STRUCTURED_PROVIDER_BUSY' });
+    await provider.withAdmission({ entityKey: 'pr:unrelated' }, () => 'unrelated admitted');
+    let started = false; void modelEntered.promise.then(() => { started = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(started, false);
+  } finally { release.resolve(); }
+  assert.deepEqual(await cleanup, { executed: true, result: 'settled' });
+  await queued;
+  await provider.close();
+});
+
 for(const sharedSessionScope of [true,false])test(`employee admission and direct code jobs serialize one PR with session scopes ${sharedSessionScope?'equal':'isolated'}`,async t=>{
   const f=await fixture(t),entered=gate(),finish=gate(),otherEntered=gate(),starts=[];
   const provider=f.create(async call=>{

@@ -5,12 +5,13 @@ const reservations = new AsyncLocalStorage();
 const problem = code => Object.assign(new Error(code), {code, statusCode:503});
 
 export function createNativeModelAdmission(capacity = 1) {
-  return {capacity, active:new Set(), queue:[], blocked:false, lastStatus:null, markers:new Set(), unknownInvocations:new Map(), preparation:new OperationQueue()};
+  return {capacity, active:new Set(), queue:[], blocked:false, lastStatus:null, markers:new Set(), unknownInvocations:new Map(), entityExclusions:new Set(), preparation:new OperationQueue()};
 }
 
 export function retainUnknownNativeInvocations(state, entries) {
   if (state.capacity <= 1 || [...state.active].some(token => token.exclusive)) return false;
   if (entries.some(entry => state.unknownInvocations.has(entry.file) && state.unknownInvocations.get(entry.file).entity !== entry.entity)) return false;
+  if (entries.some(entry => state.entityExclusions.has(entry.entity))) return false;
   if (entries.some(entry => [...state.active].some(token => !token.unknown && token.entity === entry.entity))) return false;
   const additions = entries.filter(entry => !state.unknownInvocations.has(entry.file));
   if (state.unknownInvocations.size + additions.length >= state.capacity ||
@@ -34,7 +35,18 @@ export function retainUnknownNativeInvocations(state, entries) {
 
 function fits(state, entity, exclusive) {
   return !state.blocked && state.active.size < state.capacity &&
+    !state.entityExclusions.has(entity) &&
     ![...state.active].some(token => token.exclusive || exclusive || token.entity === entity);
+}
+
+// Host reconciliation needs an entity lock, not a model slot. Existing model
+// reservations still exclude it, including retained unknown invocations.
+export async function withNativeEntityExclusion(state, entity, signal, operation) {
+  signal?.throwIfAborted();
+  if (state.entityExclusions.has(entity) || [...state.active].some(token => token.entity === entity)) return { executed: false };
+  state.entityExclusions.add(entity);
+  try { signal?.throwIfAborted(); return await operation(); }
+  finally { state.entityExclusions.delete(entity); drain(state); }
 }
 
 function reserve(state, entity, exclusive) {
@@ -80,7 +92,8 @@ export async function withNativeAdmission(state, entity, signal, operation, {wai
   signal?.throwIfAborted();
   if (state.blocked) throw problem('STRUCTURED_PROVIDER_REAP_FAILED');
   const queuedCompetitor = state.queue.some(entry => entry.exclusive ||
-    ![...state.unknownInvocations.values()].some(token => token.entity === entry.entity));
+    (!state.entityExclusions.has(entry.entity) &&
+      ![...state.unknownInvocations.values()].some(token => token.entity === entry.entity)));
   if (!waitForCapacity && (queuedCompetitor || !fits(state, entity, false))) throw problem('STRUCTURED_PROVIDER_BUSY');
   const token = waitForCapacity ? await acquireNativeAdmission(state, entity, signal) : reserve(state, entity, false);
   return reservations.run(token, async () => {
