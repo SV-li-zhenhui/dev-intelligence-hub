@@ -302,6 +302,7 @@ export class CodeJobWorkerService {
   #conflictSourceReader;
   #managedExecutions = new Map();
   #managedWorkers = new Map();
+  #preparationRecoveryCursor = 0;
   #unstartedWriteRecovery;
 
   constructor({
@@ -454,8 +455,9 @@ export class CodeJobWorkerService {
         this.#managedWorkers.delete(id);
         if (job && (RUNNABLE_STATUSES.has(job.status) || job.status === 'unknown')) this.#managedWorkers.set(id, worker);
       }
+      const preparationRecovery = await this.#settleFailedPreparations(options);
       const capacity = Math.min(options.limit, this.#concurrency - this.#managedExecutions.size);
-      if (capacity <= 0) return { selected: 0, scheduled: 0, active: this.#managedExecutions.size };
+      if (capacity <= 0) return { selected: 0, scheduled: 0, active: this.#managedExecutions.size, preparationRecovery };
       const selected = await this.#selectCycle(options, capacity, new Set(this.#managedExecutions.keys()));
       let scheduled = 0;
       for (const job of selected.items) {
@@ -485,8 +487,49 @@ export class CodeJobWorkerService {
           throw error;
         }
       }
-      return { selected: selected.items.length, scheduled, active: this.#managedExecutions.size };
+      return { selected: selected.items.length, scheduled, active: this.#managedExecutions.size, preparationRecovery };
     });
+  }
+
+  async #settleFailedPreparations(options) {
+    const page = await this.#jobs.listRunnable({ limit: options.limit, afterSequence: this.#preparationRecoveryCursor,
+      ...(options.roleId === null ? {} : { roleId: options.roleId }) });
+    this.#preparationRecoveryCursor = page.items.at(-1)?.sequence ?? 0;
+    const result = { scanned: page.items.length, failed: 0, outcomes: [] };
+    const ownerAllows = async jobId => {
+      if (!this.#taskRuns?.get) return true;
+      let run;
+      try { run = await this.#taskRuns.get('code-job', jobId); }
+      catch (error) { if (error?.code !== 'TASK_RUN_NOT_FOUND') throw error; }
+      return !run || (run.active === false && run.mode === 'active' && run.pendingCommand === null && run.stopUnconfirmed !== true);
+    };
+    // Terminal executor preparation is host bookkeeping, not another model
+    // execution. It must not wait behind occupied managed decision lanes.
+    for (const job of page.items) {
+      options.signal?.throwIfAborted();
+      if (job.status !== 'starting' || job.execution.pendingAction !== null || job.execution.actionAdmission !== null ||
+          job.execution.uncertainty !== null || this.#managedExecutions.has(job.jobId)) continue;
+      try {
+        if (!await ownerAllows(job.jobId)) continue;
+        const session = await this.#viewOptionalSession(job.jobId);
+        if (session?.status !== 'failed') continue;
+        assertJobSessionInputBinding(job, session);
+        await this.#verifyAuthority(job.grant);
+        const current = await this.#jobs.getForWorker(job.jobId);
+        if (current?.status !== 'starting' || current.revision !== job.revision || !await ownerAllows(job.jobId)) continue;
+        options.signal?.throwIfAborted();
+        const code = safeErrorCode(session.error);
+        await this.#jobs.fail({ jobId: job.jobId, expectedRevision: job.revision,
+          result: { schemaVersion: 1, code, message: cleanText(session.error?.message ?? 'Code job preparation failed', 2_048) } });
+        this.#managedWorkers.delete(job.jobId);
+        result.failed++;
+        result.outcomes.push({ jobId: job.jobId, status: 'failed', code });
+      } catch (error) {
+        options.signal?.throwIfAborted();
+        result.outcomes.push({ jobId: job.jobId, status: 'waiting', code: safeErrorCode(error) });
+      }
+    }
+    return result;
   }
 
   #createManagedWorker(jobId) {

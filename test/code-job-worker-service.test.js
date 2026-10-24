@@ -2775,7 +2775,7 @@ function concurrentWorkerFixture(count, decide, concurrency, continuous = false)
   const worker = new CodeJobWorkerService({ jobStore: jobs, executor, brainDirectory: { decide,
     ...(continuous ? { describe: () => ({ supportsCodeExecution: true }) } : {}) },
     grantVerifier: verifier([]), ...(concurrency === undefined ? {} : { concurrency }) });
-  return { worker, jobs, initial, addJob() {
+  return { worker, jobs, initial, executors, executor, addJob() {
     const value = makeJob(initial.length);
     initial.push(value); jobs.jobs.set(value.jobId, structuredClone(value)); executors.set(value.jobId, new FakeExecutor(value));
     return value;
@@ -2806,6 +2806,57 @@ test('an idle managed execution slot admits a later job before the original long
     await tick(); await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(entered, [0, 1, 2]); assert.equal(maximum, 2);
   } finally { release.forEach(value => value.resolve()); await Promise.allSettled([...polls, ...owned]); }
+});
+
+test('a known failed preparation is settled while the managed model lane remains occupied', async () => {
+  const release = deferred(), owned = []; let decisions = 0;
+  const f = concurrentWorkerFixture(1, async () => {
+    decisions++; await release.promise;
+    return continuousDecision({ type: 'read_text', path: 'src/app.js' });
+  }, 1);
+  const owner = operation => { const promise = Promise.resolve().then(operation); owned.push(promise); return promise; };
+  try {
+    await f.worker.runReady({ limit: 10 }, owner);
+    await new Promise(resolve => setImmediate(resolve));
+    const failed = f.addJob();
+    f.jobs.jobs.get(failed.jobId).status = 'starting';
+    const executor = f.executors.get(failed.jobId);
+    executor.session.status = 'failed';
+    executor.session.error = { code: 'CONTROLLED_GIT_PREFLIGHT_FAILED', message: 'Snapshot preflight failed' };
+    const result = await f.worker.runReady({ limit: 1 }, owner);
+    assert.equal((await f.jobs.getForWorker(failed.jobId)).status, 'failed');
+    assert.equal((await f.jobs.getForWorker(failed.jobId)).execution.result.detail.code, 'CONTROLLED_GIT_PREFLIGHT_FAILED');
+    assert.equal(decisions, 1, 'settling a host failure must not invoke another model');
+    assert.equal(result.active, 1, 'the original model owner remains active');
+  } finally { release.resolve(); await Promise.allSettled(owned); }
+});
+
+for (const [name, change] of [
+  ['active owner', f => { f.run.active = true; }],
+  ['owner hold', f => { f.run.mode = 'paused'; }],
+  ['owner command', f => { f.run.pendingCommand = 'pause'; }],
+  ['unconfirmed stop', f => { f.run.stopUnconfirmed = true; }],
+  ['job paused', f => { f.job.status = 'paused'; }],
+  ['pending action', f => { f.job.execution.pendingAction = {}; }],
+  ['admitted action', f => { f.job.execution.actionAdmission = {}; }],
+  ['unknown action', f => { f.job.execution.uncertainty = {}; }],
+  ['mismatched session', f => { f.session.id = 'other-job'; }],
+  ['preparing session', f => { f.session.status = 'preparing'; }],
+  ['authority revoked', f => { f.verify = async () => { throw Object.assign(new Error('revoked'), { code: 'INVALID_CODE_JOB_AUTHORITY' }); }; }],
+  ['concurrent owner pause', f => { f.verify = async value => { f.job.status = 'paused'; f.job.revision++; return value; }; }],
+]) test(`failed preparation maintenance preserves ${name}`, async () => {
+  const f = concurrentWorkerFixture(1, async () => assert.fail('no model needed'), 1);
+  const job = f.jobs.jobs.get(f.initial[0].jobId), session = f.executors.get(job.jobId).session;
+  job.status = 'starting'; session.status = 'failed';
+  session.error = { code: 'CONTROLLED_GIT_PREFLIGHT_FAILED' };
+  const context = { job, session, run: { active: false, mode: 'active', pendingCommand: null, stopUnconfirmed: false }, verify: async value => value };
+  change(context);
+  const worker = new CodeJobWorkerService({ jobStore: f.jobs, executor: f.executor,
+    brainDirectory: { async decide() { assert.fail('no model needed'); } },
+    taskRuns: { async get() { return context.run; }, async order() { return []; } },
+    grantVerifier: { verify: context.verify } });
+  await worker.runReady({ limit: 1 }, () => assert.fail('no model owner needed'));
+  assert.notEqual((await f.jobs.getForWorker(job.jobId)).status, 'failed');
 });
 
 test('managed jobs keep independent abort signals and release a rejected owner reservation', async () => {
