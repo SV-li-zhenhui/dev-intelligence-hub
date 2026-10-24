@@ -21,6 +21,14 @@ export function retainUnknownNativeInvocations(state, entries) {
     state.unknownInvocations.set(entry.file, token);
     state.markers.add(entry.file);
   }
+  // An earlier exclusive status probe can never acquire an empty home while
+  // an unknown invocation is retained. Fail its unstarted admission so its
+  // next attempt can use the remaining capacity under the updated policy.
+  if (entries.length > 0) for (const entry of [...state.queue]) {
+    if (!entry.exclusive) continue;
+    state.queue.splice(state.queue.indexOf(entry),1);
+    entry.fail(problem('STRUCTURED_PROVIDER_BUSY'));
+  }
   return entries.length > 0;
 }
 
