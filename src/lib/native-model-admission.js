@@ -9,10 +9,12 @@ export function createNativeModelAdmission(capacity = 1) {
 }
 
 export function retainUnknownNativeInvocations(state, entries) {
-  if (state.capacity <= 1 || [...state.active].some(token => !token.unknown)) return false;
+  if (state.capacity <= 1 || [...state.active].some(token => token.exclusive)) return false;
   if (entries.some(entry => state.unknownInvocations.has(entry.file) && state.unknownInvocations.get(entry.file).entity !== entry.entity)) return false;
+  if (entries.some(entry => [...state.active].some(token => !token.unknown && token.entity === entry.entity))) return false;
   const additions = entries.filter(entry => !state.unknownInvocations.has(entry.file));
-  if (state.active.size + additions.length >= state.capacity) return false;
+  if (state.unknownInvocations.size + additions.length >= state.capacity ||
+      state.active.size + additions.length > state.capacity) return false;
   for (const entry of additions) {
     const token = { entity: entry.entity, exclusive: false, unknown: true };
     state.active.add(token);

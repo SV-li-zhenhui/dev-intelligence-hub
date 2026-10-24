@@ -20,6 +20,10 @@ test('unknown native reservations are idempotent, identity-bound, and never exce
   assert.equal(retainUnknownNativeInvocations(state,[{file:'/owned/second.json',entity:'second'}]),false);
   assert.equal(state.active.size,1);
   state.active.add({entity:'running'});
-  assert.equal(retainUnknownNativeInvocations(state,[entry]),false);
+  assert.equal(retainUnknownNativeInvocations(state,[entry]),true);
+  assert.equal(retainUnknownNativeInvocations(state,[{file:'/owned/third.json',entity:'third'}]),false);
+  assert.equal(state.active.size,2);
   assert.equal(state.unknownInvocations.size,1);
+  const exclusive=createNativeModelAdmission(2); exclusive.active.add({entity:'login',exclusive:true});
+  assert.equal(retainUnknownNativeInvocations(exclusive,[entry]),false);
 });

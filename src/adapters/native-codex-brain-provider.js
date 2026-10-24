@@ -250,7 +250,7 @@ export class NativeCodexBrainProvider {
     let pending = FENCE_RECONCILIATIONS.get(this.#state);
     if (!pending) {
       pending = this.#state.preparation.enqueue(async () => {
-        if (!this.#state.blocked || [...this.#state.active].some(token => !token.unknown)) return;
+        if (!this.#state.blocked || [...this.#state.active].some(token => token.exclusive)) return;
         const entries = await readUnknownNativeInvocations({ root: this.#root,
           prefix: `active-${nativeCodexDigest(nativeCodexHomeIdentity(this.#nativeHome))}`, clock: this.#dependencies.clock });
         if (entries !== null && retainUnknownNativeInvocations(this.#state, entries) &&
