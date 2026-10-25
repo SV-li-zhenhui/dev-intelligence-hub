@@ -17,6 +17,7 @@ import { isRecoveredRepairEvidence } from "./work-ledger-inspection-continuation
 import { unstartedConflictDispatchFailure } from "./work-ledger-conflict-failure.js";
 import { unstartedDeliveryContractFailure, unstartedCodePolicyBindingFailure, recordedDeliveryFailure } from "./work-ledger-delivery-failure.js";
 import { indexRecordedDecisionFailures } from './work-ledger-decision-failure.js';
+import { indexRecordedProposalFailures } from './work-ledger-proposal-failure.js';
 
 export const WORK_LEDGER_GRAPH_ID = "work-ledger";
 
@@ -414,6 +415,7 @@ export function projectWorkLedgerGraphView(state, options) {
     }
   }
   const decisionFailures = indexRecordedDecisionFailures(state);
+  const proposalFailures = indexRecordedProposalFailures(state);
   const taskStates = graph.tasks.map((task) => {
     const item = itemsById.get(task.taskId);
     if (!item || item.get("revision") !== task.revision) {
@@ -442,6 +444,7 @@ export function projectWorkLedgerGraphView(state, options) {
       ...(dispatchFailure === null ? {} : { dispatchFailure }),
       ...(deliveryFailure === null ? {} : { deliveryFailure }),
       ...(decisionFailures.has(task.taskId) ? { decisionFailure: decisionFailures.get(task.taskId) } : {}),
+      ...(proposalFailures.has(task.taskId) ? { proposalFailure: proposalFailures.get(task.taskId) } : {}),
       updatedAt: item.get("updatedAt"),
       work: projectedItemWork(item),
     };

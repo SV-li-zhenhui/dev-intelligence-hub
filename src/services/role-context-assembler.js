@@ -18,6 +18,7 @@ import { WORK_LEDGER_STATUSES } from "./work-ledger-values.js";
 import { createRoleContextEvidenceCatalogAdapter } from "./role-context-evidence-catalog.js";
 import { normalizeRecordedDeliveryFailure } from "./work-ledger-delivery-failure.js";
 import { normalizeRecordedDecisionFailure } from './work-ledger-decision-failure.js';
+import { normalizeRecordedProposalFailure } from './work-ledger-proposal-failure.js';
 import {
   RoleContextAssemblerError,
   roleContextError,
@@ -541,6 +542,7 @@ function normalizeSnapshot(value) {
     let dispatchFailure = null;
     let deliveryFailure = null;
     let decisionFailure = null;
+    let proposalFailure = null;
     if (ledgerStatus === "blocked" && fields.get("statusReason") === "intent_failed" && fields.get("dispatchFailure") != null) {
       dispatchFailure = normalizeDispatchFailure(fields.get("dispatchFailure"), tasksById.get(taskId));
     }
@@ -552,6 +554,10 @@ function normalizeSnapshot(value) {
       decisionFailure = normalizeRecordedDecisionFailure(fields.get('decisionFailure'), fields.get('taskRevision'));
       if (decisionFailure === null) throw invalid('decision failure binding is invalid');
     }
+    if (ledgerStatus === 'blocked' && fields.get('statusReason') === 'proposal_failed' && fields.get('proposalFailure') != null) {
+      proposalFailure = normalizeRecordedProposalFailure(fields.get('proposalFailure'), fields.get('taskRevision'));
+      if (proposalFailure === null) throw invalid('proposal failure binding is invalid');
+    }
     if (statesById.has(taskId)) throw invalid("task state IDs are duplicated");
     statesById.set(taskId, {
       taskId,
@@ -561,10 +567,11 @@ function normalizeSnapshot(value) {
       ),
       ledgerStatus,
       blockingCondition: ledgerStatus === "blocked" && fields.get("statusReason") === "proposal_stale"
-        ? "proposal-stale" : dispatchFailure?.code ?? deliveryFailure?.code ?? decisionFailure?.code ?? null,
+        ? "proposal-stale" : dispatchFailure?.code ?? deliveryFailure?.code ?? decisionFailure?.code ?? proposalFailure?.code ?? null,
       dispatchFailure,
       deliveryFailure,
       decisionFailure,
+      proposalFailure,
       work: {
         title: nullableText(work.get("title"), "work.title", 256),
         description: nullableText(
@@ -944,6 +951,7 @@ function projectRootCoordination(roleId, currentTask, snapshot) {
       ...(taskState.dispatchFailure === null ? {} : { dispatchFailure: { ...taskState.dispatchFailure } }),
       ...(taskState.deliveryFailure === null ? {} : { deliveryFailure: { ...taskState.deliveryFailure } }),
       ...(taskState.decisionFailure === null ? {} : { decisionFailure: { ...taskState.decisionFailure } }),
+      ...(taskState.proposalFailure === null ? {} : { proposalFailure: { ...taskState.proposalFailure } }),
       responsibility: { ...child.responsibility },
       work: {
         title: taskState.work.title,

@@ -1,4 +1,5 @@
 import { digestValue } from "../src/domain/code-executor-contract.js";
+import { indexRecordedProposalFailures } from '../src/services/work-ledger-proposal-failure.js';
 import { createPrTriageWorkRequest, ownerWorkRequestDigest } from '../src/domain/owner-work-request.js';
 import { triageRetirementCandidate, matchRetiredTriageSource, publishedTriageReview, planTriageRetirement, automaticTriageRetirement } from '../src/services/work-ledger-triage-retirement.js';
 import { createCiRepairEvidence } from "../src/domain/ci-repair-evidence.js";
@@ -18853,6 +18854,49 @@ test('legacy CI parent admission still requires its unchanged retirement proof a
       if (variant === 'source-pending') root.source.pendingRevision = 2;
       assert.equal(hasPendingCiMaterialRecovery(state, root), false);
     });
+  }
+});
+
+test('a settled failed code proposal wakes its coordinating parent without replaying the child', async () => {
+  const record = ownerRequestedPrAssignment(1, { gitFacts: { ...prGitFacts(PR_HEAD_A), workType: 'general',
+    nextAction: 'fix_ci', suggestedCapability: 'development', expectedHeadRefOid: PR_HEAD_A } });
+  record.assignment.target = { type: 'role', id: 'orchestrator' };
+  const f = await createFixture({ records: [record] });
+  await f.service.intake();
+  const root = (await f.service.listItems()).items[0];
+  const created = await f.service.createGraphChild(prGraphChildCommand(root,
+    (await f.service.getSummary()).revision, 'failed-code-coordination'));
+  const result = await prepareProposalResult(f, { kind: 'code_action_proposal', outcome: 'failed',
+    itemId: created.taskId, intentOverrides: { operation: 'inspect' }, sealSource: true });
+  await f.service.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+  const before = await f.service.readItemForReconciliation({ itemId: created.taskId });
+  assert.equal(before.statusReason, 'proposal_failed');
+  const graph = await f.service.getGraphSnapshot();
+  const projected = graph.taskStates.find(row => row.taskId === before.itemId);
+  assert.equal(projected.proposalFailure?.code, 'CODE_ACTION_PROPOSAL_FAILED');
+  assert.equal(projected.proposalFailure.stage, 'proposal');
+  assert.equal(projected.proposalFailure.taskRevision, before.revision);
+  const page = await f.service.listClaimCandidates({ at: f.time.clock(), roleId: 'orchestrator' });
+  assert.equal(page.facts.find(row => row.itemId === root.itemId).orchestrationReady, true);
+  assert.deepEqual(await f.service.readItemForReconciliation({ itemId: before.itemId }), before);
+  const durable = f.store.stored();
+  for (const variant of ['paused', 'owned', 'active-intent', 'unknown-outbox', 'missing-seal', 'wrong-attestation',
+    'wrong-result', 'changed-binding', 'duplicate-outbox', 'later-event', 'wrong-revision']) {
+    const state = clone(durable), item = state.items.find(x => x.itemId === before.itemId);
+    const box = state.outbox.find(x => x.itemId === item.itemId);
+    const latest = state.timeline.findLast(x => x.itemId === item.itemId);
+    if (variant === 'paused') item.status = 'paused';
+    if (variant === 'owned') item.ownerId = 'another-worker';
+    if (variant === 'active-intent') item.activeIntentId = 'unknown-intent';
+    if (variant === 'unknown-outbox') box.status = 'unknown';
+    if (variant === 'missing-seal') delete box.outcome.details.resultAttestation;
+    if (variant === 'wrong-attestation') latest.details.resultAttestationDigest = 'f'.repeat(64);
+    if (variant === 'wrong-result') item.decisionContext.value.resultId = 'another-result';
+    if (variant === 'changed-binding') box.sourceBinding.inputDigest = 'f'.repeat(64);
+    if (variant === 'duplicate-outbox') state.outbox.push(clone(box));
+    if (variant === 'later-event') state.timeline.push({ itemId: item.itemId, type: 'another-event' });
+    if (variant === 'wrong-revision') latest.details.workItemRevision++;
+    assert.equal(indexRecordedProposalFailures(state).has(item.itemId), false, variant);
   }
 });
 

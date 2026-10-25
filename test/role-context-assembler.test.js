@@ -2490,6 +2490,23 @@ test("constructor rejects accessor ports without invoking them", () => {
   }
 });
 
+test('root coordination exposes a settled proposal failure without inferring an unstarted or safe-to-retry job', async () => {
+  const fixture = rootOrchestratorFixture();
+  const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === 'task-current');
+  state.ledgerStatus = 'blocked'; state.statusReason = 'proposal_failed';
+  state.proposalFailure = { code: 'CODE_ACTION_PROPOSAL_FAILED', stage: 'proposal', taskRevision: state.taskRevision,
+    timelineId: `work-timeline-${'a'.repeat(64)}`, timelineDigest: 'a'.repeat(64), recordedAt: '2026-08-03T07:00:00.000Z' };
+  state.rawError = 'PRIVATE-EXECUTION-TRACE';
+  const packet = await assemble(fixture, { roleId: 'orchestrator' });
+  const visible = packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === state.taskId);
+  assert.equal(visible.blockingCondition, 'CODE_ACTION_PROPOSAL_FAILED');
+  assert.deepEqual(visible.proposalFailure, state.proposalFailure);
+  assert.equal(Object.hasOwn(visible.proposalFailure, 'downstreamCreated'), false);
+  assert.equal(JSON.stringify(packet).includes('PRIVATE-EXECUTION-TRACE'), false);
+  state.proposalFailure.taskRevision++;
+  await assert.rejects(assemble(fixture, { roleId: 'orchestrator' }), error => error.code === 'ROLE_CONTEXT_INVALID');
+});
+
 test('root coordination exposes a retained decision rejection without claiming a delivery or granting a retry', async () => {
   const fixture = rootOrchestratorFixture();
   const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === 'task-current');
