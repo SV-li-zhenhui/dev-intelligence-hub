@@ -4,11 +4,25 @@ import { samePullRequestExecutionBinding } from '../domain/pull-request-executio
 import { approveOwnPrAction } from './automatic-own-pr-repair-authorization.js';
 import { pendingOverwriteRecoveryCandidate, stoppedCodeJobRun } from './code-job-read-recovery.js';
 import { recoverableNativePauseCode } from './automatic-code-job-pause-recovery.js';
+import { normalizeInternalReviewMetadata } from '../domain/internal-repair-review.js';
+import { currentWorkItemEvent } from './work-ledger-pr-source.js';
 
 const sameLogin = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
 const STALE_TARGET = Symbol('stale local code target');
 const ACTIVE = new Set(['queued', 'working', 'dispatch_pending', 'waiting_external', 'waiting_condition']);
 const OPERATIONS = { developer: new Set(['inspect', 'modify', 'verify']), tester: new Set(['inspect', 'verify']) };
+
+function canObserveInternalReviewOwner(root, grant) {
+  if (root.kind !== 'source_root' || root.source?.kind !== 'pull_request' ||
+      root.source.scope.kind !== 'internal_review' || root.source.identity?.provider !== 'internal-review-repair' ||
+      !['inspect', 'verify'].includes(grant.operation) || !Array.isArray(grant.writablePaths) || grant.writablePaths.length !== 0 ||
+      !Array.isArray(grant.allowedActions) ||
+      grant.allowedActions.some(action => !['list_files', 'read_text', 'run_profile', 'complete'].includes(action))) return false;
+  const event = currentWorkItemEvent(root);
+  if (event?.eventType !== 'pull_request.internal_review_requested' || event.source?.provider !== 'internal-review-repair') return false;
+  try { return normalizeInternalReviewMetadata(event.payload.internalReview).headRefOid === grant.inputBinding.headRefOid; }
+  catch { return false; }
+}
 
 // Routine local work has no external Review provenance. Its authorization
 // cannot be used as a Review-repair or conflict-publication receipt.
@@ -125,10 +139,12 @@ export class AutomaticLocalCodeAuthorization {
     if (!root || !task || !ACTIVE.has(root.status) || !ACTIVE.has(task.status) ||
         root.source?.scope?.active !== true || task.currentTarget?.type !== 'role' || task.currentTarget.id !== role) return null;
     const ownerRequested = root.source.scope.kind === 'owner_requested' && root.source.identity?.provider === 'local-owner';
-    if (!sameLogin(context.author, actor) && !ownerRequested) return null;
+    const observeInternalOwner = context.author === null && canObserveInternalReviewOwner(root, grant);
+    if (!sameLogin(context.author, actor) && !ownerRequested && !observeInternalOwner) return null;
     const facts = await this.github.readPullRequestLocalWorkFacts({ repository: binding.repository,
       number: binding.pullRequestNumber, account: actor, authorAccountId: context.author });
     if (facts.state !== 'open' || (context.author !== null && !sameLogin(facts.author, context.author)) ||
+        (observeInternalOwner && !sameLogin(facts.author, actor)) ||
         facts.headRefOid !== binding.headRefOid || facts.baseRefOid !== binding.gitTarget.baseRefOid) return STALE_TARGET;
     try {
       if (!isDeepStrictEqual(await this.grantVerifier.verify(grant), grant)) return null;

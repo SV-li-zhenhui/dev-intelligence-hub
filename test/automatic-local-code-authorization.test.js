@@ -258,6 +258,63 @@ test('legacy owner-requested work with no author uses observed PR identity and r
   assert.equal((await f.service.approveCodeJob(f.item)).status, 'pending');
 });
 
+function internalReviewFixture(operation = 'inspect') {
+  const f = fixture('developer', operation), binding = f.grant.inputBinding;
+  f.grant.writablePaths = [];
+  const event = { eventType: 'pull_request.internal_review_requested', source: { provider: 'internal-review-repair' },
+    payload: { internalReview: { kind: 'own_pr_ci_repair', headRefOid: binding.headRefOid,
+      feedbackDigest: 'c'.repeat(64), publicationConfirmationId: 'published-repair', controlledCommitEvidenceId: 'sealed-repair' } } };
+  f.root.kind = 'source_root';
+  Object.assign(f.root.source, { kind: 'pull_request', scope: { kind: 'internal_review', active: true },
+    identity: { provider: 'internal-review-repair' }, current: { event } });
+  f.ports.ledger.readPullRequestExecutionContext = async () => ({ inputBinding: binding, author: null });
+  return f;
+}
+
+for (const operation of ['inspect', 'verify']) {
+  test(`own repair internal-review ${operation} observes the missing author before automatic authorization`, async () => {
+    const f = internalReviewFixture(operation);
+    let reads = 0;
+    f.ports.github.readPullRequestLocalWorkFacts = async request => {
+      reads++;
+      assert.equal(request.authorAccountId, null);
+      assert.equal(request.account, 'me');
+      return f.facts;
+    };
+    assert.equal((await f.service.approveCodeJob(f.item)).status, 'completed');
+    assert.equal(reads, 2, 'current author and Head/Base are checked again after object preparation');
+    assert.equal(f.calls.length, 1);
+    assert.equal(Object.hasOwn(f.grant, 'executionSource'), false);
+  });
+}
+
+test('authorless internal review remains scoped to read-only own repair and current observed ownership', async t => {
+  for (const [name, change, expected = 'pending'] of [
+    ['modification', f => { f.grant.operation = 'modify'; }],
+    ['writable paths', f => { f.grant.writablePaths = ['src/app.js']; }],
+    ['write action', f => { f.grant.allowedActions.push('write_text'); }],
+    ['ordinary automatic scope', f => { f.root.source.scope.kind = 'automatic'; }],
+    ['wrong source provider', f => { f.root.source.identity.provider = 'github'; }],
+    ['wrong event', f => { f.root.source.current.event.eventType = 'pull_request.updated'; }],
+    ['wrong event provider', f => { f.root.source.current.event.source.provider = 'github'; }],
+    ['old repair Head', f => { f.root.source.current.event.payload.internalReview.headRefOid = '9'.repeat(40); }],
+    ['invalid repair provenance', f => { delete f.root.source.current.event.payload.internalReview.controlledCommitEvidenceId; }],
+    ['another current author', f => { f.facts.author = 'contributor'; }, 'stale'],
+    ['changed Base', f => { f.facts.baseRefOid = '9'.repeat(40); }, 'stale'],
+  ]) await t.test(name, async () => {
+    const f = internalReviewFixture(); change(f);
+    assert.equal((await f.service.approveCodeJob(f.item)).status, expected);
+    assert.equal(f.calls.length, 0);
+  });
+});
+
+test('internal review rechecks ownership after preparation instead of approving a newly changed target', async () => {
+  const f = internalReviewFixture();
+  f.ports.objectSync.prepare = async () => { f.facts.author = 'contributor'; };
+  assert.equal((await f.service.approveCodeJob(f.item)).status, 'stale');
+  assert.equal(f.calls.length, 0);
+});
+
 test('unknown facts defer; authority is checked again after object preparation', async () => {
   const f = fixture();
   f.ports.github.readPullRequestLocalWorkFacts = async () => { throw new Error('offline'); };
