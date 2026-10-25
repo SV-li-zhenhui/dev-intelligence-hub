@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { AutomaticCodeJobPauseRecovery } from '../src/services/automatic-code-job-pause-recovery.js';
 import { digestValue } from '../src/domain/code-executor-contract.js';
 import { incompleteReadPauseReason } from '../src/services/code-job-read-recovery.js';
+import { codeProtocolRecoveryFor, codeProtocolRecoveryMessages } from '../src/services/code-job-protocol-recovery.js';
 
 function fixture() {
   const job = { jobId: 'job-1', sequence: 1, revision: 12, status: 'paused', createdAt: '2026-10-10T03:00:00Z',
@@ -114,6 +115,38 @@ test('a stopped native turn with an incomplete final decision resumes only its e
   assert.equal((await f.create().runCycle()).resumed, 1);
   assert.equal(f.calls.length, 1);
   assert.equal((await f.create().runCycle()).resumed, 0);
+});
+
+test('incomplete source-page reading resumes automatically with fresh paging guidance after positive native stop', async () => {
+  const f = fixture(), code = 'CODE_ARTIFACT_READ_INCOMPLETE';
+  f.job.execution.pause.reason = `等待人工处理（${code}）`;
+  f.proof.receipt.outcomeCode = code;
+  Object.assign(f.proof, { kind: 'code-job', taskId: f.job.jobId, roleId: 'developer' });
+  assert.equal((await f.create().runCycle()).resumed, 1);
+  assert.equal(codeProtocolRecoveryFor(f.job, f.proof), code);
+  assert.match(codeProtocolRecoveryMessages(code)[0].content, /read_source.*full audited source pages/);
+  assert.equal((await f.create().runCycle()).resumed, 0);
+});
+
+test('incomplete source-page recovery retains user holds, pending actions and unknown executions', async t => {
+  for (const [name, change] of [
+    ['owner pause', f => { f.job.execution.pause.reason = '用户暂停'; }],
+    ['manual mode', f => { f.setEligible(false); }],
+    ['live model', f => { f.proof.active = true; }],
+    ['unconfirmed stop', f => { f.proof.receipt.stopConfirmed = false; }],
+    ['pending instruction', f => { f.proof.pendingCommand = 'pause'; }],
+    ['pending action', f => { f.job.execution.pendingAction = {}; }],
+    ['admitted action', f => { f.job.execution.actionAdmission = {}; }],
+    ['unknown action', f => { f.job.execution.uncertainty = {}; }],
+    ['other failure', f => { f.proof.receipt.outcomeCode = 'CODE_ARTIFACT_READ_INVALID'; }],
+  ]) await t.test(name, async () => {
+    const f = fixture();
+    f.job.execution.pause.reason = '等待人工处理（CODE_ARTIFACT_READ_INCOMPLETE）';
+    f.proof.receipt.outcomeCode = 'CODE_ARTIFACT_READ_INCOMPLETE';
+    change(f);
+    assert.equal((await f.create().runCycle()).resumed, 0);
+    assert.equal(f.calls.length, 0);
+  });
 });
 
 test('native completion recovery rejects mismatched failures, running actions and user holds', async t => {
