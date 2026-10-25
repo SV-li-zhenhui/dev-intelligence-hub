@@ -40,6 +40,13 @@ test("automatic publication retires duplicate same-Head reviews and positively r
   }
 });
 
+test('retirement-only reconciliation never publishes even when fresh facts describe an eligible external PR', async () => {
+  const { publisher, item, calls, invalidations } = fixture({ event: 'COMMENT', invalidator: true });
+  assert.equal(await publisher.publish(item, { publicationAllowed: false }), item);
+  assert.equal(calls.length, 0);
+  assert.equal(invalidations.length, 0);
+});
+
 test("a same-Head Review for a later incoming Assign publishes instead of revoking authorization", async () => {
   const { publisher, item, calls, invalidations } = fixture({ event: "COMMENT", invalidator: true,
     facts: { assignees: ["me"], myLatestPublishedReviewCommitOid: head,

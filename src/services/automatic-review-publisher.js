@@ -33,7 +33,7 @@ export class AutomaticReviewPublisher {
       automaticReviewContinuationEligibility(facts, item.actor.accountId, this.clock(), context?.admission) === null;
   }
 
-  async publish(item) {
+  async publish(item, { publicationAllowed = true } = {}) {
     if (!this.enabled || item.kind !== "github.work-proposal-review" || item.status !== "pending") return item;
     const action = item.display?.payload?.action;
     if (action?.type !== "pull_request_review") return item;
@@ -58,7 +58,7 @@ export class AutomaticReviewPublisher {
         throw error;
       }
     }
-    if (!await this.eligible(facts, item)) return item;
+    if (publicationAllowed !== true || !await this.eligible(facts, item)) return item;
     let reviewHandoff;
     if (this.assignAfterReview) {
       if (action.reviewEvent === "APPROVE") {

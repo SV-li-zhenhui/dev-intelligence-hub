@@ -497,8 +497,8 @@ export class GitHubReviewProposalHandler {
     if (item === null) {
       item = normalizeConfirmationItem(await this.#enqueue(plan), expected);
     }
-    if (this.#automaticReviewPublisher !== null && !selfAuthored && item.status === "pending") {
-      const published = await this.#automaticReviewPublisher.publish(item);
+    if (this.#automaticReviewPublisher !== null && item.status === "pending") {
+      const published = await this.#automaticReviewPublisher.publish(item, { publicationAllowed: !selfAuthored });
       if (published !== item) item = normalizeConfirmationItem(published, expected);
     }
     return transitionFor(item, this.#clock, this.#pollIntervalMs);

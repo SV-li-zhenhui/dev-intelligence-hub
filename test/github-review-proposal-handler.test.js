@@ -302,6 +302,22 @@ test("a self-authored blocking proposal is queued as a COMMENT review", async ()
   );
 });
 
+test('automatic mode retires an existing own-PR COMMENT confirmation without publishing or replacing it', async () => {
+  const producer = new FakeConfirmationProducer();
+  const options = { pullRequestContextReader: acceptingContextReader('review-account') };
+  const waiting = await handler(producer, options).handle(handlerInput());
+  const publisher = new AutomaticReviewPublisher({ enabled: true, queue: { approve: async () => assert.fail('No self Review') },
+    confirmationInvalidator: producer, github: { readIncomingReviewRequest: async () => ({ kind: 'pull_request',
+      incomingReviewFactsAvailable: true, state: 'open', isDraft: false, author: 'review-account',
+      currentUser: 'review-account', headRefOid: HEAD_REF_OID }) } });
+  const result = await handler(producer, { ...options, automaticReviewPublisher: publisher }).handle(handlerInput({
+    status: 'waiting_confirmation', attempt: 2, downstreamRef: waiting.downstreamRef }));
+  assert.equal(result.status, 'stale');
+  assert.equal(producer.status, 'stale');
+  assert.equal(producer.invalidateCalls.length, 1);
+  assert.equal(producer.enqueueCalls.length, 1, 'no replacement confirmation is created');
+});
+
 test("review authority accepts the ledger's optional feedback digest and keeps rejecting invalid contexts", async () => {
   for (const extra of [{}, { reviewFeedbackDigest: "a".repeat(64) },
     { reviewFeedbackDigest: null }, { reviewFeedbackDigest: "invalid" },
