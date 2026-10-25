@@ -17,6 +17,7 @@ const RUNTIME_METHODS = Object.freeze([
   "getRoleWorkloads",
   "listItems",
   "readItemProgress",
+  "readRepairDecisionBudget",
   "readInternalReviewHandoff",
   "listClaimCandidates",
   "listPendingPullRequestSources",
