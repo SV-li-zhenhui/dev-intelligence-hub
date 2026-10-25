@@ -13,7 +13,7 @@ import {
   workLedgerError,
 } from "./work-ledger-values.js";
 import { currentWorkItemInputBinding } from "./work-ledger-pr-source.js";
-import { isRecoveredConflictInspection } from "./work-ledger-inspection-continuation.js";
+import { isRecoveredRepairInspection } from "./work-ledger-inspection-continuation.js";
 import { unstartedConflictDispatchFailure } from "./work-ledger-conflict-failure.js";
 import { unstartedDeliveryContractFailure, unstartedCodePolicyBindingFailure, recordedDeliveryFailure } from "./work-ledger-delivery-failure.js";
 import { indexRecordedDecisionFailures } from './work-ledger-decision-failure.js';
@@ -657,7 +657,7 @@ export function validateWorkLedgerGraphTransition(previousState, nextState) {
         (
           (nextItem.status === "queued" &&
             nextItem.source.activeRevision > item.source.activeRevision) ||
-          isRecoveredConflictInspection(previousState, item, nextItem) ||
+          isRecoveredRepairInspection(previousState, item, nextItem) ||
           isCompletedPullRequestRootScopeExit(item, nextItem) ||
           isCompletedInactivePullRequestRootAdvanced(item, nextItem) ||
           isCompletedPullRequestRootRetiredAfterAdvance(item, nextItem, nextItemsById) ||

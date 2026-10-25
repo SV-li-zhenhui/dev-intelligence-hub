@@ -13,8 +13,8 @@ export function continuesOwnPullRequestRepairInspection(item, outbox, result) {
       item.source?.kind !== "pull_request" || item.source.scope.active !== true || item.source.scope.kind !== "automatic" ||
       item.source.pendingRevision !== null || item.source.identity.targetRoleId !== "developer" ||
       event.source.provider !== "github" || event.payload.relation !== "authored" ||
-      (event.payload.isDraft === true && event.payload.nextAction !== "resolve_conflict") ||
-      event.payload.actionState !== "action_now" || !["address_review", "resolve_conflict"].includes(event.payload.nextAction)) return false;
+      (event.payload.isDraft === true && !["resolve_conflict", "fix_ci"].includes(event.payload.nextAction)) ||
+      event.payload.actionState !== "action_now" || !["address_review", "resolve_conflict", "fix_ci"].includes(event.payload.nextAction)) return false;
   try {
     const current = currentWorkItemExecutionBinding(item);
     return SOURCE_FIELDS.every(key => current?.[key] === outbox.sourceBinding?.[key]) &&
@@ -22,10 +22,10 @@ export function continuesOwnPullRequestRepairInspection(item, outbox, result) {
   } catch { return false; }
 }
 
-export function completedConflictInspectionRecoveryProof(state, item) {
+export function completedRepairInspectionRecoveryProof(state, item) {
   if (item.kind !== "source_root" || item.status !== "completed" || item.statusReason !== "proposal_succeeded" ||
       item.activeIntentId !== null || item.ownerId !== null || item.leaseId !== null || item.sourceQuarantine !== null ||
-      item.graph?.deliveries?.length > 0 || currentWorkItemEvent(item)?.payload?.nextAction !== "resolve_conflict" ||
+      item.graph?.deliveries?.length > 0 || !["resolve_conflict", "fix_ci"].includes(currentWorkItemEvent(item)?.payload?.nextAction) ||
       item.decisionContext?.source !== "proposal" || item.decisionContext.outcome !== "succeeded") return null;
   const admission = pullRequestHeadAdmission(state, item);
   if (!admission.current || admission.pending) return null;
@@ -43,13 +43,15 @@ export function completedConflictInspectionRecoveryProof(state, item) {
         result.contentDigest !== item.decisionContext.value.resultDigest ||
         result.proposalContentDigest !== outbox.outcome.details.proposalDigest ||
         !continuesOwnPullRequestRepairInspection(item, outbox, result)) return null;
-    return { intentId: outbox.intentId, resultId: result.resultId };
+    return { intentId: outbox.intentId, resultId: result.resultId,
+      reason: currentWorkItemEvent(item).payload.nextAction === "fix_ci" ? "pr_ci_inspection_continued" : "pr_conflict_inspection_continued" };
   } catch { return null; }
 }
 
-export function isRecoveredConflictInspection(previousState, previous, next) {
-  if (!next || next.status !== "queued" || next.statusReason !== "pr_conflict_inspection_continued" ||
-      next.revision !== previous.revision + 1 || !completedConflictInspectionRecoveryProof(previousState, previous)) return false;
+export function isRecoveredRepairInspection(previousState, previous, next) {
+  if (!next || next.status !== "queued" || next.revision !== previous.revision + 1) return false;
+  const proof = completedRepairInspectionRecoveryProof(previousState, previous);
+  if (!proof || next.statusReason !== proof.reason) return false;
   return ledgerDigest({ ...next, status: previous.status, statusReason: previous.statusReason,
     revision: previous.revision, updatedAt: previous.updatedAt }) === ledgerDigest(previous);
 }

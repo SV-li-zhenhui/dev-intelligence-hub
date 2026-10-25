@@ -6,7 +6,7 @@ import { recordedFailureParentIds } from './work-ledger-graph-progress.js';
 import { ciMaterialRecoveryCandidate, ciMaterialRetirement, planCiMaterialRecovery } from "./work-ledger-ci-material-recovery.js";
 import { hostContextRecoveryCandidate, planHostContextRecovery, hostContextRetirement, hasPendingHostContextRecovery } from "./work-ledger-host-context-recovery.js";
 import { automaticRoleHandoffCandidate } from "./work-ledger-role-handoff.js";
-import { completedConflictInspectionRecoveryProof } from "./work-ledger-inspection-continuation.js";
+import { completedRepairInspectionRecoveryProof } from "./work-ledger-inspection-continuation.js";
 import { automaticReviewWorkAdmission } from "../domain/automatic-review-policy.js";
 import { inactivePullRequestTakeoverRecoveryProof, sameHeadInternalReviewTakeoverRecoveryProof } from "./work-ledger-pr-retirement-recovery.js";
 import { createWorkIntentDispatchBinding } from "../domain/work-intent-dispatch-binding.js";
@@ -682,7 +682,7 @@ export class WorkLedgerService {
           this.state = await this.#readDurableState();
           await this.#reconcileRecoveredPullRequestScopes();
           await this.#recoverInactivePullRequestTakeovers();
-          await this.#recoverCompletedConflictInspections();
+          await this.#recoverCompletedRepairInspections();
           await this.#reconcileRecoveredPullRequestAuthorityFences();
           await this.#reconcileRecoveredIssueScopes();
           this.ready = true;
@@ -3157,16 +3157,16 @@ export class WorkLedgerService {
     await this.#commitMutation({ patch: { items }, timelineEvents, result: null });
   }
 
-  async #recoverCompletedConflictInspections() {
+  async #recoverCompletedRepairInspections() {
     const now = this.#now();
     const timelineEvents = [];
     const items = this.state.items.map(item => {
-      const proof = completedConflictInspectionRecoveryProof(this.state, item);
+      const proof = completedRepairInspectionRecoveryProof(this.state, item);
       if (proof === null) return item;
       timelineEvents.push({ itemId: item.itemId, type: "transitioned", at: now, actorId: "work-ledger-system",
-        details: { fromStatus: "completed", toStatus: "queued", reason: "pr_conflict_inspection_continued",
+        details: { fromStatus: "completed", toStatus: "queued", reason: proof.reason,
           context: { evidenceRefs: [proof.intentId, proof.resultId] } } });
-      return { ...item, status: "queued", statusReason: "pr_conflict_inspection_continued",
+      return { ...item, status: "queued", statusReason: proof.reason,
         revision: item.revision + 1, updatedAt: now };
     });
     if (timelineEvents.length > 0) await this.#commitMutation({ patch: { items }, timelineEvents, result: null });
