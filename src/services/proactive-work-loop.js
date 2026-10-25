@@ -1505,7 +1505,7 @@ export class ProactiveWorkLoop {
     const repairBudget = context && await this.#readRepairDecisionBudget(item, signal);
     if (repairBudget?.failure) context = { ...context, requirements: { ...context.requirements,
       repairDecisionRecovery: { code: repairBudget.failure.code, attempt: repairBudget.attempt,
-        lifetimeClaims: item.attempt, progressResultId: repairBudget.resultId } } };
+        lifetimeClaims: item.attempt, progressReference: repairBudget.progressRef } } };
     throwIfLoopAborted(signal);
     const decide = ({instructions} = {}) => worker.decide({ item: workerItemDto(item), trigger,
       ...(context === undefined ? {} : { context }), signal,
@@ -2202,7 +2202,7 @@ export class ProactiveWorkLoop {
         receipt?.finishedAt, budget.failure.at].map(Date.parse);
       if (run.active !== false || run.mode !== 'active' || run.pendingCommand !== null || run.phase !== 'failed' ||
           run.stopUnconfirmed === true || receipt?.kind !== 'work-item' || receipt.taskId !== item.itemId ||
-          receipt.roleId !== 'developer' || receipt.phase !== 'failed' || receipt.taskRevision !== item.revision - 1 ||
+          receipt.roleId !== item.currentTarget.id || receipt.phase !== 'failed' || receipt.taskRevision !== item.revision - 1 ||
           receipt.leaseId !== budget.failure.leaseId || receipt.outcomeCode !== budget.failure.code ||
           !(receipt.stopConfirmed === true || (receipt.session?.transport === 'app-server' && receipt.session.status === 'completed')) ||
           times.some(time => !Number.isFinite(time)) || times.some((time, index) => index > 0 && time < times[index - 1])) return false;
@@ -2212,7 +2212,7 @@ export class ProactiveWorkLoop {
       throwIfLoopAborted(options.signal);
       await this.ledger.transition({ itemId: item.itemId, expectedRevision: item.revision, leaseId: null,
         actorId: 'work-ledger-system', toStatus: 'queued', reason: 'repair_decision_progress_recovered',
-        details: { evidenceRefs: [budget.failure.timelineId, budget.resultId, `run:${receipt.runId}`] } });
+        details: { evidenceRefs: [budget.failure.timelineId, budget.progressRef, `run:${receipt.runId}`] } });
       return true;
     } catch (error) {
       throwIfLoopAborted(options.signal);

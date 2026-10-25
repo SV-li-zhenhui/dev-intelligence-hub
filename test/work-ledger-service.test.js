@@ -17666,6 +17666,106 @@ test("contracted PR child inspection settles without reviving a pending newer He
   assert.deepEqual(oldChild.graph.deliveries, []);
 });
 
+async function deliverRepairRoleHandoff(f, targetRole) {
+  let item = (await f.service.listItems()).items[0];
+  const roleId = item.currentTarget.id;
+  item = await f.service.claim({ itemId: item.itemId, expectedRevision: item.revision,
+    workerId: `employee-${roleId}`, leaseDurationMs: 30000 });
+  await f.service.stageIntent({ itemId: item.itemId, expectedRevision: item.revision, leaseId: item.leaseId,
+    actorId: `employee-${roleId}`, roleId, intent: handoffIntent({
+      capability: targetRole === 'pr-engineer' ? 'pr-review' : 'development', brief: 'Continue the bound repair with the recorded evidence' }) });
+  const dispatcher = new WorkIntentDispatcher({ ledger: f.service, clock: f.time.clock,
+    policy: createWorkIntentPolicy({ capabilityRoles: { 'pr-review': 'pr-engineer', development: 'developer' } }),
+    attentionProducer: { create: async () => assert.fail('Unexpected attention') },
+    proposalProducer: { create: async () => assert.fail('Unexpected proposal') } });
+  assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  return f.service.readItemForReconciliation({ itemId: item.itemId });
+}
+
+test('a trusted repair role handoff starts the receiving roles own decision budget in both directions', async () => {
+  const f = await createFixture({ records: [authoredReviewRepairAssignment(1, { gitFacts: {
+    ...prGitFacts(PR_HEAD_A), relation: 'authored', actionState: 'action_now', nextAction: 'fix_ci', isDraft: true,
+  } })] });
+  await f.service.intake();
+  for (const target of ['pr-engineer', 'developer']) {
+    let item = await deliverRepairRoleHandoff(f, target);
+    const offset = item.attempt;
+    item = await f.service.claim({ itemId: item.itemId, expectedRevision: item.revision,
+      workerId: `employee-${target}`, leaseDurationMs: 30000 });
+    const budget = await f.service.readRepairDecisionBudget({ itemId: item.itemId, expectedRevision: item.revision });
+    assert.equal(budget?.attempt, 1, target);
+    assert.equal(budget.offset, offset);
+    assert.equal(item.attempt, offset + 1);
+    const { repairDecisionAttemptBudget } = await import('../src/services/work-ledger-inspection-continuation.js');
+    const durable = f.store.stored();
+    for (const variant of ['dispatch-seal', 'source-binding', 'unacknowledged', 'wrong-target', 'missing-stage', 'manual-scope']) {
+      const state = clone(durable), root = state.items.find(x => x.itemId === item.itemId);
+      const box = state.outbox.findLast(x => x.itemId === item.itemId && x.intent.type === 'handoff');
+      const handedOff = state.timeline.findLast(x => x.itemId === item.itemId && x.type === 'handed_off');
+      if (variant === 'dispatch-seal') box.dispatchBinding.bindingDigest = 'f'.repeat(64);
+      if (variant === 'source-binding') box.sourceBinding.inputDigest = 'f'.repeat(64);
+      if (variant === 'unacknowledged') box.status = 'dispatching';
+      if (variant === 'wrong-target') handedOff.details.toTarget.id = 'tester';
+      if (variant === 'missing-stage') state.timeline = state.timeline.filter(x => x.type !== 'intent_staged');
+      if (variant === 'manual-scope') root.source.scope.kind = 'owner_requested';
+      assert.equal(repairDecisionAttemptBudget(state, root), null, variant);
+    }
+    // Return the claim without consuming another model attempt before the next handoff.
+    await f.service.scheduleRetry({ itemId: item.itemId, expectedRevision: item.revision, leaseId: item.leaseId,
+      actorId: `employee-${target}`, availableAt: new Date(Date.parse(f.time.clock()) + 1000).toISOString(),
+      consumeAttempt: false, reason: 'context_changed' });
+    f.time.advance(1000);
+  }
+});
+
+test('an internal own-repair review inspection continues developer work instead of completing the review root', async () => {
+  const f = await exhaustedInternalReviewFactsFixture({ attempts: 1 });
+  const root = (await f.service.listItems()).items[0];
+  await f.service.transition({ itemId: root.itemId, expectedRevision: root.revision, leaseId: null,
+    actorId: 'work-ledger-system', toStatus: 'queued', reason: 'fixture_context_available' });
+  const item = await deliverRepairRoleHandoff(f, 'developer');
+  const result = await prepareProposalResult(f, { kind: 'code_action_proposal', itemId: item.itemId,
+    sealSource: true, intentOverrides: { operation: 'inspect' } });
+  await f.service.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+  const current = await f.service.readItemForReconciliation({ itemId: item.itemId });
+  assert.equal(current.status, 'queued');
+  assert.equal(current.currentTarget.id, 'developer');
+  const discovery = authoredReviewRepairAssignment(2, { headRefOid: PR_HEAD_B, occurredAt: f.time.clock(), gitFacts: {
+    ...prGitFacts(PR_HEAD_B), gitTarget: clone(current.source.current.event.payload.gitTarget),
+    relation: 'authored', actionState: 'action_now', nextAction: 'fix_ci',
+  } });
+  f.source.records.push(discovery);
+  f.source.highWatermark = 2;
+  await f.service.intake();
+  const withDiscovery = f.store.stored();
+  Object.assign(withDiscovery.items.find(x => x.itemId === current.itemId), { status: 'completed', statusReason: 'proposal_succeeded' });
+  const automatic = withDiscovery.items.find(x => x.itemId !== current.itemId && x.source?.scope.kind === 'automatic');
+  assert.ok(automatic);
+  automatic.status = 'blocked'; automatic.statusReason = 'pr_source_authority_fenced';
+  const { completedRepairEvidenceRecoveryProof } = await import('../src/services/work-ledger-inspection-continuation.js');
+  const completed = withDiscovery.items.find(x => x.itemId === current.itemId);
+  assert.equal(pullRequestHeadAdmission(withDiscovery, completed).current, false, 'false completion released authority to discovery');
+  assert.equal(completedRepairEvidenceRecoveryProof(withDiscovery, completed)?.reason, 'pr_internal_review_evidence_continued');
+  for (const variant of ['active-replacement', 'owner-hold', 'unknown-effect', 'retained-result']) {
+    const state = clone(withDiscovery), other = state.items.find(x => x.itemId === automatic.itemId);
+    if (variant === 'active-replacement') { other.status = 'working'; other.ownerId = 'another-worker'; }
+    if (variant === 'owner-hold') { other.status = 'paused'; other.statusReason = 'owner_task_run_pause'; }
+    if (variant === 'unknown-effect') state.outbox.push({ itemId: other.itemId, status: 'unknown' });
+    if (variant === 'retained-result') other.decisionContext = { source: 'proposal', outcome: 'succeeded' };
+    assert.equal(completedRepairEvidenceRecoveryProof(state, state.items.find(x => x.itemId === current.itemId)), null, variant);
+  }
+  // Retain the real authority history when simulating the old completion bug.
+  const { appendWorkGraphMemoryEvents } = await import('../src/services/work-ledger-graph-memory.js');
+  withDiscovery.graphMemoryProjection = appendWorkGraphMemoryEvents(f.store.stored(), withDiscovery,
+    normalizeWorkLedgerLimits()).graphMemoryProjection;
+  f.store.replaceStored(withDiscovery);
+  const restarted = await createFixture({ store: f.store, source: f.source, time: f.time });
+  const recovered = await restarted.service.readItemForReconciliation({ itemId: current.itemId });
+  assert.equal(recovered.status, 'queued');
+  assert.equal(recovered.statusReason, 'pr_internal_review_evidence_continued');
+  assert.equal(recovered.attempt, current.attempt);
+});
+
 for (const operation of ['inspect', 'verify']) {
 test(`successful repair ${operation} opens the next decision budget while retaining lifetime claims`, async () => {
   const f = await createFixture({ records: [authoredReviewRepairAssignment(1, { gitFacts: {
@@ -17741,6 +17841,7 @@ test(`own PR ${nextAction} ${operation} continues and a historical evidence-only
 }
 
 test('automatic repair recovers a spent lifetime budget after sealed progress and still bounds consecutive failures', async () => {
+  for (const [roleId, failureCode] of [['developer', 'ROLE_DECISION_PR_REVIEW_REQUIRED'], ['pr-engineer', 'ROLE_DECISION_INTERNAL_REVIEW_ONLY']]) {
   for (const variant of ['current', 'owner-paused', 'unknown-stop', 'running-turn', 'old-receipt']) {
     const f = await createFixture({ records: [authoredReviewRepairAssignment(1, { gitFacts: {
       ...prGitFacts(PR_HEAD_A), relation: 'authored', actionState: 'action_now', nextAction: 'fix_ci', isDraft: true,
@@ -17748,13 +17849,14 @@ test('automatic repair recovers a spent lifetime budget after sealed progress an
     const result = await prepareProposalResult(f, { kind: 'code_action_proposal', sealSource: true,
       intentOverrides: { operation: 'verify' } });
     await f.service.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+    if (roleId === 'pr-engineer') await deliverRepairRoleHandoff(f, roleId);
     let item = (await f.service.listItems()).items[0];
     item = await f.service.claim({ itemId: item.itemId, expectedRevision: item.revision,
-      workerId: 'employee-developer', leaseDurationMs: 30000 });
+      workerId: `employee-${roleId}`, leaseDurationMs: 30000 });
     const failedClaim = item;
     await f.service.transition({ itemId: item.itemId, expectedRevision: item.revision, leaseId: item.leaseId,
-      actorId: 'employee-developer', toStatus: 'blocked', reason: 'decision_attempts_exhausted',
-      details: { code: 'ROLE_DECISION_PR_REVIEW_REQUIRED' } });
+      actorId: `employee-${roleId}`, toStatus: 'blocked', reason: 'decision_attempts_exhausted',
+      details: { code: failureCode } });
     const before = await f.service.readItemForReconciliation({ itemId: item.itemId });
     let modelCalls = 0;
     const loop = new ProactiveWorkLoop({ ledger: f.service, clock: f.time.clock, maxAttempts: 3,
@@ -17762,18 +17864,18 @@ test('automatic repair recovers a spent lifetime budget after sealed progress an
       taskRuns: { order: async items => items, run: async (_task, operation) => operation({ instructions: [] }),
         get: async () => ({ active: false, phase: 'failed', mode: variant === 'owner-paused' ? 'paused' : 'active',
           pendingCommand: null, stopUnconfirmed: variant === 'unknown-stop', receipt: { kind: 'work-item',
-            taskId: item.itemId, roleId: 'developer', phase: 'failed', runId: 'failed-decision-run',
+            taskId: item.itemId, roleId, phase: 'failed', runId: 'failed-decision-run',
             taskRevision: variant === 'old-receipt' ? failedClaim.revision - 1 : failedClaim.revision,
-            leaseId: failedClaim.leaseId, outcomeCode: 'ROLE_DECISION_PR_REVIEW_REQUIRED', stopConfirmed: false,
+            leaseId: failedClaim.leaseId, outcomeCode: failureCode, stopConfirmed: false,
             registeredAt: f.time.clock(), modelStartedAt: f.time.clock(), finishedAt: f.time.clock(),
             session: { transport: 'app-server', status: variant === 'running-turn' ? 'running' : 'completed' } } }) },
-      roleDirectory: { resolve: async () => ({ roleId: 'developer', workerId: 'employee-developer', enabled: true, paused: false,
+      roleDirectory: { resolve: async () => ({ roleId, workerId: `employee-${roleId}`, enabled: true, paused: false,
         decide: async ({ context }) => { modelCalls++;
-          assert.equal(context.requirements.repairDecisionRecovery.code, 'ROLE_DECISION_PR_REVIEW_REQUIRED');
-          throw Object.assign(new Error('A further invalid completion'), { code: 'ROLE_DECISION_PR_REVIEW_REQUIRED' }); } }) },
+          assert.equal(context.requirements.repairDecisionRecovery.code, failureCode);
+          throw Object.assign(new Error('A further invalid completion'), { code: failureCode }); } }) },
       roleContextAssembler: { assemble: async () => ({ context: { requirements: {}, code: {} } }) },
       orchestratorService: { execute: async () => assert.fail('Unexpected orchestration') } });
-    const cycle = await loop.runCycle({ roleId: 'developer' });
+    const cycle = await loop.runCycle({ roleId });
     if (variant !== 'current') {
       assert.equal(cycle.claimed, 0, variant);
       assert.equal(modelCalls, 0, variant);
@@ -17783,13 +17885,14 @@ test('automatic repair recovers a spent lifetime budget after sealed progress an
     assert.equal(cycle.claimed, 1);
     assert.equal(cycle.retried, 1, 'successful verification must not consume the next failure budget');
     item = await f.service.readItemForReconciliation({ itemId: item.itemId });
-    assert.equal(item.attempt, 3, 'lifetime claims are retained');
+    assert.equal(item.attempt, failedClaim.attempt + 1, 'lifetime claims are retained');
     f.time.advance(8000);
-    assert.equal((await loop.runCycle({ roleId: 'developer' })).blocked, 1);
+    assert.equal((await loop.runCycle({ roleId })).blocked, 1);
     item = await f.service.readItemForReconciliation({ itemId: item.itemId });
-    assert.equal(item.attempt, 4);
-    assert.equal((await loop.runCycle({ roleId: 'developer' })).claimed, 0);
+    assert.equal(item.attempt, failedClaim.attempt + 2);
+    assert.equal((await loop.runCycle({ roleId })).claimed, 0);
     assert.equal(modelCalls, 2, 'no new successful progress means no further retries');
+  }
   }
 });
 

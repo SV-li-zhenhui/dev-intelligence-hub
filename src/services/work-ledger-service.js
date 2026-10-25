@@ -7,6 +7,7 @@ import { recordedFailureParentIds } from './work-ledger-graph-progress.js';
 import { ciMaterialRecoveryCandidate, ciMaterialRetirement, planCiMaterialRecovery } from "./work-ledger-ci-material-recovery.js";
 import { hostContextRecoveryCandidate, planHostContextRecovery, hostContextRetirement, hasPendingHostContextRecovery } from "./work-ledger-host-context-recovery.js";
 import { automaticRoleHandoffCandidate } from "./work-ledger-role-handoff.js";
+import { currentPrRoleHandoffProof } from './work-ledger-role-handoff-evidence.js';
 import { completedRepairEvidenceRecoveryProof, repairDecisionAttemptBudget } from "./work-ledger-inspection-continuation.js";
 import { automaticReviewWorkAdmission } from "../domain/automatic-review-policy.js";
 import { inactivePullRequestTakeoverRecoveryProof, sameHeadInternalReviewTakeoverRecoveryProof } from "./work-ledger-pr-retirement-recovery.js";
@@ -915,37 +916,11 @@ export class WorkLedgerService {
     return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
       this.state = await this.#readDurableState();
       const item = this.state.items.find((entry) => entry.itemId === itemId);
-      if (item?.currentTarget?.type !== "role" || item.currentTarget.id !== "pr-engineer" || item.sourceQuarantine != null) return null;
-      const admission = pullRequestHeadAdmission(this.state, item);
-      if (admission.applies && (!admission.current || admission.pending)) return null;
-        const outbox = this.state.outbox.findLast((entry) => entry.itemId === itemId && entry.intent.type === "handoff" &&
-          entry.status === "delivered" && entry.outcome?.status === "delivered");
-      const bound = outbox?.dispatchBinding?.boundIntent;
-      const sourceBinding = currentWorkItemInputBinding(item);
-      const executionBinding = currentWorkItemExecutionBinding(item);
-      const event = currentWorkItemEvent(item);
-      if (!outbox || !bound || sourceBinding == null || executionBinding?.schemaVersion !== 2 ||
-          outbox.inputDigest !== item.inputDigest || ledgerDigest(outbox.sourceBinding) !== ledgerDigest(sourceBinding) ||
-          outbox.requestedBy.roleId !== "developer" || outbox.intent.capability !== "pr-review" ||
-          bound.kind !== "handoff" || bound.requestedBy.roleId !== "developer" || bound.requestedBy.workItemId !== itemId ||
-          bound.binding.targetRoleId !== "pr-engineer" || bound.binding.eventId !== event.eventId ||
-          ledgerDigest(bound.binding.subject) !== ledgerDigest(event.subject) ||
-          bound.source.assignmentId !== item.assignmentId || bound.source.eventId !== event.eventId ||
-          bound.payload.capability !== "pr-review" || bound.payload.brief !== outbox.intent.brief ||
-          ledgerDigest(bound.payload.evidence) !== ledgerDigest(outbox.intent.evidence) ||
-          ledgerDigest(createWorkIntentDispatchBinding(bound)) !== ledgerDigest(outbox.dispatchBinding) ||
-          outbox.outcome.details?.downstreamRef !== bound.intentId) return null;
-      // The atomic acknowledgement records the actual new responsibility in
-      // the adjacent handed_off timeline event, not in model-supplied data.
-      const acknowledged = this.state.timeline.findLast((entry) => entry.itemId === itemId &&
-        entry.type === "intent_acknowledged" && entry.details?.intentId === outbox.intentId &&
-        entry.details.outcome === "delivered" && entry.details.nextStatus === "queued");
-      const handedOff = acknowledged && this.state.timeline.find((entry) => entry.sequence === acknowledged.sequence + 1);
-      if (handedOff?.type !== "handed_off" || handedOff.itemId !== itemId || handedOff.at !== outbox.updatedAt ||
-          handedOff.details?.fromTarget?.type !== "role" || handedOff.details.fromTarget.id !== "developer" ||
-          handedOff.details.toTarget?.type !== "role" || handedOff.details.toTarget.id !== "pr-engineer") return null;
-      return cloneLedgerValue({ kind: "developer_handoff", headRefOid: executionBinding.headRefOid,
-        brief: bound.payload.brief, evidence: bound.payload.evidence, evidenceAuthority: "developer_report" });
+      const proof = currentPrRoleHandoffProof(this.state, item, {
+        fromRoleId: 'developer', targetRoleId: 'pr-engineer', capability: 'pr-review',
+      });
+      return proof === null ? null : cloneLedgerValue({ kind: "developer_handoff", headRefOid: proof.executionBinding.headRefOid,
+        brief: proof.bound.payload.brief, evidence: proof.bound.payload.evidence, evidenceAuthority: "developer_report" });
     }));
   }
 
