@@ -3,6 +3,7 @@ import test from "node:test";
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { continuationFingerprint } from '../src/services/work-continuation-state.js';
 import { createTaskRunSettler, planWorkItemRunControl } from '../src/services/work-ledger-run-control.js';
+import { createNativeModelAdmission, retainUnknownNativeInvocations, withNativeAdmission } from '../src/lib/native-model-admission.js';
 
 test('busy model admission leaves work unclaimed without consuming decision attempts', async () => {
   const time = controlledClock(), ledger = new FakeLedger({source:[workItem(1)],time});
@@ -34,6 +35,24 @@ test('a model queue timeout leaves its task unclaimed and permits another candid
   assert.deepEqual(ledger.calls.claim.map(call=>call.itemId),[second.itemId]);
   assert.equal(ledger.items.find(item=>item.itemId===first.itemId).attempt,0);
   assert.equal(cycle.workAttempts,1);
+});
+
+test('unknown PR isolation cannot hold a role cycle ahead of unrelated work', async () => {
+  const time=controlledClock(),first=workItem(1),second=workItem(2);
+  const ledger=new FakeLedger({source:[first,second],time}),state=createNativeModelAdmission(2),candidate=worker();
+  retainUnknownNativeInvocations(state,[{file:'/owned/old-marker',entity:first.itemId}]);
+  candidate.withDecisionAdmission=({item,signal},operation)=>withNativeAdmission(state,item.itemId,signal,operation,{waitForCapacity:true});
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(new Error('role cycle stayed behind an unknown invocation')),100);
+  try {
+    const cycle=await createLoop({ledger,directory:new FakeRoleDirectory({'pr-reviewer':candidate}),time})
+      .runCycle({workLimit:1,signal:controller.signal});
+    assert.equal(cycle.outcomes[0].status,'waiting_model');
+    assert.equal(cycle.outcomes[0].code,'STRUCTURED_PROVIDER_BUSY');
+    assert.deepEqual(ledger.calls.claim.map(call=>call.itemId),[second.itemId]);
+    assert.equal(ledger.items.find(item=>item.itemId===first.itemId).attempt,0);
+    assert.equal(state.active.size,1);
+    assert.equal(state.unknownInvocations.size,1);
+  } finally {clearTimeout(timer);controller.abort();}
 });
 
 for (const command of ['pause', 'cancel']) {

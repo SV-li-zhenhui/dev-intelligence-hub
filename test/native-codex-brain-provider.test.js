@@ -1285,11 +1285,8 @@ test("an unconfirmed native invocation retains its entity and capacity slot with
   const retained = (await readdir(f.runtime)).find(name => name.startsWith("invocation-"));
   await provider.checkAvailability();
   await assert.rejects(provider.withAdmission({ entityKey: held }, () => assert.fail("the unknown entity remains fenced")), { code: "STRUCTURED_PROVIDER_BUSY" });
-  const controller = new AbortController();
-  const heldWaiter = assert.rejects(provider.withAdmission({ entityKey: held, waitForCapacity: true, signal: controller.signal }, () => assert.fail("unknown entity waiter cannot start")), { code: "STRUCTURED_PROVIDER_CANCELLED" });
-  try {
-    await provider.withAdmission({ entityKey: "github:pull_request:owner/repo#43" }, async () => {});
-  } finally { controller.abort(); await heldWaiter; }
+  await assert.rejects(provider.withAdmission({ entityKey: held, waitForCapacity: true }, () => assert.fail("unknown entity waiter cannot start")), { code: "STRUCTURED_PROVIDER_BUSY" });
+  await provider.withAdmission({ entityKey: "github:pull_request:owner/repo#43" }, async () => {});
   assert.deepEqual(JSON.parse(await provider.generate(request({ admissionEntityKey: "github:pull_request:owner/repo#43" }))), { ok: true });
   const entries = await readdir(f.runtime);
   assert.ok(entries.includes(retained));

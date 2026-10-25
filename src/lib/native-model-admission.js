@@ -8,6 +8,10 @@ export function createNativeModelAdmission(capacity = 1) {
   return {capacity, active:new Set(), queue:[], blocked:false, lastStatus:null, markers:new Set(), unknownInvocations:new Map(), entityExclusions:new Set(), preparation:new OperationQueue()};
 }
 
+function hasUnknownEntity(state, entity) {
+  return [...state.unknownInvocations.values()].some(token => token.entity === entity);
+}
+
 export function retainUnknownNativeInvocations(state, entries) {
   if (state.capacity <= 1 || [...state.active].some(token => token.exclusive)) return false;
   if (entries.some(entry => state.unknownInvocations.has(entry.file) && state.unknownInvocations.get(entry.file).entity !== entry.entity)) return false;
@@ -22,11 +26,10 @@ export function retainUnknownNativeInvocations(state, entries) {
     state.unknownInvocations.set(entry.file, token);
     state.markers.add(entry.file);
   }
-  // An earlier exclusive status probe can never acquire an empty home while
-  // an unknown invocation is retained. Fail its unstarted admission so its
-  // next attempt can use the remaining capacity under the updated policy.
+  // These admissions cannot progress while the unknown invocation is isolated.
+  // Release their callers to inspect other work, retaining the unknown slot.
   if (entries.length > 0) for (const entry of [...state.queue]) {
-    if (!entry.exclusive) continue;
+    if (!entry.exclusive && !hasUnknownEntity(state, entry.entity)) continue;
     state.queue.splice(state.queue.indexOf(entry),1);
     entry.fail(problem('STRUCTURED_PROVIDER_BUSY'));
   }
@@ -93,7 +96,7 @@ export async function withNativeAdmission(state, entity, signal, operation, {wai
   if (state.blocked) throw problem('STRUCTURED_PROVIDER_REAP_FAILED');
   const queuedCompetitor = state.queue.some(entry => entry.exclusive ||
     (!state.entityExclusions.has(entry.entity) &&
-      ![...state.unknownInvocations.values()].some(token => token.entity === entry.entity)));
+      !hasUnknownEntity(state, entry.entity)));
   if (!waitForCapacity && (queuedCompetitor || !fits(state, entity, false))) throw problem('STRUCTURED_PROVIDER_BUSY');
   const token = waitForCapacity ? await acquireNativeAdmission(state, entity, signal) : reserve(state, entity, false);
   return reservations.run(token, async () => {
@@ -104,6 +107,9 @@ export async function withNativeAdmission(state, entity, signal, operation, {wai
 
 export function acquireNativeAdmission(state, entity, signal, {exclusive = false} = {}) {
   if (state.blocked) return Promise.reject(problem('STRUCTURED_PROVIDER_REAP_FAILED'));
+  if ((exclusive && state.unknownInvocations.size > 0) || hasUnknownEntity(state, entity)) {
+    return Promise.reject(signal?.aborted ? signal.reason ?? problem('STRUCTURED_PROVIDER_CANCELLED') : problem('STRUCTURED_PROVIDER_BUSY'));
+  }
   return new Promise((resolve,reject) => {
     const cleanup = () => signal?.removeEventListener('abort',abort);
     const entry = {
