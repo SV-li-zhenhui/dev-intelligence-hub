@@ -1,3 +1,4 @@
+import { isInternalRepairReviewEvent } from "../domain/internal-repair-review.js";
 import {
   createWorkIntentDispatchBinding,
   LEGACY_UNKNOWN_WORK_INTENT_BINDING,
@@ -1283,7 +1284,9 @@ export class WorkIntentDispatcher {
       const hasExecutionSource =
         bound.kind === "code_action_proposal" &&
         Object.hasOwn(bound.binding, "executionSource");
-      if (conflictRequirement === "required") {
+      if (conflictRequirement === "required" ||
+          (hasExecutionSource && bound.binding.executionSource.kind === "conflict_preparation" &&
+            isInternalRepairReviewEvent(currentWorkItemEvent(item)))) {
         try {
           if (!hasExecutionSource) throw new TypeError("execution source missing");
           preparedExecutionSource(bound.binding.executionSource, inputBinding);
@@ -1337,8 +1340,10 @@ export class WorkIntentDispatcher {
             item, inputBinding, intent: claimed.intent, roleId: requester.roleId,
           }));
         } catch (error) {
-          if (!['OWN_PR_CI_SOURCE_NOT_READY', 'CODE_CI_REPAIR_CONTEXT_UNAVAILABLE'].includes(ownErrorCode(error))) throw error;
-          return this.#ackFailure(claimed, item, { nextStatus: 'retry_wait', code: 'ci-source-unavailable' });
+          const code = ownErrorCode(error);
+          if (!['OWN_PR_CI_SOURCE_NOT_READY', 'CODE_CI_REPAIR_CONTEXT_UNAVAILABLE', 'OWN_PR_CONFLICT_SOURCE_NOT_READY'].includes(code)) throw error;
+          return this.#ackFailure(claimed, item, { nextStatus: 'retry_wait',
+            code: code === 'OWN_PR_CONFLICT_SOURCE_NOT_READY' ? 'conflict-source-unavailable' : 'ci-source-unavailable' });
         }
       }
       let controlledCommitEvidence;

@@ -299,7 +299,7 @@ async function fixture({ enabled = true, conflict = false, ci = false, ownerRequ
     store, binding, config, item, facts, context, jobs, pushes, ownerWorkRequests, reviewLedger, details, verified,
     get proposal() { return proposal; }, get grant() { return grant; },
     adoptProposal(value) { proposal = normalizeBoundWorkProposal(value); grant = grantFor(proposal);
-      observedCiEvidence = clone(grant.executionSource.ciEvidence); },
+      observedCiEvidence = grant.executionSource.ciEvidence ? clone(grant.executionSource.ciEvidence) : null; },
     get service() { return service; }, get queue() { return queue; },
     get codeJobApprovalCount() { return codeJobApprovalCount; },
     async deliver() { return handler().handle({ proposal, status: "pending_delivery", attempt: 1, downstreamRef: null }); },
@@ -1896,4 +1896,60 @@ test("restart reconstructs a durably saved push intent after a crash before enqu
   assert.equal(f.pushes.length, 1);
   assert.equal(f.pushes[0].id, intent.pushConfirmationId);
   assert.equal(f.store.values.get(STATE_KEY).repairs[0].status, "published");
+});
+
+
+test("internal repair review handed to development prepares and publishes sealed conflicts without a copied nextAction", async () => {
+  const f = await fixture({ conflict: true, objectSync: { async prepare() {} } });
+  const b = f.binding;
+  const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.internal_review_requested", occurredAt: CREATED_AT,
+    source: { provider: "internal-review-repair", scopeId: "internal-review:123e4567-e89b-42d3-a456-426614174000" },
+    subject: { id: b.rootItemId, repository: b.repository, number: b.pullRequestNumber },
+    payload: { workType: "pull_request", state: "open", headRefOid: b.headRefOid, gitTargetAvailable: true, gitTarget: b.gitTarget,
+      internalReview: { kind: "own_pr_ci_repair", headRefOid: b.headRefOid, feedbackDigest: FEEDBACK_DIGEST,
+        publicationConfirmationId: "prior-publication", controlledCommitEvidenceId: "prior-controlled-commit" } } });
+  // Rebind the fixture through the actual event rather than inventing CI/conflict status fields.
+  Object.assign(b, { eventId: event.eventId, eventDigest: event.contentDigest });
+  Object.assign(f.item, { kind: "source_root", status: "queued", revision: 3, inputDigest: b.inputDigest,
+    currentTarget: { type: "role", id: "developer" }, sourceQuarantine: null, event,
+    source: { kind: "pull_request", identity: { provider: event.source.provider, scopeId: event.source.scopeId },
+      scope: { kind: "internal_review", active: true }, current: { event } } });
+  Object.assign(f.item.source, { workKey: b.workKey, activeRevision: b.inputRevision,
+    revisions: Array.from({ length: b.inputRevision }, () => ({ headRevision: b.headRevision })),
+    current: { event, headRefOid: b.headRefOid, eventId: b.eventId, eventDigest: b.eventDigest, inputDigest: b.inputDigest } });
+  f.context.author = null;
+  let reads = 0;
+  f.service.conflictRepair.conflictInspectionReader = { async read(inputBinding) {
+    reads += 1; return { inputBinding, preparationBinding: externalActionControlledCommit(inputBinding).executionSource.preparationBinding,
+      conflicts: [{ path: "src/conflict.txt" }] };
+  } };
+  assert.equal(await f.service.shouldRun(f.item), true);
+  assert.equal(reads, 1, "internal development must prepare current conflicts even without nextAction");
+  const request = { itemId: f.item.itemId, itemRevision: f.item.revision, inputDigest: f.item.inputDigest };
+  for (const variant of ["author", "head", "base", "clean", "context-author", "paused", "scope"]) {
+    const facts = clone(f.facts), author = f.context.author, status = f.item.status, scope = f.item.source.scope.kind;
+    if (variant === "author") f.facts.author = "another-author";
+    if (variant === "head") f.facts.headRefOid = "9".repeat(40);
+    if (variant === "base") f.facts.baseRefOid = "9".repeat(40);
+    if (variant === "clean") f.facts.mergeStateStatus = "CLEAN";
+    if (variant === "context-author") f.context.author = "another-author";
+    if (variant === "paused") f.item.status = "paused";
+    if (variant === "scope") f.item.source.scope.kind = "automatic";
+    assert.equal(await f.service.conflictRepair.prepareInspection(request), null, variant);
+    Object.assign(f.facts, facts); f.context.author = author; f.item.status = status; f.item.source.scope.kind = scope;
+  }
+  assert.equal(reads, 1, "rejected targets never regenerate sealed materials");
+  const source = await f.service.prepare({ item: f.item, intent: { type: "propose_code_action", operation: "modify" },
+    inputBinding: b, roleId: "developer" });
+  assert.equal(source.kind, "conflict_preparation");
+  const proposal = codeProposal(b, true);
+  // The pipeline fixture normally owns this proposal at construction time.
+  const { contentDigest, ...rawProposal } = proposal;
+  f.adoptProposal(rawProposal);
+  const transition = await f.deliver();
+  assert.equal(transition.status, "running");
+  const evidence = f.completeJob();
+  await f.service.runCycle();
+  assert.equal(f.pushes.length, 1);
+  assert.equal(f.pushes[0].action.controlledCommitEvidence.evidenceId, evidence.evidenceId);
 });

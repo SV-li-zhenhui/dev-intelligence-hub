@@ -1,3 +1,4 @@
+import { isInternalRepairReviewEvent } from "../domain/internal-repair-review.js";
 import { createHash } from "node:crypto";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 import { deliveryAcceptanceContractDigest, deliveryEvidenceKindsForProposal } from "../domain/delivery-evidence-contract.js";
@@ -1444,7 +1445,7 @@ export class RoleContextAssembler {
       throw contextError("ROLE_CONTEXT_STALE", "内部复审交接已不属于当前 Head", 409);
     }
     let conflictInspection = null;
-    if (roleId === "developer" && item.event.payload?.nextAction === "resolve_conflict" && this.#conflictInspectionReader) {
+    if (roleId === "developer" && (item.event.payload?.nextAction === "resolve_conflict" || isInternalRepairReviewEvent(item.event)) && this.#conflictInspectionReader) {
       try {
         conflictInspection = await this.#conflictInspectionReader.read({ itemId: item.taskId,
           itemRevision: item.taskRevision, inputDigest: item.inputDigest });

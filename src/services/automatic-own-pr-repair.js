@@ -290,6 +290,8 @@ export class AutomaticOwnPrRepair {
 
   async prepare({ item, intent, inputBinding, roleId }) {
     const event = currentWorkItemEvent(item);
+    const conflictSource = await this.conflictRepair?.prepare?.({ item, intent, inputBinding, roleId });
+    if (conflictSource !== undefined) return conflictSource;
     if (roleId !== "developer" || intent.type !== "propose_code_action" || intent.operation !== "modify" ||
         (event?.payload?.relation !== "authored" && !isOwnerRequestedCiRepairEvent(event)) ||
         !['address_review', 'fix_ci'].includes(event?.payload?.nextAction)) return undefined;

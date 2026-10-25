@@ -2588,3 +2588,21 @@ for (const variant of ['revision', 'stage', 'code', 'timeline', 'timestamp', 'ex
     assert.equal(reads, 0);
   });
 }
+
+
+test("development receives conflict materials after a typed internal repair handoff without nextAction", async () => {
+  const { fixture: f } = atomicPullRequestFixture();
+  const { eventId, contentDigest, ...old } = f.item.event;
+  const event = normalizeWorkflowEvent({ ...old, eventType: "pull_request.internal_review_requested",
+    source: { provider: "internal-review-repair", scopeId: "internal-review:123e4567-e89b-42d3-a456-426614174000" },
+    payload: { ...old.payload, workType: "pull_request", state: "open",
+      internalReview: { kind: "own_pr_ci_repair", headRefOid: old.payload.headRefOid,
+        feedbackDigest: "c".repeat(64), publicationConfirmationId: "prior-publication", controlledCommitEvidenceId: "prior-commit" } } });
+  const source = createPullRequestWorkSource(pullRequestAssignment(1, event)).source;
+  f.item = { ...f.item, currentTarget: { type: "role", id: "developer" }, event, source, inputDigest: source.current.inputDigest };
+  f.snapshot.graph.tasks.find(t => t.taskId === f.item.itemId).responsibility.id = "developer";
+  let calls = 0;
+  await assert.rejects(assemble(f, { conflictInspectionReader: { async read() { calls++; throw new Error("sealed material unavailable"); } } }),
+    { code: "ROLE_CONTEXT_CONFLICT_INSPECTION_UNAVAILABLE" });
+  assert.equal(calls, 1);
+});

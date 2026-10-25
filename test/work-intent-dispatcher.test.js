@@ -2233,7 +2233,7 @@ test("CI repair diagnostics bind and resume through canonical proposal storage",
   assert.equal(proposals.calls[0].binding.executionSource.ciEvidence.diagnostics[0].failures[0].message, "Fixture missing");
 });
 
-for (const code of ['OWN_PR_CI_SOURCE_NOT_READY', 'CODE_CI_REPAIR_CONTEXT_UNAVAILABLE']) test(`CI source ${code} retries without submitting an ordinary unpublishable proposal`, async () => {
+for (const code of ['OWN_PR_CI_SOURCE_NOT_READY', 'CODE_CI_REPAIR_CONTEXT_UNAVAILABLE', 'OWN_PR_CONFLICT_SOURCE_NOT_READY']) test(`CI source ${code} retries without submitting an ordinary unpublishable proposal`, async () => {
   const pair = conflictWorkPair(6, codeIntent(), { mergeStateStatus: 'CLEAN', relation: 'authored', nextAction: 'fix_ci' });
   const { dispatcher, proposals, ledger } = fixture([pair], {
     reviewRepairSourcePreparer: { async prepare() { throw Object.assign(new Error('CI evidence not ready'), { code }); } },
@@ -2241,7 +2241,7 @@ for (const code of ['OWN_PR_CI_SOURCE_NOT_READY', 'CODE_CI_REPAIR_CONTEXT_UNAVAI
   const result = await dispatcher.dispatchPending();
   assert.equal(result.retryWait, 1);
   assert.equal(proposals.calls.length, 0);
-  assert.equal(ledger.ackCalls[0].details.code, 'ci-source-unavailable');
+  assert.equal(ledger.ackCalls[0].details.code, code === 'OWN_PR_CONFLICT_SOURCE_NOT_READY' ? 'conflict-source-unavailable' : 'ci-source-unavailable');
   assert.equal(ledger.items[0].status, 'retry_wait');
 });
 
@@ -2509,4 +2509,27 @@ test("dispatcher rejects accessor and sparse ledger pages without invoking gette
       assert.equal(malicious.reads(), 0);
     });
   }
+});
+
+
+test("internal repair conflict source survives an interrupted host binding without ordinary modify fallback", async () => {
+  const pair = conflictWorkPair(6, codeIntent(), { mergeStateStatus: "CLEAN", relation: "authored", nextAction: "address_review" });
+  const old = pair.item.event;
+  pair.item.event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.internal_review_requested",
+    occurredAt: old.occurredAt, source: { provider: "internal-review-repair", scopeId: "internal-review:123e4567-e89b-42d3-a456-426614174000" },
+    subject: old.subject, payload: { workType: "pull_request", state: "open", headRefOid: old.payload.headRefOid,
+      gitTargetAvailable: true, gitTarget: old.payload.gitTarget,
+      internalReview: { kind: "own_pr_ci_repair", headRefOid: old.payload.headRefOid, feedbackDigest: "c".repeat(64),
+        publicationConfirmationId: "prior-publication", controlledCommitEvidenceId: "prior-commit" } } });
+  pair.item.source = createPullRequestWorkSource(prSourceEnvelope(6, pair.item.event, pair.item.assignmentId)).source;
+  const time = controlledClock(), ledger = new FakeLedger([pair], time);
+  ledger.failBindAfterOnce = true;
+  let preparations = 0;
+  const { dispatcher, proposals } = fixture([pair], { time, ledger,
+    reviewRepairSourcePreparer: { async prepare({ inputBinding }) { preparations++; return conflictExecutionSource(inputBinding); } } });
+  assert.equal((await dispatcher.dispatchPending()).uncertain, 1);
+  time.advance(1001);
+  assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  assert.equal(preparations, 1);
+  assert.equal(proposals.calls[0].binding.executionSource.kind, "conflict_preparation");
 });
