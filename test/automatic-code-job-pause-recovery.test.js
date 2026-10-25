@@ -125,6 +125,9 @@ test('incomplete source-page reading resumes automatically with fresh paging gui
   assert.equal((await f.create().runCycle()).resumed, 1);
   assert.equal(codeProtocolRecoveryFor(f.job, f.proof), code);
   assert.match(codeProtocolRecoveryMessages(code)[0].content, /read_source.*full audited source pages/);
+  assert.match(codeProtocolRecoveryMessages(code)[0].content, /fullyRead=false/);
+  assert.match(codeProtocolRecoveryMessages(code)[0].content, /read_text.*previews/);
+  assert.match(codeProtocolRecoveryMessages(code)[0].content, /same invocation/);
   assert.equal((await f.create().runCycle()).resumed, 0);
 });
 
