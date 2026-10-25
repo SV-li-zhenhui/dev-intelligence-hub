@@ -558,6 +558,22 @@ test('unknown CI push outcomes stay fenced across restart instead of publishing 
   assert.equal(await f.service.shouldRun(f.item), false);
 });
 
+test('retired CI push resumes the same confirmation after automatic mode is restored', async () => {
+  const f = await fixture({ ci: true, pushOutcome: attempt => attempt === 1 ? "absent" : "applied" });
+  await f.deliver(); f.completeJob(); await f.service.runCycle();
+  const original = (await f.store.read(STATE_KEY)).repairs[0];
+  f.config.githubActions.automaticOwnPrRepair = false;
+  await f.service.runCycle(); await f.restart();
+  assert.equal((await f.store.read(STATE_KEY)).repairs[0].status, "stale");
+  f.config.githubActions.automaticOwnPrRepair = true;
+  await f.service.runCycle(); await f.service.runCycle();
+  const recovered = (await f.store.read(STATE_KEY)).repairs[0];
+  assert.equal(recovered.status, "published");
+  assert.equal(recovered.pushConfirmationId, original.pushConfirmationId);
+  assert.equal(f.codeJobApprovalCount, 1);
+  assert.equal(f.pushes.length, 2);
+});
+
 test('a retired ledger binding invalidates an unadmitted CI push instead of leaving a manual confirmation', async () => {
   const f = await fixture({ ci: true }); await f.deliver(); f.completeJob();
   f.interruptApproval('github.pull-request-push');
@@ -938,6 +954,77 @@ for (const conflict of [false, true]) {
     for (let i = 0; i < 7; i += 1) { await f.restart(); await f.service.runCycle(); }
     assert.equal(f.pushes.length, 4, "one initial attempt and at most three retries");
     assert.equal(rows(await f.store.read(stateKey))[0].status, "failed");
+  });
+
+  for (const restart of [false, true]) {
+    test(`retired absent push retries when current authority becomes valid again (conflict=${conflict}, restart=${restart})`, async () => {
+      const f = await fixture({ conflict, pushOutcome: attempt => attempt === 1 ? "absent" : "applied" });
+      await f.deliver(); f.completeJob(); await f.service.runCycle();
+      const original = rows(await f.store.read(stateKey))[0];
+      f.config.githubActions.automaticOwnPrRepair = false;
+      await f.service.runCycle();
+      assert.equal(rows(await f.store.read(stateKey))[0].status, "stale");
+      if (restart) await f.restart();
+      await f.service.runCycle();
+      assert.equal(f.pushes.length, 1, "disabled automation cannot retry");
+      f.config.githubActions.automaticOwnPrRepair = true;
+      await f.service.runCycle(); await f.service.runCycle();
+      const recovered = rows(await f.store.read(stateKey))[0];
+      assert.equal(f.pushes.length, 2);
+      assert.equal(f.codeJobApprovalCount, 1);
+      assert.equal(recovered.status, "published");
+      assert.equal(recovered.pushConfirmationId, original.pushConfirmationId);
+      assert.equal(recovered.pushRetry.attempt, 1);
+      await f.restart(); await f.service.runCycle();
+      assert.equal(f.pushes.length, 2, "recovery cannot publish twice");
+    });
+  }
+
+  test(`retired unknown pushes remain untouched (conflict=${conflict})`, async () => {
+    const f = await fixture({ conflict, pushOutcome: "unknown" });
+    await f.deliver(); f.completeJob(); await f.service.runCycle();
+    const saved = await f.store.read(stateKey);
+    rows(saved)[0].status = "stale";
+    await f.store.write(stateKey, saved);
+    const original = await f.queue.get(rows(saved)[0].pushConfirmationId);
+    await f.restart(); await f.service.runCycle(); await f.service.runCycle();
+    assert.equal(f.pushes.length, 1);
+    assert.deepEqual(await f.queue.get(original.id), original);
+    assert.equal(rows(await f.store.read(stateKey))[0].status, "stale");
+  });
+
+  test(`failed push recovery rechecks the original code receipt after restart (conflict=${conflict})`, async (t) => {
+    for (const proof of ["incomplete", "missing-receipt", "different-job"]) await t.test(proof, async () => {
+      const f = await fixture({ conflict, pushOutcome: "absent" });
+      await f.deliver(); f.completeJob(); await f.service.runCycle();
+      const saved = await f.store.read(stateKey);
+      const record = rows(saved)[0];
+      record.status = "failed";
+      await f.store.write(stateKey, saved); await f.restart();
+      const get = f.service.confirmations.get;
+      f.service.confirmations.get = async (...args) => {
+        const item = await get(...args);
+        if (item.id !== record.confirmationId) return item;
+        if (proof === "incomplete") return { ...item, status: "pending", receipt: null };
+        return { ...item, receipt: proof === "missing-receipt" ? null : { ...item.receipt, id: "code-job-different" } };
+      };
+      await f.service.runCycle(); await f.service.runCycle();
+      assert.equal(f.pushes.length, 1);
+      assert.equal(rows(await f.store.read(stateKey))[0].pushRetry, undefined);
+    });
+  });
+
+  test(`still-disabled retired pushes do not rewrite their state (conflict=${conflict})`, async () => {
+    const f = await fixture({ conflict, pushOutcome: "absent" });
+    await f.deliver(); f.completeJob(); await f.service.runCycle();
+    f.config.githubActions.automaticOwnPrRepair = false;
+    await f.service.runCycle();
+    let writes = 0;
+    const write = f.store.write.bind(f.store);
+    f.store.write = async (key, value) => { if (key === stateKey) writes++; return write(key, value); };
+    await f.service.runCycle(); await f.service.runCycle();
+    assert.equal(f.pushes.length, 1);
+    assert.equal(writes, 0);
   });
 
   test(`retry intent is replayed once after acknowledgement loss (conflict=${conflict})`, async () => {

@@ -250,7 +250,8 @@ export class AutomaticOwnPrConflict {
   runCycle({ limit = 10, includeRecovery = true } = {}) {
     return this.#queue.enqueue(async () => {
       const recovery = includeRecovery ? await this.#recoverMaterials(limit) : {};
-      const pending = this.#state.records.filter(active);
+      const pending = this.#state.records.filter(record => active(record) ||
+        (this.confirmations.retry && record.pushConfirmationId && ["failed", "stale"].includes(record.status)));
       const start = pending.findIndex(record => record.jobId === this.#lastJobId) + 1;
       const candidates = [...pending.slice(start), ...pending.slice(0, start)].slice(0, limit);
       this.#lastJobId = candidates.at(-1)?.jobId ?? null;
@@ -267,20 +268,24 @@ export class AutomaticOwnPrConflict {
   async #advance(record) {
     const codeItem = await this.confirmations.get(record.confirmationId);
     const grant = codeItem.display.payload.action.grant;
+    const retired = ["failed", "stale"].includes(record.status);
     if (record.pushConfirmationId) {
       let push;
       try { push = await this.confirmations.get(record.pushConfirmationId); }
       catch (error) { if (error?.code !== "CONFIRMATION_NOT_FOUND") throw error; }
-      if (!push) return this.#advance({ ...record, pushConfirmationId: null });
+      if (!push) return retired ? record.status : this.#advance({ ...record, pushConfirmationId: null });
+      if (retired && !planOwnPrPushRetry(record, push)) return record.status;
       if (push.status === "completed") { await this.#update(record, "published"); return "published"; }
       if (push.status === "failed" && push.failure?.outcome === "unknown") return "waiting";
       const retry = this.confirmations.retry && planOwnPrPushRetry(record, push);
       if (retry) {
+        if (codeItem.status !== "completed" || codeItem.receipt?.id !== record.jobId) return "waiting";
         if (!await this.#grantCurrent(grant) || !await this.#current(record.inputBinding)) {
-          await this.#update(record, "stale"); return "stale";
+          if (record.status !== "stale") await this.#update(record, "stale");
+          return "stale";
         }
         await this.#save({ ...this.#state, records: this.#state.records.map(row => row.jobId === record.jobId
-          ? { ...row, pushRetry: retry } : row) });
+          ? { ...row, status: "pushing", pushRetry: retry } : row) });
         await retryOwnPrPush(this.confirmations, push, retry);
         return "waiting";
       }

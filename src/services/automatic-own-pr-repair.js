@@ -447,7 +447,8 @@ export class AutomaticOwnPrRepair {
   runCycle({ limit = 10, includeRecovery = true } = {}) {
     return this.#queue.enqueue(async () => {
       const pending = !this.codeJobReader || !this.controlledCommitReader ? [] :
-        this.#state.repairs.filter((row) => ["working", "pushing"].includes(row.status));
+        this.#state.repairs.filter((row) => ["working", "pushing"].includes(row.status) ||
+          (this.confirmations.retry && row.pushConfirmationId && ["failed", "stale"].includes(row.status)));
       const start = pending.findIndex((row) => row.jobId === this.#lastJobId) + 1;
       const candidates = [...pending.slice(start), ...pending.slice(0, start)].slice(0, limit);
       this.#lastJobId = candidates.at(-1)?.jobId ?? null;
@@ -484,7 +485,9 @@ export class AutomaticOwnPrRepair {
       }
       // An absent item after recording the intent can be reconstructed with
       // its deterministic id; an unknown queue outcome must not be replayed.
-      if (!push) return this.#advance(record);
+      const retired = ["failed", "stale"].includes(record.status);
+      if (!push) return retired ? record.status : this.#advance(record);
+      if (retired && !planOwnPrPushRetry(record, push)) return record.status;
       if (push.status === "completed") {
         const commitOid = push.display.payload.action.controlledCommitEvidence.commit.oid;
         const published = { repository: record.inputBinding.repository,
@@ -505,10 +508,12 @@ export class AutomaticOwnPrRepair {
       const retry = this.confirmations.retry && planOwnPrPushRetry(record, push);
       if (retry) {
         const codeItem = await this.confirmations.get(record.confirmationId);
+        if (codeItem.status !== "completed" || codeItem.receipt?.id !== record.jobId) return "waiting";
         if (!await this.#grantCurrent(codeItem.display.payload.action.grant) || !matchesCurrentRepair(record, await this.#current(record.inputBinding))) {
-          await this.#update(record, { status: "stale" }); return "stale";
+          if (record.status !== "stale") await this.#update(record, { status: "stale" });
+          return "stale";
         }
-        await this.#update(record, { pushRetry: retry });
+        await this.#update(record, { status: "pushing", pushRetry: retry });
         await retryOwnPrPush(this.confirmations, push, retry);
         return "waiting";
       }
