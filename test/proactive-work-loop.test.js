@@ -3225,7 +3225,7 @@ test('one orchestrator context deadline does not abort later work or consume its
     } },
     orchestratorService: { async execute({ item }) { executions.push(item.itemId); return { applied: true }; } },
   });
-  const result = await loop.runCycle({ roleId: 'orchestrator' });
+  const result = await loop.runCycle({ roleId: 'orchestrator', workLimit: 1 });
   assert.equal(firstSignal.aborted, true);
   assert.deepEqual(result.outcomes.map(({ status }) => status), ['decision_deferred', 'orchestrated']);
   assert.equal(result.outcomes[0].code, 'ROLE_CONTEXT_TIMEOUT');
@@ -3396,7 +3396,7 @@ function stalePullRequestFactsFailure() {
   );
 }
 
-function staleFactsRootLoop({ failures, time = controlledClock(), signal = null }) {
+function deferredContextRootLoop({ failures, time = controlledClock(), signal = null }) {
   const sources = Array.from({ length: failures.length + 1 }, (_, index) =>
     workItem(901 + index, { type: "role", id: "orchestrator" }));
   const cancelled = workItem(24723, { type: "role", id: "orchestrator" });
@@ -3428,7 +3428,7 @@ function staleFactsRootLoop({ failures, time = controlledClock(), signal = null 
 }
 
 test("stale PR facts defer only their root before claim and preserve the healthy work budget", async () => {
-  const { loop, ledger, sources, cancelled, executions } = staleFactsRootLoop({
+  const { loop, ledger, sources, cancelled, executions } = deferredContextRootLoop({
     failures: [stalePullRequestFactsFailure(), stalePullRequestFactsFailure()],
   });
   for (let iteration = 0; iteration < 3; iteration += 1) {
@@ -3449,7 +3449,7 @@ test("stale PR facts defer only their root before claim and preserve the healthy
 test('obsolete ledger execution bindings defer their root and leave healthy roots runnable', async () => {
   const failure = new RoleContextAssemblerError('ROLE_CONTEXT_PR_FACT_UNAVAILABLE', 'old binding', 503,
     { cause: Object.assign(new Error('old Head'), { code: 'WORK_LEDGER_PR_EXECUTION_BINDING_STALE', statusCode: 409 }) });
-  const { loop, ledger, sources, executions } = staleFactsRootLoop({ failures: [failure] });
+  const { loop, ledger, sources, executions } = deferredContextRootLoop({ failures: [failure] });
   const result = await loop.runCycle({ roleId: 'orchestrator', workLimit: 1 });
   assert.equal(result.workAttempts, 1);
   assert.deepEqual(executions, [sources[1].itemId]);
@@ -3459,7 +3459,7 @@ test('obsolete ledger execution bindings defer their root and leave healthy root
 
 test("stale PR facts respect each cycle read budget and eventually reach a healthy root beyond two windows", async () => {
   const failures = Array.from({ length: 13 }, () => stalePullRequestFactsFailure());
-  const { loop, ledger, sources, cancelled, assemblies, executions } = staleFactsRootLoop({ failures });
+  const { loop, ledger, sources, cancelled, assemblies, executions } = deferredContextRootLoop({ failures });
   let cycles = 0;
   while (executions.length === 0 && cycles < 5) {
     const priorReads = assemblies.length;
@@ -3480,7 +3480,7 @@ test("stale PR facts respect each cycle read budget and eventually reach a healt
 
 test("a revised root is eligible immediately during a partial stale-fact sweep", async () => {
   const failures = Array.from({ length: 5 }, () => stalePullRequestFactsFailure());
-  const { loop, ledger, sources, assemblies, executions } = staleFactsRootLoop({ failures });
+  const { loop, ledger, sources, assemblies, executions } = deferredContextRootLoop({ failures });
   await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
   assert.equal(assemblies.length, 4);
   ledger.items[0].revision += 1;
@@ -3490,8 +3490,53 @@ test("a revised root is eligible immediately during a partial stale-fact sweep",
   assert.equal(assemblies[4], sources[0].itemId);
 });
 
+test("root context deadlines respect the read budget and cannot starve later healthy work", async () => {
+  const failures = Array.from({ length: 13 }, () => Object.assign(new Error("host context deadline"), { code: "ROLE_CONTEXT_TIMEOUT" }));
+  const { loop, ledger, sources, cancelled, assemblies, executions } = deferredContextRootLoop({ failures });
+  for (let cycle = 0; cycle < 4; cycle += 1) {
+    const reads = assemblies.length;
+    const result = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+    assert.ok(assemblies.length - reads <= 4);
+    assert.equal(result.claimed, 0);
+    assert.equal(result.workAttempts, cycle === 3 ? 1 : 0);
+  }
+  assert.deepEqual(executions, [sources[13].itemId]);
+  assert.equal(assemblies.length, 14);
+  assert.equal(new Set(assemblies).size, 14);
+  assert.deepEqual(ledger.items, [...sources, cancelled]);
+  assert.equal(ledger.calls.scheduleRetry.length, 0);
+});
+
+test("a revised root interrupts a partial context-deadline sweep", async () => {
+  const failures = Array.from({ length: 5 }, () => Object.assign(new Error("host context deadline"), { code: "ROLE_CONTEXT_TIMEOUT" }));
+  const { loop, ledger, sources, assemblies, executions } = deferredContextRootLoop({ failures });
+  await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+  assert.equal(assemblies.length, 4);
+  ledger.items[0].revision += 1;
+  failures[0] = null;
+  await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+  assert.equal(assemblies[4], sources[0].itemId);
+  assert.deepEqual(executions, [sources[0].itemId]);
+});
+
+test("new urgent owner work precedes a partial context-deadline sweep", async () => {
+  const failures = Array.from({ length: 13 }, () => Object.assign(new Error("host context deadline"), { code: "ROLE_CONTEXT_TIMEOUT" }));
+  const { loop, ledger, executions } = deferredContextRootLoop({ failures });
+  await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+  const urgent = workItem(9999, { type: "role", id: "orchestrator" });
+  urgent.event = normalizeWorkflowEvent({
+    schemaVersion: 1, eventType: "owner_request.created", occurredAt: "2026-08-02T08:00:00.000Z",
+    source: { provider: "local-owner", scopeId: "owner-command-center" },
+    subject: { id: "owner-request:95abc353-8a86-46ba-b710-c01fb58d4a21", requestId: "95abc353-8a86-46ba-b710-c01fb58d4a21" },
+    payload: { title: "Urgent follow-up", description: "Handle the new incident", priority: "urgent", workType: "general", acceptanceCriteria: [] },
+  });
+  ledger.items.push(urgent);
+  await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+  assert.deepEqual(executions, [urgent.itemId]);
+});
+
 test("terminal PR retirement and stale PR deferral both permit the following healthy root", async () => {
-  const { loop, ledger, sources, executions } = staleFactsRootLoop({
+  const { loop, ledger, sources, executions } = deferredContextRootLoop({
     failures: [terminalPullRequestFailure(), stalePullRequestFactsFailure()],
   });
   const result = await loop.runCycle({ roleId: "orchestrator", workLimit: 2 });
@@ -3539,7 +3584,7 @@ test("untrusted or unrelated nested root failures still stop the work cycle", as
   for (const [name, createFailure] of variants) {
     await t.test(name, async () => {
       const failure = createFailure();
-      const { loop, ledger, executions } = staleFactsRootLoop({ failures: [failure] });
+      const { loop, ledger, executions } = deferredContextRootLoop({ failures: [failure] });
       await assert.rejects(loop.runCycle({ roleId: "orchestrator" }), (error) => error === failure);
       assert.deepEqual(executions, []);
       assert.equal(ledger.calls.claim.length, 0);
@@ -3549,7 +3594,7 @@ test("untrusted or unrelated nested root failures still stop the work cycle", as
 
 test("cycle cancellation takes precedence over a wrapped stale PR fact", async () => {
   const controller = new AbortController();
-  const { loop, ledger, executions } = staleFactsRootLoop({
+  const { loop, ledger, executions } = deferredContextRootLoop({
     failures: [stalePullRequestFactsFailure()], signal: controller,
   });
   await assert.rejects(loop.runCycle({ roleId: "orchestrator", signal: controller.signal }),

@@ -553,16 +553,16 @@ function claimFailureConsumesWorkBudget(claim) {
   return !NON_BUDGET_CLAIM_FAILURE_CODES.has(claim.code);
 }
 
-function isUnclaimedStalePrFact(result) {
+function isUnclaimedRootContextDeferral(result) {
   return (
     !result.claimAttempted &&
     result.outcome.status === "decision_deferred" &&
-    result.outcome.code === "PR_FACTS_STALE"
+    ["PR_FACTS_STALE", "ROLE_CONTEXT_TIMEOUT"].includes(result.outcome.code)
   );
 }
 
 function configuredResultConsumesWorkBudget(result) {
-  if (isUnclaimedStalePrFact(result)) return false;
+  if (isUnclaimedRootContextDeferral(result)) return false;
   if (result.decisionSkipped === true && result.outcome.status === "graph_blocked") return false;
   return result.claimed ||
     !result.claimAttempted ||
@@ -905,7 +905,7 @@ export class ProactiveWorkLoop {
     this.lastIssueRetirementKey = null;
     this.issueRetirementSweep = null;
     this.fencedClaimDeferrals = new Map();
-    this.stalePrFactSweeps = new Map();
+    this.rootContextDeferralSweeps = new Map();
     this.prPreparationSweeps = new Map();
     this.blockedRootSweeps = new Map();
     this.claimCycleSequences = new Map();
@@ -966,10 +966,10 @@ export class ProactiveWorkLoop {
     const itemRevisions = new Map(
       items.map((item) => [item.itemId, item.revision]),
     );
-    const stalePrFactSweep = this.stalePrFactSweeps.get(scope) ?? new Map();
-    this.stalePrFactSweeps.set(scope, stalePrFactSweep);
-    for (const [itemId, revision] of stalePrFactSweep) {
-      if (itemRevisions.get(itemId) !== revision) stalePrFactSweep.delete(itemId);
+    const rootContextDeferralSweep = this.rootContextDeferralSweeps.get(scope) ?? new Map();
+    this.rootContextDeferralSweeps.set(scope, rootContextDeferralSweep);
+    for (const [itemId, revision] of rootContextDeferralSweep) {
+      if (itemRevisions.get(itemId) !== revision) rootContextDeferralSweep.delete(itemId);
     }
     const preparationSweep = this.prPreparationSweeps.get(scope) ?? new Map();
     this.prPreparationSweeps.set(scope, preparationSweep);
@@ -1047,7 +1047,7 @@ export class ProactiveWorkLoop {
         completedCandidateSweep = false;
         break;
       }
-      if (stalePrFactSweep.get(item.itemId) === item.revision) continue;
+      if (rootContextDeferralSweep.get(item.itemId) === item.revision) continue;
       if (preparationSweep.get(item.itemId) === item.revision) continue;
       if (blockedRootSweep.has(item.itemId) && options.continuationTarget === null) continue;
       const fencedDeferral = this.fencedClaimDeferrals.get(item.itemId);
@@ -1222,11 +1222,11 @@ export class ProactiveWorkLoop {
             } else {
               blockedRootSweep.delete(item.itemId);
             }
-            const stalePrFact = isUnclaimedStalePrFact(processed);
-            if (stalePrFact) stalePrFactSweep.set(item.itemId, item.revision);
+            const rootContextDeferred = isUnclaimedRootContextDeferral(processed);
+            if (rootContextDeferred) rootContextDeferralSweep.set(item.itemId, item.revision);
             if (configuredResultConsumesWorkBudget(processed)) {
               workAttempts += 1;
-            } else if (!stalePrFact) {
+            } else if (!rootContextDeferred) {
               availabilityBudgetUsed -= 1;
               this.fencedClaimDeferrals.set(item.itemId, {
                 revision: item.revision,
@@ -1303,10 +1303,10 @@ export class ProactiveWorkLoop {
       }
     }
 
-    // Continue a bounded stale-fact sweep across cycles without moving new or
+    // Continue a bounded root-context sweep across cycles without moving new or
     // urgent candidates behind old work. A changed revision is never skipped.
     if (completedCandidateSweep && options.continuationTarget === null) {
-      this.stalePrFactSweeps.delete(scope);
+      this.rootContextDeferralSweeps.delete(scope);
       this.prPreparationSweeps.delete(scope);
       this.blockedRootSweeps.delete(scope);
     }
