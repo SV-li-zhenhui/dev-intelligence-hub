@@ -303,17 +303,17 @@ test("one generic execution acquires, uses, and releases one actor-bound lease",
   assert.equal(JSON.stringify(result).includes(credential.token), false);
 });
 
-test("controlled push budgets repeated local verification without extending a single check", async () => {
+test("controlled push shares its aggregate budget across repeated local verification", async () => {
   const envelope = envelopeFor("push");
   const transport = mutableTransport(envelope);
   let now = 1_000_000;
   const executor = executorFor(envelope, transport, {
     clock: () => now, timeoutMs: 60_000,
     controlledCommitVerifier: { async verify() {
-      now += 20_000;
+      now += 68_000;
       return structuredClone(envelope.action.controlledCommitEvidence);
     } },
-    pushAuthorization: { async verifyPush() { now += 20_000; return true; } },
+    pushAuthorization: { async verifyPush() { now += 68_000; return true; } },
   });
   assert.equal((await executor.execute(envelope)).status, "applied");
   assert.ok(now > 1_060_000, "the bounded stages exceed a single request budget in aggregate");
@@ -328,7 +328,7 @@ test("one slow controlled verification remains bounded within the aggregate push
   const executor = executorFor(envelope, transport, {
     credentialSource: credential.source, clock: () => now, timeoutMs: 60_000,
     controlledCommitVerifier: { async verify() {
-      now += 60_001;
+      now += 600_001;
       return structuredClone(envelope.action.controlledCommitEvidence);
     } },
   });

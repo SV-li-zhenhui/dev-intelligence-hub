@@ -715,7 +715,8 @@ class PullRequestExternalActionExecutor {
     this.#activeOperations.add(controller);
     if (this.#closed) controller.abort();
     // A push revalidates the sealed commit, versioned grant and remote target
-    // repeatedly. Each check remains bounded; their aggregate has its own cap.
+    // repeatedly. Local verification shares this cap; transport calls retain
+    // their individual request timeout.
     const stages = envelope.action.type === "pull_request_push" ? 10 : 1;
     const deadline = this.#clock() + Math.min(600_000, stages * this.#timeoutMs);
     const timer = setTimeout(
@@ -769,7 +770,7 @@ class PullRequestExternalActionExecutor {
 
   async #authorityCurrent(envelope, operation) {
     if (envelope.action.type === "pull_request_push" && this.#pushAuthorization !== null &&
-        !(await this.#awaitOperation(operation, () => this.#pushAuthorization.verifyPush(envelope)))) return false;
+        !(await this.#awaitOperation(operation, () => this.#pushAuthorization.verifyPush(envelope), "absent", operation.deadline))) return false;
     try {
       const verified = await this.#awaitOperation(
         operation,
@@ -803,6 +804,7 @@ class PullRequestExternalActionExecutor {
           evidenceId: envelope.action.controlledCommitEvidence.evidenceId,
         }),
         failureTrust,
+        operation.deadline,
       );
     } catch (cause) {
       if (this.#isOperationError(cause, operation)) throw cause;
@@ -832,11 +834,11 @@ class PullRequestExternalActionExecutor {
     return normalizeObservation(observation, envelope);
   }
 
-  async #awaitOperation(operation, callback, failureTrust = "absent") {
+  async #awaitOperation(operation, callback, failureTrust = "absent",
+    checkDeadline = Math.min(operation.deadline, this.#clock() + this.#timeoutMs)) {
     this.#assertOperationCurrent(operation, failureTrust);
     let abort;
     let timer;
-    const checkDeadline = Math.min(operation.deadline, this.#clock() + this.#timeoutMs);
     const timedOut = new Promise((_, reject) => {
       timer = setTimeout(() => reject(new PullRequestExternalActionTransportError("GITHUB_TIMEOUT", failureTrust)),
         Math.max(0, checkDeadline - this.#clock()));
