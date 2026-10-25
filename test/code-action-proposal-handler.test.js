@@ -306,6 +306,48 @@ function handler(producer, reader, grant = grantFor(), overrides = {}) {
   };
 }
 
+for (const changedCreation of ['unavailable', 'different-current-grant']) test(`an approved job continues with its verified original grant when new creation is ${changedCreation}`, async () => {
+  const grant = grantFor(), producer = new FakeConfirmationProducer('completed'), reader = new FakeCodeJobReader(queuedJob(grant));
+  let changed = false, creates = 0, verifies = 0;
+  const instance = handler(producer, reader, grant, { grantFactory: {
+    async create() {
+      creates++;
+      if (changed && changedCreation === 'unavailable') throw Object.assign(new Error('creation no longer matches'), { code: 'INVALID_CODE_JOB_AUTHORITY' });
+      const { grantDigest, ...input } = grant;
+      return authority(changed ? createCodeJobGrant({ ...input, brainDigest: '8'.repeat(64) }) : grant).factory.create(proposal());
+    },
+    async verify(value) { verifies++; assert.deepEqual(value, grant); return structuredClone(value); },
+  } });
+  const first = await instance.value.handle(handlerInput());
+  changed = true;
+  const next = await instance.value.handle(handlerInput({ status: 'running', downstreamRef: first.downstreamRef }));
+  assert.equal(next.status, 'running');
+  assert.equal(creates, 1, 'polling an approved job does not create another grant');
+  assert.equal(verifies, 1);
+  assert.equal(producer.enqueueCalls.length, 1);
+  assert.equal(producer.invalidateCalls.length, 0);
+});
+
+test('approved job continuation still isolates genuinely revoked original authority', async () => {
+  const grant = grantFor(), producer = new FakeConfirmationProducer('completed'), reader = new FakeCodeJobReader(queuedJob(grant));
+  const instance = handler(producer, reader, grant, { grantFactory: { ...authority(grant).factory,
+    async verify() { throw Object.assign(new Error('Head or permission changed'), { code: 'INVALID_CODE_JOB_AUTHORITY' }); } } });
+  const first = await instance.value.handle(handlerInput()), reads = reader.getCalls.length;
+  const next = await instance.value.handle(handlerInput({ status: 'running', downstreamRef: first.downstreamRef }));
+  assert.equal(next.status, 'stale');
+  assert.equal(reader.getCalls.length, reads, 'revoked grant cannot authorize job polling');
+});
+
+for (const variant of ['changed-verifier-result', 'forged-receipt']) test(`approved grant continuation rejects ${variant}`, async () => {
+  const grant = grantFor(), producer = new FakeConfirmationProducer('completed'), reader = new FakeCodeJobReader(queuedJob(grant));
+  const instance = handler(producer, reader, grant, { grantFactory: { ...authority(grant).factory,
+    async verify(value) { return variant === 'changed-verifier-result' ? { ...value, brainDigest: '7'.repeat(64) } : value; } } });
+  const first = await instance.value.handle(handlerInput());
+  if (variant === 'forged-receipt') producer.overrides = { receipt: { id: `code-job-${'7'.repeat(55)}`, createdAt: CREATED_AT } };
+  await assert.rejects(instance.value.handle(handlerInput({ status: 'running', downstreamRef: first.downstreamRef })));
+  assert.equal(producer.enqueueCalls.length, 1);
+});
+
 test("a proposal is enqueued once and waits on the exact code confirmation", async () => {
   const grant = grantFor();
   const producer = new FakeConfirmationProducer();
@@ -1013,7 +1055,7 @@ class Guard {
   async close() {}
 }
 
-test("the real proposal runner stops at running while the local job is queued", async () => {
+test("the real proposal runner continues the approved original grant when creation rules change", async () => {
   const value = proposal();
   const grant = grantFor(value);
   const store = new MemoryStore();
@@ -1034,6 +1076,14 @@ test("the real proposal runner stops at running while the local job is queued", 
   const producer = new FakeConfirmationProducer();
   const reader = new FakeCodeJobReader(queuedJob(grant));
   const trusted = authority(grant);
+  let verifies = 0;
+  let creationChanged = false;
+  const create = trusted.factory.create;
+  trusted.factory.create = async value => {
+    if (creationChanged) throw Object.assign(new Error('new creation is unavailable'), { code: 'INVALID_CODE_JOB_AUTHORITY' });
+    return create(value);
+  };
+  trusted.factory.verify = async value => { verifies++; assert.deepEqual(value, grant); return value; };
   const service = createCodeActionProposalRunnerService({
     enabled: true,
     runner: runtime.runners["code-runner"],
@@ -1052,6 +1102,7 @@ test("the real proposal runner stops at running while the local job is queued", 
   assert.equal(store.value.results.length, 0);
 
   producer.status = "completed";
+  creationChanged = true;
   now += 1_000;
   await service.runCycle({ limit: 1 });
   assert.equal(store.value.proposals[0].status, "running");
@@ -1062,5 +1113,7 @@ test("the real proposal runner stops at running while the local job is queued", 
   await service.runCycle({ limit: 1 });
   assert.equal(store.value.proposals[0].status, "running");
   assert.equal(store.value.results.length, 0);
+  assert.equal(trusted.calls.length, 1);
+  assert.equal(verifies, 2);
   await runtime.close();
 });

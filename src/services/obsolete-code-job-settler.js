@@ -6,6 +6,12 @@ import { digestValue } from "../domain/code-executor-contract.js";
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "fenced"]);
 const CANCELLATION_REASON = "PR source superseded";
 const unstartedAuthorityFences = new WeakMap();
+const unstartedPreparationFailures = new WeakMap();
+
+export function hasUnstartedCodeJobPreparationFailure(job) {
+  const proof = unstartedPreparationFailures.get(job);
+  return proof !== undefined && isDeepStrictEqual(job, proof);
+}
 const stoppedAuthorityFences = new WeakMap();
 
 export function hasUnstartedCodeJobAuthorityFence(job) {
@@ -185,15 +191,16 @@ export class ObsoleteCodeJobSettler {
     const valueFromStore = await this.#get(receipt.id);
     if (valueFromStore === null) return null;
     const job = normalizeCodeJobConfirmationResult(valueFromStore, grant, receipt);
-    if (this.#getDetail !== null && job.status === "fenced" && job.turn === 0 &&
+    if (this.#getDetail !== null && ['fenced', 'failed'].includes(job.status) && job.turn === 0 &&
         job.observationCount === 0 && job.latestObservation === null &&
         job.pendingActionType === null && job.uncertainty === null) {
       const detail = await this.#getDetail({ jobId: job.jobId, limit: 1 });
       if (detail?.archived === false && detail.historyAvailable === true &&
           detail.nextCursor === null && Array.isArray(detail.observations) && detail.observations.length === 0 &&
-          detail.terminalDetail?.code === "INVALID_CODE_JOB_AUTHORITY" &&
+          detail.terminalDetail?.code === (job.status === 'fenced' ? 'INVALID_CODE_JOB_AUTHORITY' : 'CONTROLLED_GIT_PREFLIGHT_FAILED') &&
           isDeepStrictEqual(job, normalizeCodeJobConfirmationResult(detail.job, grant, receipt))) {
-        unstartedAuthorityFences.set(job, structuredClone(job));
+        const proofs = job.status === 'fenced' ? unstartedAuthorityFences : unstartedPreparationFailures;
+        proofs.set(job, structuredClone(job));
       }
     }
     if (this.#getDetail !== null && this.#getRun !== null && this.#viewSession !== null && job.status === "fenced" &&

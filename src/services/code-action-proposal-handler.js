@@ -481,6 +481,7 @@ export class CodeActionProposalHandler {
   #invalidateConfirmation;
   #getCodeJob;
   #createGrant;
+  #verifyGrant;
   #clock;
   #pollIntervalMs;
   #automaticOwnPrRepair;
@@ -508,6 +509,8 @@ export class CodeActionProposalHandler {
       ["create"],
       "grantFactory",
     ).create;
+    this.#verifyGrant = typeof grantFactory?.verify === 'function'
+      ? requirePort(grantFactory, ['verify'], 'grantFactory').verify : null;
     if (typeof clock !== "function") throw new TypeError("clock is invalid");
     this.#clock = clock;
     this.#pollIntervalMs = positiveInteger(
@@ -562,6 +565,22 @@ export class CodeActionProposalHandler {
           `proposal:${input.proposal.proposalId}`,
         ],
       };
+    }
+    // An approved job retains its sealed grant. New-grant creation can change
+    // independently of the current authority to continue that original job.
+    if (existingItem?.status === 'completed' && this.#verifyGrant !== null &&
+        ['running', 'waiting_confirmation', 'waiting_retry'].includes(input.status)) {
+      const grant = normalizeCodeJobGrant(existingValue.display.payload.action.grant);
+      try {
+        if (!sameValue(await this.#verifyGrant(grant), grant)) throw invalidConfirmation('原代码任务授权校验结果不匹配');
+      } catch (error) {
+        if (AUTHORIZATION_ERROR_CODES.has(error?.code)) return this.#invalidateChangedAuthorization(existingItem, input.proposal);
+        throw error;
+      }
+      const expected = normalizeConfirmationPlan(createCodeActionProposalConfirmationPlan(input.proposal, {
+        grant, allowedOperationsByRole: { [input.proposal.requestedBy.roleId]: [input.proposal.payload.operation] },
+      }));
+      return this.#transitionConfirmation(normalizeConfirmationItem(existingValue, expected), grant);
     }
     let authority;
     try {

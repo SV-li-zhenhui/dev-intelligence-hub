@@ -1491,7 +1491,10 @@ import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
 import { CodeJobStore } from "../src/services/code-job-store.js";
 import { CodeJobApprovalExecutor } from "../src/services/code-job-approval-executor.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
-import { ObsoleteCodeJobSettler, hasUnstartedCodeJobAuthorityFence, hasSettledCodeJobAuthorityFence } from "../src/services/obsolete-code-job-settler.js";
+import { ObsoleteCodeJobSettler, hasUnstartedCodeJobAuthorityFence, hasSettledCodeJobAuthorityFence, hasUnstartedCodeJobPreparationFailure } from "../src/services/obsolete-code-job-settler.js";
+import { AutomaticOwnPrConflictRecovery } from '../src/services/automatic-own-pr-conflict-recovery.js';
+import { createConflictPreparationBinding } from '../src/domain/conflict-preparation-binding.js';
+import { createConflictCodeExecutionSource } from '../src/domain/code-execution-source.js';
 import {
   createLocalWorkLedgerCandidateProcessor,
   createWorkerWorkLedgerCandidateProcessor,
@@ -5498,7 +5501,8 @@ test("same-root cutover releases durably rejected attention", async () => {
   assert.equal(root.source.pendingRevision, null);
 });
 
-async function revokedCodeConfirmationFixture({ executed = false, createdJob = false, observedConfirmationStatus = null, legacyNullReference = false } = {}) {
+async function revokedCodeConfirmationFixture({ executed = false, createdJob = false, observedConfirmationStatus = null, legacyNullReference = false,
+  conflict = false, reviseSource = true } = {}) {
   let overrideSnapshot;
   let confirmationQueue;
   const reads = [];
@@ -5512,7 +5516,9 @@ async function revokedCodeConfirmationFixture({ executed = false, createdJob = f
         ? confirmationQueue.readSettlement(input) : clone(overrideSnapshot);
     },
   };
-  const record = authoredReviewRepairAssignment(1);
+  const record = authoredReviewRepairAssignment(1, conflict ? { gitFacts: {
+    ...prGitFacts(PR_HEAD_A), relation: 'authored', actionState: 'action_now', nextAction: 'resolve_conflict', mergeStateStatus: 'DIRTY',
+  } } : {});
   record.assignment.target = { type: "role", id: "developer" };
   const fixture = await createFixture({
     records: [record],
@@ -5525,6 +5531,13 @@ async function revokedCodeConfirmationFixture({ executed = false, createdJob = f
     workerId: "employee-developer", leaseDurationMs: 30_000,
   });
   const intent = codeActionIntent();
+  const executionSource = conflict ? createConflictCodeExecutionSource({ inputBinding: prExecutionBinding(item),
+    preparationBinding: createConflictPreparationBinding({ gitTarget: prExecutionBinding(item).gitTarget,
+      preparation: { schemaVersion: 1, baseCommitOid: prExecutionBinding(item).gitTarget.baseRefOid,
+      headCommitOid: prExecutionBinding(item).gitTarget.headRefOid, preparationId: '1'.repeat(64), boundaryDigest: '2'.repeat(64),
+      evidenceDigest: '3'.repeat(64), mergeBaseOid: '4'.repeat(40), resultTreeOid: '5'.repeat(40),
+      resultObjectDigest: '6'.repeat(64), status: 'conflicted', materialization: 'full-tree',
+      conflicts: [{ path: 'src/app.js', mode: '100644' }] } }) }) : null;
   const staged = await fixture.service.stageIntent({
     itemId: item.itemId, expectedRevision: item.revision, leaseId: item.leaseId,
     actorId: "employee-developer", roleId: "developer", intent,
@@ -5536,6 +5549,7 @@ async function revokedCodeConfirmationFixture({ executed = false, createdJob = f
     binding: {
       eventId: item.event.eventId, subject: item.event.subject,
       repository: "acme/repo", workspaceId: "dashboard", inputBinding: prExecutionBinding(item),
+      ...(executionSource === null ? {} : { executionSource }),
     },
     payload: Object.fromEntries(["operation", "objective", "acceptanceCriteria", "evidence", "summary", "reason"]
       .map((key) => [key, intent[key]])),
@@ -5560,12 +5574,13 @@ async function revokedCodeConfirmationFixture({ executed = false, createdJob = f
     details: { downstreamRef: proposal.proposalId, proposalDigest: proposal.contentDigest },
   });
   const grant = createCodeJobGrant({
-    schemaVersion: 2, proposalId: proposal.proposalId, contentDigest: proposal.contentDigest,
+    schemaVersion: conflict ? 3 : 2, proposalId: proposal.proposalId, contentDigest: proposal.contentDigest,
     policyVersion: proposal.policyVersion, requestedBy: proposal.requestedBy, source: proposal.source,
     subject: proposal.binding.subject, repository: proposal.binding.repository,
     workspaceId: proposal.binding.workspaceId, inputBinding: proposal.binding.inputBinding,
+    ...(executionSource === null ? {} : { executionSource }),
     workspaceAuthorityDigest: "9".repeat(64), ...proposal.payload,
-    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify], writablePaths: ["src"],
+    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify], writablePaths: conflict ? ['src/app.js'] : ["src"],
     requiredProfiles: [{ id: "node-tests", configDigest: "b".repeat(64) }], brainDigest: "c".repeat(64),
   });
   const plan = normalizeConfirmationPlan(createCodeActionProposalConfirmationPlan(proposal, {
@@ -5617,12 +5632,14 @@ async function revokedCodeConfirmationFixture({ executed = false, createdJob = f
       changedFields: ["headRefOid"] } : {}),
   });
   update.assignment.target = record.assignment.target;
-  fixture.source.records.push(update);
-  fixture.source.highWatermark = 2;
-  assert.equal((await fixture.service.intake()).error, undefined);
+  if (reviseSource) {
+    fixture.source.records.push(update);
+    fixture.source.highWatermark = 2;
+    assert.equal((await fixture.service.intake()).error, undefined);
+  }
   item = (await fixture.service.listItems()).items[0];
   assert.equal(item.status, "blocked");
-  assert.notEqual(item.source.pendingRevision, null);
+  if (reviseSource) assert.notEqual(item.source.pendingRevision, null);
   // Reproduce the retained state from earlier source intake: only the reason
   // was replaced; the proposal decision and its latest result remain intact.
   if (!createdJob) {
@@ -5644,6 +5661,77 @@ async function revokedCodeConfirmationFixture({ executed = false, createdJob = f
       expectedGraphRevision: (await fixture.service.getSummary()).revision,
     },
   };
+}
+
+test('a sealed, unstarted preflight failure requeues the same current conflict root without rewriting old results', async () => {
+  const f = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, reviseSource: false });
+  let job = (await f.jobs.list()).items[0];
+  await f.jobs.fail({ jobId: job.jobId, expectedRevision: job.revision,
+    result: { code: 'CONTROLLED_GIT_PREFLIGHT_FAILED', message: 'Mirror preflight failed' } });
+  job = await f.jobs.getForWorker(job.jobId);
+  const before = await f.jobs.get(job.jobId), confirmation = await f.confirmationQueue.get(f.plan.id);
+  const proof = await new ObsoleteCodeJobSettler({ codeJobReader: f.jobs,
+    codeJobControl: { cancel: async () => assert.fail('recovery must not cancel') } }).read({ grant: job.grant, receipt: f.snapshot.item.receipt });
+  assert.equal(hasUnstartedCodeJobPreparationFailure(proof), true);
+  assert.equal(hasUnstartedCodeJobAuthorityFence(proof), false);
+  assert.equal(hasUnstartedCodeJobPreparationFailure(clone(proof)), false);
+  proof.turn++;
+  assert.equal(hasUnstartedCodeJobPreparationFailure(proof), false);
+  const recovery = new AutomaticOwnPrConflictRecovery({ store: f.store, ledger: f.service,
+    confirmationSettlementReader: f.service.confirmationSettlementReader, codeJobReader: f.jobs,
+    current: async () => true, prepareInspection: async () => ({ inputBinding: job.grant.inputBinding,
+      preparationBinding: job.grant.executionSource.preparationBinding,
+      conflicts: job.grant.executionSource.preparationBinding.conflicts }) });
+  await recovery.recover();
+  assert.equal((await recovery.runCycle()).requeued, 1);
+  assert.equal((await f.service.readItemForReconciliation({ itemId: f.item.itemId })).status, 'queued');
+  assert.deepEqual(await f.jobs.get(job.jobId), before);
+  assert.deepEqual(await f.confirmationQueue.get(f.plan.id), confirmation);
+  const restarted = new AutomaticOwnPrConflictRecovery({ store: f.store, ledger: f.service,
+    confirmationSettlementReader: f.service.confirmationSettlementReader, codeJobReader: f.jobs,
+    current: async () => true, prepareInspection: async () => assert.fail('already recovered') });
+  await restarted.recover();
+  assert.equal((await restarted.runCycle()).requeued, 0);
+});
+
+for (const variant of ['other-failure', 'job-paused', 'archived-history', 'partial-history', 'observed-action',
+  'binding-changed', 'current-authority-revoked', 'source-revised-during-prepare']) {
+  test(`unstarted conflict failure recovery preserves ${variant}`, async () => {
+    const f = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, reviseSource: false });
+    let job = (await f.jobs.list()).items[0];
+    if (variant !== 'job-paused') await f.jobs.fail({ jobId: job.jobId, expectedRevision: job.revision,
+      result: { code: variant === 'other-failure' ? 'INVALID_CODE_JOB_AUTHORITY' : 'CONTROLLED_GIT_PREFLIGHT_FAILED' } });
+    job = await f.jobs.getForWorker(job.jobId);
+    const before = await f.jobs.get(job.jobId);
+    const reader = { get: id => f.jobs.get(id), getDetail: async request => {
+      const detail = await f.jobs.getDetail(request);
+      if (variant === 'archived-history') detail.archived = true;
+      if (variant === 'partial-history') detail.nextCursor = 'unread-history';
+      if (variant === 'observed-action') detail.observations.push({ actionType: 'write_text' });
+      if (variant === 'binding-changed') detail.job.revision++;
+      return detail;
+    } };
+    let revisedRoot = null;
+    const recovery = new AutomaticOwnPrConflictRecovery({ store: f.store, ledger: f.service,
+      confirmationSettlementReader: f.service.confirmationSettlementReader, codeJobReader: reader,
+      current: async () => variant !== 'current-authority-revoked', prepareInspection: async () => {
+        if (variant === 'source-revised-during-prepare') {
+          const update = authoredReviewRepairAssignment(2, { headRefOid: PR_HEAD_B, previousHeadRefOid: PR_HEAD_A,
+            changedFields: ['headRefOid'], occurredAt: '2026-08-02T01:15:00.000Z' });
+          f.source.records.push(update); f.source.highWatermark = 2;
+          await f.service.intake();
+          revisedRoot = await f.service.readItemForReconciliation({ itemId: f.item.itemId });
+        }
+        return { inputBinding: job.grant.inputBinding, preparationBinding: job.grant.executionSource.preparationBinding,
+          conflicts: job.grant.executionSource.preparationBinding.conflicts };
+      } });
+    await recovery.recover();
+    assert.equal((await recovery.runCycle()).requeued, 0);
+    assert.deepEqual(await f.jobs.get(job.jobId), before);
+    const root = await f.service.readItemForReconciliation({ itemId: f.item.itemId });
+    if (revisedRoot !== null) assert.deepEqual(root, revisedRoot);
+    else assert.equal(root.status, 'blocked');
+  });
 }
 
 test("a paused old-Head code job is settled after restart and the updated PR becomes claimable", async () => {

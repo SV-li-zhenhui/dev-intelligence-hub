@@ -3,7 +3,7 @@ import { normalizePullRequestExecutionBinding, samePullRequestExecutionBinding }
 import { currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
 import { unstartedConflictDispatchFailure } from "./work-ledger-conflict-failure.js";
 import { codeConfirmationSettlementId, completedCodeConfirmationForSettlement, unstartedConflictProposalForRecovery } from "./work-ledger-code-confirmation-settlement.js";
-import { ObsoleteCodeJobSettler, hasUnstartedCodeJobAuthorityFence } from "./obsolete-code-job-settler.js";
+import { ObsoleteCodeJobSettler, hasUnstartedCodeJobAuthorityFence, hasUnstartedCodeJobPreparationFailure } from "./obsolete-code-job-settler.js";
 
 const STATE_KEY = "automatic-own-pr-conflict-recovery-state";
 const MAX_RECOVERIES = 3;
@@ -105,7 +105,7 @@ export class AutomaticOwnPrConflictRecovery {
         completed.grant.executionSource?.kind !== "conflict_preparation" ||
         !samePullRequestExecutionBinding(completed.grant.inputBinding, currentWorkItemExecutionBinding(item))) return null;
     const job = await this.#settler.read(completed);
-    return hasUnstartedCodeJobAuthorityFence(job) ? job.jobId : null;
+    return hasUnstartedCodeJobAuthorityFence(job) || hasUnstartedCodeJobPreparationFailure(job) ? job.jobId : null;
   }
 
   async #recoverItem(item, outboxes) {
