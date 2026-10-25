@@ -4,6 +4,27 @@ import { createProposalDeliveryEvidenceTarget, deliveryAcceptanceContractDigest,
 import { currentWorkItemInputBinding } from "./work-ledger-pr-source.js";
 import { hasExactLedgerKeys } from "./work-ledger-values.js";
 
+export function indexUnstartedCodeDispatchFailures(state) {
+  const candidates = new Map(state.items.filter(item => item.kind === "graph_task" && item.status === "blocked" &&
+    item.statusReason === "intent_failed" && item.leaseUntil === null).map(item => [item.itemId, item]));
+  if (candidates.size === 0) return new Map();
+  const boxesByItem = new Map();
+  for (const box of state.outbox) {
+    if (!candidates.has(box.itemId)) continue;
+    const boxes = boxesByItem.get(box.itemId) ?? [];
+    boxes.push(box);
+    boxesByItem.set(box.itemId, boxes);
+  }
+  const failures = new Map();
+  for (const [id, item] of candidates) {
+    const boxes = boxesByItem.get(id) ?? [];
+    if (boxes.some(box => ["pending", "dispatching", "unknown"].includes(box.status))) continue;
+    const failure = unstartedDeliveryContractFailure(item, boxes) ?? unstartedCodePolicyBindingFailure(item, boxes);
+    if (failure) failures.set(id, failure);
+  }
+  return failures;
+}
+
 export function normalizeRecordedDeliveryFailure(value, taskRevision) {
   if (!hasExactLedgerKeys(value, ["code", "stage", "taskRevision", "timelineId", "timelineDigest", "recordedAt"]) ||
       typeof value.code !== "string" || !/^[A-Z][A-Z0-9_]{1,127}$/.test(value.code) || value.stage !== "delivery" ||

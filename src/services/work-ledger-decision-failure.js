@@ -1,6 +1,5 @@
-import { isDeepStrictEqual } from 'node:util';
 import { hasExactLedgerKeys } from './work-ledger-values.js';
-import { currentWorkItemExecutionBinding, verifyPullRequestExecutionBinding } from './work-ledger-pr-source.js';
+export { recordedFailureParentIds as decisionFailureParentIds } from './work-ledger-graph-progress.js';
 
 export function normalizeRecordedDecisionFailure(value, taskRevision) {
   if (!hasExactLedgerKeys(value, ['code', 'stage', 'taskRevision', 'timelineId', 'timelineDigest', 'recordedAt']) ||
@@ -46,22 +45,4 @@ export function indexRecordedDecisionFailures(state) {
     if (failure) failures.set(id, failure);
   }
   return failures;
-}
-
-export function decisionFailureParentIds(state, failures) {
-  if (failures.size === 0) return new Set();
-  const items = new Map(state.items.map(item => [item.itemId, item]));
-  const parents = new Set();
-  for (const id of failures.keys()) {
-    const child = items.get(id), parent = items.get(child.graph.parentItemId);
-    if (parents.has(parent?.itemId)) continue;
-    if (parent?.kind !== 'source_root' || parent.currentTarget?.id !== 'orchestrator' ||
-        !['queued', 'retry_wait'].includes(parent.status) || parent.activeIntentId !== null ||
-        parent.ownerId !== null || parent.leaseId !== null || parent.leaseUntil !== null || parent.sourceQuarantine !== null) continue;
-    const binding = currentWorkItemExecutionBinding(parent);
-    if (!binding || !isDeepStrictEqual(binding, currentWorkItemExecutionBinding(child))) continue;
-    try { verifyPullRequestExecutionBinding(state, binding); } catch { continue; }
-    parents.add(parent.itemId);
-  }
-  return parents;
 }

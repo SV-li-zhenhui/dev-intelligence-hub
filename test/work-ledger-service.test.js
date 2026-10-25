@@ -8,9 +8,9 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import { automaticRoleHandoffCandidate } from "../src/services/work-ledger-role-handoff.js";
-import { indexWorkLedgerGraphProgress } from "../src/services/work-ledger-graph-progress.js";
+import { indexWorkLedgerGraphProgress, recordedFailureParentIds } from "../src/services/work-ledger-graph-progress.js";
 import { indexRecordedDecisionFailures, decisionFailureParentIds } from '../src/services/work-ledger-decision-failure.js';
-import { unstartedDeliveryContractFailure, unstartedCodePolicyBindingFailure } from "../src/services/work-ledger-delivery-failure.js";
+import { unstartedDeliveryContractFailure, unstartedCodePolicyBindingFailure, indexUnstartedCodeDispatchFailures } from "../src/services/work-ledger-delivery-failure.js";
 import { hostContextRecoveryCandidate, planHostContextRecovery, hasPendingHostContextRecovery } from "../src/services/work-ledger-host-context-recovery.js";
 import { WorkContinuationScheduler } from "../src/services/work-continuation-scheduler.js";
 import { createWorkflowRoutingRuntime } from "../src/workflow-routing-runtime.js";
@@ -13281,6 +13281,45 @@ function codeActionIntent(overrides = {}) {
   };
 }
 
+async function assertDispatchFailureWakesParent(fixture, parent) {
+  const before = clone(fixture.store.stored());
+  const page = await fixture.service.listClaimCandidates({ at: fixture.time.clock(), roleId: "orchestrator" });
+  const fact = page.facts.find(entry => entry.itemId === parent.itemId);
+  assert.equal(fact.graphBlocked, true);
+  assert.equal(fact.orchestrationReady, true, "a retained dispatch rejection needs a fresh coordinating decision");
+  const wakes = [], operations = [];
+  const scheduler = new WorkContinuationScheduler({ store: new MemoryStore(), ledger: fixture.service,
+    configurationReader: { readActive: async () => ({ configuration: { githubActions: { enabled: true, automaticOwnPrRepair: true } } }) },
+    roleStateReader: { read: async () => ({ enabled: true, paused: false }) }, clock: fixture.time.clock });
+  await scheduler.runCycle({ dispatch: async ({ roleId }) => { wakes.push(roleId); },
+    runOperation: operation => { const pending = operation(); operations.push(pending); return pending; } });
+  await Promise.all(operations);
+  assert.deepEqual(wakes, ["orchestrator"], "the real ledger fact must wake the parent without a manual retry");
+  assert.deepEqual(fixture.store.stored(), before, "notification never resumes or replays the rejected child");
+  await assert.rejects(fixture.service.claim({ itemId: parent.itemId, expectedRevision: before.items.find(item => item.itemId === parent.itemId).revision,
+    workerId: "employee-orchestrator", leaseDurationMs: 30_000 }), { code: "WORK_LEDGER_GRAPH_BLOCKED" });
+  for (const variant of ["child-pause", "child-lease", "child-owned", "child-active-intent", "bound", "unknown", "pending", "dispatching",
+    "duplicate", "parent-pause", "parent-owned", "parent-active-intent", "source-left", "source-pending", "changed-child-binding"]) {
+    const state = clone(before), root = state.items.find(item => item.itemId === parent.itemId);
+    const child = state.items.find(item => item.graph.parentItemId === parent.itemId);
+    const box = state.outbox.find(item => item.itemId === child.itemId && item.status === "failed");
+    if (variant === "child-pause") child.status = "paused";
+    if (variant === "child-lease") child.leaseUntil = "2026-08-03T00:00:00.000Z";
+    if (variant === "child-owned") child.ownerId = "employee-developer";
+    if (variant === "child-active-intent") child.activeIntentId = box.intentId;
+    if (variant === "bound") box.dispatchBinding = {};
+    if (["unknown", "pending", "dispatching"].includes(variant)) state.outbox.push({ ...clone(box), status: variant });
+    if (variant === "duplicate") state.outbox.push(clone(box));
+    if (variant === "parent-pause") root.status = "paused";
+    if (variant === "parent-owned") root.ownerId = "employee-orchestrator";
+    if (variant === "parent-active-intent") root.activeIntentId = box.intentId;
+    if (variant === "source-left") root.source.scope.active = false;
+    if (variant === "source-pending") root.source.pendingRevision = root.source.inputRevision + 1;
+    if (variant === "changed-child-binding") child.assignment.graphTask.sourceBinding.headRefOid = "f".repeat(40);
+    assert.equal(recordedFailureParentIds(state, indexUnstartedCodeDispatchFailures(state)).has(root.itemId), false, variant);
+  }
+}
+
 test("a historical unbound verification failure reaches its waiting orchestrator without changing child history", async () => {
   const record = ownerRequestedPrAssignment(1);
   record.assignment.target = { type: "role", id: "orchestrator" };
@@ -13310,6 +13349,7 @@ test("a historical unbound verification failure reaches its waiting orchestrator
   assert.deepEqual(diagnostic.expectedDeliverables, [{ deliverableId: "ci-fix-package", kind: "change-package" }]);
   assert.equal((await fixture.service.listItems()).items.find(item => item.itemId === parent.itemId).status, "queued");
   assert.deepEqual(fixture.store.stored(), before, "diagnostic projection never resets or replays work");
+  await assertDispatchFailureWakesParent(fixture, parent);
   const failedChild = before.items.find(item => item.itemId === child.itemId);
   const failedBoxes = before.outbox.filter(item => item.itemId === child.itemId);
   for (const variant of ["paused", "active-intent", "bound", "unknown", "changed-input", "new-contract", "compatible-contract", "different-error", "duplicate"]) {
@@ -13353,6 +13393,7 @@ test("a compatible code proposal's unbound policy failure reaches its parent wit
   assert.deepEqual(snapshot.taskStates.find(item => item.taskId === child.itemId).dispatchFailure,
     { intentId: outbox.intentId, code: "policy-binding-invalid", downstreamCreated: false });
   assert.deepEqual(fixture.store.stored(), before, "diagnosis never resumes a child or replays a failed intent");
+  await assertDispatchFailureWakesParent(fixture, parent);
   const failedChild = before.items.find(item => item.itemId === child.itemId);
   const failedBoxes = before.outbox.filter(item => item.itemId === child.itemId);
   for (const variant of ["paused", "active-intent", "owner", "lease", "bound", "unknown", "changed-input",

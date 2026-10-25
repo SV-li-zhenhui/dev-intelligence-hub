@@ -1,6 +1,8 @@
 import { scheduler } from "node:timers/promises";
 import { triageRetirementCandidate, planTriageRetirement } from './work-ledger-triage-retirement.js';
-import { indexRecordedDecisionFailures, decisionFailureParentIds } from './work-ledger-decision-failure.js';
+import { indexRecordedDecisionFailures } from './work-ledger-decision-failure.js';
+import { indexUnstartedCodeDispatchFailures } from './work-ledger-delivery-failure.js';
+import { recordedFailureParentIds } from './work-ledger-graph-progress.js';
 import { ciMaterialRecoveryCandidate, ciMaterialRetirement, planCiMaterialRecovery } from "./work-ledger-ci-material-recovery.js";
 import { hostContextRecoveryCandidate, planHostContextRecovery, hostContextRetirement, hasPendingHostContextRecovery } from "./work-ledger-host-context-recovery.js";
 import { automaticRoleHandoffCandidate } from "./work-ledger-role-handoff.js";
@@ -814,7 +816,8 @@ export class WorkLedgerService {
   async listClaimCandidates(options = {}) {
     this.#assertReady();
     const page = queryClaimCandidatePage(this.state.items, options);
-    const failedChildParents = decisionFailureParentIds(this.state, indexRecordedDecisionFailures(this.state));
+    const failures = new Map([...indexRecordedDecisionFailures(this.state), ...indexUnstartedCodeDispatchFailures(this.state)]);
+    const failedChildParents = recordedFailureParentIds(this.state, failures);
     page.items.forEach((item, index) => {
       if (hasPendingHostContextRecovery(this.state, item) || failedChildParents.has(item.itemId)) page.facts[index].orchestrationReady = true;
     });
