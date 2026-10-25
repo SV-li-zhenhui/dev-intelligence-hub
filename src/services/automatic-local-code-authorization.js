@@ -6,6 +6,7 @@ import { pendingOverwriteRecoveryCandidate, stoppedCodeJobRun } from './code-job
 import { recoverableNativePauseCode } from './automatic-code-job-pause-recovery.js';
 import { normalizeInternalReviewMetadata } from '../domain/internal-repair-review.js';
 import { currentWorkItemEvent } from './work-ledger-pr-source.js';
+import { CODE_JOB_ACTIONS_BY_OPERATION } from '../domain/code-job-contract.js';
 
 const sameLogin = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
 const STALE_TARGET = Symbol('stale local code target');
@@ -17,7 +18,7 @@ function canObserveInternalReviewOwner(root, grant) {
       root.source.scope.kind !== 'internal_review' || root.source.identity?.provider !== 'internal-review-repair' ||
       !['inspect', 'verify'].includes(grant.operation) || !Array.isArray(grant.writablePaths) || grant.writablePaths.length !== 0 ||
       !Array.isArray(grant.allowedActions) ||
-      grant.allowedActions.some(action => !['list_files', 'read_text', 'run_profile', 'complete'].includes(action))) return false;
+      grant.allowedActions.some(action => !CODE_JOB_ACTIONS_BY_OPERATION[grant.operation].includes(action))) return false;
   const event = currentWorkItemEvent(root);
   if (event?.eventType !== 'pull_request.internal_review_requested' || event.source?.provider !== 'internal-review-repair') return false;
   try { return normalizeInternalReviewMetadata(event.payload.internalReview).headRefOid === grant.inputBinding.headRefOid; }

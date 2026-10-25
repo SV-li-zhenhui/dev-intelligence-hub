@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AutomaticLocalCodeAuthorization } from '../src/services/automatic-local-code-authorization.js';
 import { digestValue } from '../src/domain/code-executor-contract.js';
+import { CODE_JOB_ACTIONS_BY_OPERATION } from '../src/domain/code-job-contract.js';
 
 function fixture(role = 'developer', operation = 'modify') {
   const binding = { schemaVersion: 2, kind: 'pull_request', repository: 'acme/repo', pullRequestNumber: 42,
@@ -261,6 +262,7 @@ test('legacy owner-requested work with no author uses observed PR identity and r
 function internalReviewFixture(operation = 'inspect') {
   const f = fixture('developer', operation), binding = f.grant.inputBinding;
   f.grant.writablePaths = [];
+  f.grant.allowedActions = [...CODE_JOB_ACTIONS_BY_OPERATION[operation]];
   const event = { eventType: 'pull_request.internal_review_requested', source: { provider: 'internal-review-repair' },
     payload: { internalReview: { kind: 'own_pr_ci_repair', headRefOid: binding.headRefOid,
       feedbackDigest: 'c'.repeat(64), publicationConfirmationId: 'published-repair', controlledCommitEvidenceId: 'sealed-repair' } } };
