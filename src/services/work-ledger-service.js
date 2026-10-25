@@ -7,7 +7,7 @@ import { recordedFailureParentIds } from './work-ledger-graph-progress.js';
 import { ciMaterialRecoveryCandidate, ciMaterialRetirement, planCiMaterialRecovery } from "./work-ledger-ci-material-recovery.js";
 import { hostContextRecoveryCandidate, planHostContextRecovery, hostContextRetirement, hasPendingHostContextRecovery } from "./work-ledger-host-context-recovery.js";
 import { automaticRoleHandoffCandidate } from "./work-ledger-role-handoff.js";
-import { completedRepairEvidenceRecoveryProof } from "./work-ledger-inspection-continuation.js";
+import { completedRepairEvidenceRecoveryProof, repairDecisionAttemptBudget } from "./work-ledger-inspection-continuation.js";
 import { automaticReviewWorkAdmission } from "../domain/automatic-review-policy.js";
 import { inactivePullRequestTakeoverRecoveryProof, sameHeadInternalReviewTakeoverRecoveryProof } from "./work-ledger-pr-retirement-recovery.js";
 import { createWorkIntentDispatchBinding } from "../domain/work-intent-dispatch-binding.js";
@@ -812,6 +812,13 @@ export class WorkLedgerService {
         ...(progress === null ? {} : { graphProgressDigest: progress }),
       });
     });
+  }
+
+  async readRepairDecisionBudget({ itemId, expectedRevision }) {
+    this.#assertReady();
+    const item = this.state.items.find(entry => entry.itemId === itemId);
+    if (!item || item.revision !== expectedRevision) return null;
+    return cloneLedgerValue(repairDecisionAttemptBudget(this.state, item));
   }
 
   async listClaimCandidates(options = {}) {

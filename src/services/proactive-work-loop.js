@@ -802,6 +802,7 @@ export class ProactiveWorkLoop {
       "ledger.readItemForReconciliation",
     );
     this.listTimeline = optionalPortMethod(ledger, "listTimeline", "ledger.listTimeline");
+    this.readRepairDecisionBudget = optionalPortMethod(ledger, 'readRepairDecisionBudget', 'ledger.readRepairDecisionBudget');
     this.recoverUnstartedReviewProposal = optionalPortMethod(ledger,
       "recoverUnstartedReviewProposal", "ledger.recoverUnstartedReviewProposal");
     this.canRecoverUnstartedReviewProposal = optionalPortMethod(ledger,
@@ -1501,6 +1502,10 @@ export class ProactiveWorkLoop {
       event?.payload?.relation === "authored" && event.payload.nextAction === "address_review";
     const inputBinding = needsFeedback ? currentWorkItemExecutionBinding(item) : null;
     const feedback = needsFeedback ? await this.readReviewRepairContext({ inputBinding }) : null;
+    const repairBudget = context && await this.#readRepairDecisionBudget(item, signal);
+    if (repairBudget?.failure) context = { ...context, requirements: { ...context.requirements,
+      repairDecisionRecovery: { code: repairBudget.failure.code, attempt: repairBudget.attempt,
+        lifetimeClaims: item.attempt, progressResultId: repairBudget.resultId } } };
     throwIfLoopAborted(signal);
     const decide = ({instructions} = {}) => worker.decide({ item: workerItemDto(item), trigger,
       ...(context === undefined ? {} : { context }), signal,
@@ -2071,6 +2076,20 @@ export class ProactiveWorkLoop {
     return null;
   }
 
+  async #readRepairDecisionBudget(item, signal) {
+    if (this.readRepairDecisionBudget === null) return null;
+    try {
+      throwIfLoopAborted(signal);
+      const budget = await this.readRepairDecisionBudget({ itemId: item.itemId, expectedRevision: item.revision });
+      throwIfLoopAborted(signal);
+      return budget;
+    } catch (error) {
+      throwIfLoopAborted(signal);
+      if (RUNTIME_ADMISSION_ERROR_CODES.has(stableFailureCode(error))) throw error;
+      return null;
+    }
+  }
+
   async #recoverUnstartedReviewProposals(options) {
     if (this.automaticReviewPolicy?.enabled !== true || this.roleContextAssembler === null ||
         this.recoverUnstartedReviewProposal === null ||
@@ -2131,6 +2150,10 @@ export class ProactiveWorkLoop {
         recovered += 1;
         continue;
       }
+      if (await this.#recoverRepairDecisionBlock(item, options)) {
+        recovered += 1;
+        continue;
+      }
       if (item.kind === "graph_task" && item.currentTarget?.id === "developer" && event?.payload?.nextAction === "resolve_conflict" &&
           (item.graph?.deliveries ?? []).length === 0 &&
           item.activeIntentId === null && item.ownerId === null && item.leaseId === null && item.leaseUntil === null &&
@@ -2166,6 +2189,36 @@ export class ProactiveWorkLoop {
       }
     }
     return outcomes;
+  }
+
+  async #recoverRepairDecisionBlock(item, options) {
+    if (this.automaticOwnPrRepair === null || typeof this.taskRuns?.get !== 'function' ||
+        item.status !== 'blocked' || item.statusReason !== 'decision_attempts_exhausted') return false;
+    const budget = await this.#readRepairDecisionBudget(item, options.signal);
+    if (!budget?.failure?.current || budget.attempt < 1 || budget.attempt >= this.maxAttempts) return false;
+    try {
+      const run = await this.taskRuns.get('work-item', item.itemId), receipt = run.receipt;
+      const times = [budget.failure.claimAt, receipt?.registeredAt, receipt?.modelStartedAt,
+        receipt?.finishedAt, budget.failure.at].map(Date.parse);
+      if (run.active !== false || run.mode !== 'active' || run.pendingCommand !== null || run.phase !== 'failed' ||
+          run.stopUnconfirmed === true || receipt?.kind !== 'work-item' || receipt.taskId !== item.itemId ||
+          receipt.roleId !== 'developer' || receipt.phase !== 'failed' || receipt.taskRevision !== item.revision - 1 ||
+          receipt.leaseId !== budget.failure.leaseId || receipt.outcomeCode !== budget.failure.code ||
+          !(receipt.stopConfirmed === true || (receipt.session?.transport === 'app-server' && receipt.session.status === 'completed')) ||
+          times.some(time => !Number.isFinite(time)) || times.some((time, index) => index > 0 && time < times[index - 1])) return false;
+      const binding = currentWorkItemExecutionBinding(item);
+      if (binding?.schemaVersion !== 2) return false;
+      await this.verifyPullRequestExecutionBinding(binding);
+      throwIfLoopAborted(options.signal);
+      await this.ledger.transition({ itemId: item.itemId, expectedRevision: item.revision, leaseId: null,
+        actorId: 'work-ledger-system', toStatus: 'queued', reason: 'repair_decision_progress_recovered',
+        details: { evidenceRefs: [budget.failure.timelineId, budget.resultId, `run:${receipt.runId}`] } });
+      return true;
+    } catch (error) {
+      throwIfLoopAborted(options.signal);
+      if (RUNTIME_ADMISSION_ERROR_CODES.has(stableFailureCode(error))) throw error;
+      return false;
+    }
   }
 
   async #recoverNativeResultStringBlock(item, options) {
@@ -2339,7 +2392,7 @@ export class ProactiveWorkLoop {
       code === "ROLE_CONTEXT_PR_FACT_UNAVAILABLE" && error.statusCode === 503;
     const infrastructure = brainFailureOwnerAttention(code) !== null || contextTimeout || unavailablePrFacts;
     const restoreAttempt = contention || infrastructure;
-    const budget = contention ? null : persistedPullRequestDecisionAttemptBudget(item);
+    const budget = restoreAttempt ? null : await this.#readRepairDecisionBudget(item, options.signal) ?? persistedPullRequestDecisionAttemptBudget(item);
     const attempt = budget?.attempt ?? item.attempt;
     const input = {
       itemId: item.itemId,

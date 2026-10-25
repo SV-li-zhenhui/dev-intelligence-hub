@@ -17666,6 +17666,49 @@ test("contracted PR child inspection settles without reviving a pending newer He
   assert.deepEqual(oldChild.graph.deliveries, []);
 });
 
+for (const operation of ['inspect', 'verify']) {
+test(`successful repair ${operation} opens the next decision budget while retaining lifetime claims`, async () => {
+  const f = await createFixture({ records: [authoredReviewRepairAssignment(1, { gitFacts: {
+    ...prGitFacts(PR_HEAD_A), relation: 'authored', actionState: 'action_now', nextAction: 'fix_ci', isDraft: true,
+  } })] });
+  const result = await prepareProposalResult(f, { kind: 'code_action_proposal', sealSource: true, intentOverrides: { operation } });
+  await f.service.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+  let item = (await f.service.listItems()).items[0];
+  const progressAttempt = item.attempt;
+  item = await f.service.claim({ itemId: item.itemId, expectedRevision: item.revision,
+    workerId: 'employee-developer', leaseDurationMs: 30000 });
+  const budget = await f.service.readRepairDecisionBudget({ itemId: item.itemId, expectedRevision: item.revision });
+  assert.equal(budget.attempt, 1);
+  assert.equal(budget.offset, progressAttempt);
+  assert.equal(item.attempt, progressAttempt + 1);
+  assert.equal(await f.service.readRepairDecisionBudget({ itemId: item.itemId, expectedRevision: item.revision - 1 }), null);
+  await f.service.transition({ itemId: item.itemId, expectedRevision: item.revision, leaseId: item.leaseId,
+    actorId: 'employee-developer', toStatus: 'blocked', reason: 'decision_attempts_exhausted',
+    details: { code: 'ROLE_DECISION_PR_REVIEW_REQUIRED' } });
+  item = await f.service.readItemForReconciliation({ itemId: item.itemId });
+  const failedBudget = await f.service.readRepairDecisionBudget({ itemId: item.itemId, expectedRevision: item.revision });
+  assert.equal(failedBudget.attempt, 1);
+  assert.equal(failedBudget.failure.code, 'ROLE_DECISION_PR_REVIEW_REQUIRED');
+  assert.equal(failedBudget.failure.leaseId, budget.claimLeaseId);
+  const { repairDecisionAttemptBudget } = await import('../src/services/work-ledger-inspection-continuation.js');
+  const durable = f.store.stored();
+  for (const variant of ['manual', 'inactive', 'paused', 'changed-role', 'unknown-intent', 'missing-seal',
+    'changed-result', 'missing-claim', 'changed-claim-input']) {
+    const state = clone(durable), root = state.items.find(x => x.itemId === item.itemId);
+    if (variant === 'manual') root.source.scope.kind = 'owner_requested';
+    if (variant === 'inactive') root.source.scope.active = false;
+    if (variant === 'paused') root.status = 'paused';
+    if (variant === 'changed-role') root.currentTarget.id = 'pr-engineer';
+    if (variant === 'unknown-intent') root.activeIntentId = 'unknown-intent';
+    if (variant === 'missing-seal') delete state.outbox[0].outcome.details.resultAttestation;
+    if (variant === 'changed-result') root.decisionContext.value.resultDigest = 'f'.repeat(64);
+    if (variant === 'missing-claim') state.timeline = state.timeline.filter(x => x.type !== 'claimed');
+    if (variant === 'changed-claim-input') state.timeline.find(x => x.type === 'claimed').details.inputDigest = 'f'.repeat(64);
+    assert.equal(repairDecisionAttemptBudget(state, root), null, variant);
+  }
+});
+}
+
 for (const nextAction of ["resolve_conflict", "fix_ci"]) {
 for (const operation of nextAction === "fix_ci" ? ["inspect", "verify"] : ["inspect"]) {
 for (const isDraft of [false, true]) {
@@ -17696,6 +17739,59 @@ test(`own PR ${nextAction} ${operation} continues and a historical evidence-only
 }
 }
 }
+
+test('automatic repair recovers a spent lifetime budget after sealed progress and still bounds consecutive failures', async () => {
+  for (const variant of ['current', 'owner-paused', 'unknown-stop', 'running-turn', 'old-receipt']) {
+    const f = await createFixture({ records: [authoredReviewRepairAssignment(1, { gitFacts: {
+      ...prGitFacts(PR_HEAD_A), relation: 'authored', actionState: 'action_now', nextAction: 'fix_ci', isDraft: true,
+    } })] });
+    const result = await prepareProposalResult(f, { kind: 'code_action_proposal', sealSource: true,
+      intentOverrides: { operation: 'verify' } });
+    await f.service.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+    let item = (await f.service.listItems()).items[0];
+    item = await f.service.claim({ itemId: item.itemId, expectedRevision: item.revision,
+      workerId: 'employee-developer', leaseDurationMs: 30000 });
+    const failedClaim = item;
+    await f.service.transition({ itemId: item.itemId, expectedRevision: item.revision, leaseId: item.leaseId,
+      actorId: 'employee-developer', toStatus: 'blocked', reason: 'decision_attempts_exhausted',
+      details: { code: 'ROLE_DECISION_PR_REVIEW_REQUIRED' } });
+    const before = await f.service.readItemForReconciliation({ itemId: item.itemId });
+    let modelCalls = 0;
+    const loop = new ProactiveWorkLoop({ ledger: f.service, clock: f.time.clock, maxAttempts: 3,
+      retryBaseMs: 1000, retryMaxMs: 8000, automaticOwnPrRepair: { shouldRun: async () => true },
+      taskRuns: { order: async items => items, run: async (_task, operation) => operation({ instructions: [] }),
+        get: async () => ({ active: false, phase: 'failed', mode: variant === 'owner-paused' ? 'paused' : 'active',
+          pendingCommand: null, stopUnconfirmed: variant === 'unknown-stop', receipt: { kind: 'work-item',
+            taskId: item.itemId, roleId: 'developer', phase: 'failed', runId: 'failed-decision-run',
+            taskRevision: variant === 'old-receipt' ? failedClaim.revision - 1 : failedClaim.revision,
+            leaseId: failedClaim.leaseId, outcomeCode: 'ROLE_DECISION_PR_REVIEW_REQUIRED', stopConfirmed: false,
+            registeredAt: f.time.clock(), modelStartedAt: f.time.clock(), finishedAt: f.time.clock(),
+            session: { transport: 'app-server', status: variant === 'running-turn' ? 'running' : 'completed' } } }) },
+      roleDirectory: { resolve: async () => ({ roleId: 'developer', workerId: 'employee-developer', enabled: true, paused: false,
+        decide: async ({ context }) => { modelCalls++;
+          assert.equal(context.requirements.repairDecisionRecovery.code, 'ROLE_DECISION_PR_REVIEW_REQUIRED');
+          throw Object.assign(new Error('A further invalid completion'), { code: 'ROLE_DECISION_PR_REVIEW_REQUIRED' }); } }) },
+      roleContextAssembler: { assemble: async () => ({ context: { requirements: {}, code: {} } }) },
+      orchestratorService: { execute: async () => assert.fail('Unexpected orchestration') } });
+    const cycle = await loop.runCycle({ roleId: 'developer' });
+    if (variant !== 'current') {
+      assert.equal(cycle.claimed, 0, variant);
+      assert.equal(modelCalls, 0, variant);
+      assert.deepEqual(await f.service.readItemForReconciliation({ itemId: item.itemId }), before, variant);
+      continue;
+    }
+    assert.equal(cycle.claimed, 1);
+    assert.equal(cycle.retried, 1, 'successful verification must not consume the next failure budget');
+    item = await f.service.readItemForReconciliation({ itemId: item.itemId });
+    assert.equal(item.attempt, 3, 'lifetime claims are retained');
+    f.time.advance(8000);
+    assert.equal((await loop.runCycle({ roleId: 'developer' })).blocked, 1);
+    item = await f.service.readItemForReconciliation({ itemId: item.itemId });
+    assert.equal(item.attempt, 4);
+    assert.equal((await loop.runCycle({ roleId: 'developer' })).claimed, 0);
+    assert.equal(modelCalls, 2, 'no new successful progress means no further retries');
+  }
+});
 
 for (const nextAction of ["resolve_conflict", "fix_ci"]) {
 test(`${nextAction} continuation never reopens a completed modification, Draft review repair or owner-stopped task`, async () => {
