@@ -184,7 +184,7 @@ function assessAuthoredPullRequest(item) {
       ACTION_STATES.ACTION_NOW,
       "me",
       "fix_ci",
-      "需要你处理检查失败",
+      "检查失败，需修复或复核失败原因",
     );
   }
 
