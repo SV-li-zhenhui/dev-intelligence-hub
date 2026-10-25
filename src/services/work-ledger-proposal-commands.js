@@ -1,5 +1,5 @@
 import { normalizeWorkProposalResult } from "../domain/work-proposal-contract.js";
-import { continuesOwnPullRequestRepairInspection } from "./work-ledger-inspection-continuation.js";
+import { continuesOwnPullRequestRepairEvidence } from "./work-ledger-inspection-continuation.js";
 import { normalizeDeliveryEvidenceTarget } from "../domain/delivery-evidence-contract.js";
 import {
   normalizePullRequestExecutionBinding,
@@ -436,8 +436,8 @@ export function planProposalBatchApplication({ state, input, clock }) {
     const continueForEvidence = succeeded && (
       evidenceTarget !== null ||
       inspectionStatus === "queued" ||
-      // Inspection must return to the developer's repair decision.
-      continuesOwnPullRequestRepairInspection(item, outbox, result)
+      // Read-only repair evidence must return to the developer's next decision.
+      continuesOwnPullRequestRepairEvidence(item, outbox, result)
     );
     let nextStatus = "blocked";
     if (succeeded) {

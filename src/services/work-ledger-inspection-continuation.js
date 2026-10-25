@@ -5,16 +5,18 @@ import { ledgerDigest } from "./work-ledger-values.js";
 
 const SOURCE_FIELDS = ["kind", "rootItemId", "workKey", "inputRevision", "headRevision", "headRefOid", "eventId", "eventDigest", "inputDigest"];
 
-export function continuesOwnPullRequestRepairInspection(item, outbox, result) {
+export function continuesOwnPullRequestRepairEvidence(item, outbox, result) {
   const bound = outbox.dispatchBinding?.boundIntent;
   const event = currentWorkItemEvent(item);
+  const operation = outbox.intent.operation;
   if (result.kind !== "code_action_proposal" || result.requestedBy.roleId !== "developer" ||
-      outbox.intent.operation !== "inspect" || bound?.payload?.operation !== "inspect" ||
+      !["inspect", "verify"].includes(operation) || bound?.payload?.operation !== operation ||
       item.source?.kind !== "pull_request" || item.source.scope.active !== true || item.source.scope.kind !== "automatic" ||
       item.source.pendingRevision !== null || item.source.identity.targetRoleId !== "developer" ||
       event.source.provider !== "github" || event.payload.relation !== "authored" ||
       (event.payload.isDraft === true && !["resolve_conflict", "fix_ci"].includes(event.payload.nextAction)) ||
       event.payload.actionState !== "action_now" || !["address_review", "resolve_conflict", "fix_ci"].includes(event.payload.nextAction)) return false;
+  if (operation === "verify" && event.payload.nextAction !== "fix_ci") return false;
   try {
     const current = currentWorkItemExecutionBinding(item);
     return SOURCE_FIELDS.every(key => current?.[key] === outbox.sourceBinding?.[key]) &&
@@ -22,7 +24,7 @@ export function continuesOwnPullRequestRepairInspection(item, outbox, result) {
   } catch { return false; }
 }
 
-export function completedRepairInspectionRecoveryProof(state, item) {
+export function completedRepairEvidenceRecoveryProof(state, item) {
   if (item.kind !== "source_root" || item.status !== "completed" || item.statusReason !== "proposal_succeeded" ||
       item.activeIntentId !== null || item.ownerId !== null || item.leaseId !== null || item.sourceQuarantine !== null ||
       item.graph?.deliveries?.length > 0 || !["resolve_conflict", "fix_ci"].includes(currentWorkItemEvent(item)?.payload?.nextAction) ||
@@ -42,15 +44,17 @@ export function completedRepairInspectionRecoveryProof(state, item) {
         result.proposalId !== item.decisionContext.referenceId || result.resultId !== item.decisionContext.value.resultId ||
         result.contentDigest !== item.decisionContext.value.resultDigest ||
         result.proposalContentDigest !== outbox.outcome.details.proposalDigest ||
-        !continuesOwnPullRequestRepairInspection(item, outbox, result)) return null;
-    return { intentId: outbox.intentId, resultId: result.resultId,
-      reason: currentWorkItemEvent(item).payload.nextAction === "fix_ci" ? "pr_ci_inspection_continued" : "pr_conflict_inspection_continued" };
+        !continuesOwnPullRequestRepairEvidence(item, outbox, result)) return null;
+    const reason = currentWorkItemEvent(item).payload.nextAction === "fix_ci"
+      ? outbox.intent.operation === "verify" ? "pr_ci_verification_continued" : "pr_ci_inspection_continued"
+      : "pr_conflict_inspection_continued";
+    return { intentId: outbox.intentId, resultId: result.resultId, reason };
   } catch { return null; }
 }
 
-export function isRecoveredRepairInspection(previousState, previous, next) {
+export function isRecoveredRepairEvidence(previousState, previous, next) {
   if (!next || next.status !== "queued" || next.revision !== previous.revision + 1) return false;
-  const proof = completedRepairInspectionRecoveryProof(previousState, previous);
+  const proof = completedRepairEvidenceRecoveryProof(previousState, previous);
   if (!proof || next.statusReason !== proof.reason) return false;
   return ledgerDigest({ ...next, status: previous.status, statusReason: previous.statusReason,
     revision: previous.revision, updatedAt: previous.updatedAt }) === ledgerDigest(previous);

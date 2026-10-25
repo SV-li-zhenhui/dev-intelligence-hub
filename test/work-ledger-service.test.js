@@ -17666,16 +17666,17 @@ test("contracted PR child inspection settles without reviving a pending newer He
 });
 
 for (const nextAction of ["resolve_conflict", "fix_ci"]) {
+for (const operation of nextAction === "fix_ci" ? ["inspect", "verify"] : ["inspect"]) {
 for (const isDraft of [false, true]) {
-test(`own PR ${nextAction} inspection continues and a historical inspect-only completion recovers once (Draft=${isDraft})`, async () => {
+test(`own PR ${nextAction} ${operation} continues and a historical evidence-only completion recovers once (Draft=${isDraft})`, async () => {
   const fixture = await createFixture({ records: [authoredReviewRepairAssignment(1, { gitFacts: {
     ...prGitFacts(PR_HEAD_A), relation: "authored", actionState: "action_now", nextAction, isDraft,
   } })] });
   const result = await prepareProposalResult(fixture, { kind: "code_action_proposal", sealSource: true,
-    intentOverrides: { operation: "inspect" } });
+    intentOverrides: { operation } });
   await fixture.service.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
   const original = (await fixture.service.listItems()).items[0];
-  assert.equal(original.status, "queued", "inspection is evidence, not completion of PR repair");
+  assert.equal(original.status, "queued", "read-only evidence is not completion of PR repair");
   const durable = fixture.store.stored();
   const old = durable.items.find(i => i.itemId === original.itemId);
   old.status = "completed"; old.statusReason = "proposal_succeeded";
@@ -17683,7 +17684,9 @@ test(`own PR ${nextAction} inspection continues and a historical inspect-only co
   const recovered = await createFixture({ store: fixture.store, source: fixture.source, time: fixture.time });
   const current = (await recovered.service.listItems()).items[0];
   assert.equal(current.status, "queued");
-  assert.equal(current.statusReason, nextAction === "fix_ci" ? "pr_ci_inspection_continued" : "pr_conflict_inspection_continued");
+  assert.equal(current.statusReason, nextAction === "fix_ci"
+    ? operation === "verify" ? "pr_ci_verification_continued" : "pr_ci_inspection_continued"
+    : "pr_conflict_inspection_continued");
   assert.equal(current.attempt, original.attempt, "recovery does not reset the decision budget");
   const restarted = await createFixture({ store: fixture.store, source: fixture.source, time: fixture.time });
   assert.equal((await restarted.service.listItems()).items[0].revision, current.revision);
@@ -17691,15 +17694,16 @@ test(`own PR ${nextAction} inspection continues and a historical inspect-only co
 
 }
 }
+}
 
 for (const nextAction of ["resolve_conflict", "fix_ci"]) {
 test(`${nextAction} continuation never reopens a completed modification, Draft review repair or owner-stopped task`, async () => {
-  for (const variant of ["modify", "draft", "paused", "cancelled"]) {
+  for (const variant of ["modify", "verify-other", "draft", "paused", "cancelled"]) {
     const fixture = await createFixture({ records: [authoredReviewRepairAssignment(1, { gitFacts: {
-      ...prGitFacts(PR_HEAD_A), relation: "authored", actionState: "action_now", nextAction: variant === "draft" ? "address_review" : nextAction, isDraft: variant === "draft",
+      ...prGitFacts(PR_HEAD_A), relation: "authored", actionState: "action_now", nextAction: ["draft", "verify-other"].includes(variant) ? "address_review" : nextAction, isDraft: variant === "draft",
     } })] });
     const result = await prepareProposalResult(fixture, { kind: "code_action_proposal", sealSource: true,
-      intentOverrides: { operation: variant === "modify" ? "modify" : "inspect" } });
+      intentOverrides: { operation: variant === "modify" ? "modify" : variant === "verify-other" ? "verify" : "inspect" } });
     await fixture.service.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
     if (["paused", "cancelled"].includes(variant)) {
       const durable = fixture.store.stored();
