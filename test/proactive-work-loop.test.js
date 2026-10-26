@@ -549,6 +549,29 @@ test("PR preparation deferrals respect the scan budget and role scope", async ()
   assert.deepEqual(ledger.calls.claim.map(call => call.itemId), [healthy.itemId]);
 });
 
+test("a targeted continuation retries recovered PR preparation without waiting for a full sweep", async () => {
+  const time = controlledClock();
+  const items = Array.from({ length: 5 }, (_, index) => workItem(index + 1, { type: "role", id: "developer" }));
+  const ledger = new FakeLedger({ source: items, time });
+  let recovered = false;
+  const loop = createLoop({ ledger, time,
+    directory: new FakeRoleDirectory({ developer: worker({ roleId: "developer" }) }),
+    automaticOwnPrRepair: { async shouldRun() {
+      if (!recovered) throw Object.assign(new Error("temporary fetch failure"), { code: "OWN_PR_REPAIR_OBJECT_FETCH_FAILED" });
+      return true;
+    } },
+  });
+  const first = await loop.runCycle({ roleId: "developer", workLimit: 1 });
+  assert.equal(first.claimed, 0);
+  assert.equal(first.outcomes.filter(x => x.status === "conflict_material_deferred").length, 4);
+  recovered = true;
+  const target = ledger.items[0];
+  const retried = await loop.runCycle({ roleId: "developer", workLimit: 1,
+    continuationTarget: { itemId: target.itemId, fingerprint: continuationFingerprint(target) } });
+  assert.equal(retried.claimed, 1);
+  assert.deepEqual(ledger.calls.claim.map(x => x.itemId), [target.itemId]);
+});
+
 test("orchestrator scans do not prepare work owned by another available role", async () => {
   const time = controlledClock();
   const developer = workItem(1, { type: "role", id: "developer" });
@@ -3536,6 +3559,20 @@ test("a revised root interrupts a partial context-deadline sweep", async () => {
   await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
   assert.equal(assemblies[4], sources[0].itemId);
   assert.deepEqual(executions, [sources[0].itemId]);
+});
+
+test("a targeted continuation retries recovered root context at the same item revision", async () => {
+  const failures = Array.from({ length: 5 }, () => Object.assign(new Error("host context deadline"), { code: "ROLE_CONTEXT_TIMEOUT" }));
+  const { loop, ledger, sources, assemblies, executions } = deferredContextRootLoop({ failures });
+  await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+  assert.equal(assemblies.length, 4);
+  failures[0] = null;
+  const target = ledger.items[0];
+  const retried = await loop.runCycle({ roleId: "orchestrator", workLimit: 1,
+    continuationTarget: { itemId: target.itemId, fingerprint: continuationFingerprint(target) } });
+  assert.equal(retried.orchestrated, 1);
+  assert.deepEqual(executions, [sources[0].itemId]);
+  assert.equal(assemblies[4], target.itemId);
 });
 
 test("new urgent owner work precedes a partial context-deadline sweep", async () => {

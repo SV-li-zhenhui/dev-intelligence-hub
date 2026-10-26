@@ -1048,8 +1048,10 @@ export class ProactiveWorkLoop {
         completedCandidateSweep = false;
         break;
       }
-      if (rootContextDeferralSweep.get(item.itemId) === item.revision) continue;
-      if (preparationSweep.get(item.itemId) === item.revision) continue;
+      // Sweep cursors preserve fairness during discovery. A scheduled retry of
+      // this exact input must recheck transient preparation/context failures.
+      if (options.continuationTarget === null && rootContextDeferralSweep.get(item.itemId) === item.revision) continue;
+      if (options.continuationTarget === null && preparationSweep.get(item.itemId) === item.revision) continue;
       if (blockedRootSweep.has(item.itemId) && options.continuationTarget === null) continue;
       const fencedDeferral = this.fencedClaimDeferrals.get(item.itemId);
       if (
