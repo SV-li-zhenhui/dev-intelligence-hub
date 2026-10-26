@@ -118,6 +118,22 @@ test("an absent workflow definition constructs no routing state", async () => {
   assert.equal(store.writes, 0);
 });
 
+test('automatic scope reentry reads only complete healthy GitHub snapshots', async () => {
+  let calls = 0;
+  const runtime = await createWorkflowRoutingRuntime({ workflowRouting: definition() }, {
+    store: new MemoryStore(), createGuard: guardFactory(),
+    scopeReentryReader: { async read() { calls++; return []; } },
+  });
+  try {
+    for (const [index, health] of [{ ok: false, complete: true }, { ok: true, complete: false },
+      { ok: true, complete: true, stale: true }, { ok: true, complete: true, stale: false }].entries()) {
+      await runtime.ingestSnapshot({ snapshot: { refreshedAt: `2026-08-02T04:0${index}:00.000Z`, items: [],
+        sourceStatus: { githubPullRequests: health, githubIssues: { ok: true } } } });
+      assert.equal(calls, index === 3 ? 1 : 0);
+    }
+  } finally { await runtime.close(); }
+});
+
 test("startup records the local definition once and reuses the same version", async () => {
   const store = new MemoryStore();
   const config = { workflowRouting: definition() };

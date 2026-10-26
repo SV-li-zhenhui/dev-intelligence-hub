@@ -108,6 +108,7 @@ export class WorkflowRoutingService {
     bundleByteBudget = MAX_WORKFLOW_BUNDLE_BYTES,
     issueActiveWindowDays = DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS,
     scopeExitRecoveryReader = null,
+    scopeReentryReader = null,
     roleHandoffReader = null,
   } = {}) {
     if (
@@ -135,6 +136,8 @@ export class WorkflowRoutingService {
       throw new TypeError("scopeExitRecoveryReader is invalid");
     }
     this.scopeExitRecoveryReader = scopeExitRecoveryReader;
+    if (scopeReentryReader !== null && typeof scopeReentryReader?.read !== "function") throw new TypeError("scopeReentryReader is invalid");
+    this.scopeReentryReader = scopeReentryReader;
     if (roleHandoffReader !== null && typeof roleHandoffReader?.read !== "function") throw new TypeError("roleHandoffReader is invalid");
     this.roleHandoffReader = roleHandoffReader;
     this.operationQueue = operationQueue || new OperationQueue();
@@ -335,11 +338,15 @@ export class WorkflowRoutingService {
     const recoveredExits = this.scopeExitRecoveryReader !== null &&
       snapshot.sourceStatus?.githubPullRequests?.ok === true && snapshot.sourceStatus.githubPullRequests.complete === true
       ? await this.scopeExitRecoveryReader.read({ sourceScopeId }) : [];
-    const roleHandoffs = this.roleHandoffReader !== null &&
+    const currentPullRequestEvents = (this.roleHandoffReader !== null || this.scopeReentryReader !== null) &&
       snapshot.sourceStatus?.githubPullRequests?.ok === true && snapshot.sourceStatus.githubPullRequests.complete === true &&
       snapshot.sourceStatus.githubPullRequests.stale !== true
-      ? await this.roleHandoffReader.read({ events: workflowEventsFromSnapshots(null, currentCheckpoint,
-        { sourceScopeId, ...projectionOptions }).filter(event => event.eventType.startsWith("pull_request.")) }) : [];
+      ? Object.freeze(workflowEventsFromSnapshots(null, currentCheckpoint,
+        { sourceScopeId, ...projectionOptions }).filter(event => event.eventType.startsWith("pull_request."))) : null;
+    const roleHandoffs = this.roleHandoffReader !== null && currentPullRequestEvents !== null
+      ? await this.roleHandoffReader.read({ events: currentPullRequestEvents }) : [];
+    const reentries = this.scopeReentryReader !== null && currentPullRequestEvents !== null
+      ? await this.scopeReentryReader.read({ events: currentPullRequestEvents }) : [];
     return this.#admitNewWork(() => this.#writeTransaction(async () => {
       const replay = this.#snapshotReplay(currentCheckpoint);
       const existingEventIds = new Set(
@@ -358,16 +365,25 @@ export class WorkflowRoutingService {
         }
         if (!existingEventIds.has(event.eventId)) extraEvents.push(event);
       }
+      for (const value of reentries) {
+        const event = normalizeStoredWorkflowEvent(value);
+        if (!["pull_request.updated", "pull_request.created"].includes(event.eventType) ||
+            event.source.provider !== "github" || event.source.scopeId !== sourceScopeId) {
+          throw new TypeError("scope reentry reader may only reconnect its GitHub scope");
+        }
+        if (!existingEventIds.has(event.eventId)) extraEvents.push(event);
+      }
       if (replay && extraEvents.length === 0) return replay;
       const config = this.#requireConfig();
       const emittedEventIds = new Set(existingEventIds);
       // The proof seals pre-intake root revisions. Apply it before this same
       // snapshot's ordinary metadata can advance those revisions.
-      const events = [...extraEvents.filter(event => event.eventType === "pull_request.role_handoff"), ...(replay ? [] : workflowEventsFromSnapshots(
+      const events = [...extraEvents.filter(event => event.eventType === "pull_request.role_handoff"),
+        ...extraEvents.filter(event => ["pull_request.updated", "pull_request.created"].includes(event.eventType)), ...(replay ? [] : workflowEventsFromSnapshots(
         this.state.checkpoint,
         currentCheckpoint,
         { sourceScopeId, ...projectionOptions },
-      )), ...extraEvents.filter(event => event.eventType !== "pull_request.role_handoff")].filter(event => {
+      )), ...extraEvents.filter(event => event.eventType === "pull_request.left_scope")].filter(event => {
         if (emittedEventIds.has(event.eventId)) return false;
         emittedEventIds.add(event.eventId);
         return true;

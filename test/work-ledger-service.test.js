@@ -19734,3 +19734,65 @@ test("a sealed historical code confirmation settles after an intervening source 
   assert.equal(current.source.current.headRefOid, "c".repeat(40));
   assert.deepEqual(await f.jobs.get(job.jobId), before);
 });
+
+for (const limit of [1, 100]) test(`a fresh complete snapshot reconnects a reassigned PR whose new created Head was unproven (limit=${limit})`, async () => {
+  const f = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  await f.service.intake();
+  const left = prAssignment(2, { eventType: 'pull_request.left_scope', occurredAt: '2026-08-02T01:05:00.000Z',
+    gitFacts: prGitFacts(PR_HEAD_A) }).event;
+  f.source.records.push(prScopeLifecycleAssignment(2, left)); f.source.highWatermark = 2;
+  await f.service.intake();
+  const returned = prAssignment(4, { eventType: 'pull_request.created', headRefOid: PR_HEAD_B,
+    occurredAt: '2026-08-02T01:20:00.000Z', gitFacts: { ...prGitFacts(PR_HEAD_B), state: 'open', isDraft: false,
+      author: 'another-user', assignees: ['runtime-user'], relation: 'review_requested', nextAction: 'rereview',
+      incomingReviewFactsAvailable: true, reviewRecipient: 'runtime-user', reviewReceivedFrom: 'another-user',
+      reviewReceivedVia: 'assignee', reviewReceivedAt: '2026-08-02T01:19:00.000Z', reviewRequestEventId: 'new-assignment' } });
+  f.source.records.push(prScopeLifecycleAssignment(3, returned.event), returned); f.source.highWatermark = 4;
+  await f.service.intake();
+  const old = (await f.service.listItems()).items[0];
+  assert.equal(old.source.scope.active, false);
+  assert.equal(old.source.revisions.at(-1).disposition, 'ignored_unproven_head');
+  const { AutomaticReviewReentryReader } = await import('../src/services/automatic-review-reentry-reader.js');
+  const values = new Map();
+  let recoveryEnabled = false;
+  const reader = new AutomaticReviewReentryReader({ ledger: f.service, account: 'runtime-user' });
+  const runtime = await createWorkflowRoutingRuntime({ workflowRouting: { schemaVersion: 1, enabled: true, maxHops: 8,
+    rules: [{ id: 'review-route', source: 'root', enabled: true, priority: 1, fallback: false,
+      condition: { op: 'equals', path: 'payload.relation', value: 'review_requested' },
+      targets: [{ type: 'role', id: 'pr-engineer' }], onMatch: 'stop' }] } }, {
+    store: { async read(name, fallback) { return clone(values.get(name) ?? fallback); }, async write(name, value) { values.set(name, clone(value)); } },
+    clock: () => '2026-08-02T01:30:00.000Z',
+    createGuard: () => ({ async acquire() {}, run: operation => operation(), async close() {} }),
+    scopeReentryReader: { read: options => recoveryEnabled ? reader.read(options) : [] },
+  });
+  try {
+    const snapshot = { refreshedAt: '2026-08-02T01:30:00.000Z',
+      sourceStatus: { githubPullRequests: { ok: true, complete: true, stale: false }, githubIssues: { ok: true } },
+      items: [{ ...returned.event.payload, kind: 'pull_request', id: returned.event.subject.id, repo: 'acme/repo', number: 42 }] };
+    await runtime.ingestSnapshot({ snapshot });
+    recoveryEnabled = true;
+    await runtime.ingestSnapshot({ snapshot });
+    const feed = await runtime.readAssignmentBatch({ afterSequence: 0, limit: 100 });
+    assert.ok(feed.items.some(record => record.event.eventType === 'pull_request.created' &&
+      record.assignment.target.id === 'pr-engineer'), JSON.stringify(feed.items.map(record => ({ type: record.event.eventType,
+      target: record.assignment.target, relation: record.event.payload.relation }))));
+    f.source.records.push(...feed.items.map((record, index) => ({ ...record, sequence: 5 + index })));
+    f.source.highWatermark = 4 + feed.items.length;
+    for (let index = 0; index < feed.items.length && f.store.stored().intakeCursor < f.source.highWatermark; index++) {
+      await f.service.intake({ limit });
+    }
+    assert.equal(f.store.stored().intakeCursor, f.source.highWatermark);
+    const current = await f.service.readItemForReconciliation({ itemId: old.itemId });
+    assert.equal(current.source.scope.active, true);
+    assert.equal(current.status, 'queued');
+    assert.equal(current.source.current.headRefOid, PR_HEAD_B);
+    await f.service.verifyPullRequestExecutionBinding(prExecutionBinding(current));
+    await assert.rejects(f.service.verifyPullRequestExecutionBinding(prExecutionBinding(old)),
+      error => error.code === 'WORK_LEDGER_PR_EXECUTION_BINDING_STALE');
+    const restarted = await createFixture({ store: f.store, source: f.source });
+    await restarted.service.verifyPullRequestExecutionBinding(prExecutionBinding(current));
+    const stableFeed = await runtime.readAssignmentBatch({ afterSequence: 0, limit: 100 });
+    await runtime.ingestSnapshot({ snapshot });
+    assert.deepEqual(await runtime.readAssignmentBatch({ afterSequence: 0, limit: 100 }), stableFeed);
+  } finally { await runtime.close(); }
+});

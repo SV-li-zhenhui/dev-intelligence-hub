@@ -115,6 +115,7 @@ import { isAutomaticReviewExecution } from './domain/automatic-review-policy.js'
 import { DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS } from "./domain/prioritizer.js";
 import { createPullRequestExecutionBinding, samePullRequestExecutionBinding } from "./domain/pull-request-execution-binding.js";
 import { AutomaticReviewScopeExitReader } from "./services/automatic-review-scope-exit-reader.js";
+import { AutomaticReviewReentryReader } from "./services/automatic-review-reentry-reader.js";
 import { AutomaticRoleHandoffReader } from "./services/automatic-role-handoff-reader.js";
 
 const GITHUB_REVIEW_PROPOSAL_RUNNER_ID = "github-review-runner";
@@ -1076,6 +1077,7 @@ export async function createApplication({
   let localCodeProposalRecovery = null;
   let codeAuthorizationRoleRegistry = null;
   let automaticReviewScopeExitReader = null;
+  let automaticReviewReentryReader = null;
   let automaticRoleHandoffReader = null;
   let workflowRouting = null;
   let workLedgerRuntime = null;
@@ -1305,6 +1307,12 @@ export async function createApplication({
               account: config.githubActions.actorAccountId,
               ...(workCoordinationDependencies.clock ? { clock: workCoordinationDependencies.clock } : {}) });
             return automaticReviewScopeExitReader.read(options);
+          } }),
+          scopeReentryReader: Object.freeze({ async read(options) {
+            if (!workLedgerRuntime) return [];
+            automaticReviewReentryReader ??= new AutomaticReviewReentryReader({ ledger: workLedgerRuntime,
+              account: config.githubActions.actorAccountId });
+            return automaticReviewReentryReader.read(options);
           } }),
         } : {}),
         ...(config.githubActions?.enabled === true && config.githubActions.automaticOwnPrRepair === true && config.workCoordination?.enabled === true ? {
