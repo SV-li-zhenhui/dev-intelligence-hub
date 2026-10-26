@@ -31,7 +31,7 @@ test('production app-server certifies invalid invocations as not started',async(
   const runner=new CodexAppServerRunner({materialize:async()=>assert.fail('must not materialize or spawn')});
   await assert.rejects(runner.run({}),error=>error.code==='STRUCTURED_PROVIDER_UNAVAILABLE' && didAppServerNotStart(error));
 });
-function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null,initializationFailure=false,codeJob=false,toolInventory=null,onInterrupt=null,contained=false}={}) {
+function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null,initializationFailure=false,turnStartFailure=null,codeJob=false,toolInventory=null,onInterrupt=null,contained=false}={}) {
   let options; const calls=[]; let finish,interruptId,signalStopping;
   const stopping=new Promise(resolve=>{signalStopping=resolve;});
   const done = new Promise((r)=>{finish=r;});
@@ -52,6 +52,7 @@ function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=fals
         result={data:[{name:namespace,tools:Object.fromEntries((toolInventory??['perform_action','read_source','edit_source','get_state','read_conflict_source']).map(name=>[name,{}]))}],nextCursor:null};
     }
     if(request.method==='turn/start')result={turn:{id:'turn-1'}};
+    if(request.method==='turn/start' && turnStartFailure){send({id:request.id,error:turnStartFailure});return;}
     if(request.method==='turn/steer')result=steerTurnId===false?{}:{turnId:steerTurnId??'turn-1'};
     if(request.method==='turn/interrupt')onInterrupt?.();
     if(request.method==='turn/interrupt' && manualInterrupt){interruptId=request.id;return;}
@@ -255,6 +256,59 @@ test('live steering goes to the same active turn without rerunning the operation
 test('failed turns never publish a structured result',async()=>{
   await assert.rejects(invocation(fixture({failed:true}).runner),e=>e.code==='STRUCTURED_PROVIDER_PROCESS_FAILED' && didAppServerReap(e));
 });
+
+for (const source of ['error', 'turn/completed']) {
+  for (const error of [
+    { message: 'Selected model is at capacity. Please try a different model.', codexErrorInfo: 'serverOverloaded' },
+    { message: 'Selected model is at capacity. Please try a different model.' },
+  ]) test(`${source} model capacity is a sanitized transient failure after confirmed reap (${error.codexErrorInfo ?? 'legacy'})`, async () => {
+    const f = fixture({ hold: true });
+    await assert.rejects(invocation(f.runner, async run => {
+      const operation = run(); void operation.catch(() => {});
+      while (!f.calls.some(call => call.method === 'turn/start')) await new Promise(resolve => setImmediate(resolve));
+      await new Promise(resolve => setImmediate(resolve));
+      f.send(source === 'error'
+        ? { method: source, params: { threadId, turnId: 'turn-1', willRetry: false, error } }
+        : { method: source, params: { threadId, turn: { id: 'turn-1', status: 'failed', error } } });
+      return operation;
+    }), error => error.code === 'STRUCTURED_PROVIDER_MODEL_CAPACITY' && error.statusCode === 503 && didAppServerReap(error));
+  });
+}
+
+test('model capacity in agent content, another turn, or an internally retried error does not fail the active turn', async () => {
+  const f = fixture({ hold: true });
+  await invocation(f.runner, async run => {
+    const operation = run(); void operation.catch(() => {});
+    while (!f.calls.some(call => call.method === 'turn/start')) await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    const error = { message: 'Selected model is at capacity. Please try a different model.', codexErrorInfo: 'serverOverloaded' };
+    f.send({ method: 'error', params: { threadId, turnId: 'older-turn', willRetry: false, error } });
+    f.send({ method: 'error', params: { threadId, turnId: 'turn-1', willRetry: true, error } });
+    f.send({ method: 'item/completed', params: { threadId, turnId: 'turn-1', item: { type: 'agentMessage', text: error.message } } });
+    f.complete();
+    assert.equal((await operation).exitCode, 0);
+  });
+});
+
+for (const stopFailure of [false, true]) test(`model capacity classification preserves authentication and stop failures (${stopFailure})`, async () => {
+  const f = fixture({ hold: true, stopFailure });
+  await assert.rejects(invocation(f.runner, async run => {
+    const operation = run(); void operation.catch(() => {});
+    while (!f.calls.some(call => call.method === 'turn/start')) await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    f.send({ method: 'error', params: { threadId, turnId: 'turn-1', willRetry: false, error: {
+      message: 'Selected model is at capacity. Please try a different model.', codexErrorInfo: stopFailure ? 'serverOverloaded' : 'unauthorized',
+    } } });
+    return operation;
+  }), error => error.code === (stopFailure ? 'STRUCTURED_PROVIDER_REAP_FAILED' : 'STRUCTURED_PROVIDER_PROCESS_FAILED'));
+});
+
+for (const data of [undefined, { codexErrorInfo: 'other' }, { codexErrorInfo: 'serverOverloaded' }]) {
+  test(`turn start RPC capacity error retains outer message and structured details (${data?.codexErrorInfo ?? 'legacy'})`, async () => {
+    const f = fixture({ turnStartFailure: { code: -32603, message: 'Selected model is at capacity. Please try a different model.', ...(data ? { data } : {}) } });
+    await assert.rejects(invocation(f.runner), error => error.code === 'STRUCTURED_PROVIDER_MODEL_CAPACITY' && didAppServerReap(error));
+  });
+}
 
 test('a reaped initialization failure certifies no model turn without claiming no process spawned',async()=>{
   await assert.rejects(invocation(fixture({initializationFailure:true}).runner),error=>

@@ -46,6 +46,15 @@ test("busy primary admission waits without invoking a fallback or charging model
   });
 });
 
+test("remote model capacity waits without fallback or a business failure charge", async () => {
+  const error = fail("STRUCTURED_PROVIDER_MODEL_CAPACITY");
+  const run = setup(async () => { throw error; });
+  await assert.rejects(run.reviewer.analyze(input), failure => failure === error);
+  assert.equal(run.fallbackCalls(), 0);
+  assert.equal(run.reviewer.getFailureReceipt(error).modelFailure, false);
+  assert.equal(run.reviewer.getFailureReceipt(error).infrastructureFailure, true);
+});
+
 test("primary execution deadline starts after admission preparation", async () => {
   let admissions = 0;
   const run = setup(async () => assert.fail("use the admitted router"), { timeoutMs: 10, router: {

@@ -273,6 +273,30 @@ function durableTriageHandoff(onSubmit = () => {}) {
   };
 }
 
+test('repeated remote model capacity survives restart, backs off, and retains the PR business budget', async () => {
+  const item = pullRequest();
+  const store = new MemoryStore({ snapshot: snapshot([item]) });
+  let calls = 0;
+  const reviewer = routedTriageReviewer({ primary: async () => {
+    calls++;
+    throw Object.assign(new Error('Selected model is at capacity. Please try a different model.'), { code: 'STRUCTURED_PROVIDER_MODEL_CAPACITY' });
+  } });
+  const options = { store, reviewer, config: { triageOnly: true }, triageHandoff: durableTriageHandoff(() => assert.fail('capacity must wait')),
+    github: { async loadReviewContext() { return { ...item }; } } };
+  let now = '2026-07-31T10:01:00.000Z';
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    await createService({ ...options, now }).tick();
+    const waiting = (await store.read('pr-employee-state')).jobs[0];
+    assert.equal(waiting.status, 'retry_wait');
+    assert.equal(waiting.attempts - waiting.analysisAttemptBudget.attemptOffset, 0);
+    assert.equal(waiting.analysisFailure.infrastructureFailure, true);
+    assert.equal(Date.parse(waiting.nextAttemptAt) > Date.parse(now), true);
+    await createService({ ...options, now }).tick();
+    assert.equal(calls, attempt, 'the scheduler cannot retry before the persisted backoff expires');
+    now = waiting.nextAttemptAt;
+  }
+});
+
 function exhaustedOllamaState(item = pullRequest(), overrides = {}) {
   return queuedState(item, { policyVersion: 3, status: "blocked", attempts: 3,
     error: "Ollama employee transport request failed",

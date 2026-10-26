@@ -45,6 +45,7 @@ const DEFINITIONS = {
   STRUCTURED_PROVIDER_IDLE_TIMEOUT: [504, "Native Codex code execution stopped making progress"],
   STRUCTURED_PROVIDER_QUEUE_TIMEOUT: [503, "Native Codex queue wait timed out before execution"],
   STRUCTURED_PROVIDER_BUSY: [503, "Native Codex capacity is occupied; work remains unclaimed"],
+  STRUCTURED_PROVIDER_MODEL_CAPACITY: [503, "Selected model is temporarily at capacity; the system will retry"],
   STRUCTURED_PROVIDER_REQUEST_TOO_LARGE: [413, "Native Codex input exceeds its limit"],
   STRUCTURED_PROVIDER_RESPONSE_TOO_LARGE: [413, "Native Codex response exceeds its limit"],
   STRUCTURED_PROVIDER_RESPONSE_INVALID: [502, "Native Codex response is invalid"],

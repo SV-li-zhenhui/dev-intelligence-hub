@@ -11,6 +11,15 @@ function attention(code, summary, remediation, retryLabel = "已配置，重试"
 
 const OWNER_ATTENTION_BY_CODE = new Map([
   [
+    "STRUCTURED_PROVIDER_MODEL_CAPACITY",
+    attention(
+      "STRUCTURED_PROVIDER_MODEL_CAPACITY",
+      "所选模型暂时满载",
+      "系统将保留任务进度并稍后自动重试，无需确认或重新分配任务",
+      "自动重试中",
+    ),
+  ],
+  [
     "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
     attention(
       "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",

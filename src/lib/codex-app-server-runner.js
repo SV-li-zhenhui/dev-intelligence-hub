@@ -18,7 +18,15 @@ export const didAppServerNotStart = (error) => NOT_STARTED.has(error);
 export const didAppServerNotStartModel = (error) => NO_MODEL_TURN.has(error);
 export const didAppServerReap = (error) => REAPED_FAILURES.has(error);
 function failure(code='STRUCTURED_PROVIDER_PROCESS_FAILED') {
-  return Object.assign(new Error(code),{code,statusCode:['STRUCTURED_PROVIDER_TIMEOUT','STRUCTURED_PROVIDER_IDLE_TIMEOUT'].includes(code)?504:502});
+  return Object.assign(new Error(code),{code,statusCode:code==='STRUCTURED_PROVIDER_MODEL_CAPACITY'?503:['STRUCTURED_PROVIDER_TIMEOUT','STRUCTURED_PROVIDER_IDLE_TIMEOUT'].includes(code)?504:502});
+}
+function providerFailure(error, details = error) {
+  // Inspect only trusted protocol errors, never agent messages or tool output.
+  const info = details?.codexErrorInfo;
+  const overloaded = info === 'serverOverloaded' ||
+    ((info == null || info === 'other') &&
+      (error?.message ?? details?.message) === 'Selected model is at capacity. Please try a different model.');
+  return failure(overloaded ? 'STRUCTURED_PROVIDER_MODEL_CAPACITY' : 'STRUCTURED_PROVIDER_PROCESS_FAILED');
 }
 function deferred() {
   let resolve,reject;
@@ -91,7 +99,7 @@ export class CodexAppServerRunner {
         if(message.id!==undefined){
           const waiting=pending.get(message.id);if(!waiting)return;
           clearTimeout(waiting.timer);pending.delete(message.id);
-          if(message.error)waiting.reject(failure());else waiting.resolve(message.result);
+          if(message.error)waiting.reject(providerFailure(message.error, message.error.data ?? message.error));else waiting.resolve(message.result);
           return;
         }
         const params=message.params??{};
@@ -150,10 +158,10 @@ export class CodexAppServerRunner {
           revokeTools();terminal=true;turnId=params.turn?.id??turnId;
           interrupted=params.turn?.status==='interrupted';
           context?.reportSession?.({transport:'app-server',threadId,turnId,status:interrupted?'interrupted':params.turn?.status==='failed'?'failed':'completed'});
-          if(params.turn?.status==='failed')completed.reject(failure());
+          if(params.turn?.status==='failed')completed.reject(providerFailure(params.turn.error));
           else completed.resolve();
         }
-        if(message.method==='error' && params.willRetry===false)fail(failure());
+        if(message.method==='error' && params.willRetry===false)fail(providerFailure(params.error));
       }catch(cause){fail(cause);}
     };
     const abort=()=>fail(watchdogSignal?.aborted ? watchdogSignal.reason : failure('STRUCTURED_PROVIDER_CANCELLED'));

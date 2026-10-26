@@ -3729,7 +3729,8 @@ test("a specialist closes a terminal PR task without consuming retry attempts", 
 
 test("automatic infrastructure recovery retries both role paths without questions or business exhaustion", async (t) => {
   for (const roleId of ["developer", "orchestrator"]) {
-    for (const { code, failurePoint } of STRUCTURED_BRAIN_ATTENTION_CASES) {
+    for (const { code, failurePoint } of [...STRUCTURED_BRAIN_ATTENTION_CASES,
+      { code: 'STRUCTURED_PROVIDER_MODEL_CAPACITY', failurePoint: 'brain' }]) {
       await t.test(`${roleId}:${code}`, async () => {
         const time = controlledClock();
         const source = workItem(81, { type: "role", id: roleId });
