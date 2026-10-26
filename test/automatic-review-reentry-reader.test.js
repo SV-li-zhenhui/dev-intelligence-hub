@@ -40,6 +40,36 @@ test('returning review emits a causal update before scope reentry without modify
   assert.deepEqual(f.item, before);
 });
 
+function historicalScopeExit(f) {
+  const lifecycle = { ...f.item.source.revisions[0], eventId: f.item.source.current.event.eventId,
+    revision: 1, disposition: 'accepted', authorityEpochChanged: true };
+  f.item.source.scope.lastLifecycleEventId = lifecycle.eventId;
+  f.item.source.activeRevision = 2;
+  f.item.source.revisions = [lifecycle, { revision: 2, occurredAt: '2026-10-24T01:00:00.000Z' }];
+  f.item.source.current.event.eventType = 'pull_request.status';
+  return lifecycle;
+}
+
+test('a later accepted status input does not hide the durable scope exit from automatic review recovery', async () => {
+  const f = fixture();
+  historicalScopeExit(f);
+  const events = await f.reader.read({ events: [f.event] });
+  assert.deepEqual(events.map(event => event.eventType), ['pull_request.updated', 'pull_request.created']);
+  assert.equal(events[0].payload.previousHeadRefOid, f.item.source.current.headRefOid);
+});
+
+for (const variant of ['missing-binding', 'wrong-event', 'not-accepted', 'no-authority-change', 'not-historical']) {
+  test(`historical review scope recovery requires the durable lifecycle binding (${variant})`, async () => {
+    const f = fixture(), lifecycle = historicalScopeExit(f);
+    if (variant === 'missing-binding') delete f.item.source.scope.lastLifecycleEventId;
+    if (variant === 'wrong-event') f.item.source.scope.lastLifecycleEventId = 'another-event';
+    if (variant === 'not-accepted') lifecycle.disposition = 'ignored_unproven_head';
+    if (variant === 'no-authority-change') lifecycle.authorityEpochChanged = false;
+    if (variant === 'not-historical') lifecycle.revision = f.item.source.activeRevision;
+    assert.deepEqual(await f.reader.read({ events: [f.event] }), []);
+  });
+}
+
 for (const [key, value] of [['baseRefName', 'release'], ['headRefName', 'renamed-fix'], ['headRepository', 'author/fork']]) {
   test(`a returning review binds the current target after a legitimate ${key} change`, async () => {
     const f = fixture();

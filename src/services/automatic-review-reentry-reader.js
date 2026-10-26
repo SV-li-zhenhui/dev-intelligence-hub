@@ -34,8 +34,12 @@ export class AutomaticReviewReentryReader {
       if (item.kind !== 'source_root' || item.status !== 'blocked' || item.statusReason !== 'pr_source_left_scope' ||
           item.currentTarget?.id !== 'pr-engineer' || item.ownerId !== null || item.leaseId !== null ||
           item.activeIntentId !== null || item.sourceQuarantine !== null || item.graph.deliveries.length !== 0 ||
-          source?.scope?.kind !== 'automatic' || source.scope.active !== false || source.pendingRevision !== null ||
-          previous?.eventType !== 'pull_request.left_scope') continue;
+          source?.scope?.kind !== 'automatic' || source.scope.active !== false || source.pendingRevision !== null) continue;
+      if (previous?.eventType !== 'pull_request.left_scope') {
+        const lifecycle = source.revisions.find(revision => revision.eventId === source.scope.lastLifecycleEventId);
+        if (lifecycle?.disposition !== 'accepted' || lifecycle.authorityEpochChanged !== true ||
+            !(lifecycle.revision < source.activeRevision)) continue;
+      }
       const event = current.get(previous.subject.id);
       if (!event || event.source.scopeId !== previous.source.scopeId ||
           event.subject.repository !== previous.subject.repository || event.subject.number !== previous.subject.number ||
