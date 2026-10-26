@@ -5,6 +5,7 @@ import { requireWorkLedgerItem } from "./work-ledger-item-commands.js";
 import {
   activatePendingPullRequestWorkSource,
   currentWorkItemInputBinding,
+  matchesHistoricalPullRequestInputBinding,
   pullRequestHeadAdmission,
 } from "./work-ledger-pr-source.js";
 import { assertItemRevision } from "./work-ledger-transitions.js";
@@ -388,13 +389,7 @@ function retainedWorkflowWaitBinding(item, outbox) {
   const binding = outbox.sourceBinding;
   if (outbox.inputDigest !== binding?.inputDigest) return false;
   if (ledgerDigest(binding) === ledgerDigest(currentWorkItemInputBinding(item))) return true;
-  const source = item.source;
-  if (source?.kind !== "pull_request" || binding.kind !== "pull_request" || binding.rootItemId !== item.itemId ||
-      binding.workKey !== source.workKey || binding.inputRevision >= source.activeRevision) return false;
-  const revision = source.revisions[binding.inputRevision - 1];
-  return revision?.disposition === "accepted" && revision.revision === binding.inputRevision &&
-    ["headRevision", "headRefOid", "eventId", "eventDigest", "inputDigest"].every(key => revision[key] === binding[key]) &&
-    source.bindings.some(entry => entry.inputRevision === binding.inputRevision && entry.eventId === binding.eventId);
+  return matchesHistoricalPullRequestInputBinding(item, binding);
 }
 
 function obsoleteHeadCondition(item, outboxById) {

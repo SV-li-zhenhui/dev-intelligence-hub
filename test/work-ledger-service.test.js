@@ -19673,3 +19673,64 @@ test('the same Review diagnostic cannot repeatedly retire questions and malforme
   child.decisionContext.value.evidence = [{ toString: null }];
   assert.equal(isChangedReviewConfirmationDecision(child.decisionContext), false);
 });
+
+
+test("a sealed historical code confirmation settles after an intervening source activation", async () => {
+  const f = await revokedCodeConfirmationFixture({ createdJob: true });
+  let job = (await f.jobs.list()).items[0];
+  await f.jobs.fence({ jobId: job.jobId, expectedRevision: job.revision,
+    result: { code: "INVALID_CODE_JOB_AUTHORITY", message: "Old source authority expired before execution" } });
+  const before = await f.jobs.get(job.jobId);
+  const { activatePendingPullRequestWorkSource } = await import('../src/services/work-ledger-pr-source.js');
+  const previous = f.store.stored(), durable = clone(previous);
+  const root = durable.items.find(i => i.itemId === f.item.itemId);
+  // A retained legacy source advance leaves the sealed old decision attached.
+  root.source = activatePendingPullRequestWorkSource(root.source, { attemptAtActivation: root.attempt }).source;
+  root.inputDigest = root.source.current.inputDigest;
+  root.statusReason = "pr_source_revised";
+  durable.graphMemoryProjection = appendWorkGraphMemoryEvents(previous, durable, normalizeWorkLedgerLimits()).graphMemoryProjection;
+  f.store.replaceStored(durable);
+  const settler = new ObsoleteCodeJobSettler({ codeJobReader: f.jobs,
+    codeJobControl: { cancel: async () => assert.fail("a terminal historical job must never be replayed or cancelled") } });
+  const service = new WorkLedgerService({ store: f.store, assignmentSource: f.source, exclusiveLease: f.lease,
+    clock: f.time.clock, idFactory: incrementingIds(), confirmationSettlementReader: f.service.confirmationSettlementReader,
+    obsoleteCodeJobSettler: settler });
+  await service.recover();
+  const update = authoredReviewRepairAssignment(3, { headRefOid: "c".repeat(40), previousHeadRefOid: PR_HEAD_B,
+    changedFields: ["headRefOid"], occurredAt: "2026-08-02T01:30:00.000Z" });
+  update.assignment.target = { type: "role", id: "developer" };
+  f.source.records.push(update); f.source.highWatermark = 3;
+  await service.intake();
+  const pending = await service.readItemForReconciliation({ itemId: root.itemId });
+  assert.equal(pending.source.activeRevision, 2);
+  assert.equal(pending.source.pendingRevision, 3);
+  const command = { itemId: root.itemId, expectedRevision: pending.revision,
+    expectedPendingRevision: 3, expectedGraphRevision: (await service.getSummary()).revision };
+  const { completedCodeConfirmationForSettlement } = await import('../src/services/work-ledger-code-confirmation-settlement.js');
+  const snapshot = await f.confirmationQueue.readSettlement({ confirmationId: f.plan.id });
+  const state = f.store.stored();
+  for (const variant of ["unrecorded", "rejected", "event-digest", "wrong-work-key", "wrong-root", "input-digest", "missing-seal", "no-pending"]) {
+    const copied = clone(state), item = copied.items.find(i => i.itemId === root.itemId);
+    const box = copied.outbox.find(o => o.itemId === root.itemId && o.outcome?.details?.downstreamRef === item.decisionContext.referenceId);
+    if (variant === "unrecorded") item.source.bindings = item.source.bindings.filter(b => b.inputRevision !== box.sourceBinding.inputRevision);
+    if (variant === "rejected") item.source.revisions[box.sourceBinding.inputRevision - 1].disposition = "ignored_stale";
+    if (variant === "event-digest") item.source.revisions[box.sourceBinding.inputRevision - 1].eventDigest = "f".repeat(64);
+    if (variant === "wrong-work-key") box.sourceBinding.workKey = "another-work-key";
+    if (variant === "wrong-root") box.sourceBinding.rootItemId = "another-root";
+    if (variant === "input-digest") box.inputDigest = "f".repeat(64);
+    if (variant === "missing-seal") delete box.outcome.details.resultAttestation;
+    if (variant === "no-pending") item.source.pendingRevision = null;
+    assert.equal(completedCodeConfirmationForSettlement(item, new Map(copied.outbox.map(o => [o.intentId, o])), snapshot), null, variant);
+  }
+  service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader: { get: id => f.jobs.get(id) },
+    codeJobControl: { cancel: async () => assert.fail("no terminal detail means no recovery") } });
+  assert.equal((await service.reconcilePullRequestSource(command)).applied, false, "historical identity is not physical stop evidence");
+  service.obsoleteCodeJobSettler = settler;
+  const result = await service.reconcilePullRequestSource(command);
+  assert.equal(result.applied, true, "settled old confirmation must not pin later review/Head input forever");
+  const current = await service.readItemForReconciliation({ itemId: root.itemId });
+  assert.equal(current.status, "queued");
+  assert.equal(current.source.pendingRevision, null);
+  assert.equal(current.source.current.headRefOid, "c".repeat(40));
+  assert.deepEqual(await f.jobs.get(job.jobId), before);
+});

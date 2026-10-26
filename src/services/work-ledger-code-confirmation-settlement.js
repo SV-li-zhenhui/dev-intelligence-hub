@@ -9,7 +9,7 @@ import { createWorkDecisionContext } from "./work-ledger-state.js";
 import { currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
 import { samePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
-import { currentWorkItemInputBinding } from "./work-ledger-pr-source.js";
+import { currentWorkItemInputBinding, matchesHistoricalPullRequestInputBinding } from "./work-ledger-pr-source.js";
 import { ledgerDigest } from "./work-ledger-values.js";
 import { normalizeCodeJobConfirmationResult } from "./code-job-confirmation-result.js";
 import { hasSettledCodeJobAuthorityFence } from "./obsolete-code-job-settler.js";
@@ -55,8 +55,12 @@ function matchingDeliveredProposal(item, outboxById) {
     outbox.outcome.details?.downstreamRef === item.decisionContext.referenceId);
   if (candidates.length !== 1) return null;
   const outbox = candidates[0];
-  if (outbox.inputDigest !== item.inputDigest ||
-    digest(outbox.sourceBinding) !== digest(currentWorkItemInputBinding(item))) return null;
+  const currentBinding = outbox.inputDigest === item.inputDigest &&
+    digest(outbox.sourceBinding) === digest(currentWorkItemInputBinding(item));
+  const historicalBinding = item.kind === "source_root" && item.source?.pendingRevision != null &&
+    outbox.inputDigest === outbox.sourceBinding?.inputDigest &&
+    matchesHistoricalPullRequestInputBinding(item, outbox.sourceBinding);
+  if (!currentBinding && !historicalBinding) return null;
   const bound = outbox.dispatchBinding?.boundIntent;
   if (!bound || bound.intentId !== item.decisionContext.referenceId) return null;
   const { intentId, ...content } = bound;

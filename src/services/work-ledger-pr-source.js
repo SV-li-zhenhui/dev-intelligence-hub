@@ -1428,6 +1428,19 @@ export function currentWorkItemInputBinding(item) {
     : Object.freeze(normalizePullRequestInputBinding(inherited));
 }
 
+// A retained result describes the input that originally produced it. Historical
+// identity can settle that result; it never grants execution on the current input.
+export function matchesHistoricalPullRequestInputBinding(item, binding) {
+  const source = item?.source;
+  if (source?.kind !== "pull_request" || binding?.kind !== "pull_request" || binding.rootItemId !== item.itemId ||
+      binding.workKey !== source.workKey || !Number.isSafeInteger(binding.inputRevision) || binding.inputRevision < 1 ||
+      binding.inputRevision >= source.activeRevision) return false;
+  const revision = source.revisions[binding.inputRevision - 1];
+  return revision?.disposition === "accepted" && revision.revision === binding.inputRevision &&
+    ["headRevision", "headRefOid", "eventId", "eventDigest", "inputDigest"].every(key => revision[key] === binding[key]) &&
+    source.bindings.some(entry => entry.inputRevision === binding.inputRevision && entry.eventId === binding.eventId);
+}
+
 export function currentWorkItemExecutionBinding(item) {
   const sourceBinding = currentWorkItemInputBinding(item);
   if (sourceBinding === null) return null;
