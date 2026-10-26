@@ -19796,3 +19796,118 @@ for (const limit of [1, 100]) test(`a fresh complete snapshot reconnects a reass
     assert.deepEqual(await runtime.readAssignmentBatch({ afterSequence: 0, limit: 100 }), stableFeed);
   } finally { await runtime.close(); }
 });
+
+async function legacyAutomaticReviewTestingFixture() {
+  const { reviewHandoffRequestId } = await import('../src/domain/review-handoff.js');
+  const confirmation = { id: `confirmation-github-review-${'a'.repeat(64)}`, kind: 'github.work-proposal-review',
+    actor: { provider: 'github', accountId: 'runtime-user' }, target: { provider: 'github', resourceId: 'acme/repo#42', version: PR_HEAD_A },
+    action: { type: 'pull_request_review', reviewEvent: 'APPROVE', body: 'Reviewed' }, status: 'completed',
+    receipt: { id: 'published-review' }, execution: { requestId: `auto-review-v1-${'b'.repeat(48)}` },
+    approvalBindingDigest: 'c'.repeat(64), displayedPayloadDigest: 'd'.repeat(64) };
+  const requestId = reviewHandoffRequestId(confirmation);
+  const person = { login: 'qa-owner', product: 'qt' };
+  const record = ownerRequestedPrAssignment(1, { sourceScopeId: `owner-request:${requestId}`,
+    gitFacts: { ...prGitFacts(PR_HEAD_A), workType: 'testing', responsiblePerson: person,
+      description: `已确认完成 GitHub Review，继续处理 https://github.com/acme/repo/pull/42。\n确认：${confirmation.id}\n批准时 Head：${PR_HEAD_A}` } });
+  record.assignment.target = { type: 'role', id: 'tester' };
+  const f = await createFixture({ records: [record] }); await f.service.intake();
+  let root = (await f.service.listItems()).items[0];
+  root = await f.service.claim({ itemId: root.itemId, expectedRevision: root.revision,
+    workerId: 'employee-tester', leaseDurationMs: 30_000 });
+  await f.service.transition({ itemId: root.itemId, expectedRevision: root.revision, leaseId: root.leaseId,
+    actorId: 'employee-tester', toStatus: 'waiting_external', reason: 'legacy_automatic_testing' });
+  root = await f.service.readItemForReconciliation({ itemId: root.itemId });
+  confirmation.reviewHandoff = { requestId, selection: { workType: 'testing', responsiblePerson: person },
+    status: 'completed', workItemId: root.itemId, roleId: 'tester', assignedLogin: person.login };
+  f.service.confirmationSettlementReader = { async read() { return { item: clone(confirmation) }; } };
+  const job = { jobId: 'legacy-review-test-job', revision: 1, status: 'active', requestedBy: { roleId: 'tester', workItemId: root.itemId },
+    workspaceId: 'oct-software', operation: 'verify', inputBinding: prExecutionBinding(root), writablePaths: [], turn: 0, observationCount: 0, uncertainty: null };
+  let cancels = 0, unconfirmed = false, jobPaused = false;
+  const observations = [];
+  const session = { id: job.jobId, workspaceId: job.workspaceId, status: 'cancelled', attempt: { status: 'cancelled' },
+    cleanupPending: false, inputBinding: job.inputBinding, requestedBy: job.requestedBy, actions: [], workspaceRevision: 'e'.repeat(64) };
+  const { AutomaticReviewTestingStopReader } = await import('../src/services/automatic-review-testing-retirement.js');
+  f.service.reviewTestingRetirementReader = new AutomaticReviewTestingStopReader({
+    codeJobs: { async list() { return { revision: job.revision, items: [clone(job)], nextCursor: null }; }, async get() { return clone(job); },
+      async getDetail() { return { archived: false, historyAvailable: true, terminalDetail: { code: 'CODE_JOB_CANCELLED' },
+        job: clone(job), observations: clone(observations), nextCursor: null }; } },
+    codeControl: { async cancel(input) { assert.equal(input.jobId, job.jobId); cancels++; job.status = 'cancelling'; job.revision++; } },
+    codeExecutor: { async view() { return clone(session); } },
+    taskRuns: { async get(kind, taskId) { return { kind, taskId, roleId: 'tester', runId: `${kind}-run`,
+      active: kind === 'code-job' && ['active', 'cancelling'].includes(job.status), mode: kind === 'code-job' && jobPaused ? 'paused' : 'active',
+      pendingCommand: null, stopUnconfirmed: unconfirmed, receipt: { kind, taskId, roleId: 'tester', runId: `${kind}-run`,
+        phase: 'completed', finishedAt: '2026-08-02T01:50:00.000Z', stopConfirmed: !unconfirmed } }; } },
+  });
+  return { ...f, root, confirmation, job, session, observations, get cancels() { return cancels; },
+    setUnconfirmed(value) { unconfirmed = value; }, setJobPaused(value) { jobPaused = value; } };
+}
+
+test('system retires legacy automatic QA work only after normal code cancellation and confirmed stop', async () => {
+  const f = await legacyAutomaticReviewTestingFixture();
+  assert.deepEqual(await f.service.retireAutomaticReviewTestingWork(), { retired: 0 });
+  assert.equal(f.cancels, 1);
+  assert.equal((await f.service.readItemForReconciliation({ itemId: f.root.itemId })).status, 'waiting_external');
+  assert.deepEqual(await f.service.retireAutomaticReviewTestingWork(), { retired: 0 });
+  assert.equal(f.cancels, 1);
+  f.job.status = 'cancelled'; f.job.revision++; f.setUnconfirmed(true);
+  assert.deepEqual(await f.service.retireAutomaticReviewTestingWork(), { retired: 0 });
+  f.setUnconfirmed(false);
+  const runtime = await createWorkLedgerRuntime({ store: f.store, assignmentSource: f.source, clock: f.time.clock,
+    confirmationSettlementReader: f.service.confirmationSettlementReader,
+    reviewTestingRetirementReader: f.service.reviewTestingRetirementReader,
+    createGuard: () => ({ async acquire() {}, run: operation => f.lease.run(operation), async close() {} }) });
+  try { assert.deepEqual(await runtime.retireAutomaticReviewTestingWork(), { retired: 1 }); }
+  finally { await runtime.close(); }
+  const retired = await f.service.readItemForReconciliation({ itemId: f.root.itemId });
+  assert.equal(retired.status, 'cancelled');
+  assert.equal(retired.statusReason, 'automatic_review_external_qa_only');
+  assert.deepEqual(retired.source, f.root.source);
+  assert.deepEqual(await f.service.retireAutomaticReviewTestingWork(), { retired: 0 });
+  const restarted = await createFixture({ store: f.store, source: f.source });
+  assert.equal((await restarted.service.readItemForReconciliation({ itemId: retired.itemId })).status, 'cancelled');
+});
+
+test('a JSON stop flag cannot authorize retirement of legacy QA work', async () => {
+  const f = await legacyAutomaticReviewTestingFixture();
+  f.service.reviewTestingRetirementReader = { async read() { return { stopped: true }; } };
+  assert.deepEqual(await f.service.retireAutomaticReviewTestingWork(), { retired: 0 });
+  assert.equal(f.cancels, 0);
+  assert.equal((await f.service.readItemForReconciliation({ itemId: f.root.itemId })).status, 'waiting_external');
+});
+
+for (const variant of ['manual-review', 'wrong-Head', 'wrong-actor', 'wrong-request', 'wrong-work', 'wrong-QA', 'paused-code-job', 'paused-native-control']) {
+  test(`legacy QA retirement preserves unrelated authority (${variant})`, async () => {
+    const f = await legacyAutomaticReviewTestingFixture();
+    if (variant === 'manual-review') f.confirmation.execution.requestId = 'explicit-owner-approval';
+    if (variant === 'wrong-Head') f.confirmation.target.version = PR_HEAD_B;
+    if (variant === 'wrong-actor') f.confirmation.actor.accountId = 'another-reviewer';
+    if (variant === 'wrong-request') f.confirmation.reviewHandoff.requestId = 'different-request';
+    if (variant === 'wrong-work') f.confirmation.reviewHandoff.workItemId = 'different-root';
+    if (variant === 'wrong-QA') f.confirmation.reviewHandoff.assignedLogin = 'different-QA';
+    if (variant === 'paused-code-job') f.job.status = 'paused';
+    if (variant === 'paused-native-control') f.setJobPaused(true);
+    assert.deepEqual(await f.service.retireAutomaticReviewTestingWork(), { retired: 0 });
+    assert.equal(f.cancels, 0);
+    assert.equal((await f.service.readItemForReconciliation({ itemId: f.root.itemId })).status, 'waiting_external');
+  });
+}
+
+for (const status of ['completed', 'failed', 'fenced']) {
+  test(`legacy QA work with positively stopped ${status} execution can retire without rewriting job history`, async () => {
+    const f = await legacyAutomaticReviewTestingFixture();
+    f.job.status = status; f.job.turn = 1; f.job.observationCount = 1;
+    f.session.status = f.session.attempt.status = status === 'fenced' ? 'interrupted' : status;
+    f.session.actions.push({ id: 'read-1', type: 'read_text', status: 'succeeded', workspaceRevisionAfter: f.session.workspaceRevision });
+    f.observations.push({ actionId: 'read-1', actionType: 'read_text', status: 'succeeded', workspaceRevision: f.session.workspaceRevision });
+    const before = clone(f.job);
+    f.setUnconfirmed(true);
+    assert.deepEqual(await f.service.retireAutomaticReviewTestingWork(), { retired: 0 });
+    f.setUnconfirmed(false);
+    f.session.cleanupPending = true;
+    assert.deepEqual(await f.service.retireAutomaticReviewTestingWork(), { retired: 0 });
+    f.session.cleanupPending = false;
+    assert.deepEqual(await f.service.retireAutomaticReviewTestingWork(), { retired: 1 });
+    assert.deepEqual(f.job, before);
+    assert.equal(f.cancels, 0);
+  });
+}

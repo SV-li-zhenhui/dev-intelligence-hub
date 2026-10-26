@@ -189,11 +189,20 @@ for (const reviewEvent of ["REQUEST_CHANGES", "COMMENT"]) {
   });
 }
 
-test("automatic APPROVE preserves the tester work and explicit manual Review preserves local work", async () => {
+test("automatic APPROVE only assigns external QA while explicit manual Review preserves local work", async () => {
   for (const options of [{ reviewEvent: "APPROVE" }, { automatic: false }]) {
     const f = await fixture(options); assert.equal((await f.reconciler().runCycle())[0].status, "completed");
-    assert.equal(f.localRequests, 1);
-    assert.equal((await f.queue.list()).items[0].reviewHandoff.workItemId, "work-followup");
+    const automatic = options.reviewEvent === 'APPROVE';
+    assert.equal(f.localRequests, automatic ? 0 : 1);
+    const handoff = (await f.queue.list()).items[0].reviewHandoff;
+    assert.equal(handoff.workItemId, automatic ? null : 'work-followup');
+    if (automatic) {
+      assert.equal(handoff.assignedLogin, 'tester');
+      assert.equal(handoff.deliveryKind, 'assignment_only');
+      assert.deepEqual([...f.assignees], ['tester']);
+      await f.restart(); await f.reconciler().runCycle();
+      assert.equal(f.localRequests, 0);
+    }
   }
 });
 

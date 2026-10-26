@@ -99,12 +99,19 @@ export class ReviewHandoffReconciler {
   async #dispatch(item, signal) {
     let outcome;
     let assignedLogin;
-    const assignmentOnly = item.automaticReview && ["REQUEST_CHANGES", "COMMENT"].includes(item.automaticReview.reviewEvent) &&
+    const authorAssignment = item.automaticReview && ["REQUEST_CHANGES", "COMMENT"].includes(item.automaticReview.reviewEvent) &&
       (item.request.kind === "review_author_assignment" || item.request.workType === "pull_request");
+    const testingAssignment = item.automaticReview?.reviewEvent === "APPROVE" && item.request.responsiblePerson &&
+      (item.request.kind === "review_testing_assignment" || item.request.workType === "testing");
+    const assignmentOnly = Boolean(authorAssignment || testingAssignment);
     try {
       if (item.automaticReview && !this.automaticAssignmentsEnabled) throw failure("REVIEW_HANDOFF_AUTOMATION_DISABLED");
       if (item.request.kind === "review_author_assignment" && (!assignmentOnly ||
           item.request.headRefOid !== item.automaticReview.headRefOid || item.request.reviewEvent !== item.automaticReview.reviewEvent)) {
+        throw failure("REVIEW_HANDOFF_ASSIGNMENT_INVALID");
+      }
+      if (item.request.kind === "review_testing_assignment" && (!testingAssignment ||
+          item.request.headRefOid !== item.automaticReview.headRefOid || item.request.reviewEvent !== "APPROVE")) {
         throw failure("REVIEW_HANDOFF_ASSIGNMENT_INVALID");
       }
       if (item.automaticReview?.reviewEvent === "APPROVE" && this.testingOwners !== null) {

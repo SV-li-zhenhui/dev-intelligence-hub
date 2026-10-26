@@ -1,5 +1,7 @@
 import { scheduler } from "node:timers/promises";
 import { triageRetirementCandidate, planTriageRetirement } from './work-ledger-triage-retirement.js';
+import { isReviewTestingRetirementCandidate, reviewTestingRetirementCandidate, matchesAutomaticReviewTestingHandoff,
+  planAutomaticReviewTestingRetirement } from './automatic-review-testing-retirement.js';
 import { indexRecordedDecisionFailures } from './work-ledger-decision-failure.js';
 import { indexRecordedProposalFailures } from './work-ledger-proposal-failure.js';
 import { indexUnstartedCodeDispatchFailures } from './work-ledger-delivery-failure.js';
@@ -607,6 +609,7 @@ export class WorkLedgerService {
     confirmationSettlementReader = null,
     obsoleteCodeJobSettler = null,
     hostContextRecoveryReader = null,
+    reviewTestingRetirementReader = null,
   } = {}) {
     if (
       !store ||
@@ -665,6 +668,11 @@ export class WorkLedgerService {
     this.confirmationSettlementReader = confirmationSettlementReader;
     this.obsoleteCodeJobSettler = obsoleteCodeJobSettler;
     this.hostContextRecoveryReader = hostContextRecoveryReader;
+    if (reviewTestingRetirementReader !== null && typeof reviewTestingRetirementReader?.read !== 'function') {
+      throw new TypeError('reviewTestingRetirementReader must provide read');
+    }
+    this.reviewTestingRetirementReader = reviewTestingRetirementReader;
+    this.reviewTestingRetirementCursor = 0;
     this.limits = normalizeWorkLedgerLimits(limits);
     this.state = emptyWorkLedgerState();
     this.durableContentVersion = undefined;
@@ -1648,6 +1656,31 @@ export class WorkLedgerService {
       ? planScopedWorkGraphCancellation
       : planWorkGraphCancellation;
     return this.#executeCommand(planner, input);
+  }
+
+  async retireAutomaticReviewTestingWork({ limit = 10 } = {}) {
+    validatePositiveLimit(limit, 100, 'limit');
+    if (!this.confirmationSettlementReader || !this.reviewTestingRetirementReader) return { retired: 0 };
+    const captured = await this.#writeTransaction(() => {
+      const candidates = this.state.items.filter(isReviewTestingRetirementCandidate);
+      const start = this.reviewTestingRetirementCursor % Math.max(1, candidates.length);
+      this.reviewTestingRetirementCursor = start + limit;
+      return cloneLedgerValue([...candidates.slice(start), ...candidates.slice(0, start)].slice(0, limit)
+        .map(reviewTestingRetirementCandidate).filter(Boolean));
+    });
+    let retired = 0;
+    for (const candidate of captured) {
+      const snapshot = await this.confirmationSettlementReader.read({ confirmationId: candidate.confirmationId });
+      if (!matchesAutomaticReviewTestingHandoff(candidate, snapshot)) continue;
+      // Stop/cancel executor activity outside the ledger lease, then recheck
+      // the captured root under its normal writer and graph cancellation rules.
+      const stopped = await this.reviewTestingRetirementReader.read(candidate);
+      if (!stopped) continue;
+      const result = await this.#admitNewWork(() => this.#executeCommand(options =>
+        planAutomaticReviewTestingRetirement({ ...options, captured: candidate, snapshot, stopped }), {}));
+      retired += result.retired;
+    }
+    return { retired };
   }
 
   async createGraphChild(input = {}) {

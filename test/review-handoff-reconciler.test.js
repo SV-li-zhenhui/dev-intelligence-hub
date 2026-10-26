@@ -13,7 +13,8 @@ test("all automatic Review verdicts complete their GitHub handoff before acknowl
         confirmations: {
           readReviewHandoffs: async () => [{
             id: "auto-1", actorAccountId: "me",
-            request: { requestId: "request-1", workType: reviewEvent === "APPROVE" ? "testing" : "pull_request", pullRequest: { repository: "acme/repo", number: 1 } },
+            request: { requestId: "request-1", workType: reviewEvent === "APPROVE" ? "testing" : "pull_request", pullRequest: { repository: "acme/repo", number: 1 },
+              ...(reviewEvent === "APPROVE" ? { responsiblePerson: { login: "tester", product: "qt" } } : {}) },
             automaticReview: { reviewEvent, headRefOid: "a".repeat(40) },
           }],
           recordReviewHandoff: async (_id, _requestId, outcome) => events.push(["ack", outcome.status, outcome.assignedLogin]),
@@ -28,7 +29,7 @@ test("all automatic Review verdicts complete their GitHub handoff before acknowl
         },
       });
       assert.equal((await reconciler.runCycle())[0].status, "completed");
-      assert.deepEqual(events, [...(reviewEvent === "APPROVE" ? [["work"]] : []),
+      assert.deepEqual(events, [
         ["github", reviewEvent], ["ack", "completed", reviewEvent === "APPROVE" ? "tester" : "developer"]]);
     });
   }

@@ -42,7 +42,9 @@ export function normalizeReviewHandoff(value, item = null) {
   if (value.deliveryKind !== undefined && value.deliveryKind !== "assignment_only") throw invalid();
   const assignmentOnly = selection.workType === "assignment" || value.deliveryKind === "assignment_only";
   if (assignmentOnly && (!/^auto-review-v1-[a-f0-9]{48}$/.test(value.acceptedRequestId) ||
-      (item && (item.kind !== "github.work-proposal-review" || !["REQUEST_CHANGES", "COMMENT"].includes(item.action?.reviewEvent))))) throw invalid();
+      (item && (item.kind !== "github.work-proposal-review" ||
+        !(["REQUEST_CHANGES", "COMMENT"].includes(item.action?.reviewEvent) ||
+          (item.action?.reviewEvent === "APPROVE" && selection.workType === "testing" && selection.responsiblePerson)))))) throw invalid();
   if (!UUID.test(value.requestId) || typeof value.acceptedRequestId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{6,127}$/.test(value.acceptedRequestId) ||
       !["pending", "retrying", "completed", "stale"].includes(value.status) || !Number.isSafeInteger(value.attempts) || value.attempts < 0 ||
       (value.diagnosticCode !== null && (typeof value.diagnosticCode !== "string" || !/^[A-Z][A-Z0-9_]{0,127}$/.test(value.diagnosticCode))) ||
@@ -70,7 +72,8 @@ export function createReviewHandoff(item, request, policy) {
     if (!policy?.[field]?.[person.product]?.some((login) => login.toLowerCase() === person.login.toLowerCase())) throw invalid("负责人不在当前配置的交接名单中");
   }
   const result = { selection, requestId: reviewHandoffRequestId(item), acceptedRequestId: request.requestId, status: "pending", attempts: 0, diagnosticCode: null, workItemId: null, roleId: null };
-  if (selection.workType === "assignment") result.deliveryKind = "assignment_only";
+  if (selection.workType === "assignment" || (selection.workType === "testing" && item.action.reviewEvent === "APPROVE" &&
+      isAutomaticReviewExecution({ ...item, execution: { requestId: request.requestId } }))) result.deliveryKind = "assignment_only";
   reviewHandoffWorkRequest({ ...item, reviewHandoff: result });
   return result;
 }
@@ -79,6 +82,12 @@ export function reviewHandoffWorkRequest(item) {
   const match = /^([^#]+)#([1-9]\d*)$/.exec(item.target.resourceId);
   if (!match) throw invalid("Review 交接缺少明确的 PR 目标");
   const { workType, responsiblePerson } = handoff.selection;
+  if (workType === "testing" && item.action.reviewEvent === "APPROVE" &&
+      (handoff.deliveryKind === "assignment_only" || isAutomaticReviewExecution(item))) {
+    return { schemaVersion: 1, kind: "review_testing_assignment", requestId: handoff.requestId,
+      pullRequest: { repository: match[1], number: Number(match[2]) }, headRefOid: item.target.version,
+      reviewEvent: "APPROVE", responsiblePerson };
+  }
   if (workType === "assignment" || handoff.deliveryKind === "assignment_only" ||
       (isAutomaticReviewExecution(item) && ["REQUEST_CHANGES", "COMMENT"].includes(item.action.reviewEvent) && workType === "pull_request")) {
     return { schemaVersion: 1, kind: "review_author_assignment", requestId: handoff.requestId,

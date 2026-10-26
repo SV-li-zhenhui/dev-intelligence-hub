@@ -116,6 +116,7 @@ import { DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS } from "./domain/prioritizer.js";
 import { createPullRequestExecutionBinding, samePullRequestExecutionBinding } from "./domain/pull-request-execution-binding.js";
 import { AutomaticReviewScopeExitReader } from "./services/automatic-review-scope-exit-reader.js";
 import { AutomaticReviewReentryReader } from "./services/automatic-review-reentry-reader.js";
+import { AutomaticReviewTestingStopReader } from './services/automatic-review-testing-retirement.js';
 import { AutomaticRoleHandoffReader } from "./services/automatic-role-handoff-reader.js";
 
 const GITHUB_REVIEW_PROPOSAL_RUNNER_ID = "github-review-runner";
@@ -1078,6 +1079,7 @@ export async function createApplication({
   let codeAuthorizationRoleRegistry = null;
   let automaticReviewScopeExitReader = null;
   let automaticReviewReentryReader = null;
+  let automaticReviewTestingStopReader = null;
   let automaticRoleHandoffReader = null;
   let workflowRouting = null;
   let workLedgerRuntime = null;
@@ -1499,6 +1501,14 @@ export async function createApplication({
             read: (input) => obsoleteCodeJobSettler?.read(input),
             settle: (input, options) => obsoleteCodeJobSettler?.settle(input, options) ?? null,
           }),
+          ...(config.githubActions?.enabled === true && config.githubActions.automaticReview === true ? {
+            reviewTestingRetirementReader: Object.freeze({ async read(candidate) {
+              if (!codeJobReader || !codeJobControl || !taskRuns || !codeExecutorRuntime?.executor?.view) return null;
+              automaticReviewTestingStopReader ??= new AutomaticReviewTestingStopReader({ codeJobs: codeJobReader,
+                codeControl: codeJobControl, taskRuns, codeExecutor: codeExecutorRuntime.executor });
+              return automaticReviewTestingStopReader.read(candidate);
+            } }),
+          } : {}),
           ...(ordinaryActionAdmissionGate === null
             ? {}
             : { actionAdmissionGate: ordinaryActionAdmissionGate }),
@@ -2785,6 +2795,7 @@ export async function createApplication({
           store, ledger: workLedgerRuntime, configurationReader: configurationRuntime.reader, taskRuns,
           roleStateReader: { async read(roleId) { return employeeRegistry.get(roleId)?.roleView() ?? null; } },
           preparations: [
+            () => workLedgerRuntime.retireAutomaticReviewTestingWork?.({ limit: 10 }),
             () => proposalResultReconciler.runCycle({ limit: 10 }),
             () => conditionWaker.runCycle({ limit: 10 }),
           ],

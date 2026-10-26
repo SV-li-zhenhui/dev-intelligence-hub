@@ -132,7 +132,7 @@ test("my PR enters testing after an external reviewer approves the current Head"
   ]);
 });
 
-test("another author's PR enters testing after my approval of the current Head", () => {
+test("another author's approved PR does not create an automatic local tester route", () => {
   const routed = routeWorkflowEvent({
     event: pullRequestEvent({
       relation: "review_requested",
@@ -144,6 +144,6 @@ test("another author's PR enters testing after my approval of the current Head",
   });
 
   assert.deepEqual(routed.assignments.map(({ target }) => target), [
-    { type: "role", id: "tester" },
+    { type: "role", id: "pr-engineer" },
   ]);
 });

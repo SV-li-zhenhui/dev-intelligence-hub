@@ -35,6 +35,7 @@ const RUNTIME_METHODS = Object.freeze([
   "readAutomaticReviewAdmission",
   "intake",
   "retireInactiveIssues",
+  "retireAutomaticReviewTestingWork",
   "reconcilePullRequestSource",
   "reconcilePullRequestSourceBatch",
   "claim",
@@ -118,6 +119,7 @@ export async function createWorkLedgerRuntime({
   confirmationSettlementReader,
   obsoleteCodeJobSettler,
   hostContextRecoveryReader,
+  reviewTestingRetirementReader,
   createCandidateProcessor = createWorkerWorkLedgerCandidateProcessor,
   createGuard = (options) => new ProcessExclusiveGuard(options),
 } = {}) {
@@ -196,6 +198,7 @@ export async function createWorkLedgerRuntime({
       ...(confirmationSettlementReader === undefined ? {} : { confirmationSettlementReader }),
       ...(obsoleteCodeJobSettler === undefined ? {} : { obsoleteCodeJobSettler }),
       ...(hostContextRecoveryReader === undefined ? {} : { hostContextRecoveryReader }),
+      ...(reviewTestingRetirementReader === undefined ? {} : { reviewTestingRetirementReader }),
     });
     await service.recover();
     const graph = new WorkGraphStore({ ledger: service });

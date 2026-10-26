@@ -58,6 +58,8 @@ function stoppedExecutor(job, session, observations, statuses = ["interrupted", 
     /^[a-f0-9]{64}$/.test(session.workspaceRevision ?? "") && lastAction.workspaceRevisionAfter === session.workspaceRevision;
 }
 
+export { stoppedExecutor as stoppedCodeJobExecutor };
+
 function admitImmediately(operation) {
   return { operation: operation() };
 }
