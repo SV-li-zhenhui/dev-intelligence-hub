@@ -1012,6 +1012,28 @@ test("cached conflict reference pages stop when the job is paused", async () => 
   assert.equal(attempts, 1);
 });
 
+test("cached audited workspace pages do not repeat full authority scans", async () => {
+  const authorityCalls = [];
+  let pageVerifications;
+  const content = "unchanged audited source\n".repeat(3_000);
+  const fixture = continuousFixture(async ({ codeExecutionContext }) => {
+    const tools = beginCodeExecutionSession(codeExecutionContext);
+    let page = await tools.invoke("read_source", { path: "src/app.js", offset: 0, length: 1 });
+    const beforePages = authorityCalls.length;
+    let actual = page.text;
+    while (page.nextOffset !== null) {
+      page = await tools.invoke("read_source", { path: "src/app.js", offset: page.nextOffset, sourceVersion: page.sourceVersion });
+      actual += page.text;
+    }
+    pageVerifications = authorityCalls.length - beforePages;
+    assert.equal(actual, content);
+    await tools.close();
+    return continuousDecision({ type: "complete", outcome: "read", evidence: [] });
+  }, { content, grantVerifier: verifier(authorityCalls) });
+  assert.equal((await fixture.worker.runCycle()).outcomes[0].status, "completed");
+  assert.equal(pageVerifications, 0, "subsequent immutable audited pages reuse the verified read");
+});
+
 test("continuous final completion checks current required profiles and current full reads", async (t) => {
   for (const missing of ["profile", "pages"]) await t.test(missing, async () => {
     const fixture = continuousFixture(async ({ codeExecutionContext }) => {

@@ -1005,14 +1005,25 @@ export class CodeJobWorkerService {
       }
       return state;
     };
-    const assertConflictReadActive = async (signal) => {
+    const readActiveJob = async (signal) => {
       currentTaskExecution()?.assertRunning?.();
       controller.signal.throwIfAborted();
       signal?.throwIfAborted();
+      if (fatal) throw fatal;
       const job = await this.#jobs.getForWorker(initial.jobId);
       if (job?.status !== "active" || job.execution.pendingAction !== null || !sameValue(job.grant, initial.grant)) {
-        throw workerError("CODE_JOB_SESSION_BUSY", "Conflict reference job is no longer active");
+        throw workerError("CODE_JOB_SESSION_BUSY", "Source read job is no longer active");
       }
+      if (workspaceRevision !== job.execution.workspaceRevision) {
+        closeReads(); workspaceRevision = job.execution.workspaceRevision;
+      }
+      return job;
+    };
+    const readSourcePage = (entry, sourcePath, offset, length) => {
+      const page = entry.reader.readDocument(sourcePath, offset, length);
+      entry.reader.commit();
+      lastSourceReadIdentity = { path: page.path, sha256: entry.sha256, totalLength: page.totalLength };
+      return { ...page, sourceVersion: entry.actionId };
     };
     const latestRead = (job, sourcePath) => job.execution.observations.findLast((entry) =>
       isCurrentAuditedRead(job, entry) && trustedObservationAction(entry).path === sourcePath);
@@ -1069,7 +1080,7 @@ export class CodeJobWorkerService {
       sourceReadIdentity: () => lastSourceReadIdentity,
       getState,
       readConflictSource: async ({ path: sourcePath, version, offset, length, sourceVersion }, options) => {
-        await assertConflictReadActive(options?.signal);
+        await readActiveJob(options?.signal);
         if (!this.#conflictSourceReader || initial.grant.executionSource?.kind !== "conflict_preparation") {
           throw workerError("CODE_READ_DOCUMENT_NOT_FOUND", "No sealed conflict versions are available");
         }
@@ -1080,7 +1091,7 @@ export class CodeJobWorkerService {
         conflictReads ??= await this.#openConflictReads(initial, options);
         // The reader owns an immutable, verified reference copy. Page reads
         // cannot authorize writes; actions and completion use fresh snapshots.
-        await assertConflictReadActive(options?.signal);
+        await readActiveJob(options?.signal);
         const key = `conflict-versions/${version}/${sourcePath}`;
         const document = conflictReads.documents.get(key);
         if (!document) throw workerError("CODE_READ_DOCUMENT_NOT_FOUND", "Path/version is outside the sealed conflicts");
@@ -1122,6 +1133,15 @@ export class CodeJobWorkerService {
         return current?.status === "active" ? getState() : { status: current?.status ?? "missing" };
       },
       readSource: async ({ path: sourcePath, offset, length, sourceVersion }, options) => {
+        const current = await readActiveJob(options?.signal);
+        const cached = reads.get(sourcePath);
+        if (cached && latestRead(current, sourcePath)?.actionId === cached.actionId) {
+          if ((sourceVersion !== undefined && sourceVersion !== cached.actionId) ||
+              (offset !== 0 && sourceVersion !== cached.actionId)) {
+            throw workerError("CODE_READ_REVISION_INVALID", "Source pages must belong to the current audited read");
+          }
+          return readSourcePage(cached, sourcePath, offset, length);
+        }
         let state = await snapshot();
         let entry = reads.get(sourcePath);
         const audit = latestRead(state.job, sourcePath);
@@ -1147,10 +1167,7 @@ export class CodeJobWorkerService {
             sha256: currentRead.detail.result.sha256 };
           reads.set(sourcePath, entry);
         }
-        const page = entry.reader.readDocument(sourcePath, offset, length);
-        entry.reader.commit();
-        lastSourceReadIdentity = { path: page.path, sha256: entry.sha256, totalLength: page.totalLength };
-        return { ...page, sourceVersion: entry.actionId };
+        return readSourcePage(entry, sourcePath, offset, length);
       },
       close: async () => {
         const current = await this.#jobs.getForWorker(initial.jobId);
