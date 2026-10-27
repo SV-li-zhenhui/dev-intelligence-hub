@@ -435,6 +435,58 @@ test("owner-requested CI repair seals fresh ownership and uses controlled commit
   assert.equal(await f.service.shouldRun(f.item), false, 'published original Head remains consumed');
 });
 
+for (const ci of [false, true]) {
+  test(`settled empty repair releases the PR without fabricating publication across restart (ci=${ci})`, async () => {
+    const f = await fixture({ ci });
+    await f.deliver();
+    f.completeJob();
+    const detail = f.details.get(codeJobIdForGrant(f.grant));
+    detail.changePackage = { status: 'ready', receipt: { noChanges: true } };
+    const before = clone(detail);
+    const conflictItem = clone(f.item);
+    conflictItem.event.payload.nextAction = 'resolve_conflict';
+    conflictItem.event.payload.headRefOid = '9'.repeat(40);
+    assert.equal(await f.service.shouldRun(f.item), false);
+    assert.equal(await f.service.shouldRun(conflictItem), false, 'historical repair excludes newer conflict work');
+    await f.restart();
+    const result = await f.service.runCycle();
+    assert.equal(result.failed, 1);
+    assert.equal(f.store.values.get(STATE_KEY).repairs[0].status, 'failed');
+    assert.equal(await f.service.shouldRun(f.item), true);
+    assert.equal(await f.service.shouldRun(conflictItem), true, 'empty completion releases newer conflict work');
+    await f.restart();
+    assert.equal((await f.service.runCycle()).scanned, 0);
+    assert.equal(f.codeJobApprovalCount, 1, 'the old job must never be replayed');
+    assert.equal(f.jobs.size, 1);
+    assert.equal(f.pushes.length, 0);
+    assert.deepEqual(f.store.values.get(STATE_KEY).published, []);
+    assert.deepEqual((await f.ownerWorkRequests.list()).items, []);
+    assert.deepEqual(detail, before, 'the terminal job and its source binding remain immutable');
+  });
+}
+
+for (const scenario of ['active-job', 'paused-job', 'pending-package', 'missing-package', 'nonempty-package']) {
+  test(`repair keeps its exclusion until empty completion is proven (${scenario})`, async () => {
+    const f = await fixture({ ci: true });
+    await f.deliver();
+    f.completeJob();
+    const detail = f.details.get(codeJobIdForGrant(f.grant));
+    detail.changePackage = { status: 'ready', receipt: { noChanges: true } };
+    if (scenario === 'active-job') detail.job.status = 'active';
+    if (scenario === 'paused-job') detail.job.status = 'paused';
+    if (scenario === 'pending-package') detail.changePackage.status = 'pending';
+    if (scenario === 'missing-package') delete detail.changePackage;
+    if (scenario === 'nonempty-package') detail.changePackage.receipt.noChanges = false;
+    const before = clone(detail);
+    await f.restart();
+    assert.equal((await f.service.runCycle()).failed, 0);
+    assert.equal(f.store.values.get(STATE_KEY).repairs[0].status, 'working');
+    assert.equal(await f.service.shouldRun(f.item), false);
+    assert.equal(f.pushes.length, 0);
+    assert.deepEqual(detail, before);
+  });
+}
+
 test("normal local completion cannot strand an already controlled owner CI publication", async () => {
   const f = await fixture({ ci: true, ownerRequestedCi: true });
   await f.deliver(); f.completeJob();

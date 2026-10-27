@@ -19,7 +19,7 @@ export const VERIFICATION_RECOVERY_REASON = 'automatic_verification_preparation_
 export const VERIFICATION_RECOVERY_ACTOR = 'automatic-own-pr-verification-recovery';
 export const AUTOMATIC_VERIFICATION_FAILURE = 'CODE_JOB_VERIFICATION_ENVIRONMENT_UNAVAILABLE';
 
-function portMethod(port, method) {
+function portMethod(port, method, optional = false) {
   let owner = port;
   while (owner && (typeof owner === "object" || typeof owner === "function")) {
     const field = Object.getOwnPropertyDescriptor(owner, method);
@@ -29,6 +29,7 @@ function portMethod(port, method) {
     }
     owner = Object.getPrototypeOf(owner);
   }
+  if (optional && owner == null) return null;
   throw new TypeError(`failed code job ${method} reader is invalid`);
 }
 
@@ -46,10 +47,34 @@ function retryNote(value) {
 export class FailedCodeJobContextReader {
   #getDetail;
   #listTimeline;
+  #verifyBinding;
 
   constructor({ codeJobReader, ledger }) {
     this.#getDetail = portMethod(codeJobReader, "getDetail");
     this.#listTimeline = portMethod(ledger, "listTimeline");
+    this.#verifyBinding = portMethod(ledger, "verifyPullRequestExecutionBinding", true);
+  }
+
+  async #matchesBinding(previous, current, signal) {
+    if (samePullRequestExecutionBinding(previous, current)) return true;
+    // Fact-only revisions retain the execution epoch. Keep the historical
+    // failure as diagnostics only after both observations pass ledger authority;
+    // matching Head strings alone cannot prove provenance or a settled cutover.
+    if (this.#verifyBinding === null || previous.schemaVersion !== 2 ||
+        current.schemaVersion !== 2 || previous.inputRevision >= current.inputRevision ||
+        !samePullRequestExecutionBinding({ ...previous, inputRevision: current.inputRevision,
+          eventId: current.eventId, eventDigest: current.eventDigest, inputDigest: current.inputDigest }, current)) return false;
+    signal?.throwIfAborted();
+    let verified;
+    try {
+      verified = await Promise.all([this.#verifyBinding(previous), this.#verifyBinding(current)]);
+    } catch (cause) {
+      signal?.throwIfAborted();
+      if (cause?.code === 'WORK_LEDGER_PR_EXECUTION_BINDING_STALE') return false;
+      throw roleContextError('ROLE_CONTEXT_CODE_JOB_UNAVAILABLE', 'Unable to verify the failed code job source', 503, { cause });
+    }
+    signal?.throwIfAborted();
+    return samePullRequestExecutionBinding(verified[0], previous) && samePullRequestExecutionBinding(verified[1], current);
   }
 
   async #readRetry(itemId, jobId, observedAfter, signal) {
@@ -107,8 +132,9 @@ export class FailedCodeJobContextReader {
     const job = normalizeCodeJobBrowserProjection(detail.job);
     const memory = evidence.filter((entry) => entry.startsWith("memory:"));
     if (job.jobId !== jobId || job.status !== "failed" || job.requestedBy.workItemId !== itemId ||
-        job.inputBinding == null || !samePullRequestExecutionBinding(job.inputBinding, expectedBinding) ||
+        job.inputBinding == null ||
         memory.length !== 1 || memory[0] !== `memory:${job.memoryProjection?.recordId}`) throw stale();
+    if (!await this.#matchesBinding(job.inputBinding, expectedBinding, signal)) throw stale();
     if (!Array.isArray(detail.observations) || detail.observations.length > 20) throw stale();
     const observedActions = detail.observations.map(({ actionType, status }) => {
       if (!ACTION_TYPES.has(actionType) || !["succeeded", "failed", "interrupted"].includes(status)) throw stale();

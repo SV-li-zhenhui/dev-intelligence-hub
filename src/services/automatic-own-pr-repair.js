@@ -561,6 +561,12 @@ export class AutomaticOwnPrRepair {
     if (["failed", "cancelled", "fenced"].includes(detail.job.status)) {
       await this.#update(record, { status: "failed" }); return "failed";
     }
+    // A settled empty export can never acquire a publication receipt. Release
+    // this repair's exclusion without claiming the PR or its CI was repaired.
+    if (detail.job.status === "completed" && detail.changePackage?.status === "ready" &&
+        detail.changePackage.receipt?.noChanges === true) {
+      await this.#update(record, { status: "failed" }); return "failed";
+    }
     const receipt = detail.changePackage?.receipt?.controlledCommit;
     if (detail.job.status !== "completed" || !receipt) return "waiting";
     const codeItem = await this.confirmations.get(record.confirmationId);

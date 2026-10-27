@@ -6,10 +6,15 @@ import { FailedCodeJobContextReader, VERIFICATION_RECOVERY_ACTOR, VERIFICATION_R
   AUTOMATIC_VERIFICATION_FAILURE } from "../src/services/failed-code-job-context-reader.js";
 import { AutomaticOwnPrInspectionRecovery } from "../src/services/automatic-own-pr-inspection-recovery.js";
 import { encodeVerificationRecoveryEvidence } from '../src/domain/verification-recovery-evidence.js';
+import { normalizeWorkflowEvent } from '../src/domain/workflow-events.js';
+import { createPullRequestExecutionBinding } from '../src/domain/pull-request-execution-binding.js';
+import { createPullRequestWorkSource, appendPullRequestWorkSource, currentWorkItemInputBinding,
+  currentWorkItemEvent, verifyPullRequestExecutionBinding } from '../src/services/work-ledger-pr-source.js';
 
-function fixture({ operation = "modify", failureCode = "GIT_SNAPSHOT_TIMEOUT", actions = ["read_text", "search_text", "read_text"] } = {}) {
+function fixture({ operation = "modify", failureCode = "GIT_SNAPSHOT_TIMEOUT", actions = ["read_text", "search_text", "read_text"],
+  inputBinding: suppliedBinding, verifyBinding } = {}) {
   const itemId = "work-item-repair";
-  const inputBinding = {
+  const inputBinding = suppliedBinding ?? {
     schemaVersion: 1, kind: "pull_request", repository: "acme/widgets", pullRequestNumber: 17,
     rootItemId: itemId, workKey: "pr-work-repair", inputRevision: 3, headRevision: 2,
     headRefOid: "1".repeat(40), eventId: "event-repair", eventDigest: "2".repeat(64), inputDigest: "3".repeat(64),
@@ -17,7 +22,7 @@ function fixture({ operation = "modify", failureCode = "GIT_SNAPSHOT_TIMEOUT", a
   const grant = createCodeJobGrant({
     schemaVersion: 2, proposalId: "work-intent-repair", contentDigest: "a".repeat(64), policyVersion: 1,
     requestedBy: { roleId: "developer", workItemId: itemId },
-    source: { assignmentId: "assignment-repair", eventId: "event-repair" },
+    source: { assignmentId: "assignment-repair", eventId: inputBinding.eventId },
     subject: { id: "github:pr:acme/widgets#17", repository: "acme/widgets", number: 17 },
     repository: "acme/widgets", workspaceId: "widgets-local", inputBinding,
     workspaceAuthorityDigest: "9".repeat(64), operation, objective: "Repair the review feedback",
@@ -51,7 +56,8 @@ function fixture({ operation = "modify", failureCode = "GIT_SNAPSHOT_TIMEOUT", a
   const calls = [];
   const reader = new FailedCodeJobContextReader({
     codeJobReader: { async getDetail(request) { calls.push(request); return structuredClone(detail); } },
-    ledger: { async listTimeline(request) { calls.push(request); return structuredClone(page); } },
+    ledger: { async listTimeline(request) { calls.push(request); return structuredClone(page); },
+      ...(verifyBinding ? { verifyPullRequestExecutionBinding: verifyBinding } : {}) },
   });
   return { reader, input: { itemId, inputBinding, decisionContext }, detail, page, retry, calls };
 }
@@ -65,6 +71,84 @@ test("failed repair context includes the actual failure and matching owner recov
   assert.equal(result.ownerRetry.note, f.retry.details.context.note);
   assert.equal(JSON.stringify(result).includes("DO-NOT-EXPOSE-RAW-ERROR"), false);
   assert.deepEqual(f.calls, [{ jobId: f.detail.job.jobId, limit: 20 }, { itemId: f.input.itemId, limit: 100, order: "newest" }]);
+});
+
+function revisedSourceFixture() {
+  const target = { schemaVersion: 1, provider: 'github', sourceAccountId: 'runtime-user',
+    baseRepository: 'acme/widgets', baseRefName: 'main', baseRefOid: '5'.repeat(40),
+    headRepository: 'acme/widgets', headRefName: 'fix/repair', headRefOid: '1'.repeat(40) };
+  const envelope = (sequence, gitTarget = target) => {
+    const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: 'pull_request.updated',
+      occurredAt: `2026-08-02T05:00:0${sequence}.000Z`, source: { provider: 'github', scopeId: 'dashboard' },
+      subject: { id: 'github:pr:acme/widgets#17', repository: 'acme/widgets', number: 17 },
+      payload: { title: 'Repair feedback', headRefOid: gitTarget.headRefOid, ciStatus: 'FAILURE',
+        changedFields: ['ciStatus'], gitTargetAvailable: true, gitTarget } });
+    return { sequence, event, assignment: { assignmentId: `assignment-${sequence}`, eventId: event.eventId,
+      target: { type: 'role', id: 'pr-engineer' }, reason: 'repair', createdAt: event.occurredAt } };
+  };
+  const root = { itemId: 'work-item-repair', kind: 'source_root', sourceQuarantine: null,
+    source: createPullRequestWorkSource(envelope(1)).source };
+  const binding = () => createPullRequestExecutionBinding({ sourceBinding: currentWorkItemInputBinding(root),
+    event: currentWorkItemEvent(root) });
+  const verified = [];
+  const f = fixture({ inputBinding: binding(), verifyBinding: async value => {
+    verified.push(structuredClone(value));
+    return verifyPullRequestExecutionBinding({ items: [root] }, value);
+  } });
+  root.source = appendPullRequestWorkSource(root.source, envelope(2), { attemptAtActivation: 0 }).source;
+  f.input.inputBinding = structuredClone(binding());
+  return { ...f, root, binding, envelope, target, verified };
+}
+
+test('failed code diagnostics survive a same-target fact revision verified by the ledger', async () => {
+  const f = revisedSourceFixture();
+  const before = structuredClone(f.input);
+  const result = await f.reader.read(f.input);
+  assert.equal(result.jobId, f.detail.job.jobId);
+  assert.equal(result.failureCode, 'GIT_SNAPSHOT_TIMEOUT');
+  assert.equal(result.observedActions.length, 3);
+  assert.deepEqual(f.verified, [f.detail.job.inputBinding, f.input.inputBinding]);
+  assert.deepEqual(f.input, before);
+});
+
+test('historical diagnostics still reject changed targets, epochs and unregistered source facts', async t => {
+  for (const scenario of ['base', 'account', 'head', 'epoch', 'forged-old-event', 'forged-current-event', 'pending', 'quarantine']) {
+    await t.test(scenario, async () => {
+      const f = revisedSourceFixture();
+      if (scenario === 'base') f.input.inputBinding.gitTarget.baseRefOid = '6'.repeat(40);
+      if (scenario === 'account') f.input.inputBinding.gitTarget.sourceAccountId = 'another-user';
+      if (scenario === 'head') {
+        f.input.inputBinding.headRefOid = '6'.repeat(40);
+        f.input.inputBinding.gitTarget.headRefOid = f.input.inputBinding.headRefOid;
+      }
+      if (scenario === 'epoch') f.input.inputBinding.headRevision += 1;
+      if (scenario === 'forged-old-event') f.detail.job.inputBinding.eventDigest = '0'.repeat(64);
+      if (scenario === 'forged-current-event') f.input.inputBinding.eventDigest = '0'.repeat(64);
+      if (scenario === 'pending') f.root.source = appendPullRequestWorkSource(f.root.source,
+        f.envelope(3, { ...f.target, baseRefOid: '6'.repeat(40) }), { activate: false, attemptAtActivation: 0 }).source;
+      if (scenario === 'quarantine') f.root.sourceQuarantine = { reason: 'unknown_execution' };
+      await assert.rejects(f.reader.read(f.input), { code: 'ROLE_CONTEXT_CODE_JOB_STALE' });
+    });
+  }
+});
+
+test('historical source verification respects cancellation and unavailable ledger evidence', async t => {
+  for (const cancel of [false, true]) await t.test(cancel ? 'cancelled' : 'unavailable', async () => {
+    const f = revisedSourceFixture();
+    const controller = new AbortController();
+    const reader = new FailedCodeJobContextReader({
+      codeJobReader: { async getDetail() { return f.detail; } },
+      ledger: {
+        async listTimeline() { return f.page; },
+        async verifyPullRequestExecutionBinding() {
+          if (cancel) controller.abort();
+          throw Object.assign(new Error('DO-NOT-EXPOSE-LEDGER-ERROR'), { code: 'WORK_LEDGER_RUNTIME_CLOSED' });
+        },
+      },
+    });
+    await assert.rejects(reader.read({ ...f.input, signal: controller.signal }),
+      cancel ? { name: 'AbortError' } : { code: 'ROLE_CONTEXT_CODE_JOB_UNAVAILABLE' });
+  });
 });
 
 function automaticRetry(f) {
@@ -364,5 +448,8 @@ test("failed context readers reject accessor ports without invoking them", () =>
   const port = {};
   Object.defineProperty(port, "getDetail", { get() { calls += 1; return async () => {}; } });
   assert.throws(() => new FailedCodeJobContextReader({ codeJobReader: port, ledger: {} }), TypeError);
+  const ledger = { async listTimeline() {} };
+  Object.defineProperty(ledger, 'verifyPullRequestExecutionBinding', { get() { calls += 1; return async () => {}; } });
+  assert.throws(() => new FailedCodeJobContextReader({ codeJobReader: { async getDetail() {} }, ledger }), TypeError);
   assert.equal(calls, 0);
 });
