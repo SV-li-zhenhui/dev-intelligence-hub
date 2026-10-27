@@ -2686,8 +2686,20 @@ export class ControlledGitService {
       }
       const evidence = validatedBlob(bytes, entry.oid, this.#limits, baseBoundary.objectFormat,
         { textOnly: conflictPaths.has(entry.path) });
-      await this.#sealBlob(blobDirectory, bytes);
       treeEntries.push(deepFreeze({ ...entry, ...evidence }));
+    }
+    // Different tree paths can share one blob. Seal each OID once so concurrent
+    // writers never mistake a still-open duplicate for corrupted evidence.
+    const uniqueBlobs = [...blobs.values()];
+    for (let offset = 0; offset < uniqueBlobs.length; offset += 4) {
+      throwIfPreparationAborted();
+      const results = await Promise.allSettled(
+        uniqueBlobs.slice(offset, offset + 4).map((bytes) =>
+          this.#sealBlob(blobDirectory, bytes)),
+      );
+      // Drain started writers before failure can trigger scratch cleanup.
+      const failed = results.find((result) => result.status === "rejected");
+      if (failed) throw failed.reason;
     }
     const treePaths = new Set(treeEntries.map(({ path: relativePath }) => relativePath));
     if ([...conflictPaths].some((relativePath) => !treePaths.has(relativePath))) {

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import fsPromises from "node:fs/promises";
 import {
   access,
   chmod,
@@ -12,6 +13,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -105,6 +107,7 @@ async function fixture(t, {
   mutateGitDuringRun = false,
   mergeBaseOutput = Buffer.from(`${MERGE_BASE}\n`),
   mergeBaseExitCode = 0,
+  extraBlobs = [],
 } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "controlled-git-service-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -167,6 +170,7 @@ async function fixture(t, {
     [THEIRS, THEIRS_CONTENT],
     [README, README_CONTENT],
     [RESULT_CONFLICT, RESULT_CONFLICT_CONTENT],
+    ...extraBlobs,
   ]);
   const processRunner = {
     calls: [],
@@ -235,6 +239,161 @@ function inspectionRequest(setup) {
     headMirrorRoot: setup.headMirrorRoot,
   };
 }
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((complete) => { resolve = complete; });
+  return { promise, resolve };
+}
+
+async function sealingFixture(t) {
+  const contents = Array.from({ length: 7 }, (_, index) => Buffer.from(`document ${index}\n`));
+  const paths = contents.map((_, index) => `files/${index}.txt`);
+  const records = contents.map((bytes, index) => `100644 blob ${blobOid(bytes)}\t${paths[index]}\0`);
+  paths.push("files/repeat.txt", "src/value.js");
+  records.push(`100644 blob ${blobOid(contents[0])}\tfiles/repeat.txt\0`,
+    `100644 blob ${RESULT_CONFLICT}\tsrc/value.js\0`);
+  const setup = await fixture(t, {
+    treeOutput: Buffer.from(records.join("")),
+    extraBlobs: contents.map((bytes) => [blobOid(bytes), bytes]),
+  });
+  return {
+    ...setup,
+    paths,
+    blobNames: new Set([...contents, RESULT_CONFLICT_CONTENT].map((bytes) =>
+      `${createHash("sha256").update(bytes).digest("hex")}.blob`)),
+  };
+}
+
+function observeSealing(t, setup, onSync) {
+  const originalOpen = fsPromises.open;
+  const originalRm = fsPromises.rm;
+  const firstStarted = deferred();
+  const fourSyncsStarted = deferred();
+  const firstClosed = deferred();
+  const state = { started: [], synced: [], closed: [], active: 0, maximumActive: 0, cleanupActive: [] };
+  t.mock.method(fsPromises, "open", async (file, flags, ...args) => {
+    if (flags !== "wx" || !setup.blobNames.has(path.basename(file))) {
+      return originalOpen(file, flags, ...args);
+    }
+    const ordinal = state.started.length;
+    state.started.push(path.basename(file));
+    state.maximumActive = Math.max(state.maximumActive, ++state.active);
+    firstStarted.resolve();
+    const handle = await originalOpen(file, flags, ...args);
+    const originalSync = handle.sync.bind(handle);
+    const originalClose = handle.close.bind(handle);
+    t.mock.method(handle, "sync", async () => {
+      state.synced.push(ordinal);
+      if (state.synced.length === 4) fourSyncsStarted.resolve();
+      await onSync(ordinal);
+      await originalSync();
+    });
+    t.mock.method(handle, "close", async () => {
+      await originalClose();
+      state.active -= 1;
+      state.closed.push(ordinal);
+      if (ordinal === 0) firstClosed.resolve();
+    });
+    return handle;
+  });
+  t.mock.method(fsPromises, "rm", async (file, ...args) => {
+    if (path.dirname(file) === setup.preparationRoot && path.basename(file).startsWith(".controlled-git-scratch-")) {
+      state.cleanupActive.push(state.active);
+    }
+    return originalRm(file, ...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  return { state, firstStarted, fourSyncsStarted, firstClosed };
+}
+
+test("result sealing overlaps four distinct durable writes and preserves duplicate paths", async (t) => {
+  const setup = await sealingFixture(t);
+  const release = deferred();
+  const { state, firstStarted } = observeSealing(t, setup, () => release.promise);
+  const inspection = setup.createService().inspectConflict(inspectionRequest(setup));
+  let firstBatchSize;
+  try {
+    await firstStarted.promise;
+    firstBatchSize = state.started.length;
+  } finally {
+    release.resolve();
+  }
+  const prepared = await inspection;
+  assert.equal(firstBatchSize, 4);
+  assert.equal(state.maximumActive, 4);
+  assert.equal(state.active, 0);
+  assert.deepEqual(new Set(state.started), setup.blobNames);
+  assert.equal(state.started.length, setup.blobNames.size);
+  assert.equal(state.synced.length, state.started.length);
+  assert.equal(state.closed.length, state.started.length);
+  const directory = path.join(setup.preparationRoot, "preparations", prepared.preparationId);
+  const manifest = JSON.parse(await readFile(path.join(directory, "manifest.json"), "utf8"));
+  assert.deepEqual(manifest.treeEntries.map(({ path }) => path), setup.paths);
+  assert.equal(manifest.treeEntries[0].sha256, manifest.treeEntries[7].sha256);
+  assert.equal((await setup.createService().verifyPreparation({ preparationId: prepared.preparationId })).preparationId,
+    prepared.preparationId);
+});
+
+test("failed result sealing closes its entire batch before scratch cleanup", async (t) => {
+  const setup = await sealingFixture(t);
+  const failFirst = deferred();
+  const releaseRest = deferred();
+  const failure = new Error("simulated blob flush failure");
+  const { state, fourSyncsStarted, firstClosed } = observeSealing(t, setup, async (ordinal) => {
+    await (ordinal === 0 ? failFirst.promise : releaseRest.promise);
+    if (ordinal === 0) throw failure;
+  });
+  let settled = false;
+  const inspection = setup.createService().inspectConflict(inspectionRequest(setup));
+  const result = inspection.then(() => { settled = true; return null; }, (error) => { settled = true; return error; });
+  let whileOtherFlushesBlocked;
+  try {
+    await fourSyncsStarted.promise;
+    failFirst.resolve();
+    await firstClosed.promise;
+    await new Promise(setImmediate);
+    whileOtherFlushesBlocked = { settled, active: state.active, cleanupActive: [...state.cleanupActive] };
+  } finally {
+    failFirst.resolve();
+    releaseRest.resolve();
+  }
+  assert.equal((await result).cause, failure);
+  assert.deepEqual(whileOtherFlushesBlocked, { settled: false, active: 3, cleanupActive: [] });
+  assert.equal(state.started.length, 4);
+  assert.equal(state.active, 0);
+  assert.equal(state.closed.length, 4);
+  assert.deepEqual(state.cleanupActive, [0]);
+  assert.deepEqual(await readdir(setup.preparationRoot), []);
+});
+
+test("result sealing drains cancellation before starting another batch", async (t) => {
+  const setup = await sealingFixture(t);
+  const release = deferred();
+  const controller = new AbortController();
+  const { state, fourSyncsStarted } = observeSealing(t, setup, () => release.promise);
+  const inspection = withPreparationCancellation(controller.signal, () =>
+    setup.createService().inspectConflict(inspectionRequest(setup)));
+  const result = inspection.then(() => null, (error) => error);
+  let activeWhenCancelled;
+  try {
+    await fourSyncsStarted.promise;
+    controller.abort();
+    activeWhenCancelled = state.active;
+  } finally {
+    release.resolve();
+  }
+  const error = await result;
+  assert.equal(activeWhenCancelled, 4);
+  assert.equal(error.code, "CONTROLLED_GIT_INSPECTION_FAILED");
+  assert.equal(error.cause.code, "CODE_PREPARATION_ABORTED");
+  assert.equal(state.started.length, 4);
+  assert.equal(state.closed.length, 4);
+  assert.equal(state.active, 0);
+  assert.deepEqual(state.cleanupActive, [0]);
+  assert.deepEqual(await readdir(setup.preparationRoot), []);
+});
 
 test("seals a both-modified conflict behind fixed Git commands and a content manifest", async (t) => {
   const setup = await fixture(t);
