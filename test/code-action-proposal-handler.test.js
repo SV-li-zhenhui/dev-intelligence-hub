@@ -306,7 +306,7 @@ function handler(producer, reader, grant = grantFor(), overrides = {}) {
   };
 }
 
-for (const changedCreation of ['unavailable', 'different-current-grant']) test(`an approved job continues with its verified original grant when new creation is ${changedCreation}`, async () => {
+for (const changedCreation of ['unavailable', 'different-current-grant']) test(`an approved handoff follows its original job when new creation is ${changedCreation}`, async () => {
   const grant = grantFor(), producer = new FakeConfirmationProducer('completed'), reader = new FakeCodeJobReader(queuedJob(grant));
   let changed = false, creates = 0, verifies = 0;
   const instance = handler(producer, reader, grant, { grantFactory: {
@@ -323,27 +323,38 @@ for (const changedCreation of ['unavailable', 'different-current-grant']) test(`
   const next = await instance.value.handle(handlerInput({ status: 'running', downstreamRef: first.downstreamRef }));
   assert.equal(next.status, 'running');
   assert.equal(creates, 1, 'polling an approved job does not create another grant');
-  assert.equal(verifies, 1);
+  assert.equal(verifies, 0, 'observation does not reauthorize an already handed-off job');
   assert.equal(producer.enqueueCalls.length, 1);
   assert.equal(producer.invalidateCalls.length, 0);
 });
 
-test('approved job continuation still isolates genuinely revoked original authority', async () => {
+for (const code of ['INVALID_CODE_JOB_AUTHORITY', 'CONTROLLED_GIT_TIMEOUT']) test(`an approved handoff follows executor state despite observer verification error ${code}`, async () => {
   const grant = grantFor(), producer = new FakeConfirmationProducer('completed'), reader = new FakeCodeJobReader(queuedJob(grant));
   const instance = handler(producer, reader, grant, { grantFactory: { ...authority(grant).factory,
-    async verify() { throw Object.assign(new Error('Head or permission changed'), { code: 'INVALID_CODE_JOB_AUTHORITY' }); } } });
+    async verify() { throw Object.assign(new Error('verification unavailable or revoked'), { code }); } } });
   const first = await instance.value.handle(handlerInput()), reads = reader.getCalls.length;
   const next = await instance.value.handle(handlerInput({ status: 'running', downstreamRef: first.downstreamRef }));
-  assert.equal(next.status, 'stale');
-  assert.equal(reader.getCalls.length, reads, 'revoked grant cannot authorize job polling');
+  assert.equal(next.status, 'running');
+  assert.equal(reader.getCalls.length, reads + 1);
+  reader.value = queuedJob(grant, {
+    status: 'fenced', revision: 5,
+    terminalResult: { kind: 'fenced', recordedAt: CREATED_AT },
+    memoryProjection: { recordId: `memory-${'d'.repeat(64)}`, projectedAt: CREATED_AT },
+  });
+  const fenced = await instance.value.handle(handlerInput({ status: 'running', downstreamRef: first.downstreamRef }));
+  assert.equal(fenced.status, 'unknown');
+  assert.ok(fenced.evidence.includes('code-job-status:fenced'));
+  assert.equal(producer.enqueueCalls.length, 1);
+  assert.equal(producer.invalidateCalls.length, 0);
 });
 
-for (const variant of ['changed-verifier-result', 'forged-receipt']) test(`approved grant continuation rejects ${variant}`, async () => {
+for (const variant of ['changed-sealed-grant', 'changed-job-grant', 'forged-receipt']) test(`approved grant continuation rejects ${variant}`, async () => {
   const grant = grantFor(), producer = new FakeConfirmationProducer('completed'), reader = new FakeCodeJobReader(queuedJob(grant));
-  const instance = handler(producer, reader, grant, { grantFactory: { ...authority(grant).factory,
-    async verify(value) { return variant === 'changed-verifier-result' ? { ...value, brainDigest: '7'.repeat(64) } : value; } } });
+  const instance = handler(producer, reader, grant);
   const first = await instance.value.handle(handlerInput());
   if (variant === 'forged-receipt') producer.overrides = { receipt: { id: `code-job-${'7'.repeat(55)}`, createdAt: CREATED_AT } };
+  if (variant === 'changed-sealed-grant') producer.plan.action.grant.brainDigest = '7'.repeat(64);
+  if (variant === 'changed-job-grant') reader.value.brainDigest = '7'.repeat(64);
   await assert.rejects(instance.value.handle(handlerInput({ status: 'running', downstreamRef: first.downstreamRef })));
   assert.equal(producer.enqueueCalls.length, 1);
 });
@@ -852,7 +863,7 @@ test("a lost proposal advance still finds and revokes its stable confirmation sl
   assert.equal(reader.getCalls.length, 0);
 });
 
-test("an already completed old confirmation is isolated without claiming revocation", async () => {
+test("an already completed handoff follows the original job without a grant verification port", async () => {
   const firstGrant = grantFor();
   const { grantDigest: _grantDigest, ...firstGrantContent } = firstGrant;
   const secondGrant = createCodeJobGrant({
@@ -884,11 +895,9 @@ test("an already completed old confirmation is isolated without claiming revocat
     }),
   );
 
-  assert.equal(transition.status, "stale");
-  assert.match(transition.summary, /隔离/);
-  assert.doesNotMatch(transition.summary, /已撤销/);
+  assert.equal(transition.status, "running");
   assert.equal(producer.invalidateCalls.length, 0);
-  assert.equal(reader.getCalls.length, 0);
+  assert.deepEqual(reader.getCalls, [codeJobIdForGrant(firstGrant)]);
 });
 
 test("rejected, stale, and failed confirmations never start a code job", async (t) => {
@@ -1114,6 +1123,6 @@ test("the real proposal runner continues the approved original grant when creati
   assert.equal(store.value.proposals[0].status, "running");
   assert.equal(store.value.results.length, 0);
   assert.equal(trusted.calls.length, 1);
-  assert.equal(verifies, 2);
+  assert.equal(verifies, 0);
   await runtime.close();
 });
