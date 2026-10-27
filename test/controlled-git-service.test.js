@@ -815,7 +815,7 @@ test("enforces the evidence-directory limit before descending into overflow topo
   );
 });
 
-test("rejects result-tree paths excluded by the Code Job execution policy", async (t) => {
+test("preserves excluded result-tree paths without exposing them to the Code Job", async (t) => {
   for (const excludedPath of [
     ".env.production",
     "config.local.json",
@@ -834,12 +834,30 @@ test("rejects result-tree paths excluded by the Code Job execution policy", asyn
             `100644 blob ${RESULT_CONFLICT}\tsrc/value.js\0`,
         ),
       });
-      await assert.rejects(
-        setup.createService().inspectConflict(inspectionRequest(setup)),
-        (error) => error?.code === "CONTROLLED_GIT_UNSUPPORTED_TREE",
-      );
+      const service = setup.createService();
+      const prepared = await service.inspectConflict(inspectionRequest(setup));
+      const targetRoot = path.join(setup.root, "workspace");
+      await mkdir(targetRoot);
+      const receipt = await service.materializeForCodeJob({ preparationId: prepared.preparationId, targetRoot });
+      assert.equal(receipt.files.some(entry => entry.path === excludedPath), false);
+      await assert.rejects(access(path.join(targetRoot, excludedPath)), { code: "ENOENT" });
+      assert.match(await readFile(path.join(targetRoot, "src/value.js"), "utf8"), /<<<<<<< /);
     });
   }
+});
+
+test("excluded paths cannot become editable conflict documents", async t => {
+  const excludedPath = "data/value.js";
+  const setup = await fixture(t, {
+    mergeOutput: conflictProtocol({ pathName: excludedPath }),
+    headRaw: rawModification(ANCESTOR, OURS, excludedPath),
+    baseRaw: rawModification(ANCESTOR, THEIRS, excludedPath),
+    headNumstat: Buffer.from(`1\t1\t${excludedPath}\0`),
+    baseNumstat: Buffer.from(`1\t1\t${excludedPath}\0`),
+    treeOutput: Buffer.from(`100644 blob ${RESULT_CONFLICT}\t${excludedPath}\0`),
+  });
+  await assert.rejects(setup.createService().inspectConflict(inspectionRequest(setup)),
+    error => error.code === "CONTROLLED_GIT_UNSUPPORTED_CONFLICT");
 });
 
 test("rejects non-modification, mode, binary, and unsafe result-tree entries", async (t) => {

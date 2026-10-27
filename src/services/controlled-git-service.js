@@ -792,12 +792,6 @@ function parseResultTree(bytes, oidLength, limits) {
       );
     }
     const relativePath = normalizeConflictPath(match[4], limits);
-    if (CODE_JOB_PATH_POLICY.isExcluded(relativePath)) {
-      throw controlledGitError(
-        "CONTROLLED_GIT_UNSUPPORTED_TREE",
-        "Result tree 包含 Code Job 默认排除路径",
-      );
-    }
     return {
       path: relativePath,
       mode: "100644",
@@ -2602,6 +2596,11 @@ export class ControlledGitService {
     const conflicts = [];
     let totalBytes = 0;
     for (const conflict of merge.conflicts) {
+      // Unrelated excluded files stay in the sealed Git tree and are skipped
+      // during materialization. Only editable conflict documents need access.
+      if (CODE_JOB_PATH_POLICY.isExcluded(conflict.path)) {
+        throw controlledGitError("CONTROLLED_GIT_UNSUPPORTED_CONFLICT", "Conflict path 被 Code Job 策略排除");
+      }
       const stages = [];
       for (const stage of conflict.stages) {
         const output = checkedProcessOutput(

@@ -203,7 +203,7 @@ async function workspaceFiles(root) {
   return files.sort((left, right) => left.localeCompare(right, "en"));
 }
 
-async function createRepositoryFixture(t, gitCommand, { binaryConflict = false, oneSidedDirectories = false, deploymentAssets = false } = {}) {
+async function createRepositoryFixture(t, gitCommand, { binaryConflict = false, oneSidedDirectories = false, deploymentAssets = false, excludedAssets = false } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "controlled-git-integration-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const repositoryRoot = path.join(root, "source");
@@ -242,6 +242,10 @@ async function createRepositoryFixture(t, gitCommand, { binaryConflict = false, 
       "head side at ancestor\n",
     ),
   ]);
+  if (excludedAssets) {
+    await mkdir(path.join(repositoryRoot, "Test/Data"), { recursive: true });
+    await writeFile(path.join(repositoryRoot, "Test/Data/sample.mat"), "tracked test fixture\n");
+  }
   if (deploymentAssets) {
     await mkdir(path.join(repositoryRoot, 'Projects/Deploy'), { recursive: true });
     await writeFile(path.join(repositoryRoot, 'Projects/Deploy/GCL.mat.enc'), Buffer.alloc(5_127_832, 1));
@@ -351,6 +355,23 @@ function serviceFor(gitCommand, setup) {
 }
 
 const gitCommand = locateGit();
+
+test("tracked test data does not block an unrelated text conflict or enter its editable workspace", { skip: gitCommand === null }, async t => {
+  const setup = await createRepositoryFixture(t, gitCommand, { excludedAssets: true });
+  const service = serviceFor(gitCommand, setup);
+  const prepared = await service.inspectConflict(setup.request);
+  assert.equal(prepared.status, "conflicted");
+  const binding = createConflictPreparationBinding({ preparation: prepared, gitTarget: setup.request.gitTarget });
+  const workspace = path.join(setup.root, "workspace"); await mkdir(workspace);
+  const receipt = await service.materializeConflictPreparationForCodeJob({ binding, targetRoot: workspace, excludePaths: [] });
+  assert.equal(receipt.files.some(entry => entry.path === "Test/Data/sample.mat"), false);
+  assert.equal(existsSync(path.join(workspace, "Test/Data/sample.mat")), false);
+  assert.match(await readFile(path.join(workspace, "src/conflict.txt"), "utf8"), /<<<<<<< /);
+  const resultTreeObject = await findLooseObject(setup.preparationRoot, prepared.resultTreeOid);
+  assert.equal(await resultTreeFile(gitCommand, setup,
+    path.dirname(path.dirname(resultTreeObject)),
+    prepared.resultTreeOid, "Test/Data/sample.mat"), "tracked test fixture\n");
+});
 
 test('unchanged deployment assets do not prevent preparing and materializing a text conflict', { skip: gitCommand === null }, async t => {
   const setup = await createRepositoryFixture(t, gitCommand, { deploymentAssets: true });
