@@ -595,7 +595,7 @@ export class CodeJobWorkerService {
     const selected = await this.#selectCycle(options);
     const processSelected = async selectedJob => {
       options.signal?.throwIfAborted();
-      if (selectedJob.status === "active" && this.#maintenanceRetryNotBefore.has(selectedJob.jobId)) {
+      if (["queued", "starting", "active"].includes(selectedJob.status) && this.#maintenanceRetryNotBefore.has(selectedJob.jobId)) {
         return { jobId: selectedJob.jobId, status: "retry", actionType: null, code: "CODE_JOB_MAINTENANCE_BACKOFF" };
       }
       try {
@@ -2067,8 +2067,11 @@ export class CodeJobWorkerService {
       stoppedCodeJobQueueTimeout(current, await this.#taskRuns.get('code-job', jobId));
     const stoppedPreparedRead = code === 'STRUCTURED_PROVIDER_RESPONSE_INVALID' && hasUnadmittedProtocolRead(current) &&
       this.#taskRuns?.get && codeProtocolRecoveryFor(current, await this.#taskRuns.get('code-job', jobId)) === code;
-    if ((brainFailureOwnerAttention(code) !== null || code === "STRUCTURED_PROVIDER_RESPONSE_INVALID" || stoppedQueueWait) && current?.status === "active" &&
-        (current.execution.pendingAction === null || stoppedPreparedRead) && current.execution.actionAdmission === null) {
+    const authorityVerificationUnavailable = code === "CODE_JOB_AUTHORITY_VERIFICATION_UNAVAILABLE" && current &&
+      ["queued", "starting", "active"].includes(current.status) && current.execution.actionAdmission === null;
+    if (authorityVerificationUnavailable ||
+        ((brainFailureOwnerAttention(code) !== null || code === "STRUCTURED_PROVIDER_RESPONSE_INVALID" || stoppedQueueWait) && current?.status === "active" &&
+          (current.execution.pendingAction === null || stoppedPreparedRead) && current.execution.actionAdmission === null)) {
       const now = new Date(this.#clock()).getTime();
       if (!Number.isFinite(now)) throw workerError("CODE_JOB_CLOCK_INVALID", "Code job worker clock is invalid");
       if (this.#maintenanceRetryNotBefore.size >= 1_024) {

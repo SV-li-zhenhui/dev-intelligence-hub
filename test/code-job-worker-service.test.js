@@ -19,6 +19,8 @@ import { OperationQueue } from "../src/lib/operation-queue.js";
 import { CodeJobStore } from "../src/services/code-job-store.js";
 import { CodeJobBrainDirectory } from "../src/services/code-job-brain-directory.js";
 import { CodeJobWorkerService } from "../src/services/code-job-worker-service.js";
+import { CodeJobGrantFactory } from "../src/services/code-job-grant-factory.js";
+import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { createTaskRunSettler } from '../src/services/work-ledger-run-control.js';
 import { currentTaskExecution } from '../src/lib/task-execution-context.js';
@@ -1087,6 +1089,81 @@ test("continuous execution records an uncertain admitted action and never admits
   assert.equal(result.outcomes[0].status, "unknown", JSON.stringify(result));
   assert.equal(current.execution.actionAdmission !== null, true);
   assert.equal(fixture.executor.calls.filter(({ method }) => method === "perform").length, 1);
+});
+
+for (const status of ["starting", "active"]) test(`temporary real authority verification preserves a ${status} job and backs off before retrying`, async () => {
+  let now = Date.parse("2026-08-02T08:00:00.000Z");
+  const clock = () => new Date(now);
+  const fixture = await createVerifiedApprovedJob(clock);
+  let current = (await fixture.jobs.claimStarting({ jobId: fixture.durableJob.jobId, expectedRevision: fixture.durableJob.revision })).job;
+  if (status === "active") current = (await fixture.jobs.activate({ jobId: current.jobId, expectedRevision: current.revision, workspaceRevision: REVISION_A })).job;
+  const executor = new FakeExecutor(current), brainCalls = [];
+  const worker = new CodeJobWorkerService({ jobStore: fixture.jobs, executor, clock,
+    grantVerifier: fixture.factory, brainDirectory: brain([{ type: "run_profile" }], brainCalls) });
+  fixture.failWith(Object.assign(new Error("ledger read unavailable"), { code: "WORK_LEDGER_NOT_READY" }));
+  const result = await worker.runCycle();
+  assert.equal(result.outcomes[0].status, "retry");
+  assert.equal(result.outcomes[0].code, "CODE_JOB_AUTHORITY_VERIFICATION_UNAVAILABLE");
+  assert.deepEqual(await fixture.jobs.getForWorker(current.jobId), current);
+  assert.deepEqual(executor.calls, []);
+  assert.equal(brainCalls.length, 0);
+  const checks = fixture.checks();
+  fixture.failWith(null);
+  assert.equal((await worker.runCycle()).outcomes[0].code, "CODE_JOB_MAINTENANCE_BACKOFF");
+  assert.equal(fixture.checks(), checks);
+  now += 60_000;
+  assert.equal((await worker.runCycle()).outcomes[0].actionType, "run_profile");
+  assert.equal((await fixture.jobs.getForWorker(current.jobId)).status, "active");
+  assert.equal(executor.calls.filter(({ method }) => method === "perform").length, 1);
+});
+
+test("continuous real verifier outage after a settled action cannot admit another tool or complete the job", async () => {
+  let now = Date.parse("2026-08-02T08:00:00.000Z"), decisions = 0;
+  const clock = () => new Date(now), fixture = await createVerifiedApprovedJob(clock);
+  const executor = new FakeExecutor(fixture.durableJob);
+  const worker = new CodeJobWorkerService({ jobStore: fixture.jobs, executor, clock, grantVerifier: fixture.factory,
+    brainDirectory: { describe: () => ({ supportsCodeExecution: true, supportsCodeReading: true }),
+      async decide({ codeExecutionContext }) {
+        decisions++;
+        if (decisions > 1) return continuousDecision({ type: "complete", outcome: "done", evidence: [] });
+        const tools = beginCodeExecutionSession(codeExecutionContext);
+        await tools.invoke("perform_action", { decision: continuousDecision({ type: "run_profile" }) });
+        fixture.failWith(Object.assign(new Error("assignment facts unavailable"), { code: "OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE" }));
+        await assert.rejects(tools.invoke("perform_action", { decision: continuousDecision({ type: "list_files", path: "" }) }),
+          { code: "CODE_JOB_AUTHORITY_VERIFICATION_UNAVAILABLE" });
+        await tools.close();
+        return continuousDecision({ type: "complete", outcome: "cannot complete while authority is unavailable", evidence: [] });
+      } } });
+  const result = await worker.runCycle();
+  assert.equal(result.outcomes[0].status, "retry");
+  assert.equal(result.outcomes[0].code, "CODE_JOB_AUTHORITY_VERIFICATION_UNAVAILABLE");
+  const current = await fixture.jobs.getForWorker(fixture.durableJob.jobId);
+  assert.equal(current.status, "active");
+  assert.equal(current.execution.pendingAction, null);
+  assert.equal(current.execution.actionAdmission, null);
+  assert.equal(current.execution.result, null);
+  assert.deepEqual(current.execution.observations.map(({ actionType }) => actionType), ["run_profile"]);
+  assert.equal((await worker.runCycle()).outcomes[0].code, "CODE_JOB_MAINTENANCE_BACKOFF");
+  assert.equal(decisions, 1);
+  fixture.failWith(null); now += 60_000;
+  assert.equal((await worker.runCycle()).outcomes[0].status, "completed");
+  assert.deepEqual(executor.calls.filter(({ method }) => method === "perform").map(({ value }) => value.action.type), ["run_profile", "complete"]);
+});
+
+for (const control of ["pause", "cancel"]) test(`authority verification backoff does not delay ${control} reconciliation`, async () => {
+  let now = Date.parse("2026-08-01T00:00:02.000Z");
+  const clock = () => new Date(now), fixture = await createVerifiedApprovedJob(clock);
+  const starting = (await fixture.jobs.claimStarting({ jobId: fixture.durableJob.jobId, expectedRevision: fixture.durableJob.revision })).job;
+  const executor = new FakeExecutor(starting);
+  const worker = new CodeJobWorkerService({ jobStore: fixture.jobs, executor, clock, grantVerifier: fixture.factory, brainDirectory: brain([]) });
+  fixture.failWith(Object.assign(new Error("ledger not ready"), { code: "WORK_LEDGER_NOT_READY" }));
+  assert.equal((await worker.runCycle()).outcomes[0].status, "retry");
+  await fixture.jobs[control]({ jobId: starting.jobId, expectedRevision: starting.revision, reason: "owner control during backoff" });
+  now += 2_000;
+  const result = await worker.runCycle();
+  assert.equal(result.outcomes[0].status, control === "pause" ? "paused" : "cancelled", JSON.stringify(result.outcomes));
+  assert.equal((await fixture.jobs.getForWorker(starting.jobId)).status, control === "pause" ? "paused" : "cancelled");
+  assert.equal(executor.calls.some(({ method }) => ["start", "perform"].includes(method)), false);
 });
 
 test("continuous authority revocation after one action durably fences later tools and completion", async () => {
@@ -3838,6 +3915,31 @@ async function createRealApprovedJob(grantOverrides = {}, {
   });
   const durableJob = await jobs.getForWorker(created.job.jobId);
   return {jobs,created,durableJob};
+}
+
+async function createVerifiedApprovedJob(clock) {
+  let failure = null, checks = 0;
+  const binding = conflictInputBinding();
+  const factory = new CodeJobGrantFactory({
+    executorAuthority: { workspaces: [{ id: "dashboard", capabilities: ["git_head_snapshot"],
+      writablePaths: ["src", "test"], requiredProfiles: [{ id: "node-tests", configDigest: PROFILE_DIGEST }], authorityDigest: "2".repeat(64) }] },
+    policyVersion: 1, workspaceByRepository: { "acme/dashboard": "dashboard" },
+    codeActionRoles: ["developer"], codeOperationsByRole: { developer: ["inspect"] },
+    taskBrainByRole: { developer: { provider: "ollama", model: "test-model", remoteData: { requirements: false, code: false, memory: false } } },
+    brainProviders: { ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:11434" } },
+    inputAuthorityVerifier: { verify(value) { checks++; if (failure) throw failure; return structuredClone(value); } },
+  });
+  const { grant: sealed } = factory.create(normalizeBoundWorkProposal({
+    proposalId: "verified-worker-proposal", policyVersion: 1, kind: "code_action_proposal",
+    requestedBy: { roleId: "developer", workItemId: binding.rootItemId },
+    source: { assignmentId: "verified-worker-assignment", eventId: binding.eventId },
+    binding: { eventId: binding.eventId, subject: { id: "github:pr:acme/dashboard#42", repository: "acme/dashboard", number: 42 },
+      repository: "acme/dashboard", workspaceId: "dashboard", inputBinding: binding },
+    payload: { operation: "inspect", objective: "Inspect with current authority", acceptanceCriteria: ["Current authority is verified"],
+      evidence: [], summary: "Verify before effects", reason: "Temporary check failures preserve the checkpoint" },
+  }));
+  const { grantDigest: _grantDigest, ...content } = sealed;
+  return { ...await createRealApprovedJob(content, { clock }), factory, failWith: value => { failure = value; }, checks: () => checks };
 }
 
 async function createRealReviewRepairJob(sourceKind = 'review_repair') {

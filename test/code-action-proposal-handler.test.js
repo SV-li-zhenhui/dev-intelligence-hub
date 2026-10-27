@@ -17,6 +17,7 @@ import {
   createCodeActionProposalRunnerService,
 } from "../src/services/code-action-proposal-handler.js";
 import { createWorkProposalRuntime } from "../src/work-proposal-runtime.js";
+import { CodeJobGrantFactory } from "../src/services/code-job-grant-factory.js";
 
 const CREATED_AT = "2026-08-02T03:00:01.000Z";
 const HEAD_REF_OID = "1".repeat(40);
@@ -1063,6 +1064,120 @@ class Guard {
   }
   async close() {}
 }
+
+test("temporary real grant verification failures retry without making the proposal or pending confirmation stale", async (t) => {
+  const value = proposal();
+  const store = new MemoryStore();
+  let now = Date.parse("2026-08-02T03:00:00.000Z");
+  let unavailableCode = "WORK_LEDGER_NOT_READY";
+  const grantFactory = new CodeJobGrantFactory({
+    executorAuthority: {
+      workspaces: [{
+        id: "acme-workspace",
+        capabilities: ["git_head_snapshot"],
+        writablePaths: ["src"],
+        requiredProfiles: [{ id: "node-tests", configDigest: "b".repeat(64) }],
+        authorityDigest: "9".repeat(64),
+      }],
+    },
+    policyVersion: 7,
+    workspaceByRepository: { "acme/repo": "acme-workspace" },
+    codeActionRoles: ["developer"],
+    codeOperationsByRole: { developer: ["modify"] },
+    taskBrainByRole: {
+      developer: {
+        provider: "ollama", model: "qwen3.5:9b",
+        remoteData: { requirements: false, code: false, memory: false },
+      },
+    },
+    brainProviders: { ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:11434" } },
+    inputAuthorityVerifier: {
+      async verify(binding) {
+        if (unavailableCode !== null) {
+          throw Object.assign(new Error("authority verification is temporarily unavailable"), { code: unavailableCode });
+        }
+        return structuredClone(binding);
+      },
+    },
+  });
+  const runtime = await createWorkProposalRuntime({
+    store,
+    clock: () => new Date(now),
+    idFactory: () => "code-proposal-operational-lease",
+    runnerScopes: [{
+      runnerId: "code-runner",
+      allowedKinds: ["code_action_proposal"],
+      allowedRoleIds: ["developer"],
+    }],
+    createGuard: () => new Guard(),
+  });
+  t.after(() => runtime.close());
+  const producer = new FakeConfirmationProducer();
+  producer.get = async (id) => {
+    producer.getCalls.push(id);
+    if (producer.plan === null) {
+      throw Object.assign(new Error("confirmation not created"), { code: "CONFIRMATION_NOT_FOUND" });
+    }
+    return confirmationItem(producer.plan, producer.status, producer.overrides);
+  };
+  const reader = new FakeCodeJobReader(null);
+  const service = createCodeActionProposalRunnerService({
+    enabled: true,
+    runner: runtime.runners["code-runner"],
+    confirmationProducer: producer,
+    codeJobReader: reader,
+    grantFactory,
+    clock: () => new Date(now),
+    pollIntervalMs: 1_000,
+    leaseDurationMs: 30_000,
+  });
+  const { contentDigest: _contentDigest, ...input } = value;
+  await runtime.producer.create(input);
+
+  const failed = await service.runCycle({ limit: 1 });
+  assert.equal(failed.outcomes[0].status, "waiting_retry");
+  assert.equal(store.value.proposals[0].lastError.reason, "CODE_JOB_AUTHORITY_VERIFICATION_UNAVAILABLE");
+  assert.equal(store.value.proposals[0].nextAttemptAt, "2026-08-02T03:00:30.000Z");
+  assert.equal(store.value.proposals[0].downstreamRef, null);
+  assert.equal(store.value.results.length, 0);
+  assert.equal(producer.enqueueCalls.length, 0);
+  assert.equal(producer.invalidateCalls.length, 0);
+  assert.deepEqual(reader.getCalls, []);
+
+  unavailableCode = null;
+  now += 30_000;
+  await service.runCycle({ limit: 1 });
+  const confirmationId = codeJobConfirmationIdForProposal(value);
+  assert.equal(store.value.proposals[0].status, "waiting_confirmation");
+  assert.equal(store.value.proposals[0].downstreamRef, confirmationId);
+  assert.equal(producer.plan.id, confirmationId);
+  assert.equal(producer.enqueueCalls.length, 1);
+
+  unavailableCode = "OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE";
+  now += 1_000;
+  await service.runCycle({ limit: 1 });
+  assert.equal(store.value.proposals[0].status, "waiting_retry");
+  assert.equal(store.value.proposals[0].lastError.reason, "CODE_JOB_AUTHORITY_VERIFICATION_UNAVAILABLE");
+  assert.equal(store.value.proposals[0].downstreamRef, confirmationId);
+  assert.equal(producer.status, "pending");
+  assert.equal(producer.enqueueCalls.length, 1);
+  assert.equal(producer.invalidateCalls.length, 0);
+  assert.equal(store.value.results.length, 0);
+  assert.deepEqual(reader.getCalls, []);
+
+  const retryAt = Date.parse(store.value.proposals[0].nextAttemptAt);
+  now = retryAt - 1;
+  assert.equal((await service.runCycle({ limit: 1 })).claimed, 0);
+  unavailableCode = null;
+  now = retryAt;
+  await service.runCycle({ limit: 1 });
+  assert.equal(store.value.proposals[0].status, "waiting_confirmation");
+  assert.equal(store.value.proposals[0].downstreamRef, confirmationId);
+  assert.equal(producer.enqueueCalls.length, 1);
+  assert.equal(producer.invalidateCalls.length, 0);
+  assert.equal(store.value.results.length, 0);
+  assert.deepEqual(reader.getCalls, []);
+});
 
 test("the real proposal runner continues the approved original grant when creation rules change", async () => {
   const value = proposal();
