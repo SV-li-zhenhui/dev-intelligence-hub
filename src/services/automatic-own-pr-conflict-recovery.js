@@ -2,8 +2,11 @@ import { isDeepStrictEqual } from "node:util";
 import { normalizePullRequestExecutionBinding, samePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
 import { unstartedConflictDispatchFailure } from "./work-ledger-conflict-failure.js";
-import { codeConfirmationSettlementId, completedCodeConfirmationForSettlement, unstartedConflictProposalForRecovery } from "./work-ledger-code-confirmation-settlement.js";
+import { codeConfirmationSettlementId, completedCodeConfirmationForSettlement, failedCodeConfirmationRecoveryId,
+  failedCodeConfirmationForRecovery, unstartedConflictProposalForRecovery } from "./work-ledger-code-confirmation-settlement.js";
 import { ObsoleteCodeJobSettler, hasUnstartedCodeJobAuthorityFence, hasUnstartedCodeJobPreparationFailure } from "./obsolete-code-job-settler.js";
+import { AUTOMATIC_CONFLICT_PREPARATION_FAILURE, CONFLICT_PREPARATION_RECOVERY_ACTOR,
+  CONFLICT_PREPARATION_RECOVERY_REASON } from "./failed-code-job-context-reader.js";
 
 const STATE_KEY = "automatic-own-pr-conflict-recovery-state";
 const MAX_RECOVERIES = 3;
@@ -23,7 +26,8 @@ function normalizeState(value) {
 }
 
 function eligible(item) {
-  return item?.status === "blocked" && ["intent_failed", "proposal_stale"].includes(item.statusReason) &&
+  return item?.status === "blocked" && ["intent_failed", "proposal_stale", "proposal_failed"].includes(item.statusReason) &&
+    (item.statusReason !== "proposal_failed" || failedCodeConfirmationRecoveryId(item.decisionContext) !== null) &&
     item.currentTarget?.type === "role" && item.currentTarget.id === "developer" &&
     item.activeIntentId === null && item.leaseId === null && item.sourceQuarantine == null &&
     Array.isArray(item.graph?.deliveries) && item.graph.deliveries.length === 0;
@@ -89,6 +93,17 @@ export class AutomaticOwnPrConflictRecovery {
     if (item.statusReason === "intent_failed" && item.decisionContext === null) {
       return unstartedConflictDispatchFailure(item, outboxes.values())?.intentId ?? null;
     }
+    if (item.statusReason === "proposal_failed") {
+      const confirmationId = failedCodeConfirmationRecoveryId(item.decisionContext);
+      if (confirmationId === null || typeof this.confirmationSettlementReader?.read !== "function") return null;
+      const snapshot = await this.confirmationSettlementReader.read({ confirmationId });
+      const completed = failedCodeConfirmationForRecovery(item, outboxes, snapshot);
+      if (completed === null || completed.grant.operation !== "modify" ||
+          completed.grant.executionSource?.kind !== "conflict_preparation") return null;
+      const job = await this.#settler.read(completed);
+      return hasUnstartedCodeJobPreparationFailure(job) && job.memoryProjection !== null &&
+        item.decisionContext.value.evidence[3] === `memory:${job.memoryProjection.recordId}` ? job.jobId : null;
+    }
     if (item.statusReason !== "proposal_stale") return null;
     const unstarted = unstartedConflictProposalForRecovery(item, outboxes);
     if (unstarted !== null && typeof this.confirmationSettlementReader?.read === "function") {
@@ -133,8 +148,9 @@ export class AutomaticOwnPrConflictRecovery {
       await this.#save([...this.#state.records, record]);
     }
     await this.ledger.transition({ itemId: item.itemId, expectedRevision: item.revision, leaseId: null,
-      actorId: "automatic-own-pr-conflict-recovery", toStatus: "queued", reason: "automatic_conflict_material_recovered",
-      details: { evidenceRefs: [`failure:${failureRef}`, `conflict-preparation:${inspection.preparationBinding.preparationId}`,
+      actorId: CONFLICT_PREPARATION_RECOVERY_ACTOR, toStatus: "queued", reason: CONFLICT_PREPARATION_RECOVERY_REASON,
+      details: { ...(item.statusReason === "proposal_failed" ? { code: AUTOMATIC_CONFLICT_PREPARATION_FAILURE, downstreamRef: failureRef } : {}),
+        evidenceRefs: [`failure:${failureRef}`, `conflict-preparation:${inspection.preparationBinding.preparationId}`,
         `head:${binding.headRefOid}`] } });
     await this.#save(this.#state.records.map(entry => entry.itemId === item.itemId && entry.failureRef === failureRef
       ? { ...entry, status: "requeued" } : entry));

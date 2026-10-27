@@ -1494,6 +1494,7 @@ import { CodeJobApprovalExecutor } from "../src/services/code-job-approval-execu
 import { OperationQueue } from "../src/lib/operation-queue.js";
 import { ObsoleteCodeJobSettler, hasUnstartedCodeJobAuthorityFence, hasSettledCodeJobAuthorityFence, hasUnstartedCodeJobPreparationFailure } from "../src/services/obsolete-code-job-settler.js";
 import { AutomaticOwnPrConflictRecovery } from '../src/services/automatic-own-pr-conflict-recovery.js';
+import { FailedCodeJobContextReader } from '../src/services/failed-code-job-context-reader.js';
 import { createConflictPreparationBinding } from '../src/domain/conflict-preparation-binding.js';
 import { createConflictCodeExecutionSource } from '../src/domain/code-execution-source.js';
 import {
@@ -5503,7 +5504,7 @@ test("same-root cutover releases durably rejected attention", async () => {
 });
 
 async function revokedCodeConfirmationFixture({ executed = false, createdJob = false, observedConfirmationStatus = null, legacyNullReference = false,
-  conflict = false, reviseSource = true } = {}) {
+  conflict = false, reviseSource = true, failedPreparation = false, failureCode = 'CONTROLLED_GIT_PREFLIGHT_FAILED' } = {}) {
   let overrideSnapshot;
   let confirmationQueue;
   const reads = [];
@@ -5590,6 +5591,7 @@ async function revokedCodeConfirmationFixture({ executed = false, createdJob = f
   const jobs = new CodeJobStore({
     store: fixture.store, exclusiveLease: new ExclusiveLease(), clock: () => new Date(fixture.time.clock()),
     operationQueue: new OperationQueue(),
+    memoryReceiptVerifier: { verify: async value => ({ ...clone(value), persisted: true }) },
   });
   await jobs.recover();
   confirmationQueue = new ConfirmationQueue({
@@ -5615,13 +5617,23 @@ async function revokedCodeConfirmationFixture({ executed = false, createdJob = f
   }
   if (createdJob) {
     const job = (await jobs.list()).items[0];
-    await jobs.pause({ jobId: job.jobId, expectedRevision: job.revision,
-      reason: "等待人工处理（CODE_BRAIN_RESPONSE_INVALID）" });
+    if (failedPreparation) {
+      const failed = await jobs.fail({ jobId: job.jobId, expectedRevision: job.revision,
+        result: { code: failureCode, message: 'Mirror preflight failed before any action' } });
+      await jobs.markMemoryProjected({ jobId: job.jobId, expectedRevision: failed.job.revision,
+        sourceRecordDigest: failed.job.recordDigest, memoryRecordId: `memory-${'8'.repeat(64)}`, memoryRecordDigest: '8'.repeat(64) });
+    } else {
+      await jobs.pause({ jobId: job.jobId, expectedRevision: job.revision,
+        reason: "等待人工处理（CODE_BRAIN_RESPONSE_INVALID）" });
+    }
   }
   const snapshot = await confirmationQueue.readSettlement({ confirmationId: queued.id });
+  const failedJob = failedPreparation ? await jobs.get(snapshot.item.receipt.id) : null;
   const result = createWorkProposalResult({
     proposal, sequence: 1, at: fixture.time.clock(), downstreamRef: legacyNullReference ? null : plan.id,
-    transition: { status: "stale", summary: "旧确认已安全撤销", evidence: [
+    transition: failedPreparation ? { status: 'failed', summary: '本地代码任务执行失败', evidence: [
+      `confirmation:${plan.id}`, `code-job:${failedJob.jobId}`, 'code-job-status:failed', `memory:${failedJob.memoryProjection.recordId}`,
+    ] } : { status: "stale", summary: "旧确认已安全撤销", evidence: [
       `confirmation:${plan.id}`, "authorization_changed", `old_confirmation_status:${observedConfirmationStatus ?? (createdJob ? "completed" : "stale")}`,
     ] },
   });
@@ -5663,6 +5675,129 @@ async function revokedCodeConfirmationFixture({ executed = false, createdJob = f
     },
   };
 }
+
+test('a normally settled proposal_failed conflict preparation requeues once without rewriting its failed job or confirmation', async () => {
+  const f = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, reviseSource: false, failedPreparation: true });
+  const job = (await f.jobs.list()).items[0], before = await f.jobs.get(job.jobId);
+  const item = await f.service.readItemForReconciliation({ itemId: f.item.itemId });
+  assert.equal(item.statusReason, 'proposal_failed');
+  assert.equal(item.decisionContext.outcome, 'failed');
+  const outbox = (await f.service.listOutbox({ itemId: item.itemId })).items[0];
+  assert.equal(outbox.outcome.details.resultAttestation.payload.outcome, 'failed');
+  const confirmation = await f.confirmationQueue.get(f.plan.id);
+  const refreshedPreparation = { ...clone(job.executionSource.preparationBinding), preparationId: '7'.repeat(64) };
+  f.time.advance(1_000);
+  const recovery = new AutomaticOwnPrConflictRecovery({ store: f.store, ledger: f.service,
+    confirmationSettlementReader: f.service.confirmationSettlementReader, codeJobReader: f.jobs,
+    current: async () => true, prepareInspection: async request => {
+      assert.equal(request.force, true);
+      return { inputBinding: job.inputBinding, preparationBinding: refreshedPreparation, conflicts: refreshedPreparation.conflicts };
+    } });
+  await recovery.recover();
+  assert.equal((await recovery.runCycle()).requeued, 1);
+  const queued = await f.service.readItemForReconciliation({ itemId: item.itemId });
+  assert.equal(queued.status, 'queued');
+  assert.equal(queued.attempt, item.attempt);
+  assert.deepEqual(await f.jobs.get(job.jobId), before);
+  assert.deepEqual(await f.confirmationQueue.get(f.plan.id), confirmation);
+  assert.deepEqual((await f.service.listOutbox({ itemId: item.itemId })).items[0], outbox);
+  const failedContext = await new FailedCodeJobContextReader({ codeJobReader: f.jobs, ledger: f.service }).read({
+    itemId: queued.itemId, inputBinding: job.inputBinding, decisionContext: queued.decisionContext });
+  assert.equal(failedContext.ownerRetry, null);
+  assert.deepEqual(failedContext.automaticRecovery, { at: queued.updatedAt, reason: 'automatic_conflict_material_recovered',
+    failureCode: 'CONTROLLED_GIT_PREFLIGHT_FAILED', jobId: job.jobId,
+    preparationId: refreshedPreparation.preparationId, headRefOid: job.inputBinding.headRefOid });
+  await recovery.recover();
+  assert.equal((await recovery.runCycle()).requeued, 0);
+});
+
+test('normal failed conflict preparation recovery preserves invalid proofs, changed inputs and possible effects', async t => {
+  const f = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, reviseSource: false, failedPreparation: true });
+  const before = await f.jobs.get(f.snapshot.item.receipt.id), original = await f.service.readItemForReconciliation({ itemId: f.item.itemId });
+  const boxes = (await f.service.listOutbox({ itemId: original.itemId })).items;
+  const originalDetail = await f.jobs.getDetail({ jobId: before.jobId, limit: 1 });
+  for (const variant of ['genuine-execution-failure', 'missing-confirmation', 'confirmation-binding', 'wrong-receipt',
+    'wrong-job-evidence', 'wrong-memory-evidence', 'job-memory-changed', 'unsealed-result', 'changed-decision', 'changed-input', 'unknown-outbox',
+    'archived-history', 'partial-history', 'observed-action', 'written-job', 'uncertain-job', 'job-changed',
+    'current-authority-revoked', 'source-revised-during-prepare', 'owner-paused', 'leased', 'delivered']) {
+    await t.test(variant, async () => {
+      const item = clone(original), outboxes = clone(boxes), snapshot = clone(f.snapshot), job = clone(before), detail = clone(originalDetail);
+      if (variant === 'genuine-execution-failure') detail.terminalDetail.code = 'CODE_BRAIN_RESPONSE_INVALID';
+      if (variant === 'confirmation-binding') snapshot.item.approvalBindingDigest = 'f'.repeat(64);
+      if (variant === 'wrong-receipt') snapshot.item.receipt.id = 'code-job-another';
+      if (variant === 'wrong-job-evidence') item.decisionContext.value.evidence[1] = 'code-job:code-job-another';
+      if (variant === 'wrong-memory-evidence') item.decisionContext.value.evidence[3] = `memory:memory-${'f'.repeat(64)}`;
+      if (variant === 'job-memory-changed') {
+        job.memoryProjection.recordId = `memory-${'f'.repeat(64)}`;
+        detail.job = clone(job);
+      }
+      if (variant === 'unsealed-result') delete outboxes[0].outcome.details.resultAttestation;
+      if (variant === 'changed-decision') item.decisionContext.value.summary = 'Unsealed replacement result';
+      if (variant === 'changed-input') item.inputDigest = 'f'.repeat(64);
+      if (variant === 'unknown-outbox') outboxes.push({ ...clone(outboxes[0]), intentId: 'unknown-intent', status: 'unknown' });
+      if (variant === 'archived-history') detail.archived = true;
+      if (variant === 'partial-history') detail.nextCursor = 'unread-history';
+      if (variant === 'observed-action') detail.observations.push({ actionType: 'write_text' });
+      if (variant === 'written-job') {
+        job.turn = 1; job.observationCount = 1;
+        job.latestObservation = { actionType: 'write_text', status: 'succeeded', recordedAt: job.updatedAt };
+        detail.job = clone(job); detail.observations = [{ actionType: 'write_text', status: 'succeeded' }];
+      }
+      if (variant === 'uncertain-job') {
+        job.status = 'unknown'; job.terminalResult = null; job.memoryProjection = null; job.pendingActionType = 'write_text';
+        job.uncertainty = { from: 'active', code: 'CODE_ACTION_RESULT_UNKNOWN', message: 'Write effect is unknown', at: job.updatedAt };
+        detail.job = clone(job);
+      }
+      if (variant === 'job-changed') detail.job.revision++;
+      if (variant === 'owner-paused') item.status = 'paused';
+      if (variant === 'leased') item.leaseId = 'another-lease';
+      if (variant === 'delivered') item.graph.deliveries.push({ deliveryId: 'existing-delivery' });
+      const recovery = new AutomaticOwnPrConflictRecovery({ store: f.store,
+        ledger: { listItems: async () => ({ items: [clone(item)], nextCursor: null }),
+          listOutbox: async () => ({ items: clone(outboxes), nextCursor: null }), readItemForReconciliation: async () => clone(item),
+          transition: async () => assert.fail('Unproven recovery must not transition') },
+        confirmationSettlementReader: { read: async () => variant === 'missing-confirmation' ? null : clone(snapshot) },
+        codeJobReader: { get: async () => clone(job), getDetail: async () => clone(detail) },
+        current: async () => variant !== 'current-authority-revoked', prepareInspection: async () => {
+          if (variant === 'source-revised-during-prepare') item.revision++;
+          return { inputBinding: before.inputBinding, preparationBinding: before.executionSource.preparationBinding,
+            conflicts: before.executionSource.preparationBinding.conflicts };
+        } });
+      await recovery.recover();
+      assert.deepEqual(await recovery.runCycle(), { scanned: ['owner-paused', 'leased', 'delivered'].includes(variant) ? 0 : 1, requeued: 0, failed: 0 });
+      assert.deepEqual(await f.jobs.get(before.jobId), before);
+      assert.deepEqual(await f.service.readItemForReconciliation({ itemId: original.itemId }), original);
+    });
+  }
+});
+
+test('normal failed conflict preparation recovery shares the durable three-attempt budget and resumes only its prepared record', async t => {
+  for (const { prior, status, requeued } of [{ prior: 2, requeued: 1 }, { prior: 3, requeued: 0 },
+    { prior: 3, status: 'prepared', requeued: 1 }, { prior: 3, status: 'requeued', requeued: 0 }]) {
+    await t.test(`${prior} prior recoveries, ${status ?? 'new failure'}`, async () => {
+      const f = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, reviseSource: false, failedPreparation: true });
+      const job = await f.jobs.get(f.snapshot.item.receipt.id), key = 'automatic-own-pr-conflict-recovery-state';
+      await f.store.write(key, { schemaVersion: 1, records: Array.from({ length: prior }, (_, index) => ({
+        itemId: f.item.itemId, inputBinding: job.inputBinding, failureRef: status && index === prior - 1 ? job.jobId : `previous-failure-${index}`,
+        attempt: index + 1, status: status && index === prior - 1 ? status : 'requeued',
+      })) });
+      const recovery = new AutomaticOwnPrConflictRecovery({ store: f.store, ledger: f.service,
+        confirmationSettlementReader: f.service.confirmationSettlementReader, codeJobReader: f.jobs,
+        current: async () => true, prepareInspection: async () => {
+          assert.equal(requeued, 1, 'Exhausted or acknowledged recovery must not prepare');
+          return { inputBinding: job.inputBinding, preparationBinding: job.executionSource.preparationBinding,
+            conflicts: job.executionSource.preparationBinding.conflicts };
+        } });
+      await recovery.recover();
+      assert.equal((await recovery.runCycle()).requeued, requeued);
+      assert.equal((await f.service.readItemForReconciliation({ itemId: f.item.itemId })).status, requeued ? 'queued' : 'blocked');
+      const saved = await f.store.read(key);
+      assert.equal(saved.records.length, status || !requeued ? prior : prior + 1);
+      assert.equal(Math.max(...saved.records.map(record => record.attempt)), 3);
+      assert.deepEqual(await f.jobs.get(job.jobId), job);
+    });
+  }
+});
 
 test('a sealed, unstarted preflight failure requeues the same current conflict root without rewriting old results', async () => {
   const f = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, reviseSource: false });

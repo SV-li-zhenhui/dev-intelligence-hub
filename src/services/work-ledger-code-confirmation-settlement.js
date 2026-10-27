@@ -124,6 +124,48 @@ function matchingHistoricalConfirmation(item, outboxById, confirmation) {
   return digest(expected) === digest(actual) ? { grant: expected.action.grant, outbox } : null;
 }
 
+export function failedCodeConfirmationRecoveryId(decision) {
+  const value = decision?.value, reference = value?.downstreamRef, evidence = value?.evidence;
+  return decision?.source === "proposal" && decision.outcome === "failed" && value?.kind === "code_action_proposal" &&
+    typeof reference === "string" && reference.startsWith("confirmation-code-job-") &&
+    Array.isArray(evidence) && evidence.length === 4 && evidence[0] === `confirmation:${reference}` &&
+    typeof evidence[1] === "string" && evidence[1].startsWith("code-job:") && evidence[2] === "code-job-status:failed" &&
+    typeof evidence[3] === "string" && evidence[3].startsWith("memory:") ? reference : null;
+}
+
+// Normal failed results have their own proof path. They must not become stale
+// confirmation settlements or confer authority to resume the failed job.
+export function failedCodeConfirmationForRecovery(item, outboxById, snapshot) {
+  const confirmationId = failedCodeConfirmationRecoveryId(item?.decisionContext);
+  if (item?.status !== "blocked" || item.statusReason !== "proposal_failed" || item.activeIntentId !== null ||
+      item.sourceQuarantine != null || confirmationId === null || snapshot == null ||
+      [...outboxById.values()].some(outbox => outbox.itemId === item.itemId &&
+        ["pending", "dispatching", "unknown"].includes(outbox.status))) return null;
+  try {
+    const confirmation = normalizeConfirmationState({
+      schemaVersion: 1, revision: snapshot.queueRevision, items: [snapshot.item],
+    }).items[0];
+    if (confirmation.id !== confirmationId || confirmation.kind !== "local.code-job-create" ||
+        confirmation.status !== "completed") return null;
+    const historical = matchingHistoricalConfirmation(item, outboxById, confirmation);
+    if (historical === null || confirmation.receipt.id !== codeJobIdForGrant(historical.grant) ||
+        historical.outbox.updatedAt !== item.updatedAt || historical.grant.source.assignmentId !== item.assignmentId ||
+        digest(createWorkIntentDispatchBinding(historical.outbox.dispatchBinding.boundIntent)) !== digest(historical.outbox.dispatchBinding) ||
+        !samePullRequestExecutionBinding(historical.grant.inputBinding, currentWorkItemExecutionBinding(item)) ||
+        item.decisionContext.value.evidence[1] !== `code-job:${confirmation.receipt.id}`) return null;
+    const attestation = normalizeWorkResultAttestation(historical.outbox.outcome.details.resultAttestation);
+    const result = attestation.payload;
+    if (attestation.kind !== "proposal_result" || attestation.intentId !== historical.outbox.intentId ||
+        result.outcome !== "failed" || result.proposalId !== item.decisionContext.referenceId ||
+        result.proposalContentDigest !== historical.grant.contentDigest || result.kind !== "code_action_proposal" ||
+        digest(result.requestedBy) !== digest(historical.grant.requestedBy)) return null;
+    const expected = createWorkDecisionContext({ source: "proposal", referenceId: result.proposalId, outcome: result.outcome,
+      value: { kind: result.kind, resultId: result.resultId, resultDigest: result.contentDigest, summary: result.summary,
+        downstreamRef: result.downstreamRef, evidence: result.evidence }, observedAt: result.at });
+    return digest(expected) === digest(item.decisionContext) ? { ...historical, receipt: confirmation.receipt } : null;
+  } catch { return null; }
+}
+
 export function completedCodeConfirmationForSettlement(item, outboxById, snapshot) {
   if (item?.status !== "blocked" || item.activeIntentId !== null || item.sourceQuarantine != null ||
     !isChangedCodeConfirmationDecision(item.decisionContext) ||

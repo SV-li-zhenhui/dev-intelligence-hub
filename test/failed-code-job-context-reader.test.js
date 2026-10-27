@@ -8,11 +8,13 @@ import { AutomaticOwnPrInspectionRecovery } from "../src/services/automatic-own-
 import { encodeVerificationRecoveryEvidence } from '../src/domain/verification-recovery-evidence.js';
 import { normalizeWorkflowEvent } from '../src/domain/workflow-events.js';
 import { createPullRequestExecutionBinding } from '../src/domain/pull-request-execution-binding.js';
+import { createConflictCodeExecutionSource } from '../src/domain/code-execution-source.js';
+import { createConflictPreparationBinding } from '../src/domain/conflict-preparation-binding.js';
 import { createPullRequestWorkSource, appendPullRequestWorkSource, currentWorkItemInputBinding,
   currentWorkItemEvent, verifyPullRequestExecutionBinding } from '../src/services/work-ledger-pr-source.js';
 
 function fixture({ operation = "modify", failureCode = "GIT_SNAPSHOT_TIMEOUT", actions = ["read_text", "search_text", "read_text"],
-  inputBinding: suppliedBinding, verifyBinding } = {}) {
+  inputBinding: suppliedBinding, verifyBinding, conflict = false } = {}) {
   const itemId = "work-item-repair";
   const inputBinding = suppliedBinding ?? {
     schemaVersion: 1, kind: "pull_request", repository: "acme/widgets", pullRequestNumber: 17,
@@ -20,15 +22,21 @@ function fixture({ operation = "modify", failureCode = "GIT_SNAPSHOT_TIMEOUT", a
     headRefOid: "1".repeat(40), eventId: "event-repair", eventDigest: "2".repeat(64), inputDigest: "3".repeat(64),
   };
   const grant = createCodeJobGrant({
-    schemaVersion: 2, proposalId: "work-intent-repair", contentDigest: "a".repeat(64), policyVersion: 1,
+    schemaVersion: conflict ? 3 : 2, proposalId: "work-intent-repair", contentDigest: "a".repeat(64), policyVersion: 1,
     requestedBy: { roleId: "developer", workItemId: itemId },
     source: { assignmentId: "assignment-repair", eventId: inputBinding.eventId },
     subject: { id: "github:pr:acme/widgets#17", repository: "acme/widgets", number: 17 },
     repository: "acme/widgets", workspaceId: "widgets-local", inputBinding,
+    ...(conflict ? { executionSource: createConflictCodeExecutionSource({ inputBinding,
+      preparationBinding: createConflictPreparationBinding({ gitTarget: inputBinding.gitTarget,
+        preparation: { schemaVersion: 1, baseCommitOid: inputBinding.gitTarget.baseRefOid, headCommitOid: inputBinding.headRefOid,
+          preparationId: '1'.repeat(64), boundaryDigest: '2'.repeat(64), evidenceDigest: '3'.repeat(64), mergeBaseOid: '4'.repeat(40),
+          resultTreeOid: '5'.repeat(40), resultObjectDigest: '6'.repeat(64), status: 'conflicted', materialization: 'full-tree',
+          conflicts: [{ path: 'src/app.js', mode: '100644' }] } }) }) } : {}),
     workspaceAuthorityDigest: "9".repeat(64), operation, objective: "Repair the review feedback",
     acceptanceCriteria: ["Cover each outstanding defect"], evidence: ["review-feedback"],
     summary: "Repair feedback", reason: "Requested changes", allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION[operation]],
-    writablePaths: operation === "modify" ? ["src"] : [], requiredProfiles: [{ id: "tests", configDigest: "b".repeat(64) }], brainDigest: "c".repeat(64),
+    writablePaths: operation === "modify" ? [conflict ? "src/app.js" : "src"] : [], requiredProfiles: [{ id: "tests", configDigest: "b".repeat(64) }], brainDigest: "c".repeat(64),
   });
   const raw = structuredClone(createQueuedCodeJob({
     confirmationId: "confirmation-repair", requestId: "request-repair-0001", grant,
@@ -156,6 +164,36 @@ function automaticRetry(f) {
   f.retry.details.reason = "automatic_inspection_objects_ready";
   f.retry.details.context = { downstreamRef: f.detail.job.jobId, code: "GIT_HEAD_UNAVAILABLE" };
 }
+
+test('failed conflict context recognizes only the exact zero-action preparation recovery', async t => {
+  const binding = revisedSourceFixture().detail.job.inputBinding;
+  for (const scenario of ['valid', 'actor', 'reason', 'code', 'job', 'failure', 'action', 'history', 'archived',
+    'head', 'preparation', 'extra-evidence', 'not-conflict']) {
+    await t.test(scenario, async () => {
+      const f = fixture({ operation: 'modify', inputBinding: binding, conflict: scenario !== 'not-conflict',
+        failureCode: 'CONTROLLED_GIT_PREFLIGHT_FAILED', actions: scenario === 'action' ? ['write_text'] : [] });
+      f.detail.archived = false;
+      f.retry.actorId = 'automatic-own-pr-conflict-recovery';
+      f.retry.details.reason = 'automatic_conflict_material_recovered';
+      f.retry.details.context = { code: 'CONTROLLED_GIT_PREFLIGHT_FAILED', downstreamRef: f.detail.job.jobId,
+        evidenceRefs: [`failure:${f.detail.job.jobId}`, `conflict-preparation:${'7'.repeat(64)}`, `head:${binding.headRefOid}`] };
+      if (scenario === 'actor') f.retry.actorId = 'other-system';
+      if (scenario === 'reason') f.retry.details.reason = 'other-recovery';
+      if (scenario === 'code') f.retry.details.context.code = 'OTHER_FAILURE';
+      if (scenario === 'job') f.retry.details.context.downstreamRef = 'other-job';
+      if (scenario === 'failure') f.detail.terminalDetail.code = 'CODE_BRAIN_RESPONSE_INVALID';
+      if (scenario === 'history') f.detail.historyAvailable = false;
+      if (scenario === 'archived') f.detail.archived = true;
+      if (scenario === 'head') f.retry.details.context.evidenceRefs[2] = `head:${'9'.repeat(40)}`;
+      if (scenario === 'preparation') f.retry.details.context.evidenceRefs[1] = 'conflict-preparation:unsealed';
+      if (scenario === 'extra-evidence') f.retry.details.context.evidenceRefs.push('note:untrusted');
+      const result = await f.reader.read(f.input);
+      assert.equal(result.ownerRetry, null);
+      assert.deepEqual(result.automaticRecovery, scenario === 'valid' ? { at: f.retry.at, reason: 'automatic_conflict_material_recovered',
+        failureCode: 'CONTROLLED_GIT_PREFLIGHT_FAILED', jobId: f.detail.job.jobId, preparationId: '7'.repeat(64), headRefOid: binding.headRefOid } : null);
+    });
+  }
+});
 
 test('verification recovery context requires exact settled readonly failure metadata', async t => {
   for (const scenario of ['valid', 'reordered', 'head', 'action', 'execution', 'profile', 'fingerprint', 'workspace',

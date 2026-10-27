@@ -18,6 +18,9 @@ export const AUTOMATIC_INSPECTION_FAILURES = Object.freeze([
 export const VERIFICATION_RECOVERY_REASON = 'automatic_verification_preparation_settled';
 export const VERIFICATION_RECOVERY_ACTOR = 'automatic-own-pr-verification-recovery';
 export const AUTOMATIC_VERIFICATION_FAILURE = 'CODE_JOB_VERIFICATION_ENVIRONMENT_UNAVAILABLE';
+export const CONFLICT_PREPARATION_RECOVERY_REASON = 'automatic_conflict_material_recovered';
+export const CONFLICT_PREPARATION_RECOVERY_ACTOR = 'automatic-own-pr-conflict-recovery';
+export const AUTOMATIC_CONFLICT_PREPARATION_FAILURE = 'CONTROLLED_GIT_PREFLIGHT_FAILED';
 
 function portMethod(port, method, optional = false) {
   let owner = port;
@@ -92,7 +95,9 @@ export class FailedCodeJobContextReader {
             entry.details?.reason === "automatic_inspection_objects_ready" &&
             AUTOMATIC_INSPECTION_FAILURES.includes(entry.details.context?.code)) ||
           (entry.actorId === VERIFICATION_RECOVERY_ACTOR && entry.details?.reason === VERIFICATION_RECOVERY_REASON &&
-            entry.details.context?.code === AUTOMATIC_VERIFICATION_FAILURE)) &&
+            entry.details.context?.code === AUTOMATIC_VERIFICATION_FAILURE) ||
+          (entry.actorId === CONFLICT_PREPARATION_RECOVERY_ACTOR && entry.details?.reason === CONFLICT_PREPARATION_RECOVERY_REASON &&
+            entry.details.context?.code === AUTOMATIC_CONFLICT_PREPARATION_FAILURE)) &&
         entry.details?.toStatus === "queued" &&
         entry.details.context?.downstreamRef === jobId &&
         Date.parse(entry.at) > Date.parse(observedAfter));
@@ -153,6 +158,20 @@ export class FailedCodeJobContextReader {
         profileId: recoveryEvidence.profileId, profileConfigDigest: recoveryEvidence.profileConfigDigest,
         workspaceRevision: recoveryEvidence.workspaceRevision,
       } : null;
+    const conflictEvidence = retry?.details.context?.evidenceRefs;
+    const conflictRecovery = retry?.actorId === CONFLICT_PREPARATION_RECOVERY_ACTOR &&
+      retry.details.reason === CONFLICT_PREPARATION_RECOVERY_REASON && retry.details.context.code === AUTOMATIC_CONFLICT_PREPARATION_FAILURE &&
+      failureCode === AUTOMATIC_CONFLICT_PREPARATION_FAILURE && job.operation === 'modify' && job.turn === 0 &&
+      job.observationCount === 0 && observedActions.length === 0 && historyComplete && detail.archived === false &&
+      job.executionSource?.kind === 'conflict_preparation' && expectedBinding.schemaVersion === 2 &&
+      samePullRequestExecutionBinding(job.inputBinding, expectedBinding) &&
+      samePullRequestExecutionBinding(job.executionSource.inputBinding, expectedBinding) &&
+      Array.isArray(conflictEvidence) && conflictEvidence.length === 3 && conflictEvidence[0] === `failure:${jobId}` &&
+      typeof conflictEvidence[1] === 'string' && /^conflict-preparation:[a-f0-9]{64}$/u.test(conflictEvidence[1]) &&
+      conflictEvidence[2] === `head:${expectedBinding.headRefOid}` ? {
+        at: retry.at, reason: CONFLICT_PREPARATION_RECOVERY_REASON, failureCode, jobId,
+        preparationId: conflictEvidence[1].slice('conflict-preparation:'.length), headRefOid: expectedBinding.headRefOid,
+      } : null;
     return {
       jobId, status: job.status, operation: job.operation,
       failureCode: typeof failureCode === "string" && FAILURE_CODE.test(failureCode) ? failureCode : null,
@@ -170,7 +189,7 @@ export class FailedCodeJobContextReader {
         retry.details.context.code === failureCode &&
         historyComplete && job.observationCount === 0 ? {
           at: retry.at, reason: "automatic_inspection_objects_ready", failureCode, jobId,
-        } : recovery,
+        } : conflictRecovery ?? recovery,
     };
   }
 }
