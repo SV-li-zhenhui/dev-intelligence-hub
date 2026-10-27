@@ -1005,6 +1005,15 @@ export class CodeJobWorkerService {
       }
       return state;
     };
+    const assertConflictReadActive = async (signal) => {
+      currentTaskExecution()?.assertRunning?.();
+      controller.signal.throwIfAborted();
+      signal?.throwIfAborted();
+      const job = await this.#jobs.getForWorker(initial.jobId);
+      if (job?.status !== "active" || job.execution.pendingAction !== null || !sameValue(job.grant, initial.grant)) {
+        throw workerError("CODE_JOB_SESSION_BUSY", "Conflict reference job is no longer active");
+      }
+    };
     const latestRead = (job, sourcePath) => job.execution.observations.findLast((entry) =>
       isCurrentAuditedRead(job, entry) && trustedObservationAction(entry).path === sourcePath);
     const currentReads = (job) => {
@@ -1060,7 +1069,7 @@ export class CodeJobWorkerService {
       sourceReadIdentity: () => lastSourceReadIdentity,
       getState,
       readConflictSource: async ({ path: sourcePath, version, offset, length, sourceVersion }, options) => {
-        await snapshot();
+        await assertConflictReadActive(options?.signal);
         if (!this.#conflictSourceReader || initial.grant.executionSource?.kind !== "conflict_preparation") {
           throw workerError("CODE_READ_DOCUMENT_NOT_FOUND", "No sealed conflict versions are available");
         }
@@ -1069,7 +1078,9 @@ export class CodeJobWorkerService {
           throw workerError("CODE_READ_REVISION_INVALID", "Conflict pages require their sealed preparation version");
         }
         conflictReads ??= await this.#openConflictReads(initial, options);
-        await snapshot();
+        // The reader owns an immutable, verified reference copy. Page reads
+        // cannot authorize writes; actions and completion use fresh snapshots.
+        await assertConflictReadActive(options?.signal);
         const key = `conflict-versions/${version}/${sourcePath}`;
         const document = conflictReads.documents.get(key);
         if (!document) throw workerError("CODE_READ_DOCUMENT_NOT_FOUND", "Path/version is outside the sealed conflicts");

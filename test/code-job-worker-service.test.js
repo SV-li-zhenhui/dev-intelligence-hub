@@ -774,7 +774,7 @@ class FakeExecutor {
   }
 }
 
-function continuousFixture(decide, { content = "\uFEFForiginal\n", maxTurns = 64, requiredProfiles = [], executionSource, conflictSourceReader } = {}) {
+function continuousFixture(decide, { content = "\uFEFForiginal\n", maxTurns = 64, requiredProfiles = [], executionSource, conflictSourceReader, grantVerifier = verifier([]) } = {}) {
   const initial = currentReadJob([]);
   initial.grant.requiredProfiles = requiredProfiles;
   if (executionSource) Object.assign(initial.grant, { schemaVersion: 3, executionSource, inputBinding: executionSource.inputBinding });
@@ -797,7 +797,7 @@ function continuousFixture(decide, { content = "\uFEFForiginal\n", maxTurns = 64
     conflictSourceReader,
     brainDirectory: { describe: () => ({ supportsCodeExecution: true, supportsCodeReading: true }),
       async decide(input, authorization) { calls++; await authorization.beforeGenerate(); return decide(input); } },
-    grantVerifier: verifier([]) });
+    grantVerifier });
   return { initial, jobs, executor, get worker() { return createWorker(); }, calls: () => calls };
 }
 
@@ -953,14 +953,15 @@ test("continuous conflict versions are complete sealed reference pages and canno
   const executionSource = conflictExecutionSource(conflictInputBinding());
   const contents = { ancestor: "original\n".repeat(20_000), head: "head\n", base: "base\n" };
   let readCalls = 0;
+  const authorityCalls = [];
+  let referenceVerificationCount;
   const fixture = continuousFixture(async ({ codeExecutionContext }) => {
     const tools = beginCodeExecutionSession(codeExecutionContext);
+    const admittedCalls = authorityCalls.length;
     let page = await tools.invoke("read_conflict_source", { path: "src/app.js", version: "ancestor", offset: 0 });
     let actual = page.text;
     await assert.rejects(tools.invoke("read_conflict_source", { path: "src/app.js", version: "ancestor", offset: page.nextOffset, sourceVersion: "stale" }),
       { code: "CODE_READ_REVISION_INVALID" });
-    await assert.rejects(tools.invoke("edit_source", { path: "src/app.js", sourceVersion: page.sourceVersion,
-      edits: [{ oldText: "original", newText: "wrong" }] }), { code: "CODE_READ_REVISION_INVALID" });
     while (page.nextOffset !== null) {
       page = await tools.invoke("read_conflict_source", { path: "src/app.js", version: "ancestor", offset: page.nextOffset, sourceVersion: page.sourceVersion });
       actual += page.text;
@@ -971,9 +972,14 @@ test("continuous conflict versions are complete sealed reference pages and canno
     })).text, contents[version]);
     await assert.rejects(tools.invoke("read_conflict_source", { path: "Other/app.js", version: "head", offset: 0 }),
       { code: "CODE_READ_DOCUMENT_NOT_FOUND" });
+    referenceVerificationCount = authorityCalls.length - admittedCalls;
+    const beforeEdit = authorityCalls.length;
+    await assert.rejects(tools.invoke("edit_source", { path: "src/app.js", sourceVersion: page.sourceVersion,
+      edits: [{ oldText: "original", newText: "wrong" }] }), { code: "CODE_READ_REVISION_INVALID" });
+    assert.ok(authorityCalls.length > beforeEdit, "writes still verify current authority");
     await tools.close();
     return continuousDecision({ type: "complete", outcome: "reference inspected", evidence: [] });
-  }, { executionSource, conflictSourceReader: { async read(source) {
+  }, { executionSource, grantVerifier: verifier(authorityCalls), conflictSourceReader: { async read(source) {
     readCalls++;
     return { inputBinding: source.inputBinding, preparationBinding: source.preparationBinding,
       documents: Object.entries(contents).map(([version, content]) => ({ path: "src/app.js", version, content,
@@ -981,7 +987,29 @@ test("continuous conflict versions are complete sealed reference pages and canno
   } } });
   assert.equal((await fixture.worker.runCycle()).outcomes[0].status, "completed");
   assert.equal(readCalls, 1);
+  assert.equal(referenceVerificationCount, 0, "immutable reference pages do not repeat full grant/preparation verification");
   assert.equal(fixture.executor.calls.filter(({ method }) => method === "perform").length, 1, "only final completion reaches the executor");
+});
+
+test("cached conflict reference pages stop when the job is paused", async () => {
+  const executionSource = conflictExecutionSource(conflictInputBinding());
+  let attempts = 0;
+  const fixture = continuousFixture(async ({ codeExecutionContext }) => {
+    const tools = beginCodeExecutionSession(codeExecutionContext);
+    const page = await tools.invoke("read_conflict_source", { path: "src/app.js", version: "ancestor", offset: 0, length: 1 });
+    fixture.jobs.jobs.get(fixture.initial.jobId).status = "paused";
+    await assert.rejects(tools.invoke("read_conflict_source", { path: "src/app.js", version: "ancestor", offset: page.nextOffset, sourceVersion: page.sourceVersion }),
+      { code: "CODE_JOB_SESSION_BUSY" });
+    attempts++;
+    await tools.close();
+    return continuousDecision({ type: "complete", outcome: "paused", evidence: [] });
+  }, { executionSource, conflictSourceReader: { async read(source) {
+    return { inputBinding: source.inputBinding, preparationBinding: source.preparationBinding,
+      documents: ["ancestor", "head", "base"].map(version => ({ path: "src/app.js", version, content: "original\n",
+        bytes: 9, sha256: createHash("sha256").update("original\n").digest("hex") })) };
+  } } });
+  assert.equal((await fixture.worker.runCycle()).outcomes[0].status, "paused");
+  assert.equal(attempts, 1);
 });
 
 test("continuous final completion checks current required profiles and current full reads", async (t) => {
