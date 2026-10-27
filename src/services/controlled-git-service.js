@@ -99,8 +99,10 @@ const DEFAULT_LIMITS = Object.freeze({
   maxFiles: 5_000,
   maxObjectFiles: 10_000,
   maxDirectories: 10_000,
-  maxBlobBytes: 1_000_000,
-  maxTotalBytes: 8_000_000,
+  // Preparation seals the full result tree, including unchanged deployment
+  // assets. OCT currently needs about 34 MB total and 5.2 MB for one blob.
+  maxBlobBytes: 8_000_000,
+  maxTotalBytes: 64_000_000,
   maxResultObjectBytes: 32_000_000,
   maxProtocolBytes: 1_000_000,
   maxManifestBytes: 16_000_000,

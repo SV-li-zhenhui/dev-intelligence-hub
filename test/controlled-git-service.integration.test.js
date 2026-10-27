@@ -203,7 +203,7 @@ async function workspaceFiles(root) {
   return files.sort((left, right) => left.localeCompare(right, "en"));
 }
 
-async function createRepositoryFixture(t, gitCommand, { binaryConflict = false, oneSidedDirectories = false } = {}) {
+async function createRepositoryFixture(t, gitCommand, { binaryConflict = false, oneSidedDirectories = false, deploymentAssets = false } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "controlled-git-integration-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const repositoryRoot = path.join(root, "source");
@@ -242,6 +242,11 @@ async function createRepositoryFixture(t, gitCommand, { binaryConflict = false, 
       "head side at ancestor\n",
     ),
   ]);
+  if (deploymentAssets) {
+    await mkdir(path.join(repositoryRoot, 'Projects/Deploy'), { recursive: true });
+    await writeFile(path.join(repositoryRoot, 'Projects/Deploy/GCL.mat.enc'), Buffer.alloc(5_127_832, 1));
+    await writeFile(path.join(repositoryRoot, 'Projects/Deploy/Retina.mat.enc'), Buffer.alloc(4_274_520, 2));
+  }
   await git(gitCommand, repositoryRoot, ["add", "--all"]);
   await git(gitCommand, repositoryRoot, ["commit", "-m", "common ancestor"]);
   const ancestorOid = (
@@ -346,6 +351,22 @@ function serviceFor(gitCommand, setup) {
 }
 
 const gitCommand = locateGit();
+
+test('unchanged deployment assets do not prevent preparing and materializing a text conflict', { skip: gitCommand === null }, async t => {
+  const setup = await createRepositoryFixture(t, gitCommand, { deploymentAssets: true });
+  const constrained = new ControlledGitService({ gitCommand, mirrorInspector: new GitBareMirrorInspector({ gitCommand }),
+    preparationRoot: setup.preparationRoot, limits: { maxBlobBytes: 1_000_000, maxTotalBytes: 8_000_000 } });
+  await assert.rejects(constrained.inspectConflict(setup.request), error =>
+    ['CONTROLLED_GIT_OUTPUT_LIMIT', 'CONTROLLED_GIT_UNSUPPORTED_TREE'].includes(error.code));
+  const prepared = await serviceFor(gitCommand, setup).inspectConflict(setup.request);
+  assert.equal(prepared.status, 'conflicted');
+  const binding = createConflictPreparationBinding({ preparation: prepared, gitTarget: setup.request.gitTarget });
+  const workspace = path.join(setup.root, 'workspace'); await mkdir(workspace);
+  await serviceFor(gitCommand, setup).materializeConflictPreparationForCodeJob({ binding, targetRoot: workspace, excludePaths: [] });
+  assert.equal((await readFile(path.join(workspace, 'Projects/Deploy/GCL.mat.enc'))).length, 5_127_832);
+  assert.equal((await readFile(path.join(workspace, 'Projects/Deploy/Retina.mat.enc'))).length, 4_274_520);
+  assert.match(await readFile(path.join(workspace, 'src/conflict.txt'), 'utf8'), /<<<<<<< /);
+});
 
 test("merge preparation and repeated verification preserve donor object metadata", { skip: gitCommand === null }, async t => {
   const setup = await createRepositoryFixture(t, gitCommand, { oneSidedDirectories: true });
