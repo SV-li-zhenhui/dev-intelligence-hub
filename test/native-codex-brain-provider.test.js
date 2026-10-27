@@ -920,7 +920,7 @@ test("native timeout waits for supervised exit before the next queued provider l
   assert.deepEqual(await readdir(f.runtime), ["sessions"]);
 });
 
-test("native cancellation waits for supervised cleanup beyond ten seconds without blocking the home", async (t) => {
+test("native cancellation and close track supervised cleanup beyond twenty seconds without blocking the home", async (t) => {
   const f = await fixture(t);
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const started = gate(), aborted = gate(), reaped = gate();
@@ -933,19 +933,28 @@ test("native cancellation waits for supervised cleanup beyond ten seconds withou
   const controller = new AbortController();
   const generation = provider.generate(request({ signal: controller.signal }));
   const cancelled = assert.rejects(generation, { code: "STRUCTURED_PROVIDER_CANCELLED" });
+  void cancelled.catch(() => {});
   let settled = false;
   generation.then(() => { settled = true; }, () => { settled = true; });
   await started.promise;
   controller.abort();
   await aborted.promise;
   await new Promise(setImmediate);
-  t.mock.timers.tick(10_001);
-  await new Promise(setImmediate);
-  assert.equal(settled, false, "supervision still owns the bounded teardown");
-  t.mock.timers.tick(5_000);
-  reaped.resolve();
-  await cancelled;
-  await provider.close();
+  let closed = false;
+  const closing = provider.close().then(() => { closed = true; });
+  void closing.catch(() => {});
+  try {
+    t.mock.timers.tick(20_001);
+    await new Promise(setImmediate);
+    assert.equal(settled, false, "supervision still owns the bounded teardown");
+    assert.equal(closed, false, "close must retain the actual supervision promise");
+    reaped.resolve();
+    await cancelled;
+    await closing;
+  } finally {
+    reaped.resolve();
+    await Promise.allSettled([cancelled, closing]);
+  }
   assert.deepEqual(await readdir(f.runtime), ["sessions"]);
 });
 

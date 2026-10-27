@@ -11,11 +11,14 @@ export class ContainedStdioProcess {
     this.notStarted = false;
   }
 
-  async start({ executable, args, cwd, env, timeoutMs, codeExecutionWatchdog=null, maxStdoutBytes, maxStderrBytes,
+  async start({ executable, args, cwd, env, timeoutMs, signal=null, codeExecutionWatchdog=null, maxStdoutBytes, maxStderrBytes,
     onLine, onError, onLimit, onExit }) {
     if (codeExecutionWatchdog !== null) codeExecutionWatchdogSignal(codeExecutionWatchdog);
     const controller = new AbortController();
     this.controller = controller;
+    const abort = () => controller.abort(signal.reason);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
     let ready, rejectReady;
     const initialized = new Promise((resolve, reject) => { ready = resolve; rejectReady = reject; });
     const streams = new Map(['stdout', 'stderr'].map(name => [name, { decoder: new StringDecoder('utf8'), text: '' }]));
@@ -31,11 +34,11 @@ export class ContainedStdioProcess {
       }
       if (Buffer.byteLength(state.text) > 16 * 1024 * 1024) onLimit();
     };
-    this.done = this.runner.run({ executable, args, cwd, env, timeoutMs,
+    this.done = Promise.resolve().then(() => this.runner.run({ executable, args, cwd, env, timeoutMs,
       ...(codeExecutionWatchdog ? { codeExecutionWatchdog } : {}),
       maxStdoutBytes, maxStderrBytes, signal: controller.signal,
       duplex: { onReady: control => { this.control = control; ready(); }, onOutput: receive },
-    }).then(result => {
+    })).then(result => {
       this.exited = true;
       onExit(result);
       return { result };
@@ -45,7 +48,7 @@ export class ContainedStdioProcess {
       rejectReady(error);
       onError(error);
       return { error };
-    });
+    }).finally(() => signal?.removeEventListener('abort', abort));
     await initialized;
   }
 

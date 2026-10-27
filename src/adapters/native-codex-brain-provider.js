@@ -307,48 +307,31 @@ export class NativeCodexBrainProvider {
       if (error?.code === "EEXIST") { this.#state.blocked = true; throw failure("STRUCTURED_PROVIDER_REAP_FAILED"); }
       throw error;
     }
-    let outcome;
-    const processAttempt = Promise.resolve().then(() => {
+    // Supervision owns bounded teardown even after the caller cancels. Keeping
+    // this same promise attached preserves its reap proof and close tracking.
+    const outcome = await Promise.resolve().then(() => {
       signal.throwIfAborted();
       onProcessAttempt();
       return runner.run({ ...processOptions, signal });
     }).then((value) => ({ value }), (error) => ({ error }));
-    let onAbort;
-    const aborted = new Promise((resolve) => {
-      onAbort = () => resolve(null);
-      signal.addEventListener("abort", onAbort, { once: true });
-      if (signal.aborted) onAbort();
-    });
-    try {
-      outcome = await Promise.race([processAttempt, aborted]);
-      if (outcome === null) {
-        let timer;
-        try {
-          // Default supervision can need three 5s termination/wait phases,
-          // plus the app-server's 1s graceful stop. Keep tracking that same
-          // attempt until its bounded teardown has had time to settle.
-          outcome = await Promise.race([processAttempt, new Promise((resolve) => { timer = setTimeout(() => resolve(null), 20_000); })]);
-        } finally { clearTimeout(timer); }
-      }
-      if (outcome === null || outcome.error?.code === "STRUCTURED_PROVIDER_REAP_FAILED") {
-        this.#state.blocked = true;
-        throw failure("STRUCTURED_PROVIDER_REAP_FAILED");
-      }
-      await unlink(marker);
-      this.#state.markers.delete(marker);
-      if (signal.aborted) {
-        if (didAppServerReap(outcome.error) || (runner === this.#dependencies.appServerRunner &&
-            outcome.value?.exitCode === 0 && outcome.value?.signal === null)) SETTLED_NATIVE_REAPED.add(signal.reason);
-        if (didSupervisedProcessNotStart(outcome.error) || didAppServerNotStart(outcome.error)) SETTLED_NOT_STARTED.add(signal.reason);
-        if (didAppServerNotStartModel(outcome.error)) SETTLED_NO_MODEL.add(signal.reason);
-        const output = outcome.value ?? readReapedProcessFailureOutput(outcome.error) ?? readAppServerFailureOutput(outcome.error);
-        if (output) SETTLED_FAILURE_OUTPUT.set(signal.reason, output);
-        throw signal.reason;
-      }
-      if (outcome.error) throw outcome.error;
-      if (outcome.value?.exitCode !== 0 || outcome.value?.signal !== null) throw failure("STRUCTURED_PROVIDER_PROCESS_FAILED");
-      return outcome.value;
-    } finally { signal.removeEventListener("abort", onAbort); }
+    if (outcome.error?.code === "STRUCTURED_PROVIDER_REAP_FAILED") {
+      this.#state.blocked = true;
+      throw failure("STRUCTURED_PROVIDER_REAP_FAILED");
+    }
+    await unlink(marker);
+    this.#state.markers.delete(marker);
+    if (signal.aborted) {
+      if (didAppServerReap(outcome.error) || (runner === this.#dependencies.appServerRunner &&
+          outcome.value?.exitCode === 0 && outcome.value?.signal === null)) SETTLED_NATIVE_REAPED.add(signal.reason);
+      if (didSupervisedProcessNotStart(outcome.error) || didAppServerNotStart(outcome.error)) SETTLED_NOT_STARTED.add(signal.reason);
+      if (didAppServerNotStartModel(outcome.error)) SETTLED_NO_MODEL.add(signal.reason);
+      const output = outcome.value ?? readReapedProcessFailureOutput(outcome.error) ?? readAppServerFailureOutput(outcome.error);
+      if (output) SETTLED_FAILURE_OUTPUT.set(signal.reason, output);
+      throw signal.reason;
+    }
+    if (outcome.error) throw outcome.error;
+    if (outcome.value?.exitCode !== 0 || outcome.value?.signal !== null) throw failure("STRUCTURED_PROVIDER_PROCESS_FAILED");
+    return outcome.value;
   }
 
   async #cleanup(directory, files, directories = []) {

@@ -31,6 +31,81 @@ test('production app-server certifies invalid invocations as not started',async(
   const runner=new CodexAppServerRunner({materialize:async()=>assert.fail('must not materialize or spawn')});
   await assert.rejects(runner.run({}),error=>error.code==='STRUCTURED_PROVIDER_UNAVAILABLE' && didAppServerNotStart(error));
 });
+
+test('cancellation during contained startup waits for supervised preparation to settle without starting a model', async () => {
+  let enteredPreparation, finishPreparation;
+  const preparing = new Promise(resolve => { enteredPreparation = resolve; });
+  const cleanup = new Promise(resolve => { finishPreparation = resolve; });
+  let spawns = 0, settled = false, sawAbort = false;
+  const supervised = createTestSupervisedProcessRunner({
+    platform: 'linux',
+    spawnImpl: () => { spawns++; assert.fail('cancelled preparation must not spawn'); },
+    descriptorMaterializer: async (_descriptor, { signal }) => {
+      enteredPreparation();
+      signal.addEventListener('abort', () => { sawAbort = true; }, { once: true });
+      await cleanup;
+      signal.throwIfAborted();
+    },
+  });
+  const runner = new CodexAppServerRunner({ processFactory: () => new ContainedStdioProcess(supervised), materialize: async () => null });
+  const controller = new AbortController();
+  await invocation({ run: options => runner.run({ ...options, signal: controller.signal }) }, async run => {
+    const running = run();
+    const outcome = running.then(() => { settled = true; return null; }, error => { settled = true; return error; });
+    try {
+      await preparing;
+      controller.abort();
+      await new Promise(setImmediate);
+      assert.equal(sawAbort, true, 'caller cancellation reaches supervised startup');
+      assert.equal(settled, false, 'startup cleanup still owns the invocation');
+      finishPreparation();
+      const error = await outcome;
+      assert.equal(error.code, 'STRUCTURED_PROVIDER_CANCELLED');
+      assert.equal(didAppServerNotStart(error), true);
+      assert.equal(didAppServerReap(error), true);
+      assert.equal(spawns, 0);
+    } finally {
+      finishPreparation();
+      await outcome;
+    }
+  });
+});
+
+test('startup completion after cancellation cannot initialize or start a model before confirmed teardown', async () => {
+  let enteredStartup, finishStartup, enteredStop, finishStop;
+  const starting = new Promise(resolve => { enteredStartup = resolve; });
+  const startup = new Promise(resolve => { finishStartup = resolve; });
+  const stopping = new Promise(resolve => { enteredStop = resolve; });
+  const stopped = new Promise(resolve => { finishStop = resolve; });
+  const writes = [];
+  const process = { exited: false,
+    async start() { enteredStartup(); await startup; },
+    write(line) { writes.push(JSON.parse(line)); throw new Error('cancelled startup wrote an RPC'); },
+    async stop() { enteredStop(); await stopped; this.exited = true; },
+  };
+  const runner = new CodexAppServerRunner({ processFactory: () => process, materialize: async () => null });
+  const controller = new AbortController();
+  await invocation({ run: options => runner.run({ ...options, signal: controller.signal }) }, async run => {
+    let settled = false;
+    const running = run().then(() => { settled = true; return null; }, error => { settled = true; return error; });
+    try {
+      await starting;
+      controller.abort();
+      finishStartup();
+      await stopping;
+      assert.deepEqual(writes, [], 'no initialize, thread/start or turn/start may follow cancellation');
+      assert.equal(settled, false, 'a direct startup return does not certify teardown');
+      finishStop();
+      const error = await running;
+      assert.equal(error.code, 'STRUCTURED_PROVIDER_CANCELLED');
+      assert.equal(didAppServerReap(error), true);
+    } finally {
+      finishStartup(); finishStop();
+      await running;
+    }
+  });
+});
+
 function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null,initializationFailure=false,turnStartFailure=null,codeJob=false,toolInventory=null,onInterrupt=null,contained=false}={}) {
   let options; const calls=[]; let finish,interruptId,signalStopping;
   const stopping=new Promise(resolve=>{signalStopping=resolve;});

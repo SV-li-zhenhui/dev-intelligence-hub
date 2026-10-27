@@ -170,9 +170,10 @@ export class CodexAppServerRunner {
     try {
       started=true;
       await process.start({...(descriptor ? {command:descriptor.command,args:[...descriptor.prefixArgs,...args]} : {executable,args}),cwd,env,
-        timeoutMs,...(codeExecutionWatchdog ? { codeExecutionWatchdog } : {}),maxStdoutBytes:64*1024*1024,maxStderrBytes:1024*1024,
+        timeoutMs,signal,...(codeExecutionWatchdog ? { codeExecutionWatchdog } : {}),maxStdoutBytes:64*1024*1024,maxStderrBytes:1024*1024,
         keepStdinOpen:true,onLine:receive,onError:fail,onLimit:()=>fail(failure('STRUCTURED_PROVIDER_OUTPUT_LIMIT')),
         onExit:()=>{if(!terminal)fail(failure(initialized ? 'STRUCTURED_PROVIDER_PROCESS_FAILED' : 'STRUCTURED_PROVIDER_UNAVAILABLE'));}});
+      if (!accepting) await completed.promise;
       await request('initialize',{clientInfo:{name:'dev_intelligence_hub',version:'0.1.0'},capabilities:{experimentalApi:true}});
       initialized=true;
       process.write(`${JSON.stringify({method:'initialized',params:{}})}\n`);
