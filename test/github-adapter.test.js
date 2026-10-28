@@ -58,7 +58,7 @@ function currentTargetBatchResponse(args, target = (number) => ({ number, url: `
   }])) };
 }
 
-test("fresh incoming approval updates shared facts and automatically routes the snapshot to testing", async () => {
+test("fresh incoming approval updates shared facts without creating testing work for another author", async () => {
   const head = "b".repeat(40);
   const approved = { author: { login: "runtime-user" }, state: "APPROVED",
     submittedAt: "2026-10-16T01:00:00Z", commit: { oid: head } };
@@ -87,7 +87,8 @@ test("fresh incoming approval updates shared facts and automatically routes the 
     const [event] = workflowEventsFromSnapshots(null, { refreshedAt: "2026-10-16T03:00:00.000Z", items: [classified],
       sourceStatus: { githubPullRequests: { ok: true, stale: false } } }, { sourceScopeId: "dashboard" });
     const routed = routeWorkflowEvent({ event, config: withPrLifecycleRoutes({ schemaVersion: 1, enabled: true, maxHops: 8, rules: [] }) });
-    assert.deepEqual(routed.assignments.map(({ target }) => target), [{ type: "role", id: "tester" }]);
+    assert.equal(classified.relation, "review_requested");
+    assert.deepEqual(routed.assignments, []);
   }
 });
 
