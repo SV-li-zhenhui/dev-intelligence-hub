@@ -1587,6 +1587,11 @@ export class WorkLedgerService {
       if (proof === null && this.obsoleteCodeJobSettler !== null) {
         const completed = completedCodeConfirmationForSettlement(item, outboxById, confirmation);
         if (completed !== null) {
+          // A stored unknown result cannot authorize cancelling another live or
+          // uncertain job. Only its already terminal fence can enter settlement.
+          if (item.decisionContext.outcome === "unknown" &&
+              (typeof this.obsoleteCodeJobSettler.read !== "function" ||
+                (await this.obsoleteCodeJobSettler.read(completed))?.status !== "fenced")) continue;
           const job = await this.obsoleteCodeJobSettler.settle({ grant: completed.grant, receipt: completed.receipt }, {
             admitCancellation: (operation) => this.#writeTransaction(() => {
               if (this.state.revision !== expectedGraphRevision) {

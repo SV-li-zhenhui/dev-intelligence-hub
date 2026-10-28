@@ -12,7 +12,7 @@ import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js"
 import { currentWorkItemInputBinding, matchesHistoricalPullRequestInputBinding } from "./work-ledger-pr-source.js";
 import { ledgerDigest } from "./work-ledger-values.js";
 import { normalizeCodeJobConfirmationResult } from "./code-job-confirmation-result.js";
-import { hasSettledCodeJobAuthorityFence } from "./obsolete-code-job-settler.js";
+import { hasSettledCodeJobAuthorityFence, hasStoppedCodeJobAuthorityFence } from "./obsolete-code-job-settler.js";
 import { codeJobIdForGrant } from "../domain/code-job-contract.js";
 
 // Only server-side confirmation reads can mint these ephemeral capabilities.
@@ -21,6 +21,16 @@ const settlements = new WeakMap();
 
 export function codeConfirmationSettlementId(decision) {
   const value = decision?.value;
+  // These references locate the historical proof readers; the result remains
+  // unknown until exact job/memory and stopped-execution proof are checked.
+  if (decision?.source === "proposal" && decision.outcome === "unknown" &&
+      typeof decision.referenceId === "string" && value?.kind === "code_action_proposal" &&
+      typeof value.downstreamRef === "string" && value.downstreamRef.startsWith("confirmation-code-job-") &&
+      Array.isArray(value.evidence) && value.evidence.length === 4 &&
+      value.evidence[0] === `confirmation:${value.downstreamRef}` &&
+      typeof value.evidence[1] === "string" && value.evidence[1].startsWith("code-job:") &&
+      value.evidence[2] === "code-job-status:fenced" &&
+      typeof value.evidence[3] === "string" && value.evidence[3].startsWith("memory:memory-")) return value.downstreamRef;
   if (decision?.source !== "proposal" || decision.outcome !== "stale" ||
       typeof decision.referenceId !== "string" || value?.kind !== "code_action_proposal" ||
       !Array.isArray(value.evidence) || value.evidence.length !== 3 ||
@@ -189,6 +199,10 @@ export function createCompletedCodeConfirmationSettlement(item, outboxById, snap
   if (completed === null || value == null) return null;
   try {
     const job = normalizeCodeJobConfirmationResult(value, completed.grant, completed.receipt);
+    if (item.decisionContext.outcome === "unknown" &&
+        (job.status !== "fenced" || !hasStoppedCodeJobAuthorityFence(value) || job.memoryProjection === null ||
+          item.decisionContext.value.evidence[1] !== `code-job:${job.jobId}` ||
+          item.decisionContext.value.evidence[3] !== `memory:${job.memoryProjection.recordId}`)) return null;
     if ((!["completed", "failed", "cancelled"].includes(job.status) && !hasSettledCodeJobAuthorityFence(value)) ||
       job.terminalResult?.kind !== job.status || job.pendingActionType !== null || job.uncertainty !== null) return null;
     return createSettlement(item, completed.outbox);
@@ -222,7 +236,7 @@ export function createRevokedCodeConfirmationSettlement(item, outboxById, snapsh
 
 export function unstartedCodeConfirmationForSettlement(item, outboxById, snapshot) {
   if (item?.status !== "blocked" || item.activeIntentId !== null || item.sourceQuarantine != null ||
-      !isChangedCodeConfirmationDecision(item.decisionContext) || snapshot == null) return null;
+      item.decisionContext?.outcome !== "stale" || !isChangedCodeConfirmationDecision(item.decisionContext) || snapshot == null) return null;
   try {
     const confirmation = normalizeConfirmationState({ schemaVersion: 1, revision: snapshot.queueRevision, items: [snapshot.item] }).items[0];
     if (confirmation.id !== codeConfirmationSettlementId(item.decisionContext) || confirmation.kind !== "local.code-job-create" ||

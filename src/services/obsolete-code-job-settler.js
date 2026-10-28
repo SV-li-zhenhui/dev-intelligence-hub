@@ -14,14 +14,18 @@ export function hasUnstartedCodeJobPreparationFailure(job) {
 }
 const stoppedAuthorityFences = new WeakMap();
 
+export function hasStoppedCodeJobAuthorityFence(job) {
+  const proof = stoppedAuthorityFences.get(job);
+  return proof !== undefined && isDeepStrictEqual(job, proof);
+}
+
 export function hasUnstartedCodeJobAuthorityFence(job) {
   const proof = unstartedAuthorityFences.get(job);
   return proof !== undefined && isDeepStrictEqual(job, proof);
 }
 
 export function hasSettledCodeJobAuthorityFence(job) {
-  const proof = stoppedAuthorityFences.get(job);
-  return hasUnstartedCodeJobAuthorityFence(job) || (proof !== undefined && isDeepStrictEqual(job, proof));
+  return hasUnstartedCodeJobAuthorityFence(job) || hasStoppedCodeJobAuthorityFence(job);
 }
 
 function stoppedNativeRun(job, run) {
@@ -203,6 +207,22 @@ export class ObsoleteCodeJobSettler {
           isDeepStrictEqual(job, normalizeCodeJobConfirmationResult(detail.job, grant, receipt))) {
         const proofs = job.status === 'fenced' ? unstartedAuthorityFences : unstartedPreparationFailures;
         proofs.set(job, structuredClone(job));
+        // A zero-action job can still have started its model. Unknown proposal
+        // results additionally require a stopped native run, not just no actions.
+        if (job.status === 'fenced' && this.#getRun !== null) {
+          try {
+            const run = await this.#readRun(job.jobId);
+            if (stoppedNativeRun(job, run)) {
+              const [latestJob, latestRun] = await Promise.all([this.#get(job.jobId), this.#readRun(job.jobId)]);
+              if (isDeepStrictEqual(job, normalizeCodeJobConfirmationResult(latestJob, grant, receipt)) && isDeepStrictEqual(run, latestRun)) {
+                stoppedAuthorityFences.set(job, structuredClone(job));
+              }
+            }
+          } catch {
+            // Optional stop evidence cannot invalidate the legacy no-action
+            // proof; unknown results still have no stopped-fence capability.
+          }
+        }
       }
     }
     if (this.#getDetail !== null && this.#getRun !== null && this.#viewSession !== null && job.status === "fenced" &&

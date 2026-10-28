@@ -1492,7 +1492,7 @@ import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
 import { CodeJobStore } from "../src/services/code-job-store.js";
 import { CodeJobApprovalExecutor } from "../src/services/code-job-approval-executor.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
-import { ObsoleteCodeJobSettler, hasUnstartedCodeJobAuthorityFence, hasSettledCodeJobAuthorityFence, hasUnstartedCodeJobPreparationFailure } from "../src/services/obsolete-code-job-settler.js";
+import { ObsoleteCodeJobSettler, hasUnstartedCodeJobAuthorityFence, hasSettledCodeJobAuthorityFence, hasStoppedCodeJobAuthorityFence, hasUnstartedCodeJobPreparationFailure } from "../src/services/obsolete-code-job-settler.js";
 import { AutomaticOwnPrConflictRecovery } from '../src/services/automatic-own-pr-conflict-recovery.js';
 import { FailedCodeJobContextReader } from '../src/services/failed-code-job-context-reader.js';
 import { createConflictPreparationBinding } from '../src/domain/conflict-preparation-binding.js';
@@ -5504,7 +5504,8 @@ test("same-root cutover releases durably rejected attention", async () => {
 });
 
 async function revokedCodeConfirmationFixture({ executed = false, createdJob = false, observedConfirmationStatus = null, legacyNullReference = false,
-  conflict = false, reviseSource = true, failedPreparation = false, failureCode = 'CONTROLLED_GIT_PREFLIGHT_FAILED' } = {}) {
+  conflict = false, reviseSource = true, failedPreparation = false, failureCode = 'CONTROLLED_GIT_PREFLIGHT_FAILED',
+  fencedResult = false, sameHeadBaseChange = false, fencedEvidence = null } = {}) {
   let overrideSnapshot;
   let confirmationQueue;
   const reads = [];
@@ -5617,9 +5618,10 @@ async function revokedCodeConfirmationFixture({ executed = false, createdJob = f
   }
   if (createdJob) {
     const job = (await jobs.list()).items[0];
-    if (failedPreparation) {
-      const failed = await jobs.fail({ jobId: job.jobId, expectedRevision: job.revision,
-        result: { code: failureCode, message: 'Mirror preflight failed before any action' } });
+    if (failedPreparation || fencedResult) {
+      const failed = await jobs[fencedResult ? 'fence' : 'fail']({ jobId: job.jobId, expectedRevision: job.revision,
+        result: { code: fencedResult ? 'INVALID_CODE_JOB_AUTHORITY' : failureCode,
+          message: fencedResult ? 'The bound Base changed' : 'Mirror preflight failed before any action' } });
       await jobs.markMemoryProjected({ jobId: job.jobId, expectedRevision: failed.job.revision,
         sourceRecordDigest: failed.job.recordDigest, memoryRecordId: `memory-${'8'.repeat(64)}`, memoryRecordDigest: '8'.repeat(64) });
     } else {
@@ -5628,11 +5630,12 @@ async function revokedCodeConfirmationFixture({ executed = false, createdJob = f
     }
   }
   const snapshot = await confirmationQueue.readSettlement({ confirmationId: queued.id });
-  const failedJob = failedPreparation ? await jobs.get(snapshot.item.receipt.id) : null;
+  const failedJob = failedPreparation || fencedResult ? await jobs.get(snapshot.item.receipt.id) : null;
   const result = createWorkProposalResult({
     proposal, sequence: 1, at: fixture.time.clock(), downstreamRef: legacyNullReference ? null : plan.id,
-    transition: failedPreparation ? { status: 'failed', summary: '本地代码任务执行失败', evidence: [
-      `confirmation:${plan.id}`, `code-job:${failedJob.jobId}`, 'code-job-status:failed', `memory:${failedJob.memoryProjection.recordId}`,
+    transition: failedPreparation || fencedResult ? { status: fencedResult ? 'unknown' : 'failed',
+      summary: fencedResult ? '本地代码任务已停止' : '本地代码任务执行失败', evidence: fencedEvidence ?? [
+      `confirmation:${plan.id}`, `code-job:${failedJob.jobId}`, `code-job-status:${fencedResult ? 'fenced' : 'failed'}`, `memory:${failedJob.memoryProjection.recordId}`,
     ] } : { status: "stale", summary: "旧确认已安全撤销", evidence: [
       `confirmation:${plan.id}`, "authorization_changed", `old_confirmation_status:${observedConfirmationStatus ?? (createdJob ? "completed" : "stale")}`,
     ] },
@@ -5641,7 +5644,9 @@ async function revokedCodeConfirmationFixture({ executed = false, createdJob = f
     oldestAvailableSequence: 1 });
   const update = authoredReviewRepairAssignment(2, {
     occurredAt: "2026-08-02T01:15:00.000Z", ciStatus: "SUCCESS", title: "Updated PR facts",
-    ...(createdJob ? { headRefOid: PR_HEAD_B, previousHeadRefOid: PR_HEAD_A,
+    ...(createdJob ? sameHeadBaseChange ? { gitFacts: { ...prGitFacts(PR_HEAD_A, { baseRefOid: 'e'.repeat(40) }),
+      relation: 'authored', actionState: 'action_now', nextAction: 'resolve_conflict', mergeStateStatus: 'DIRTY' },
+      changedFields: ['gitTarget'] } : { headRefOid: PR_HEAD_B, previousHeadRefOid: PR_HEAD_A,
       changedFields: ["headRefOid"] } : {}),
   });
   update.assignment.target = record.assignment.target;
@@ -5675,6 +5680,158 @@ async function revokedCodeConfirmationFixture({ executed = false, createdJob = f
     },
   };
 }
+
+function stoppedFenceRun(job) {
+  return { kind: 'code-job', taskId: job.jobId, roleId: job.requestedBy.roleId, runId: 'settled-native-fence',
+    active: false, mode: 'active', pendingCommand: null, receipt: { kind: 'code-job', taskId: job.jobId,
+      roleId: job.requestedBy.roleId, runId: 'settled-native-fence', phase: 'failed', stopConfirmed: true,
+      finishedAt: job.updatedAt, outcomeCode: 'INVALID_CODE_JOB_AUTHORITY', session: { transport: 'app-server' } } };
+}
+
+test('a stopped authority-fenced proposal_unknown activates a new Base after restart without rewriting its old outcome', async () => {
+  const f = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, fencedResult: true, sameHeadBaseChange: true });
+  const job = await f.jobs.get(f.snapshot.item.receipt.id), beforeJob = clone(job), beforeConfirmation = clone(f.snapshot.item);
+  const root = await f.service.readItemForReconciliation({ itemId: f.item.itemId });
+  const decision = clone(root.decisionContext), boxes = (await f.service.listOutbox({ itemId: root.itemId })).items;
+  assert.equal(root.statusReason, 'proposal_unknown');
+  assert.equal(root.source.current.headRefOid, PR_HEAD_A);
+  assert.equal(root.source.current.event.payload.gitTarget.baseRefOid, 'd'.repeat(40));
+  assert.equal(root.source.pending.event.payload.gitTarget.baseRefOid, 'e'.repeat(40));
+  const run = stoppedFenceRun(job);
+  f.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader: f.jobs,
+    codeJobControl: { cancel: async () => assert.fail('A terminal job must not be resumed or cancelled') },
+    taskRuns: { get: async () => clone(run) } });
+  const result = await f.service.reconcilePullRequestSource(f.command);
+  assert.equal(result.applied, true, 'The exact stopped fence must settle the historical proposal_unknown');
+  const next = await f.service.readItemForReconciliation({ itemId: root.itemId });
+  assert.equal(next.status, 'queued');
+  assert.equal(next.source.pendingRevision, null);
+  assert.equal(next.source.current.headRefOid, PR_HEAD_A);
+  assert.equal(next.source.current.event.payload.gitTarget.baseRefOid, 'e'.repeat(40));
+  assert.deepEqual(await f.jobs.get(job.jobId), beforeJob);
+  assert.deepEqual((await f.confirmationQueue.readSettlement({ confirmationId: f.plan.id })).item, beforeConfirmation);
+  const historical = (await f.service.listOutbox({ itemId: root.itemId })).items;
+  assert.deepEqual(historical, boxes);
+  assert.equal(decision.outcome, 'unknown');
+  const timeline = f.store.stored().timeline.filter(entry => entry.itemId === root.itemId && entry.type === 'proposal_result_applied');
+  assert.equal(timeline.at(-1).details.decision.outcome, 'unknown');
+  await f.service.recover();
+  const stable = await f.service.readItemForReconciliation({ itemId: root.itemId });
+  assert.equal(stable.status, 'queued');
+  assert.equal((await f.service.reconcilePullRequestSource({ itemId: stable.itemId, expectedRevision: stable.revision,
+    expectedPendingRevision: stable.source.activeRevision, expectedGraphRevision: (await f.service.getSummary()).revision })).applied, false);
+});
+
+test('proposal_unknown cutover keeps missing stop evidence, unsettled execution and mismatched history fenced', async t => {
+  for (const variant of ['missing-run', 'active-run', 'unconfirmed-stop', 'stop-unconfirmed', 'pending-command',
+    'wrong-run-job', 'wrong-run-role', 'wrong-run-id', 'wrong-transport', 'missing-finish', 'changed-run', 'changed-job',
+    'missing-detail', 'wrong-terminal-code', 'archived-history', 'partial-history', 'memory-mismatch',
+    'wrong-confirmation', 'wrong-receipt', 'unknown-action', 'unsettled-write', 'cloned-proof', 'changed-proof']) await t.test(variant, async () => {
+    const f = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, fencedResult: true, sameHeadBaseChange: true });
+    const originalJob = await f.jobs.get(f.snapshot.item.receipt.id), originalRoot = await f.service.readItemForReconciliation({ itemId: f.item.itemId });
+    const job = clone(originalJob), detail = await f.jobs.getDetail({ jobId: job.jobId, limit: 1 }), run = stoppedFenceRun(job);
+    if (variant === 'active-run') run.active = true;
+    if (variant === 'unconfirmed-stop') run.receipt.stopConfirmed = false;
+    if (variant === 'stop-unconfirmed') run.stopUnconfirmed = true;
+    if (variant === 'pending-command') run.pendingCommand = { type: 'cancel' };
+    if (variant === 'wrong-run-job') run.taskId = 'another-job';
+    if (variant === 'wrong-run-role') run.roleId = 'tester';
+    if (variant === 'wrong-run-id') run.runId = 'another-run';
+    if (variant === 'wrong-transport') run.receipt.session.transport = 'untrusted';
+    if (variant === 'missing-finish') run.receipt.finishedAt = null;
+    if (variant === 'wrong-terminal-code') detail.terminalDetail.code = 'CODE_ACTION_RESULT_UNKNOWN';
+    if (variant === 'archived-history') detail.archived = true;
+    if (variant === 'partial-history') detail.nextCursor = 'unread-history';
+    if (variant === 'memory-mismatch') job.memoryProjection.recordId = `memory-${'f'.repeat(64)}`;
+    if (variant === 'unknown-action') Object.assign(job, { status: 'unknown', terminalResult: null, memoryProjection: null,
+      pendingActionType: 'write_text', uncertainty: { from: 'active', code: 'CODE_ACTION_RESULT_UNKNOWN', message: 'Possible write', at: job.updatedAt } });
+    if (variant === 'unsettled-write') {
+      Object.assign(job, { turn: 1, observationCount: 1,
+        latestObservation: { actionType: 'write_text', status: 'succeeded', recordedAt: job.updatedAt } });
+      detail.observations = [{ actionType: 'write_text', status: 'succeeded' }];
+    }
+    detail.job = clone(job);
+    if (['wrong-confirmation', 'wrong-receipt'].includes(variant)) {
+      const snapshot = clone(f.snapshot);
+      if (variant === 'wrong-confirmation') snapshot.item.approvalBindingDigest = 'f'.repeat(64);
+      else snapshot.item.receipt.id = 'code-job-another';
+      f.replaceSnapshot(snapshot);
+    }
+    let reads = 0, jobReads = 0;
+    const reader = { get: async () => {
+      const value = clone(job);
+      if (variant === 'changed-job' && jobReads++ > 0) value.revision++;
+      return value;
+    }, ...(variant === 'missing-detail' ? {} : { getDetail: async () => clone(detail) }) };
+    f.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader: reader,
+      codeJobControl: { cancel: async () => assert.fail('Unproven fenced execution must not be cancelled') },
+      taskRuns: variant === 'missing-run' ? null : { get: async () => {
+        const value = clone(run);
+        if (variant === 'changed-run') value.receipt.finishedAt = new Date(Date.parse(run.receipt.finishedAt) + reads++).toISOString();
+        return value;
+      } } });
+    if (['cloned-proof', 'changed-proof'].includes(variant)) {
+      const raw = await f.jobs.getForWorker(job.jobId);
+      const proof = await f.service.obsoleteCodeJobSettler.read({ grant: raw.grant, receipt: f.snapshot.item.receipt });
+      assert.equal(hasStoppedCodeJobAuthorityFence(proof), true);
+      const forwarded = variant === 'cloned-proof' ? clone(proof) : proof;
+      if (variant === 'changed-proof') forwarded.revision++;
+      assert.equal(hasStoppedCodeJobAuthorityFence(forwarded), false);
+      f.service.obsoleteCodeJobSettler = { read: async () => forwarded, settle: async () => forwarded };
+    }
+    assert.equal((await f.service.reconcilePullRequestSource(f.command)).applied, false);
+    assert.deepEqual(await f.service.readItemForReconciliation({ itemId: f.item.itemId }), originalRoot);
+    assert.deepEqual(await f.jobs.get(originalJob.jobId), originalJob);
+  });
+});
+
+test('proposal_unknown requires the exact code-job, fenced status and memory references from its sealed result', async t => {
+  for (const variant of ['wrong-job-reference', 'wrong-memory-reference', 'wrong-status-reference', 'extra-reference']) await t.test(variant, async () => {
+    const base = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, fencedResult: true, sameHeadBaseChange: true });
+    const references = clone(base.item.decisionContext.value.evidence);
+    if (variant === 'wrong-job-reference') references[1] = 'code-job:code-job-another';
+    if (variant === 'wrong-memory-reference') references[3] = `memory:memory-${'f'.repeat(64)}`;
+    if (variant === 'wrong-status-reference') references[2] = 'code-job-status:failed';
+    if (variant === 'extra-reference') references.push('owner-approval');
+    const f = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, fencedResult: true, sameHeadBaseChange: true, fencedEvidence: references });
+    const job = await f.jobs.get(f.snapshot.item.receipt.id), root = await f.service.readItemForReconciliation({ itemId: f.item.itemId });
+    f.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader: f.jobs,
+      codeJobControl: { cancel: async () => assert.fail('The old result must remain intact') }, taskRuns: { get: async () => stoppedFenceRun(job) } });
+    assert.equal((await f.service.reconcilePullRequestSource(f.command)).applied, false);
+    assert.deepEqual(await f.service.readItemForReconciliation({ itemId: f.item.itemId }), root);
+  });
+});
+
+test('proposal_unknown cannot use an unstarted stale confirmation and missing job as native stop proof', async () => {
+  const f = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, fencedResult: true, sameHeadBaseChange: true });
+  const root = await f.service.readItemForReconciliation({ itemId: f.item.itemId }), snapshot = clone(f.snapshot);
+  snapshot.item.status = 'stale';
+  snapshot.item.receipt = null;
+  snapshot.item.execution.outcome = 'stale';
+  f.replaceSnapshot(snapshot);
+  f.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader: { get: async () => null },
+    codeJobControl: { cancel: async () => assert.fail('A missing job is not native stop proof for an unknown result') } });
+  assert.equal((await f.service.reconcilePullRequestSource(f.command)).applied, false);
+  assert.deepEqual(await f.service.readItemForReconciliation({ itemId: f.item.itemId }), root);
+});
+
+test('optional native proof errors preserve old stale settlement but keep proposal_unknown fenced', async t => {
+  for (const unknownResult of [false, true]) await t.test(unknownResult ? 'unknown' : 'stale', async () => {
+    const f = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, sameHeadBaseChange: true, fencedResult: unknownResult });
+    let job = await f.jobs.get(f.snapshot.item.receipt.id);
+    if (!unknownResult) {
+      await f.jobs.fence({ jobId: job.jobId, expectedRevision: job.revision, result: { code: 'INVALID_CODE_JOB_AUTHORITY' } });
+      job = await f.jobs.get(job.jobId);
+    }
+    const root = await f.service.readItemForReconciliation({ itemId: f.item.itemId });
+    f.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader: f.jobs,
+      codeJobControl: { cancel: async () => assert.fail('A failed optional reader cannot authorize a mutation') },
+      taskRuns: { get: async () => { throw Object.assign(new Error('Native reader temporarily unavailable'), { code: 'TASK_RUN_READER_UNAVAILABLE' }); } } });
+    assert.equal((await f.service.reconcilePullRequestSource(f.command)).applied, !unknownResult);
+    if (unknownResult) assert.deepEqual(await f.service.readItemForReconciliation({ itemId: f.item.itemId }), root);
+    assert.deepEqual(await f.jobs.get(job.jobId), job);
+  });
+});
 
 test('a normally settled proposal_failed conflict preparation requeues once without rewriting its failed job or confirmation', async () => {
   const f = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, reviseSource: false, failedPreparation: true });
