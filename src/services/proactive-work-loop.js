@@ -3,7 +3,7 @@ import { isDeepStrictEqual } from "node:util";
 import { permitsReviewPublicationSettlementIntent } from "./review-publication-settlement.js";
 import { samePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { TaskRunControlError } from './task-run-registry.js';
-import { automaticReviewEligibility, automaticReviewContinuationEligibility, automaticReviewWorkAdmission } from "../domain/automatic-review-policy.js";
+import { automaticReviewWorkEligibility } from "../domain/automatic-review-policy.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { TargetedCycleQueue } from "../lib/targeted-cycle-queue.js";
 import { normalizeContinuationTarget, matchesContinuationTarget } from "./work-continuation-state.js";
@@ -1068,18 +1068,8 @@ export class ProactiveWorkLoop {
         options.roleId !== ORCHESTRATOR_ROLE_ID &&
         (item.currentTarget.type !== "role" || item.currentTarget.id !== options.roleId)
       ) continue;
-      if (this.automaticReviewPolicy !== null && item.currentTarget?.id === "pr-engineer") {
-        const event = currentWorkItemEvent(item);
-        if (event.source?.provider === "github" && event.payload?.relation === "review_requested") {
-          if (!this.automaticReviewPolicy.enabled) continue;
-          const admission = automaticReviewWorkAdmission(item);
-          const facts = { ...event.payload, kind: "pull_request" };
-          const eligibility = admission === null
-            ? automaticReviewEligibility(facts, this.automaticReviewPolicy.account, normalizeLoopClock(this.clock))
-            : automaticReviewContinuationEligibility(facts, this.automaticReviewPolicy.account, normalizeLoopClock(this.clock), admission);
-          if (eligibility !== null) continue;
-        }
-      }
+      if (this.automaticReviewPolicy !== null && item.currentTarget?.id === "pr-engineer" &&
+          automaticReviewWorkEligibility(item, this.automaticReviewPolicy, normalizeLoopClock(this.clock)) !== null) continue;
       if (
         !issueIsEligible(
           item,

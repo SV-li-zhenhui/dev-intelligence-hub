@@ -52,6 +52,76 @@ function relatedProgressFixture() {
   return f;
 }
 
+test('an unassigned automatic Review waits across retries and restart until assignment changes', async () => {
+  const f = fixture();
+  f.config.githubActions.automaticReview = true;
+  f.config.githubActions.actorAccountId = 'reviewer';
+  f.items[0].currentTarget.id = 'pr-engineer';
+  f.items[0].event = { source: { provider: 'github' }, payload: { relation: 'review_requested', state: 'open', isDraft: false,
+    author: 'developer', assignees: [], headRefOid: 'a'.repeat(40) } };
+  let scheduler = new WorkContinuationScheduler(f.options);
+  for (let index = 0; index < 3; index++) {
+    await scheduler.runCycle(f); await f.drain(); f.advance(600_000);
+  }
+  assert.deepEqual(f.dispatched, []);
+  const waiting = f.state().records[0];
+  assert.equal(waiting.status, 'waiting');
+  assert.equal(waiting.recovery.action, 'await_condition');
+  assert.equal(waiting.condition.type, 'fact_change');
+  assert.match(waiting.condition.reference, /NO_CURRENT_INCOMING_REQUEST/);
+  scheduler = new WorkContinuationScheduler(f.options);
+  await scheduler.runCycle(f); await f.drain();
+  assert.deepEqual(f.state().records[0], waiting, 'unchanged admission does not write another wake or retry');
+  f.items[0].event.payload.assignees = ['reviewer'];
+  f.items[0].revision++;
+  await scheduler.runCycle(f); await f.drain();
+  assert.deepEqual(f.dispatched, ['pr-engineer']);
+  assert.equal(f.state().records[0].status, 'delivered');
+});
+
+test('automatic Review configuration and already-reviewed Head use the same wait gate as execution', async () => {
+  const f = fixture();
+  Object.assign(f.config.githubActions, { automaticReview: false, actorAccountId: 'reviewer' });
+  f.items[0].currentTarget.id = 'pr-engineer';
+  const payload = { relation: 'review_requested', state: 'open', isDraft: false, author: 'developer', assignees: ['reviewer'],
+    headRefOid: 'a'.repeat(40), myReviewState: 'APPROVED', myReviewCommitOid: 'a'.repeat(40) };
+  f.items[0].event = { source: { provider: 'github' }, payload };
+  const scheduler = new WorkContinuationScheduler(f.options);
+  await scheduler.runCycle(f); await f.drain();
+  assert.equal(f.dispatched.length, 0);
+  assert.match(f.state().records[0].condition.reference, /AUTOMATIC_REVIEW_DISABLED/);
+  f.config.githubActions.automaticReview = true;
+  await scheduler.runCycle(f); await f.drain();
+  assert.equal(f.dispatched.length, 0);
+  assert.match(f.state().records[0].condition.reference, /HEAD_ALREADY_REVIEWED/);
+  payload.headRefOid = 'b'.repeat(40);
+  f.items[0].revision++;
+  await scheduler.runCycle(f); await f.drain();
+  assert.deepEqual(f.dispatched, ['pr-engineer']);
+});
+
+test('explicit owner Review and manual role pause retain their existing controls', async () => {
+  const owner = fixture();
+  Object.assign(owner.config.githubActions, { automaticReview: false, actorAccountId: 'reviewer' });
+  owner.items[0].currentTarget.id = 'pr-engineer';
+  owner.items[0].event = { source: { provider: 'local-owner' }, payload: { relation: 'review_requested' } };
+  await new WorkContinuationScheduler(owner.options).runCycle(owner); await owner.drain();
+  assert.deepEqual(owner.dispatched, ['pr-engineer']);
+  const paused = fixture();
+  Object.assign(paused.config.githubActions, { automaticReview: true, actorAccountId: 'reviewer' });
+  paused.items[0].currentTarget.id = 'pr-engineer';
+  paused.items[0].event = { source: { provider: 'github' }, payload: { relation: 'review_requested', state: 'open', isDraft: false,
+    author: 'developer', assignees: ['reviewer'], headRefOid: 'a'.repeat(40) } };
+  paused.role.paused = true;
+  const scheduler = new WorkContinuationScheduler(paused.options);
+  await scheduler.runCycle(paused); await paused.drain();
+  assert.deepEqual(paused.dispatched, []);
+  assert.equal(paused.state().records[0].condition.type, 'manual_resume');
+  paused.role.paused = false;
+  await scheduler.runCycle(paused); await paused.drain();
+  assert.deepEqual(paused.dispatched, ['pr-engineer']);
+});
+
 test('unrelated graph churn keeps backoff while a related child or dependency change rearms once', async () => {
   const f = relatedProgressFixture(), scheduler = new WorkContinuationScheduler(f.options);
   f.items.push({ itemId: 'unrelated', revision: 1, status: 'completed', currentTarget: { type: 'role', id: 'tester' } });

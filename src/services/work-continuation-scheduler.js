@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { OperationQueue } from '../lib/operation-queue.js';
 import { canonicalJsonDigest } from '../lib/canonical-json-digest.js';
 import { currentWorkItemInputBinding } from './work-ledger-pr-source.js';
+import { automaticReviewWorkEligibility } from '../domain/automatic-review-policy.js';
 import {
   WORK_CONTINUATION_STATE_KEY, CONTINUATION_MAX_RECORDS, CONTINUATION_ROLES,
   continuationFingerprint, emptyWorkContinuations, migrateWorkContinuationState, normalizeWorkContinuationState,
@@ -83,6 +84,8 @@ export class WorkContinuationScheduler {
       const config = await this.#configuration();
       if (!config) return { started: 0, skipped: 'disabled' };
       const executionRevision = canonicalJsonDigest([runtimeRevision, config]);
+      const automaticReviewPolicy = Object.hasOwn(config.githubActions || {}, 'automaticReview')
+        ? { enabled: config.githubActions.automaticReview, account: config.githubActions.actorAccountId } : null;
       if (typeof dispatch !== 'function') throw new TypeError('Work continuation dispatch is required');
       const preparationAt = Date.parse(this.#now());
       if (allowDispatch && preparationAt >= this.#nextPreparationAt) {
@@ -122,10 +125,14 @@ export class WorkContinuationScheduler {
         const fact = facts.get(item.itemId);
         if (!roleStates.has(roleId)) roleStates.set(roleId, await this.#ports.roleStateReader.read(roleId));
         const role = roleStates.get(roleId);
+        const reviewRejection = eligible.has(item.itemId) ? automaticReviewWorkEligibility(item, automaticReviewPolicy, now) : null;
         const canRun = eligible.has(item.itemId) && fact &&
           (!fact.graphBlocked || (roleId === 'orchestrator' && (fact.submittedChildren > 0 || fact.orchestrationReady === true))) &&
-          role?.enabled === true && role.paused === false;
+          role?.enabled === true && role.paused === false && reviewRejection === null;
         const condition = conditionFor(item, fact, executionRevision);
+        if (reviewRejection !== null) {
+          condition.type = 'fact_change'; condition.reference = `review-policy:${reviewRejection}:${executionRevision}`;
+        }
         if ((role?.enabled !== true || role.paused !== false || (fact && !eligible.has(item.itemId))) && !fact?.graphBlocked) {
           condition.type = 'manual_resume'; condition.reference = roleId;
         }

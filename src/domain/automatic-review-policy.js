@@ -125,6 +125,18 @@ export function automaticReviewContinuationEligibility(item, account, now, admis
   return "INVALID_REVIEW_ADMISSION";
 }
 
+// Scheduling and execution must agree before waking an automatic Review role.
+export function automaticReviewWorkEligibility(item, policy, now) {
+  const event = item.source?.kind === "pull_request" ? item.source.current?.event : item.event;
+  if (policy === null || item.currentTarget?.id !== "pr-engineer" ||
+      event?.source?.provider !== "github" || event.payload?.relation !== "review_requested") return null;
+  if (!policy.enabled) return "AUTOMATIC_REVIEW_DISABLED";
+  const admission = automaticReviewWorkAdmission(item);
+  const facts = { ...event.payload, kind: "pull_request" };
+  return admission === null ? automaticReviewEligibility(facts, policy.account, now)
+    : automaticReviewContinuationEligibility(facts, policy.account, now, admission);
+}
+
 export function automaticTestingOwner(item, ownersByProduct = {}) {
   const text = [item.title, ...(item.labels || []), item.gitTarget?.baseRefName, item.gitTarget?.headRefName, item.repo].filter(Boolean).join(" ");
   const bs = /\bB\s*\/\s*S\b|\bBS(?:[-_ ]|版)|\bweb\b|网页端|浏览器端|Picasso-ProductAndFE/iu.test(text);
