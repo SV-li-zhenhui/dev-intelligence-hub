@@ -907,6 +907,50 @@ test("required external Review context exposes reuse candidates without treating
   assert.equal(Object.isFrozen(packet.context.code.reviewPublicationReuse), true);
 });
 
+test("root Review recovery uses current host candidates rather than one historical rejection code", async (t) => {
+  for (const code of ["ROLE_DECISION_PR_REVIEW_REQUIRED", "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION"]) await t.test(code, async () => {
+    const { fixture, pullRequestContext, gitTarget } = atomicPullRequestFixture();
+    const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.owner_requested",
+      occurredAt: fixture.item.event.occurredAt, source: { provider: "local-owner", scopeId: "owner-request:00000000-0000-4000-8000-000000000001" },
+      subject: fixture.item.event.subject, payload: { gitTarget, gitTargetAvailable: true, headRefOid: gitTarget.headRefOid,
+        workType: "general", nextAction: "rereview", suggestedCapability: "pr-review", expectedHeadRefOid: gitTarget.headRefOid } });
+    const envelope = pullRequestAssignment(1, event);
+    envelope.assignment.target.id = "orchestrator";
+    const source = createPullRequestWorkSource(envelope).source;
+    fixture.item = { ...fixture.item, event, source, inputDigest: source.current.inputDigest, currentTarget: { type: "role", id: "orchestrator" } };
+    const current = fixture.snapshot.graph.tasks.find(value => value.taskId === fixture.item.itemId);
+    current.parentTaskId = null; current.responsibility.id = "orchestrator"; current.dependsOn = [];
+    fixture.snapshot.graph.tasks.push(task({ taskId: "blocked-review", revision: 17, status: "failed", roleId: "pr-engineer",
+      parentTaskId: current.taskId, contracts: [contract(1, [expected("review", "review-report")])] }));
+    const childState = { ...state("blocked-review", 17), ledgerStatus: "blocked", statusReason: "decision_attempts_exhausted",
+      decisionFailure: { code, stage: "decision", taskRevision: 17, timelineId: `work-timeline-${DIGEST_A}`,
+        timelineDigest: DIGEST_A, recordedAt: "2026-08-03T07:00:00.000Z" } };
+    fixture.snapshot.taskStates.push(childState);
+    pullRequestContext.materialDigest = DIGEST_C;
+    let reads = 0, candidates = [{ candidateId: `review-publication-candidate-${DIGEST_B}`, materialDigest: DIGEST_C,
+      deliverableId: "review", verdict: "approve", reviewUrl: "https://github.com/octo/repo/pull/12#pullrequestreview-123", requiresCurrentReview: true }];
+    const options = { roleId: "orchestrator", pullRequestContextReader: { async read() { return pullRequestContext; } },
+      publicationReuseReader: { async listCandidates(input) {
+        reads++; assert.deepEqual(input, { taskId: "blocked-review", materialDigest: DIGEST_C });
+        return { complete: true, candidates };
+      } } };
+    const recovery = (await assemble(fixture, options)).context.code.reviewPublicationRecovery;
+    assert.equal(reads, 1);
+    assert.equal(recovery.childTaskId, "blocked-review");
+    assert.equal(recovery.childTaskRevision, 17);
+    assert.equal(recovery.requiresTaskControlChecks, true);
+    assert.match(recovery.candidates[0].replacementChildKey, /^review-reuse-[a-f0-9]{64}$/);
+    assert.equal(Object.isFrozen(recovery), true);
+    childState.ledgerStatus = "paused"; childState.decisionFailure = null;
+    assert.equal((await assemble(fixture, options)).context.code.reviewPublicationRecovery, undefined);
+    assert.equal(reads, 1, "paused work does not request recovery candidates");
+    childState.ledgerStatus = "blocked"; childState.decisionFailure = { code, stage: "decision", taskRevision: 17,
+      timelineId: `work-timeline-${DIGEST_A}`, timelineDigest: DIGEST_A, recordedAt: "2026-08-03T07:00:00.000Z" };
+    candidates = [];
+    assert.equal((await assemble(fixture, options)).context.code.reviewPublicationRecovery, undefined);
+  });
+});
+
 test("CI diagnostics retain the GitHub digest and bind the complete role context to the current Head", async () => {
   const { fixture, gitTarget, pullRequestContext } = atomicPullRequestFixture();
   const read = { async read() { return structuredClone(pullRequestContext); } };

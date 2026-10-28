@@ -1280,6 +1280,45 @@ test("a created child recovers through the same ledger authority", async () => {
   );
 });
 
+test("Review replacement persists cancellation and creation together and survives failed writes and restart", async () => {
+  const { service, store, lease, source } = await fixture(1);
+  let parent = (await service.listItems()).items[0];
+  const { planner } = graphPorts(service, "employee-orchestrator", parent.itemId);
+  const contract = { revision: 1, acceptanceCriteria: [{ criterionId: "reviewed", description: "Verified Review evidence" }],
+    expectedDeliverables: [{ deliverableId: "review", kind: "review-report", description: "Current Review", required: true }] };
+  const initial = createCommand({ parent, graphRevision: 1, childKey: "original-review", contract });
+  initial.target.id = "pr-engineer";
+  const created = await planner.createChild(initial);
+  let old = (await service.listItems()).items.find(item => item.itemId === created.taskId);
+  old = await service.transition({ itemId: old.itemId, expectedRevision: old.revision, leaseId: null,
+    actorId: "work-ledger-system", toStatus: "blocked", reason: "decision_attempts_exhausted", details: {} });
+  parent = (await service.listItems()).items.find(item => item.itemId === parent.itemId);
+  const revision = (await service.getGraphSnapshot()).graph.revision;
+  const command = createCommand({ parent, graphRevision: revision, childKey: "review-reuse-stable", contract });
+  command.target.id = "pr-engineer";
+  command.reviewReplacement = { taskId: old.itemId, expectedTaskRevision: old.revision, reason: "Host verified current candidate" };
+  const before = structuredClone(store.values.get(STATE_KEY)), writes = store.writes.length;
+  store.failNextWrite();
+  await assert.rejects(planner.createChild(command), error => error.code === "WORK_LEDGER_STATE_WRITE_FAILED" && error.cause?.message === "durable write failed");
+  assert.deepEqual(store.values.get(STATE_KEY), before);
+  assert.equal(store.writes.length, writes);
+  const result = await planner.createChild(command);
+  assert.equal(store.writes.length, writes + 1);
+  const durable = store.values.get(STATE_KEY);
+  assert.equal(durable.revision, revision + 1);
+  assert.equal(durable.items.find(item => item.itemId === old.itemId).status, "cancelled");
+  assert.equal(durable.items.find(item => item.itemId === result.taskId).status, "queued");
+  assert.deepEqual(durable.timeline.slice(-3).map(event => event.type), ["cancelled", "graph_child_created", "graph_parent_revised"]);
+  const restarted = new WorkLedgerService({ store, assignmentSource: source, exclusiveLease: lease,
+    clock: () => "2026-08-03T01:00:01.000Z", idFactory: () => "restart-lease" });
+  await restarted.recover();
+  const resumed = graphPorts(restarted, "employee-orchestrator", parent.itemId).planner;
+  const replay = await resumed.createChild(command);
+  assert.equal(replay.applied, false);
+  assert.equal(replay.taskId, result.taskId);
+  assert.equal(store.writes.length, writes + 1);
+});
+
 test("recovery rejects a forged graph assignment identity after generic bindings are resigned", async () => {
   const { service, store, lease, source } = await fixture(1);
   const parent = (await service.listItems()).items[0];

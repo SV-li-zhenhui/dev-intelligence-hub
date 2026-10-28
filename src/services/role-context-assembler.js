@@ -2,7 +2,7 @@ import { isInternalRepairReviewEvent } from "../domain/internal-repair-review.js
 import { createHash } from "node:crypto";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 import { deliveryAcceptanceContractDigest, deliveryEvidenceKindsForProposal } from "../domain/delivery-evidence-contract.js";
-import { hasRequiredReviewDeliverable } from "../domain/pr-review-work-policy.js";
+import { hasRequiredReviewDeliverable, isExternalRereview } from "../domain/pr-review-work-policy.js";
 
 import {
   normalizePullRequestGitTarget,
@@ -1485,6 +1485,25 @@ export class RoleContextAssembler {
         signal === null ? {} : { signal }));
       signal?.throwIfAborted();
     }
+    let reviewPublicationRecovery = null;
+    if (coordination !== null && this.#publicationReuseReader !== null && typeof pullRequest?.materialDigest === "string" &&
+        isExternalRereview({ code: { sourceEvent: item.event } })) {
+      const child = coordination.coordination.directChildren.find(child => child.ledgerStatus === "blocked" &&
+        child.responsibility.type === "role" && child.responsibility.id === "pr-engineer" && child.decisionFailure &&
+        !child.hasMoreDeliverables && child.deliverables.every(slot => slot.state === "none") &&
+        hasRequiredReviewDeliverable({ expectedDeliverables: child.deliverables }));
+      if (child) {
+        const catalog = canonicalValue(await this.#publicationReuseReader({ taskId: child.taskId, materialDigest: pullRequest.materialDigest },
+          signal === null ? {} : { signal }));
+        signal?.throwIfAborted();
+        if (catalog.complete === true && catalog.candidates.length > 0) {
+          reviewPublicationRecovery = { childTaskId: child.taskId, childTaskRevision: child.taskRevision,
+            candidates: catalog.candidates.map(candidate => ({ ...candidate,
+              replacementChildKey: `review-reuse-${canonicalJsonDigest([currentTask.taskId, candidate.reviewUrl, candidate.deliverableId])}` })),
+            requiresTaskControlChecks: true };
+        }
+      }
+    }
 
     const binding = {
       roleId,
@@ -1558,6 +1577,7 @@ export class RoleContextAssembler {
         ...(pullRequest === null ? {} : { pullRequest }),
         ...(reviewPublicationSettlement === null ? {} : { reviewPublicationSettlement }),
         ...(reviewPublicationReuse === null ? {} : { reviewPublicationReuse }),
+        ...(reviewPublicationRecovery === null ? {} : { reviewPublicationRecovery }),
         acceptedDependencies: dependencies.code,
         facts: isPullRequest ? facts : [],
         ...(proposalDecisionContext === null

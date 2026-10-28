@@ -54,6 +54,7 @@ import {
 } from "./work-ledger-graph-commands.js";
 import {
   planScopedWorkGraphCancellation,
+  planWorkGraphReviewReplacement,
   planWorkGraphEscalation,
   planWorkGraphTaskPause,
   planWorkGraphTaskReassignment,
@@ -1730,7 +1731,8 @@ export class WorkLedgerService {
   }
 
   async createGraphChild(input = {}) {
-    return this.#executeCommand(planWorkGraphChildCreation, input);
+    return this.#executeCommand(Object.hasOwn(input.command ?? {}, "reviewReplacement")
+      ? planWorkGraphReviewReplacement : planWorkGraphChildCreation, input);
   }
 
   async reviseGraphAcceptance(input = {}) {

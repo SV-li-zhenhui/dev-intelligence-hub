@@ -924,6 +924,41 @@ test("external rereview can return but cannot accept a local text report", async
   }
 });
 
+test("host-backed Review replacement stays exact and is attached only to a matching decomposition", async (t) => {
+  for (const automaticMode of [false, true]) for (const variant of ["valid", "missing", "key", "revision", "paused", "active sibling", "contract"]) await t.test(`${automaticMode}:${variant}`, async () => {
+    const root = task({ taskId: "reuse-root", revision: 1 });
+    const old = task({ taskId: "reuse-root/old", revision: 17, parentTaskId: root.taskId, status: "failed", role: "pr-engineer",
+      acceptanceContract: contract({ kind: "review-report" }) });
+    const children = [old, task({ taskId: "reuse-root/diagnostic", parentTaskId: root.taskId, status: "cancelled", role: "orchestrator",
+      acceptanceContract: contract({ kind: "text-report" }) })];
+    if (variant === "active sibling") children.push(task({ taskId: "reuse-root/active", parentTaskId: root.taskId, role: "pr-engineer" }));
+    const view = graphView([root, ...children], 20);
+    const event = structuredTriageEvent("pr-review"); event.payload.nextAction = "rereview";
+    const packet = packetFor(view, root, { directChildren: children, event });
+    Object.assign(packet.context.requirements.coordination.directChildren[0], { ledgerStatus: variant === "paused" ? "paused" : "blocked",
+      decisionFailure: { code: "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION" } });
+    packet.context.code.reviewPublicationRecovery = { childTaskId: old.taskId, childTaskRevision: variant === "revision" ? 18 : 17,
+      requiresTaskControlChecks: true, candidates: [{ replacementChildKey: "stable-reuse-key", deliverableId: "implementation" }] };
+    if (variant === "missing") delete packet.context.code.reviewPublicationRecovery;
+    const fakes = fakePorts({ packet, views: view });
+    const operation = () => new OrchestratorService({ ...fakes.ports, capabilityRoles: { "pr-review": "pr-engineer" }, automaticMode }).execute({
+      worker: { roleId: "orchestrator", workerId: "employee-orchestrator" }, item: itemFor(root), contextPacket: packet,
+      intent: orchestrate({ ...commonAction("decompose", root, view), childKey: variant === "key" ? "another-key" : "stable-reuse-key",
+        work: { title: "Review", description: "Assess and adopt verified original Review" }, capability: "pr-review", dependsOn: [],
+        acceptanceContract: contract({ kind: variant === "contract" ? "text-report" : "review-report" }) }),
+    });
+    if (variant === "valid") {
+      assert.equal((await operation()).action, "decompose");
+      assert.deepEqual(fakes.calls.planner[0].command.reviewReplacement, {
+        taskId: old.taskId, expectedTaskRevision: 17, reason: "当前任务需要协调",
+      });
+    } else {
+      await assert.rejects(operation(), { code: "ORCHESTRATOR_AUTHORITY_DENIED" });
+      assertNoTrustedMutation(fakes.calls);
+    }
+  });
+});
+
 test('external rereview accepts its subsequent tester text delivery without requiring another Review', async () => {
   const root = task({ taskId: 'rereview-root', revision: 1 });
   const child = task({ taskId: 'rereview-root/testing', revision: 2, parentTaskId: root.taskId,

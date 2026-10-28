@@ -9,7 +9,8 @@ import {
   assertWorkGraphTasksInScope,
   normalizeWorkGraphCommandAuthority,
 } from "./work-ledger-graph-command-support.js";
-import { planWorkGraphCancellation } from "./work-ledger-graph-commands.js";
+import { planWorkGraphCancellation, planWorkGraphChildCreation } from "./work-ledger-graph-commands.js";
+import { hasRequiredReviewDeliverable, requiredReviewDeliverables } from "../domain/pr-review-work-policy.js";
 import {
   createWorkIntentRecord,
   normalizeLedgerWorkIntent,
@@ -22,6 +23,7 @@ import {
 } from "./work-ledger-transitions.js";
 import {
   boundedLedgerString,
+  canonicalLedgerValue,
   hasExactLedgerKeys,
   normalizeLedgerTarget,
   workLedgerError,
@@ -375,6 +377,48 @@ export function planScopedWorkGraphCancellation({ state, input, clock }) {
       reason: command.reason,
     },
   });
+}
+
+// The Review recovery hint grants no execution authority. Reuse the ordinary
+// cancellation and creation gates, then commit both graph changes together.
+export function planWorkGraphReviewReplacement({ state, input, clock }) {
+  const value = canonicalLedgerValue(input, { errorCode: "WORK_LEDGER_GRAPH_COMMAND_INVALID" });
+  if (!hasExactLedgerKeys(value, ["authority", "command"]) ||
+      !hasExactLedgerKeys(value.command.reviewReplacement, ["taskId", "expectedTaskRevision", "reason"])) throw invalidCommand("Review 替代请求无效");
+  const authority = normalizeWorkGraphCommandAuthority(value.authority);
+  const { reviewReplacement, ...command } = value.command;
+  const old = requireScopedTask(state, authority, reviewReplacement.taskId);
+  const parent = requireScopedTask(state, authority, command.parentTaskId);
+  if (old.kind !== "graph_task" || old.graph.parentItemId !== parent.itemId ||
+      authority.scopeRootTaskId !== parent.itemId || parent.currentTarget.type !== "role" || parent.currentTarget.id !== "orchestrator" ||
+      old.currentTarget.type !== "role" || old.currentTarget.id !== "pr-engineer" || old.activeIntentId !== null ||
+      old.graph.deliveries.length !== 0 || state.items.some(item => item.graph.parentItemId === old.itemId) ||
+      !hasRequiredReviewDeliverable(old.graph.acceptanceContracts.at(-1)) ||
+      !requiredReviewDeliverables(command.acceptanceContract).some(slot =>
+        requiredReviewDeliverables(old.graph.acceptanceContracts.at(-1)).some(oldSlot => oldSlot.deliverableId === slot.deliverableId)) ||
+      command.target.type !== "role" || command.target.id !== "pr-engineer") throw invalidCommand("Review 替代目标无效");
+  const reason = commandReason(reviewReplacement.reason);
+  assertNoActiveSideEffects(old);
+  const createInput = { authority, command };
+  if (old.status === "cancelled" && old.revision === reviewReplacement.expectedTaskRevision + 1 && old.statusReason === reason) {
+    const retained = planWorkGraphChildCreation({ state, input: createInput, clock });
+    if (retained.write === false) return retained;
+    throw invalidCommand("Review 替代任务缺失");
+  }
+  if (old.status !== "blocked") throw invalidCommand("Review 任务尚未结算");
+  const now = clock(), pinnedClock = () => now;
+  const cancelled = planScopedWorkGraphCancellation({ state, clock: pinnedClock, input: { authority, command: {
+    taskId: old.itemId, expectedTaskRevision: reviewReplacement.expectedTaskRevision,
+    expectedGraphRevision: command.expectedGraphRevision, reason,
+  } } });
+  // The ordinary planner validates its intermediate graph at the next revision;
+  // the combined mutation still commits exactly one durable ledger revision.
+  const created = planWorkGraphChildCreation({ state: { ...state, ...cancelled.patch, revision: state.revision + 1 },
+    input: { authority, command: { ...command, expectedGraphRevision: state.revision + 1 } }, clock: pinnedClock });
+  if (created.write === false) throw invalidCommand("Review 替代任务已存在但原任务未取消");
+  assertWorkGraphCommandTransition(state, created.patch.items);
+  return { ...created, result: { ...created.result, graphRevision: state.revision + 1 },
+    timelineEvents: [...cancelled.timelineEvents, ...created.timelineEvents] };
 }
 
 function normalizeEscalationCommand(input) {

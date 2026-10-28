@@ -1,4 +1,4 @@
-import { structuredPrTriage, isExternalRereview, hasRequiredReviewDeliverable, requiresReviewDelivery } from "../domain/pr-review-work-policy.js";
+import { structuredPrTriage, isExternalRereview, hasRequiredReviewDeliverable, requiredReviewDeliverables, requiresReviewDelivery } from "../domain/pr-review-work-policy.js";
 import { createHash } from "node:crypto";
 import { permitsReviewPublicationSettlementIntent } from "./review-publication-settlement.js";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
@@ -643,6 +643,21 @@ function cancelledConflictChildWithoutDelivery(task) {
     task.responsibility.id === "developer" && task.deliveries.length === 0;
 }
 
+function verifiedReviewReplacement(packet, action, tasksById, children) {
+  if (!requiresReviewDelivery(packet.context, action)) return null;
+  const recovery = packet.context.code?.reviewPublicationRecovery;
+  if (recovery?.requiresTaskControlChecks !== true || !children.has(recovery.childTaskId)) return null;
+  const old = tasksById.get(recovery.childTaskId);
+  const visible = packet.context.requirements.coordination.directChildren.find(child => child.taskId === old.taskId);
+  const candidate = recovery.candidates.find(candidate => candidate.replacementChildKey === action.childKey &&
+    requiredReviewDeliverables(action.acceptanceContract).some(slot => slot.deliverableId === candidate.deliverableId));
+  if (!candidate || old.revision !== recovery.childTaskRevision || visible?.ledgerStatus !== "blocked" || !visible.decisionFailure ||
+      old.responsibility.type !== "role" || old.responsibility.id !== "pr-engineer" || old.deliveries.length !== 0 ||
+      !hasRequiredReviewDeliverable(latestContract(old)) || [...children].some(taskId => taskId !== old.taskId &&
+        (!["cancelled", "superseded"].includes(tasksById.get(taskId).status) || tasksById.get(taskId).deliveries.length !== 0))) return null;
+  return { taskId: old.taskId, expectedTaskRevision: old.revision, reason: action.reason };
+}
+
 function assertStructuredPrTriageAction(packet, children, action, tasksById, automaticMode, capabilityRoles) {
   const triage = structuredPrTriage(packet.context);
   if (triage === null) return;
@@ -662,6 +677,14 @@ function assertStructuredPrTriageAction(packet, children, action, tasksById, aut
     throw denied("Automatic rereview correction must preserve an intentionally paused Review child");
   }
   if (action.type !== "decompose") return;
+  const reviewReplacement = verifiedReviewReplacement(packet, action, tasksById, children);
+  if (requiresReviewDelivery(packet.context, action) && !reviewReplacement &&
+      (packet.context.code?.reviewPublicationRecovery || [...children].some(taskId => {
+        const child = tasksById.get(taskId);
+        const visible = packet.context.requirements.coordination.directChildren.find(value => value.taskId === taskId);
+        return visible?.ledgerStatus === "blocked" && child.responsibility.type === "role" &&
+          child.responsibility.id === "pr-engineer" && hasRequiredReviewDeliverable(latestContract(child));
+      }))) throw denied("Blocked authoritative Review replacement requires an exact current host recovery candidate");
   if (automaticMode && [...children].some((taskId) => {
     const child = tasksById.get(taskId);
     return child.status === "paused" && child.responsibility.type === "role" &&
@@ -673,7 +696,7 @@ function assertStructuredPrTriageAction(packet, children, action, tasksById, aut
   const replaceCancelledConflict = !automaticMode && triage.nextAction === "resolve_conflict" &&
     triage.suggestedCapability === "development" &&
     [...children].every((taskId) => cancelledConflictChildWithoutDelivery(tasksById.get(taskId)));
-  if (!automaticMode && children.size !== 0 && !replaceCancelledConflict && !(isExternalRereview(packet.context) &&
+  if (!automaticMode && children.size !== 0 && !replaceCancelledConflict && !reviewReplacement && !(isExternalRereview(packet.context) &&
       [...children].every((taskId) => cancelledMalformedReviewChild(tasksById.get(taskId))))) {
     throw denied("Structured PR triage permits only one direct child");
   }
@@ -684,6 +707,7 @@ function assertStructuredPrTriageAction(packet, children, action, tasksById, aut
       !hasRequiredReviewDeliverable(action.acceptanceContract)) {
     throw denied("External rereview requires a required authoritative Review delivery");
   }
+  return reviewReplacement;
 }
 
 function hasVisibleSubmittedDelivery(packet, taskId, revision) {
@@ -1182,6 +1206,7 @@ function planDecomposition({
   children,
   tasksById,
   capabilityRoles,
+  reviewReplacement,
 }) {
   if (source.taskId !== rootId) {
     throw denied("Only the configured root task can be decomposed");
@@ -1239,6 +1264,7 @@ function planDecomposition({
         { taskId: source.taskId, revision: source.revision },
         ...action.dependsOn.map(({ taskId, revision }) => ({ taskId, revision })),
       ].sort((left, right) => compareText(left.taskId, right.taskId)),
+      ...(reviewReplacement ? { reviewReplacement } : {}),
     },
     recover: null,
     result: projectActionResult(action.type, rootId, source.taskId, {
@@ -1598,7 +1624,7 @@ export class OrchestratorService {
     }
     const children = directChildIds(packet);
     const action = intent.action;
-    assertStructuredPrTriageAction(packet, children, action, tasksById, this.#automaticMode, this.#capabilityRoles);
+    const reviewReplacement = assertStructuredPrTriageAction(packet, children, action, tasksById, this.#automaticMode, this.#capabilityRoles);
     const source = assertActionSource(
       action,
       graph,
@@ -1617,6 +1643,7 @@ export class OrchestratorService {
       tasksById,
       summary: intent.summary,
       capabilityRoles: this.#capabilityRoles,
+      reviewReplacement,
       evidenceVerifier: this.#evidenceVerifier,
       evidenceVerificationTimeoutMs: this.#evidenceVerificationTimeoutMs,
       graphReader: this.#graphReader,
