@@ -2013,45 +2013,155 @@ async function createFixture({
   return { service, source, store, lease, time };
 }
 
-test("expired queued graph contexts skip durable reads and leave the next live read available", async () => {
+test("committed context authority stays readable while candidate validation holds the writer lease", async () => {
+  const entered = deferred(), release = deferred();
+  let hold = false;
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })], store: new ContentVersionMemoryStore(),
+    candidateProcessor: {
+      async prepare(input) { if (hold) { entered.resolve(); await release.promise; } return prepareWorkLedgerCandidate(input); },
+      async commit() {}, async discard() {},
+    },
+  });
+  await fixture.service.intake();
+  const root = (await fixture.service.listItems()).items[0];
+  const binding = prExecutionBinding(root);
+  hold = true;
+  fixture.source.records.push(prAssignment(2, { pullRequestNumber: 43 }));
+  fixture.source.highWatermark = 2;
+  const write = fixture.service.intake();
+  await entered.promise;
+  try {
+    const blocked = Symbol('writer blocked readers');
+    const result = await Promise.race([
+      Promise.all([fixture.service.getGraphSnapshot(), fixture.service.readItemForReconciliation({ itemId: root.itemId }),
+        fixture.service.verifyPullRequestExecutionBinding(binding), fixture.service.readAutomaticReviewAdmission(binding),
+        fixture.service.readPullRequestExecutionContext(binding)]),
+      new Promise(resolve => setImmediate(() => resolve(blocked))),
+    ]);
+    assert.notEqual(result, blocked, 'reading committed context must not wait for an unrelated uncommitted candidate');
+    assert.equal(result[0].graph.tasks.length, 1);
+    assert.deepEqual(result[1], root);
+    assert.deepEqual(result[2], binding);
+    assert.deepEqual(result[3].inputBinding, binding);
+    assert.deepEqual(result[4].inputBinding, binding);
+    result[1].status = 'cancelled';
+    assert.equal((await fixture.service.readItemForReconciliation({ itemId: root.itemId })).status, root.status);
+  } finally { release.resolve(); await write; }
+  assert.equal((await fixture.service.getGraphSnapshot()).graph.tasks.length, 2);
+});
+
+test("a version observed by a context read also fences later mutations against durable rollback", async () => {
+  const store = new ContentVersionMemoryStore();
+  const fixture = await createFixture({ records: [assignment(1)], store });
+  await fixture.service.intake();
+  const previous = store.stored();
+  const item = (await fixture.service.listItems()).items[0];
+  const other = await createFixture({ source: fixture.source, store });
+  fixture.source.records.push(assignment(2));
+  fixture.source.highWatermark = 2;
+  await other.service.intake();
+  assert.equal((await fixture.service.getGraphSnapshot()).graph.tasks.length, 2);
+  store.replaceStored(previous);
+  const writes = store.writes.length;
+  await assert.rejects(fixture.service.claim({ itemId: item.itemId, expectedRevision: item.revision,
+    workerId: 'employee-pr-reviewer', leaseDurationMs: 30_000 }), { code: 'WORK_LEDGER_STATE_REVISION_CONFLICT' });
+  assert.equal(store.writes.length, writes);
+});
+
+for (const variant of ['older', 'fork']) {
+test(`committed authority reads preserve the latest cache against a late ${variant} snapshot`, async () => {
+  const store = new ContentVersionMemoryStore();
+  const fixture = await createFixture({ records: [assignment(1)], store });
+  await fixture.service.intake();
+  const other = await createFixture({ source: fixture.source, store });
+  fixture.source.records.push(assignment(2)); fixture.source.highWatermark = 2;
+  await other.service.intake();
+  const captured = await store.readVersioned(STATE_KEY);
+  const entered = deferred(), release = deferred();
+  const readVersioned = store.readVersioned.bind(store);
+  let intercept = true;
+  store.readVersioned = (...args) => {
+    if (!intercept) return readVersioned(...args);
+    intercept = false; entered.resolve(); return release.promise;
+  };
+  const slow = fixture.service.getGraphSnapshot();
+  await entered.promise;
+  if (variant === 'fork') {
+    const fork = store.stored(); fork.items[0].statusReason = 'valid-but-forked'; store.replaceStored(fork);
+  } else {
+    fixture.source.records.push(assignment(3)); fixture.source.highWatermark = 3;
+    await other.service.intake();
+  }
+  const latest = await fixture.service.getGraphSnapshot();
+  if (variant === 'fork') {
+    const rejected = assert.rejects(slow, { code: 'WORK_LEDGER_STATE_REVISION_CONFLICT' });
+    release.resolve(captured); await rejected;
+  } else {
+    release.resolve(captured);
+    assert.equal((await slow).graph.tasks.length, 2);
+  }
+  assert.equal(await fixture.service.getGraphSnapshot(), latest, 'a late result must not evict the latest validated graph');
+});
+}
+
+for (const variant of ['changed', 'unchanged', 'missing']) {
+test(`a late ${variant} writer read cannot lower the context-observed authority revision`, async () => {
+  const store = new ContentVersionMemoryStore();
+  const fixture = await createFixture({ records: variant === 'missing' ? [] : [assignment(1)], store });
+  if (variant !== 'missing') await fixture.service.intake();
+  const captured = await store.readVersioned(STATE_KEY);
+  const entered = deferred(), release = deferred();
+  const readVersioned = store.readVersioned.bind(store);
+  let intercept = true;
+  store.readVersioned = (...args) => {
+    if (!intercept) return readVersioned(...args);
+    intercept = false; entered.resolve(); return release.promise;
+  };
+  const writer = fixture.service.verifyPullRequestExecutionBindings({ ledgerRevision: captured.value?.revision ?? 0, bindings: [] });
+  await entered.promise;
+  const other = await createFixture({ source: fixture.source, store });
+  fixture.source.records.push(assignment(variant === 'missing' ? 1 : 2));
+  fixture.source.highWatermark = variant === 'missing' ? 1 : 2;
+  await other.service.intake();
+  const latest = await fixture.service.getGraphSnapshot();
+  const code = variant === 'missing' ? 'WORK_LEDGER_STATE_CORRUPTED' : 'WORK_LEDGER_STATE_REVISION_CONFLICT';
+  const rejected = assert.rejects(writer, { code });
+  release.resolve(variant === 'unchanged' ? { changed: false, version: captured.version } : captured);
+  await rejected;
+  assert.equal(await fixture.service.getGraphSnapshot(), latest);
+});
+}
+
+test('concurrent committed authority reads reuse validation of the same returned content version', async () => {
+  const store = new ContentVersionMemoryStore();
+  const fixture = await createFixture({ records: [assignment(1)], store });
+  await fixture.service.intake();
+  const other = await createFixture({ source: fixture.source, store });
+  fixture.source.records.push(assignment(2)); fixture.source.highWatermark = 2;
+  await other.service.intake();
+  const result = await Promise.all(Array.from({ length: 3 }, () => fixture.service.getGraphSnapshot()));
+  assert.equal(result[0].graph.tasks.length, 2);
+  assert.ok(result.every(snapshot => snapshot === result[0]));
+});
+
+test("already expired graph contexts skip durable reads and leave the next live read available", async () => {
   const fixture = await createFixture();
   let reads = 0;
   const originalRead = fixture.store.read.bind(fixture.store);
   fixture.store.read = async (...args) => { reads++; return originalRead(...args); };
-  const entered = deferred(), release = deferred();
-  const blocker = fixture.service.operationQueue.enqueue(async () => { entered.resolve(); await release.promise; });
-  await entered.promise;
   const controller = new AbortController();
-  const reason = new Error("role context expired while queued");
+  const reason = new Error("role context already expired");
+  controller.abort(reason);
   const cancelled = Array.from({ length: 5 }, () => fixture.service.getGraphSnapshot({ signal: controller.signal }));
   const outcomes = Promise.allSettled(cancelled);
-  controller.abort(reason);
-  release.resolve();
-  await blocker;
   const results = await outcomes;
   assert.ok(results.every(result => result.status === "rejected" && result.reason === reason));
-  assert.equal(reads, 0, "expired contexts must not consume the durable read queue");
+  assert.equal(reads, 0, "expired contexts must not start another durable read");
   assert.ok((await fixture.service.getGraphSnapshot()).graph);
   assert.equal(reads, 1);
 });
 
-test("graph cancellation is rechecked after waiting for the exclusive lease and after an in-flight read", async (t) => {
-  await t.test("lease wait", async () => {
-    const fixture = await createFixture();
-    const entered = deferred(), release = deferred();
-    const blocker = fixture.lease.run(async () => { entered.resolve(); await release.promise; });
-    await entered.promise;
-    let reads = 0;
-    fixture.store.read = async () => { reads++; assert.fail("cancelled lease waiter must not read"); };
-    const controller = new AbortController(), reason = new Error("expired during lease wait");
-    const result = fixture.service.getGraphSnapshot({ signal: controller.signal });
-    const rejected = assert.rejects(result, error => error === reason);
-    controller.abort(reason);
-    release.resolve();
-    await blocker;
-    await rejected;
-    assert.equal(reads, 0);
-  });
+test("graph cancellation is rechecked after an in-flight committed read", async (t) => {
   await t.test("read in flight", async () => {
     const fixture = await createFixture();
     const entered = deferred(), release = deferred();
@@ -15912,6 +16022,7 @@ test("attention does not pair an old question with a newer durable version durin
     producer: { roleId: "requirements-analyst", workItemId: waiting.itemId },
   };
   const oldState = fixture.service.state;
+  const oldVersion = fixture.service.durableContentVersion;
   const other = new WorkLedgerService({
     store, assignmentSource: fixture.source, exclusiveLease: new ExclusiveLease(),
     clock: fixture.time.clock, idFactory: incrementingIds(),
@@ -15939,7 +16050,7 @@ test("attention does not pair an old question with a newer durable version durin
   readRelease.resolve(newer);
   queueMicrotask(() => {
     try {
-      assert.equal(fixture.service.durableContentVersion, newer.version);
+      assert.equal(fixture.service.durableContentVersion, oldVersion, 'a read must not advance writer bookkeeping');
       assert.equal(fixture.service.state, oldState);
       fixture.service.isAttentionRequestCurrent(authority).then(checked.resolve, checked.reject);
     } catch (error) { checked.reject(error); }
@@ -16178,7 +16289,7 @@ test("content-version caching reuses validated graph state and still fails close
   });
 });
 
-test("browser graph reads bypass an in-flight write without weakening authoritative reads", async () => {
+test("browser and authoritative graph reads expose only committed state during an in-flight write", async () => {
   const store = new ContentVersionMemoryStore();
   const fixture = await createFixture({
     records: [assignment(1)],
@@ -16205,19 +16316,11 @@ test("browser graph reads bypass an in-flight write without weakening authoritat
   });
   await writeStarted.promise;
   const browserSnapshot = await fixture.service.getLastCommittedGraphSnapshot();
-  const authoritativeSnapshot = fixture.service.getGraphSnapshot();
-  let authoritativeSettled = false;
-  authoritativeSnapshot.finally(() => {
-    authoritativeSettled = true;
-  });
-  await Promise.resolve();
-
-  assert.equal(browserSnapshot, before);
-  assert.equal(authoritativeSettled, false);
-
-  releaseWrite.resolve();
-  await claim;
-  const after = await authoritativeSnapshot;
+  try {
+    assert.equal(browserSnapshot, before);
+    assert.equal(await fixture.service.getGraphSnapshot(), before);
+  } finally { releaseWrite.resolve(); await claim; }
+  const after = await fixture.service.getGraphSnapshot();
   assert.equal(after.graph.revision, before.graph.revision + 1);
 });
 

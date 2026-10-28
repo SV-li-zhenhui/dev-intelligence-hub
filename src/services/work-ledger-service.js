@@ -198,6 +198,15 @@ const PR_SOURCE_AUTHORITY_FENCE_SAFE_STATUSES = new Set([
 ]);
 const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 
+function assertLedgerRevisionProgress(durable, baseline) {
+  if (durable === baseline) return;
+  if (durable.revision < baseline.revision ||
+      (durable.revision === baseline.revision &&
+        workLedgerPersistedStateDigest(durable) !== workLedgerPersistedStateDigest(baseline))) {
+    throw workLedgerError("WORK_LEDGER_STATE_REVISION_CONFLICT", "员工工作台账持久状态发生回退或分叉", 409);
+  }
+}
+
 function isContentVersion(value) {
   return (
     isPlainLedgerObject(value) &&
@@ -679,7 +688,7 @@ export class WorkLedgerService {
     this.limits = normalizeWorkLedgerLimits(limits);
     this.state = emptyWorkLedgerState();
     this.durableContentVersion = undefined;
-    this.attentionAuthoritySnapshot = null;
+    this.committedAuthoritySnapshot = null;
     this.graphSnapshotCache = null;
     this.roleWorkloadCache = null;
     this.ready = false;
@@ -946,15 +955,9 @@ export class WorkLedgerService {
         "工作项恢复查询无效",
       );
     }
-    return this.operationQueue.enqueue(() =>
-      this.exclusiveLease.run(async () => {
-        this.state = await this.#readDurableState();
-        const item = this.state.items.find(
-          (candidate) => candidate.itemId === itemId,
-        );
-        return item ? cloneLedgerValue(item) : null;
-      }),
-    );
+    const state = await this.#readCommittedAuthorityState();
+    const item = state.items.find(candidate => candidate.itemId === itemId);
+    return item ? cloneLedgerValue(item) : null;
   }
 
   async readInternalReviewHandoff(input = {}) {
@@ -985,7 +988,7 @@ export class WorkLedgerService {
     }
     const bindings = inputs.map((input) => this.#normalizeAttentionAuthority(input));
     if (bindings.length === 0) return [];
-    const state = await this.#readAttentionAuthorityState();
+    const state = await this.#readCommittedAuthorityState();
     return bindings.map((binding) => this.#attentionCurrentInState(state, binding));
   }
 
@@ -1121,14 +1124,8 @@ export class WorkLedgerService {
 
   async verifyPullRequestExecutionBinding(input = {}) {
     this.#assertReady();
-    return this.operationQueue.enqueue(() =>
-      this.exclusiveLease.run(async () => {
-        this.state = await this.#readDurableState();
-        return cloneLedgerValue(
-          verifyPullRequestExecutionAuthority(this.state, input),
-        );
-      }),
-    );
+    const state = await this.#readCommittedAuthorityState();
+    return cloneLedgerValue(verifyPullRequestExecutionAuthority(state, input));
   }
 
   async verifyPullRequestExecutionBindings(input = {}) {
@@ -1176,40 +1173,24 @@ export class WorkLedgerService {
 
   async readAutomaticReviewAdmission(input = {}) {
     this.#assertReady();
-    return this.operationQueue.enqueue(() =>
-      this.exclusiveLease.run(async () => {
-        this.state = await this.#readDurableState();
-        const inputBinding = verifyPullRequestExecutionAuthority(this.state, input);
-        const root = this.state.items.find(item => item.itemId === inputBinding.rootItemId);
-        return cloneLedgerValue({ inputBinding, admission: automaticReviewWorkAdmission(root, inputBinding.inputRevision) });
-      }),
-    );
+    const state = await this.#readCommittedAuthorityState();
+    const inputBinding = verifyPullRequestExecutionAuthority(state, input);
+    const root = state.items.find(item => item.itemId === inputBinding.rootItemId);
+    return cloneLedgerValue({ inputBinding, admission: automaticReviewWorkAdmission(root, inputBinding.inputRevision) });
   }
 
   async readPullRequestExecutionContext(input = {}) {
     this.#assertReady();
-    return this.operationQueue.enqueue(() =>
-      this.exclusiveLease.run(async () => {
-        this.state = await this.#readDurableState();
-        const inputBinding = verifyPullRequestExecutionAuthority(
-          this.state,
-          input,
-        );
-        const root = this.state.items.find(
-          (candidate) => candidate.itemId === inputBinding.rootItemId,
-        );
-        const author = root?.source?.current?.event?.payload?.author;
-        const reviewFeedbackDigest = root?.source?.current?.event?.payload?.reviewFeedbackDigest;
-        return cloneLedgerValue({
-          inputBinding,
-          author:
-            typeof author === "string" && GITHUB_LOGIN.test(author)
-              ? author
-              : null,
-          ...(typeof reviewFeedbackDigest === "string" ? { reviewFeedbackDigest } : {}),
-        });
-      }),
-    );
+    const state = await this.#readCommittedAuthorityState();
+    const inputBinding = verifyPullRequestExecutionAuthority(state, input);
+    const root = state.items.find(candidate => candidate.itemId === inputBinding.rootItemId);
+    const author = root?.source?.current?.event?.payload?.author;
+    const reviewFeedbackDigest = root?.source?.current?.event?.payload?.reviewFeedbackDigest;
+    return cloneLedgerValue({
+      inputBinding,
+      author: typeof author === "string" && GITHUB_LOGIN.test(author) ? author : null,
+      ...(typeof reviewFeedbackDigest === "string" ? { reviewFeedbackDigest } : {}),
+    });
   }
 
   async getGraphSnapshot({ signal = null } = {}) {
@@ -1219,25 +1200,17 @@ export class WorkLedgerService {
       if (signal?.aborted) throw signal.reason ?? new DOMException("Graph read was aborted", "AbortError");
     };
     assertActive();
-    return this.operationQueue.enqueue(() => {
-      assertActive();
-      return this.exclusiveLease.run(async () => {
-        assertActive();
-        // Graph reads are also used to reconcile uncertain writes. Refresh
-        // from durable state so an applied write with a lost ACK is visible in
-        // the same recovery cycle rather than only after another mutation.
-        const state = await this.#readDurableState();
-        assertActive();
-        this.state = state;
-        return this.#currentGraphSnapshot();
-      });
-    });
+    // Read the committed file even when an unrelated candidate holds the writer
+    // lease. A lost write ACK remains visible; an uncommitted candidate does not.
+    const state = await this.#readCommittedAuthorityState();
+    assertActive();
+    return this.#currentGraphSnapshot(state);
   }
 
   async readAttentionRequestRetirement(input = {}) {
     // A temporarily non-current question is not proof that its task ended.
     await this.isAttentionRequestCurrent(input);
-    const state = await this.#readAttentionAuthorityState();
+    const state = await this.#readCommittedAuthorityState();
     const item = state.items.find((candidate) => candidate.itemId === input.producer.workItemId);
     const intent = state.outbox.find((candidate) => candidate.intentId === input.requestKey);
     const ciRetirement = ciMaterialRetirement(intent);
@@ -1259,7 +1232,7 @@ export class WorkLedgerService {
 
   async getLastCommittedGraphSnapshot() {
     this.#assertReady();
-    return this.#currentGraphSnapshot();
+    return this.#currentGraphSnapshot(this.committedAuthoritySnapshot?.state ?? this.state);
   }
 
   async readGraphMemoryProjectionBatch(options = {}) {
@@ -3320,7 +3293,7 @@ export class WorkLedgerService {
         isContentVersion(writtenVersion)
           ? writtenVersion
           : undefined;
-      this.attentionAuthoritySnapshot = {
+      this.committedAuthoritySnapshot = {
         version: this.durableContentVersion, state: normalized,
       };
     } catch (error) {
@@ -3353,14 +3326,13 @@ export class WorkLedgerService {
     }
   }
 
-  #currentGraphSnapshot() {
-    if (this.graphSnapshotCache?.state !== this.state) {
-      this.graphSnapshotCache = {
-        state: this.state,
-        value: projectWorkLedgerGraphView(this.state),
-      };
+  #currentGraphSnapshot(state) {
+    if (this.graphSnapshotCache?.state === state) return this.graphSnapshotCache.value;
+    const value = projectWorkLedgerGraphView(state);
+    if (!this.graphSnapshotCache || state.revision >= this.graphSnapshotCache.state.revision) {
+      this.graphSnapshotCache = { state, value };
     }
-    return this.graphSnapshotCache.value;
+    return value;
   }
 
   async #yieldAfterCommit() {
@@ -3381,14 +3353,17 @@ export class WorkLedgerService {
         }),
         this.durableContentVersion,
       );
-      if (!result.changed) return this.state;
+      if (!result.changed) {
+        if (this.ready) assertLedgerRevisionProgress(this.state, this.committedAuthoritySnapshot?.state ?? this.state);
+        return this.state;
+      }
       stored = result.value;
       observedVersion = result.version;
     } else {
       stored = await this.store.read(WORK_LEDGER_STATE_KEY, null);
     }
     if (stored === null) {
-      if (this.ready && this.state.revision !== 0) {
+      if (this.ready && (this.committedAuthoritySnapshot?.state ?? this.state).revision !== 0) {
         throw workLedgerError(
           "WORK_LEDGER_STATE_CORRUPTED",
           "员工工作台账持久状态意外消失",
@@ -3397,37 +3372,28 @@ export class WorkLedgerService {
       }
       this.durableContentVersion = observedVersion;
       const state = emptyWorkLedgerState();
-      this.attentionAuthoritySnapshot = { version: observedVersion, state };
+      this.committedAuthoritySnapshot = { version: observedVersion, state };
       return state;
     }
-    const durable = normalizeWorkLedgerPersistedState(stored, this.limits);
-    if (
-      this.ready &&
-      (durable.revision < this.state.revision ||
-        (durable.revision === this.state.revision &&
-          workLedgerPersistedStateDigest(durable) !==
-            workLedgerPersistedStateDigest(this.state)))
-    ) {
-      throw workLedgerError(
-        "WORK_LEDGER_STATE_REVISION_CONFLICT",
-        "员工工作台账持久状态发生回退或分叉",
-        409,
-      );
-    }
+    const durable = observedVersion !== undefined && observedVersion === this.committedAuthoritySnapshot?.version
+      ? this.committedAuthoritySnapshot.state : normalizeWorkLedgerPersistedState(stored, this.limits);
+    if (this.ready) assertLedgerRevisionProgress(durable, this.committedAuthoritySnapshot?.state ?? this.state);
     this.durableContentVersion = observedVersion;
-    this.attentionAuthoritySnapshot = { version: observedVersion, state: durable };
+    this.committedAuthoritySnapshot = { version: observedVersion, state: durable };
     return durable;
   }
 
-  async #readAttentionAuthorityState() {
-    // AttentionInbox can call this while holding its own lease. Read the
-    // committed ledger directly without taking another lease or changing the
-    // work ledger's version cache, so another instance cannot leave an old
-    // question authorized and no nested lease can deadlock.
+  async #readCommittedAuthorityState() {
+    // Authority reads need committed state, not a place behind pending writes.
+    // Keep their version cache separate from mutation bookkeeping, including
+    // when another instance commits or a durable write loses its ACK.
+    const snapshot = this.committedAuthoritySnapshot;
+    const baseline = snapshot?.state ?? this.state;
     let stored;
+    let durable;
+    let observedVersion;
     if (typeof this.store.readVersioned === "function") {
       // The pair is published atomically after validation or a committed write.
-      const snapshot = this.attentionAuthoritySnapshot;
       const version = snapshot?.version;
       const result = normalizeVersionedRead(
         await this.store.readVersioned(WORK_LEDGER_STATE_KEY, null, {
@@ -3435,20 +3401,34 @@ export class WorkLedgerService {
         }),
         version,
       );
-      if (!result.changed) return snapshot.state;
-      stored = result.value;
+      observedVersion = result.version;
+      // Every caller still performs fresh I/O. Concurrent reads may return the
+      // same token after another caller has already validated that content.
+      if (result.version === this.committedAuthoritySnapshot?.version) durable = this.committedAuthoritySnapshot.state;
+      else if (!result.changed) durable = snapshot.state;
+      else stored = result.value;
     } else {
       stored = await this.store.read(WORK_LEDGER_STATE_KEY, null);
     }
-    if (stored === null) {
-      if (this.state.revision === 0) return emptyWorkLedgerState();
-      throw workLedgerError(
-        "WORK_LEDGER_STATE_CORRUPTED",
-        "员工工作台账持久状态意外消失",
-        503,
-      );
+    if (durable === undefined) {
+      if (stored === null && baseline.revision !== 0) {
+        throw workLedgerError(
+          "WORK_LEDGER_STATE_CORRUPTED",
+          "员工工作台账持久状态意外消失",
+          503,
+        );
+      }
+      durable = stored === null ? emptyWorkLedgerState() : normalizeWorkLedgerPersistedState(stored, this.limits);
     }
-    return normalizeWorkLedgerPersistedState(stored, this.limits);
+    assertLedgerRevisionProgress(durable, baseline);
+    const latest = this.committedAuthoritySnapshot;
+    if (latest?.state.revision === durable.revision) assertLedgerRevisionProgress(durable, latest.state);
+    // A slower read cannot replace a newer committed snapshot published while
+    // its I/O was in flight. Its own result still describes that earlier read.
+    if (latest === snapshot || durable.revision > latest.state.revision) {
+      this.committedAuthoritySnapshot = { version: observedVersion, state: durable };
+    }
+    return durable;
   }
 
   #writeTransaction(operation) {
