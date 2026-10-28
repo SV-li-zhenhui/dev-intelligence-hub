@@ -3,7 +3,8 @@ import test from "node:test";
 import { normalizeBoundWorkProposal, createWorkProposalResult } from "../src/domain/work-proposal-contract.js";
 import { createGitHubReviewProposalConfirmationPlan } from "../src/domain/github-review-proposal-confirmation.js";
 import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
-import { verifyReviewPublicationSource, createReviewPublicationCandidate } from "../src/services/published-review-adoption.js";
+import { verifyReviewPublicationSource, createReviewPublicationCandidate, createReviewPublicationAdoption,
+  verifyReviewPublicationAdoption, ReviewPublicationAdoptionStore } from "../src/services/published-review-adoption.js";
 
 async function sourceFixture() {
   const at = "2026-10-26T08:47:13.000Z";
@@ -100,6 +101,14 @@ test("publication candidates bind complete current material and the new contract
   assert.match(first.candidateId, /^review-publication-candidate-[a-f0-9]{64}$/);
   const later = createReviewPublicationCandidate({ ...f, facts: f.createFacts({ ...f.factsInput, observedAt: "2026-10-28T05:30:00.000Z" }) });
   assert.equal(later.candidateId, first.candidateId, "observation refresh is not a new recovery condition");
+  const withChecks = createReviewPublicationCandidate({ ...f, facts: f.createFacts({ ...f.factsInput,
+    checks: [{ kind: "check_run", name: "CI", status: "COMPLETED", conclusion: "SUCCESS", url: "https://ci.example/run/1", requirement: "required",
+      startedAt: "2026-10-28T05:00:00.000Z", completedAt: "2026-10-28T05:05:00.000Z" }] }) });
+  assert.ok(withChecks);
+  assert.notEqual(withChecks.materialDigest, first.materialDigest);
+  assert.match(first.coverage.feedbackDigest, /^[a-f0-9]{64}$/);
+  assert.equal(withChecks.coverage.feedbackDigest, first.coverage.feedbackDigest);
+  assert.equal(withChecks.candidateId, first.candidateId, "CI status is not a new Review feedback coverage condition");
   const differentContract = createReviewPublicationCandidate({ ...f, target: { ...f.target,
     evidenceTarget: { ...f.target.evidenceTarget, contractDigest: "0".repeat(64) } } });
   assert.notEqual(differentContract.candidateId, first.candidateId);
@@ -158,4 +167,74 @@ test("publication source discovery retains outstanding work and reports an incom
   assert.ok(withLegacy.items.some(item => item.proposal.proposalId === legacy.proposalId));
   const otherRequest = { ...f.target.inputBinding, pullRequestNumber: 43 };
   assert.equal(reader.listReviewPublicationSources({ inputBinding: otherRequest, limit: 10 }).items.length, 0);
+});
+
+
+async function adoptionFixture() {
+  const f = await candidateFixture();
+  const candidate = createReviewPublicationCandidate(f);
+  const { contentDigest: _sourceDigest, ...content } = structuredClone(f.source.proposal);
+  const proposal = normalizeBoundWorkProposal({ ...content, proposalId: "work-intent-" + "e".repeat(64),
+    requestedBy: { roleId: f.target.evidenceTarget.roleId, workItemId: f.target.evidenceTarget.taskId },
+    source: { assignmentId: "new-review-assignment", eventId: f.target.inputBinding.eventId },
+    binding: { ...content.binding, eventId: f.target.inputBinding.eventId, inputBinding: f.target.inputBinding,
+      evidenceTarget: f.target.evidenceTarget },
+    payload: { ...content.payload, body: "Current complete feedback was reviewed; this note is local, not a new GitHub body",
+      publicationReuse: { candidateId: candidate.candidateId, materialDigest: candidate.materialDigest } } });
+  return { ...f, candidate, proposal, adoptedAt: "2026-10-28T05:50:00.000Z" };
+}
+
+test("adoption receipts bind the new assessment while preserving the original published body", async () => {
+  const f = await adoptionFixture();
+  const receipt = createReviewPublicationAdoption(f);
+  assert.ok(receipt);
+  assert.equal(receipt.outcome, "adopted_existing_review");
+  assert.equal(receipt.source.publishedBody, f.source.proposal.payload.body);
+  assert.equal(receipt.assessment.coverageNote, f.proposal.payload.body);
+  assert.notEqual(receipt.source.publishedBodyDigest, receipt.assessment.coverageNoteDigest);
+  assert.equal(receipt.target.evidenceTarget.taskId, "new-review-child");
+  assert.equal(verifyReviewPublicationAdoption({ ...f, receipt }), true);
+  const later = createReviewPublicationAdoption({ ...f, adoptedAt: "2026-10-28T06:00:00.000Z" });
+  assert.equal(later.adoptionId, receipt.adoptionId);
+  const changed = structuredClone(receipt); changed.assessment.coverageNote = "An unsealed note";
+  assert.equal(verifyReviewPublicationAdoption({ ...f, receipt: changed }), false);
+  const { contentDigest: _old, ...content } = f.proposal;
+  for (const payload of [
+    { ...content.payload, verdict: "request_changes" },
+    { ...content.payload, publicationReuse: { ...content.payload.publicationReuse, materialDigest: "0".repeat(64) } },
+  ]) assert.equal(createReviewPublicationAdoption({ ...f, proposal: normalizeBoundWorkProposal({ ...content, payload }) }), null);
+  assert.equal(createReviewPublicationAdoption({ ...f, proposal: undefined }), null);
+});
+
+test("adoption persistence is restart-safe and does not rewrite source or duplicate the receipt", async () => {
+  const f = await adoptionFixture();
+  const receipt = createReviewPublicationAdoption(f);
+  const values = new Map(); let writes = 0;
+  const store = { async read(key, fallback) { return structuredClone(values.get(key) ?? fallback); },
+    async write(key, value) { writes++; values.set(key, structuredClone(value)); } };
+  const first = new ReviewPublicationAdoptionStore({ store });
+  await first.recover();
+  assert.deepEqual(await first.record(receipt), receipt);
+  const restarted = new ReviewPublicationAdoptionStore({ store }); await restarted.recover();
+  assert.deepEqual(await restarted.get(receipt.adoptionId), receipt);
+  const again = createReviewPublicationAdoption({ ...f, adoptedAt: "2026-10-28T06:00:00.000Z" });
+  assert.deepEqual(await restarted.record(again), receipt);
+  assert.equal(writes, 1);
+  const changed = structuredClone(receipt); changed.source.receipt.id = "99999";
+  await assert.rejects(first.record(changed), { code: "REVIEW_PUBLICATION_ADOPTION_INVALID" });
+  assert.deepEqual(await restarted.get(receipt.adoptionId), receipt);
+});
+
+
+test("adoption recovery validates each retained receipt without applying a single-proposal budget to the whole history", async () => {
+  const f = await adoptionFixture();
+  const { contentDigest: _digest, ...content } = f.proposal;
+  const records = Array.from({ length: 60 }, (_, index) => createReviewPublicationAdoption({ ...f,
+    proposal: normalizeBoundWorkProposal({ ...content, proposalId: "work-intent-" + index.toString(16).padStart(64, "0"),
+      payload: { ...content.payload, body: `Coverage assessment ${index}` } }) }));
+  assert.equal(records.every(Boolean), true);
+  const store = { async read() { return { schemaVersion: 1, records: structuredClone(records) }; }, async write() { assert.fail("Recovery is read-only"); } };
+  const receipts = new ReviewPublicationAdoptionStore({ store });
+  assert.equal((await receipts.recover()).records, 60);
+  assert.deepEqual(await receipts.get(records[59].adoptionId), records[59]);
 });
