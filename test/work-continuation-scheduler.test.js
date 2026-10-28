@@ -215,6 +215,74 @@ test('repeated unchanged inputs back off and remain recoverable after stalled di
   assert.equal(f.state().records[0].status, 'delivered');
 });
 
+test('unchanged deterministic decision failures stop model retries across restart and rearm on effective input changes', async t => {
+  for (const status of ['queued', 'retry_wait']) for (const change of ['task', 'related-child', 'configuration', 'runtime']) await t.test(`${status}: ${change}`, async () => {
+    const f = relatedProgressFixture();
+    f.items[0].status = status;
+    let runtimeRevision = 'a'.repeat(64), calls = 0, receipt;
+    f.options.taskRuns = { async order(items) { return items; }, async get() { return { active: false, receipt }; } };
+    let scheduler = new WorkContinuationScheduler(f.options);
+    const dispatch = async () => {
+      calls++;
+      receipt = { roleId: f.items[0].currentTarget.id, taskId: f.items[0].itemId, taskRevision: f.items[0].revision, registeredAt: f.options.clock().toISOString(),
+        phase: 'failed', outcomeCode: 'ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION' };
+    };
+    const run = async () => { await scheduler.runCycle({ ...f, dispatch, runtimeRevision }); await f.drain(); };
+    for (let i = 0; i < 3; i++) { await run(); f.advance(90_000); }
+    assert.equal(calls, 3);
+    assert.equal(f.state().records[0].recovery.action, 'await_condition');
+    scheduler = new WorkContinuationScheduler(f.options);
+    f.advance(3600_000); await run();
+    assert.equal(calls, 3, 'restart and elapsed time do not change the rejected input');
+    if (change === 'task') f.items[0].revision++;
+    if (change === 'related-child') f.items[1].revision++;
+    if (change === 'configuration') f.config.workCoordination = { leaseDurationMs: 180_000 };
+    if (change === 'runtime') runtimeRevision = 'b'.repeat(64);
+    await run();
+    assert.equal(calls, 4, `${change} rearms the existing task without a new enqueue`);
+  });
+});
+
+test('real task-run failure receipts bound repeated automatic model decisions without losing restart recovery', async () => {
+  const f = fixture(), values = new Map(); let modelCalls = 0;
+  const runStore = { async read(key, fallback) { return clone(values.get(key) ?? fallback); },
+    async write(key, value) { values.set(key, clone(value)); } };
+  const taskRuns = new TaskRunRegistry({ store: runStore, receiptStore: runStore, clock: f.options.clock,
+    settleControl: async () => { assert.fail('no owner control is requested'); } });
+  f.options.taskRuns = taskRuns;
+  let scheduler = new WorkContinuationScheduler(f.options);
+  const dispatch = async () => {
+    await assert.rejects(taskRuns.run({ kind: 'work-item', taskId: 'work-one', roleId: 'developer',
+      title: 'Resolve a task', subject: 'Test work', revision: f.items[0].revision }, async () => {
+      modelCalls++;
+      throw Object.assign(new Error('invalid decision contract'), { code: 'ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION' });
+    }), { code: 'ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION' });
+  };
+  for (let i = 0; i < 3; i++) { await scheduler.runCycle({ ...f, dispatch }); await f.drain(); f.advance(90_000); }
+  assert.equal(modelCalls, 3);
+  assert.equal(f.state().records[0].recovery.action, 'await_condition');
+  scheduler = new WorkContinuationScheduler(f.options);
+  f.advance(3600_000); await scheduler.runCycle({ ...f, dispatch }); await f.drain();
+  assert.equal(modelCalls, 3);
+  f.items[0].revision++;
+  await scheduler.runCycle({ ...f, dispatch }); await f.drain();
+  assert.equal(modelCalls, 4);
+});
+
+test('transient or stale decision failure receipts keep automatic backoff', async t => {
+  for (const variant of ['transient', 'old-revision', 'old-run']) await t.test(variant, async () => {
+    const f = fixture(); let receipt, calls = 0;
+    f.options.taskRuns = { async order(items) { return items; }, async get() { return { active: false, receipt }; } };
+    const scheduler = new WorkContinuationScheduler(f.options);
+    const dispatch = async () => { calls++; receipt = { roleId: 'developer', taskId: 'work-one', taskRevision: variant === 'old-revision' ? 0 : 1,
+      registeredAt: variant === 'old-run' ? '2026-10-20T00:00:00.000Z' : f.options.clock().toISOString(),
+      phase: 'failed', outcomeCode: variant === 'transient' ? 'STRUCTURED_PROVIDER_MODEL_CAPACITY' : 'ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION' }; };
+    for (let i = 0; i < 4; i++) { await scheduler.runCycle({ ...f, dispatch }); await f.drain(); f.advance(3600_000); }
+    assert.equal(calls, 4);
+    assert.equal(f.state().records[0].recovery.action, 'retry');
+  });
+});
+
 test('slow unchanged retries cannot keep a third ready item from its role', async () => {
   const f = fixture();
   f.config.workCoordination = { leaseDurationMs: 20 * 60_000 };
@@ -445,7 +513,8 @@ test('handoff records preserve source, condition and execution receipts across t
   let record = f.state().records[0];
   assert.equal(record.source.parentItemId, 'work-parent');
   assert.equal(record.source.itemRevision, 1);
-  assert.deepEqual(record.condition, { type: 'claimable', reference: null });
+  assert.equal(record.condition.type, 'claimable');
+  assert.match(record.condition.reference, /^input:[a-f0-9]{64}$/);
   assert.equal(record.receipts.length, 1);
   assert.equal(record.receipts[0].outcome, 'progressed');
   assert.equal(record.receipts[0].observedRevision, 2);

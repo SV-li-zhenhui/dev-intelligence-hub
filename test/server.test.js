@@ -99,6 +99,33 @@ async function targetedContinuationChain({ holdOrdinary = false } = {}) {
   } finally { ordinaryRelease.resolve(); enabled = false; await background.stop(); }
 }
 
+test('automatic role timer ticks use durable scheduling while manual runs and nonautomatic schedules remain available', async t => {
+  for (const automatic of [true, false]) await t.test(String(automatic), async () => {
+    const timers = [], decisions = [], revisions = [];
+    const background = startApplicationBackgroundWork({
+      config: { refreshMinutes: 7, githubActions: { enabled: true, automaticReview: automatic } },
+      refreshService: { async refresh() {} },
+      employeeRegistry: { schedules: () => [{ id: 'developer', intervalMinutes: 5 }],
+        async runSelected(ids) { decisions.push(...ids); }, async runAll() {} },
+      workContinuationScheduler: { async runCycle(options) { revisions.push(options.runtimeRevision); return { started: 0 }; } },
+    }, { runtimeRevision: 'a'.repeat(64),
+      setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; },
+      clearIntervalFn() {}, reportError(error) { throw error; } });
+    try {
+      await background.initialRefresh;
+      for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+      decisions.length = 0;
+      const wakes = revisions.length;
+      await timers.find(timer => timer.delay === 5 * 60_000).callback();
+      for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+      assert.equal(decisions.includes('developer'), !automatic);
+      if (automatic) { assert.ok(revisions.length > wakes); assert.equal(revisions.at(-1), 'a'.repeat(64)); }
+      await background.runEmployee('developer', { trigger: 'manual' });
+      assert.equal(decisions.includes('developer'), true);
+    } finally { await background.stop(); }
+  });
+});
+
 test('a durable continuation executes its exact lower-ranked item through the configured role chain', { timeout: 5_000 },
   () => targetedContinuationChain());
 test('a targeted wake waits for an existing ordinary role cycle and executes afterwards without coalescing it away', { timeout: 5_000 },

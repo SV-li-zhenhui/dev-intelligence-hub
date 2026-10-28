@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { OperationQueue } from '../lib/operation-queue.js';
+import { canonicalJsonDigest } from '../lib/canonical-json-digest.js';
 import { currentWorkItemInputBinding } from './work-ledger-pr-source.js';
 import {
   WORK_CONTINUATION_STATE_KEY, CONTINUATION_MAX_RECORDS, CONTINUATION_ROLES,
@@ -8,11 +9,12 @@ import {
 
 const WAITING = new Set(['waiting_external', 'waiting_condition', 'dispatch_pending', 'retry_wait', 'paused']);
 const TERMINAL = new Set(['completed', 'cancelled', 'superseded']);
+const DETERMINISTIC_DECISION_FAILURES = new Set(['ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION', 'STRUCTURED_BRAIN_RESPONSE_INVALID']);
 const timeout = () => Object.assign(new Error('Work continuation execution exceeded its lease budget'), { code: 'WORK_CONTINUATION_TIMEOUT' });
 const recovery = (action, reason, dueAt = null) => ({ action, reason, dueAt });
 const graphProgress = value => typeof value?.graphProgressDigest === 'string' && /^[a-f0-9]{64}$/.test(value.graphProgressDigest)
   ? value.graphProgressDigest : null;
-function conditionFor(item, fact) {
+function conditionFor(item, fact, executionRevision) {
   let type = 'claimable';
   if (item.status === 'paused') type = 'manual_resume';
   else if (['waiting_external', 'dispatch_pending'].includes(item.status)) type = 'intent_result';
@@ -21,7 +23,8 @@ function conditionFor(item, fact) {
   else if (fact?.graphBlocked) type = 'child_delivery';
   const progress = graphProgress(fact);
   return { type, reference: ['intent_result', 'fact_change'].includes(type) ? item.activeIntentId ?? null :
-    ['claimable', 'child_delivery'].includes(type) && progress !== null ? `graph:${progress}` : null };
+    ['claimable', 'child_delivery', 'retry_due'].includes(type)
+      ? `${progress === null ? 'input' : 'graph'}:${canonicalJsonDigest([progress, executionRevision])}` : null };
 }
 function sourceFor(item) {
   const binding = currentWorkItemInputBinding(item);
@@ -74,11 +77,12 @@ export class WorkContinuationScheduler {
     return page;
   }
 
-  runCycle({ dispatch, runOperation = operation => operation(), signal = null, allowDispatch = true } = {}) {
+  runCycle({ dispatch, runOperation = operation => operation(), signal = null, allowDispatch = true, runtimeRevision = null } = {}) {
     return this.#queue.enqueue(async () => {
       signal?.throwIfAborted();
       const config = await this.#configuration();
       if (!config) return { started: 0, skipped: 'disabled' };
+      const executionRevision = canonicalJsonDigest([runtimeRevision, config]);
       if (typeof dispatch !== 'function') throw new TypeError('Work continuation dispatch is required');
       const preparationAt = Date.parse(this.#now());
       if (allowDispatch && preparationAt >= this.#nextPreparationAt) {
@@ -121,12 +125,13 @@ export class WorkContinuationScheduler {
         const canRun = eligible.has(item.itemId) && fact &&
           (!fact.graphBlocked || (roleId === 'orchestrator' && (fact.submittedChildren > 0 || fact.orchestrationReady === true))) &&
           role?.enabled === true && role.paused === false;
-        const condition = conditionFor(item, fact);
+        const condition = conditionFor(item, fact, executionRevision);
         if ((role?.enabled !== true || role.paused !== false || (fact && !eligible.has(item.itemId))) && !fact?.graphBlocked) {
           condition.type = 'manual_resume'; condition.reference = roleId;
         }
         const record = this.#record(state, item, condition, Boolean(canRun), now);
         if (record && canRun && !this.#active.has(roleId) && ['pending', 'retry_wait', 'stalled'].includes(record.status) &&
+            record.recovery.action !== 'await_condition' &&
             (record.nextAttemptAt === null || Date.parse(record.nextAttemptAt) <= Date.parse(now))) ready.push(record);
       }
       const selected = this.#select(await this.#orderReady(ready));
@@ -209,7 +214,8 @@ export class WorkContinuationScheduler {
       if (!record && state.records.length >= CONTINUATION_MAX_RECORDS) {
         const inactive = record => record.receipts.every(receipt => receipt.outcome !== 'running');
         let discard = state.records.findIndex(record => ['delivered', 'superseded'].includes(record.status) && inactive(record));
-        if (discard < 0 && canRun) discard = state.records.findIndex(record => ['waiting', 'stalled'].includes(record.status) && inactive(record));
+        if (discard < 0 && canRun) discard = state.records.findIndex(record => ['waiting', 'stalled'].includes(record.status) &&
+          !(record.status === 'stalled' && record.recovery.action === 'await_condition') && inactive(record));
         if (discard < 0) { this.#status.lastError = 'continuation_capacity'; return null; }
         state.records.splice(discard, 1);
       }
@@ -273,6 +279,15 @@ export class WorkContinuationScheduler {
             relatedProgressed = beforeProgress !== null && afterProgress !== null && beforeProgress !== afterProgress;
           }
           result = latest === null ? 'input_changed' : observedRevision !== item.revision || relatedProgressed ? 'role_woken' : 'no_progress';
+          if (result === 'no_progress' && this.#ports.taskRuns?.get) {
+            try {
+              const run = await this.#ports.taskRuns.get('work-item', claim.itemId), receipt = run?.receipt;
+              if (run.active === false && receipt?.taskRevision === item.revision &&
+                  receipt.roleId === claim.roleId && receipt.taskId === claim.itemId &&
+                  Date.parse(receipt.registeredAt) >= Date.parse(claim.receipts.at(-1).startedAt) &&
+                  receipt.phase === 'failed' && DETERMINISTIC_DECISION_FAILURES.has(receipt.outcomeCode)) errorCode = receipt.outcomeCode;
+            } catch { this.#status.lastError = 'progress_observation_failed'; }
+          }
         }
       }
     } catch (error) {
@@ -295,10 +310,13 @@ export class WorkContinuationScheduler {
         } else {
           if (result === 'runtime_deferred') record.attempt = Math.max(0, record.attempt - 1);
           const done = ['role_woken', 'input_changed'].includes(result);
-          const nextAttemptAt = done ? null : new Date(Date.parse(now) + (record.attempt >= 3 ? 300_000 : 30_000 * Math.max(1, record.attempt))).toISOString();
+          const rejected = record.receipts.slice(-3);
+          const waitForChange = record.attempt >= 3 && DETERMINISTIC_DECISION_FAILURES.has(errorCode) && rejected.length === 3 &&
+            rejected.every(entry => entry.fingerprint === claim.fingerprint && entry.outcome === 'no_progress' && entry.errorCode === errorCode);
+          const nextAttemptAt = done || waitForChange ? null : new Date(Date.parse(now) + (record.attempt >= 3 ? 300_000 : 30_000 * Math.max(1, record.attempt))).toISOString();
           const status = done ? (result === 'role_woken' ? 'delivered' : 'superseded') : record.attempt >= 3 ? 'stalled' : 'retry_wait';
           Object.assign(record, { reason: result, updatedAt: now, status, nextAttemptAt,
-            recovery: recovery(done ? 'none' : 'retry', result, nextAttemptAt) });
+            recovery: recovery(done ? 'none' : waitForChange ? 'await_condition' : 'retry', result, nextAttemptAt) });
         }
       }
       await this.#ports.store.write(WORK_CONTINUATION_STATE_KEY, normalizeWorkContinuationState(state));

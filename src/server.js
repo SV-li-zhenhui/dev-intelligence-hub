@@ -22,7 +22,7 @@ import {
 } from "node:fs";
 import http from "node:http";
 import { TargetedCycleQueue } from "./lib/targeted-cycle-queue.js";
-import { normalizeContinuationTarget } from "./services/work-continuation-state.js";
+import { CONTINUATION_ROLES, normalizeContinuationTarget } from "./services/work-continuation-state.js";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -4195,6 +4195,7 @@ export function startApplicationBackgroundWork(
     log = console.log,
     drainTimeoutMs = defaultShutdownDrainTimeoutMs,
     observeDrainParticipant = () => {},
+    runtimeRevision = null,
   } = {},
 ) {
   drainTimeoutMs = shutdownTimeoutMilliseconds(drainTimeoutMs);
@@ -4724,6 +4725,7 @@ export function startApplicationBackgroundWork(
     return runCoalescedTracked(coalescedAgencyCycles, "work-continuations", (signal) =>
       runDrainParticipant(DRAIN_PARTICIPANTS.workContinuation, () => application.workContinuationScheduler.runCycle({
         signal,
+        runtimeRevision,
         allowDispatch: independentEmployeeFactsReady(),
         dispatch: ({ roleId, signal: executionSignal, continuationTarget }) => runCoalescedAgencyCycle(`employee:${roleId}`, {
           trigger: "scheduled", employeeIds: [roleId], discardWhenFactsPending: true, signal: executionSignal, continuationTarget,
@@ -4853,7 +4855,9 @@ export function startApplicationBackgroundWork(
   for (const schedule of employeeRegistry.schedules()) {
     timers.push(
       setIntervalFn(
-        () => runCoalescedAgencyCycle(`employee:${schedule.id}`, {
+        () => application.workContinuationScheduler && automaticAgencyCyclesEnabled() && CONTINUATION_ROLES.has(schedule.id)
+          ? signalWorkContinuations()
+          : runCoalescedAgencyCycle(`employee:${schedule.id}`, {
           trigger: "scheduled",
           employeeIds: [schedule.id],
           discardWhenFactsPending: true,
@@ -4968,6 +4972,7 @@ function createDeferredBackgroundWork(
   reportError,
   drainTimeoutMs,
   log,
+  runtimeRevision,
 ) {
   let delegate = null;
   let startPromise = null;
@@ -4988,6 +4993,7 @@ function createDeferredBackgroundWork(
         reportError,
         drainTimeoutMs,
         log,
+        runtimeRevision,
       });
       if (!started || typeof started !== "object") {
         throw new TypeError("startBackgroundWorkFn must return background work");
@@ -5067,12 +5073,14 @@ export async function startDashboardServer(
         reportError,
         shutdownDrainTimeoutMs,
         log,
+        runtimeSourceIdentityInput?.runtimeDigest ?? null,
       );
     } else {
       backgroundWork = startBackgroundWorkFn(application, {
         reportError,
         drainTimeoutMs: shutdownDrainTimeoutMs,
         log,
+        runtimeRevision: runtimeSourceIdentityInput?.runtimeDigest ?? null,
       });
     }
     server = createDashboardServer(application, {
