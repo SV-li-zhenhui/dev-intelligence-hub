@@ -6353,7 +6353,9 @@ test("real offline CLI teardown survives an injected post-start failure", async 
     assert.equal(processExists(processId), false, processId);
   }
   assert.equal(lifecycle.readStatus().complete, true);
-  assert.deepEqual((await within(100, decisionOutcome)).value?.action, {
+  const settledDecision = await within(100, decisionOutcome);
+  assert.equal(settledDecision.error, null, settledDecision.error?.stack);
+  assert.deepEqual(settledDecision.value?.action, {
     type: "read_text",
     path: "src/app.js",
   });
