@@ -989,7 +989,7 @@ test("receipt, confirmation, and job binding mismatches fail closed", async () =
     },
     {
       confirmation: {},
-      job: queuedJob(grant, { updatedAt: "2026-08-02T03:00:02.000Z" }),
+      job: queuedJob(grant, { updatedAt: "2026-08-02T02:59:59.000Z" }),
     },
     {
       confirmation: {},
@@ -1016,7 +1016,7 @@ test("receipt, confirmation, and job binding mismatches fail closed", async () =
     { confirmation: {}, job: null },
   ];
 
-  for (const { confirmation, job } of cases) {
+  for (const [index, { confirmation, job }] of cases.entries()) {
     const producer = new FakeConfirmationProducer("completed", confirmation);
     const reader = new FakeCodeJobReader(job);
     const instance = handler(producer, reader, grant);
@@ -1027,8 +1027,22 @@ test("receipt, confirmation, and job binding mismatches fail closed", async () =
           "INVALID_CODE_ACTION_CONFIRMATION",
           "INVALID_CODE_JOB_RESULT",
         ].includes(error?.code),
+      `binding mismatch case ${index + 1}`,
     );
   }
+});
+
+test("resumed queued jobs retain receipt authority when their update timestamp advances", async () => {
+  const grant = grantFor();
+  const producer = new FakeConfirmationProducer("completed");
+  const reader = new FakeCodeJobReader(queuedJob(grant, {
+    revision: 3,
+    updatedAt: "2026-08-02T03:00:02.000Z",
+  }));
+  const instance = handler(producer, reader, grant);
+  const transition = await instance.value.handle(handlerInput());
+  assert.equal(transition.status, "running");
+  assert.deepEqual(reader.getCalls, [codeJobIdForGrant(grant)]);
 });
 
 test("runner factory stays disabled by default and rejects incomplete authority", () => {
