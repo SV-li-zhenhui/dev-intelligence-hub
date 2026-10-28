@@ -2299,6 +2299,16 @@ function runConfirmationRead(backgroundWork, operation) {
   return runConfirmationAccess(backgroundWork, "runConfirmationRead", operation);
 }
 
+function runAttentionOperation(backgroundWork, operation) {
+  return runConfirmationAccess(backgroundWork, "runAttentionOperation", operation);
+}
+
+function localOperationRunner({ operationalAdmission, access, runDrainParticipant, signal }) {
+  return operation => operationalAdmission.run(() => access.run(() => runDrainParticipant(
+    DRAIN_PARTICIPANTS.confirmationOperation, () => { signal.throwIfAborted(); return operation(signal); },
+  )));
+}
+
 function signalBackgroundAgency(backgroundWork, options, reportError) {
   if (typeof backgroundWork?.signalAgency !== "function") return;
   Promise.resolve()
@@ -3678,7 +3688,7 @@ export function createDashboardServer(
           throw httpError(400, "requestId 只能来自请求路径");
         }
         const operation = internalAttentionAction[2];
-        const item = await runConfirmationOperation(backgroundWork, () =>
+        const item = await runAttentionOperation(backgroundWork, () =>
           requireAttentionBrowser(application)[operation]({
             ...input,
             requestId: internalAttentionAction[1],
@@ -4135,11 +4145,13 @@ function configurationSafeModeBackgroundWork(
   const skip = () => Promise.resolve(skipped);
   const confirmationEnabled = Boolean(application.confirmationQueue);
   const confirmationAccess = createConfirmationAccessGate(confirmationEnabled);
-  const confirmationReadAccess = createConfirmationAccessGate(confirmationEnabled);
+  const confirmationReadAccess = createConfirmationAccessGate(true);
   confirmationAccess.open();
   confirmationReadAccess.open();
   const workController = new AbortController();
   let stopPromise = null;
+  const runLocalOperation = localOperationRunner({ operationalAdmission, access: confirmationReadAccess,
+    runDrainParticipant, signal: workController.signal });
   return Object.freeze({
     initialRefresh: Promise.resolve(skipped),
     timers: Object.freeze([]),
@@ -4157,14 +4169,8 @@ function configurationSafeModeBackgroundWork(
     mutateFacts: skip,
     signalAgency: skip,
     runEmployee: skip,
-    runConfirmationRead(operation) {
-      return operationalAdmission.run(() => confirmationReadAccess.run(
-        () => runDrainParticipant(
-          DRAIN_PARTICIPANTS.confirmationOperation,
-          () => operation(workController.signal),
-        ),
-      ));
-    },
+    runConfirmationRead: runLocalOperation,
+    runAttentionOperation: runLocalOperation,
     runConfirmationOperation(operation) {
       return operationalAdmission.run(() => confirmationAccess.run(
         () => runDrainParticipant(
@@ -4217,13 +4223,13 @@ export function startApplicationBackgroundWork(
   const confirmationAccess = createConfirmationAccessGate(
     Boolean(application.confirmationQueue),
   );
-  const confirmationReadAccess = createConfirmationAccessGate(
-    Boolean(application.confirmationQueue),
-  );
-  // Local projections can be read during external refresh. Mutation admission
-  // still waits for fresh facts and confirmation reconciliation below.
+  const confirmationReadAccess = createConfirmationAccessGate(true);
+  // Local projections and source-bound internal answers do not need GitHub
+  // freshness. External confirmations retain the separate mutation gate.
   confirmationReadAccess.open();
   const workController = new AbortController();
+  const runLocalOperation = localOperationRunner({ operationalAdmission, access: confirmationReadAccess,
+    runDrainParticipant, signal: workController.signal });
   let stopped = false;
   let stopPromise = null;
   const backgroundPriority = Object.freeze({
@@ -4936,13 +4942,8 @@ export function startApplicationBackgroundWork(
         backgroundPriority.factOrExplicit,
         { rethrow: true },
       ),
-    runConfirmationRead: (operation) =>
-      operationalAdmission.run(() => {
-        return confirmationReadAccess.run(() => runDrainParticipant(
-          DRAIN_PARTICIPANTS.confirmationOperation,
-          () => operation(workController.signal),
-        ));
-      }),
+    runConfirmationRead: runLocalOperation,
+    runAttentionOperation: runLocalOperation,
     runConfirmationOperation: (operation) =>
       operationalAdmission.run(() => confirmationAccess.run(
         () => runDrainParticipant(
@@ -5031,6 +5032,8 @@ function createDeferredBackgroundWork(
     runEmployee: (...arguments_) => requireDelegate().runEmployee(...arguments_),
     runConfirmationRead: (...arguments_) =>
       requireDelegate().runConfirmationRead(...arguments_),
+    runAttentionOperation: (...arguments_) =>
+      requireDelegate().runAttentionOperation(...arguments_),
     runConfirmationOperation: (...arguments_) =>
       requireDelegate().runConfirmationOperation(...arguments_),
     confirmationReady: () => delegate?.confirmationReady?.() === true,

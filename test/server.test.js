@@ -2762,6 +2762,7 @@ test("configuration safe mode cannot bypass closed operational admission", async
     backgroundWork.runConfirmationOperation(async () => "must-not-run"),
     { code: "SYSTEM_QUIESCING" },
   );
+  await assert.rejects(backgroundWork.runAttentionOperation(async () => "must-not-run"), { code: "SYSTEM_QUIESCING" });
   const mutation = await request(server, {
     method: "POST",
     path: "/api/configuration/drafts",
@@ -5375,8 +5376,9 @@ test("manual refresh fences facts but reopens confirmations before slow agency",
   await exerciseConfirmationRefreshGate("manual");
 });
 
-test("an unhealthy GitHub refresh leaves local confirmation reads available and writes closed", async () => {
+test("an unhealthy GitHub refresh permits local answers while external confirmation writes stay closed", async () => {
   const queueCalls = [];
+  let internalAnswers = 0;
   const application = startupApplication({
     port: 4173,
     queueCalls,
@@ -5395,6 +5397,8 @@ test("an unhealthy GitHub refresh leaves local confirmation reads available and 
       };
     },
   });
+  application.attentionBrowser = Object.fromEntries(["answer", "reject", "later"].map(method =>
+    [method, async () => { internalAnswers++; return { status: "answered" }; }]));
   const backgroundWork = startApplicationBackgroundWork(application, {
     setIntervalFn() {
       return { unref() {} };
@@ -5434,20 +5438,30 @@ test("an unhealthy GitHub refresh leaves local confirmation reads available and 
     assert.equal(history.status, 200);
     assert.equal(approve.status, 503);
     assert.equal(manualEmployee.status, 503);
+    const internalAnswer = await request(server, { method: "POST", path: `/api/attention/internal/attention-${"a".repeat(64)}/answer`,
+      headers: { origin: "http://127.0.0.1:4173", "x-mydashboard-action": "1", "content-type": "application/json" },
+      body: JSON.stringify({ expectedRevision: 1, contentDigest: "b".repeat(64), answer: { type: "text", text: "继续" } }),
+    });
+    assert.equal(internalAnswer.status, 200);
+    assert.equal(internalAnswers, 1);
     assert.deepEqual(queueCalls, ["next", "history"]);
   } finally {
     await server.shutdown();
   }
 });
 
-test("shutdown drains a local confirmation read accepted before initial refresh completes", async () => {
+test("shutdown drains local reads and internal answers during refresh and safe mode", async (t) => {
+  for (const safeMode of [false, true]) for (const confirmationsEnabled of [true, false]) for (const method of ["runConfirmationRead", "runAttentionOperation"]) await t.test(`${safeMode}:${confirmationsEnabled}:${method}`, async () => {
   const refreshRelease = deferred();
   const readStarted = deferred();
   const readRelease = deferred();
-  const backgroundWork = startApplicationBackgroundWork(startupApplication({
+  const app = startupApplication({
     async refresh() { await refreshRelease.promise; return healthyRefreshResult(); },
-  }), { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
-  const reading = backgroundWork.runConfirmationRead(async () => {
+  });
+  if (!confirmationsEnabled) app.confirmationQueue = null;
+  if (safeMode) app.configuration = { status: { safeMode: true, migrationError: null } };
+  const backgroundWork = startApplicationBackgroundWork(app, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
+  const reading = backgroundWork[method](async () => {
     readStarted.resolve();
     await readRelease.promise;
     return "local history";
@@ -5456,7 +5470,7 @@ test("shutdown drains a local confirmation read accepted before initial refresh 
   let stopped = false;
   const stopping = backgroundWork.stop().then(() => { stopped = true; });
   try {
-    await assert.rejects(backgroundWork.runConfirmationRead(async () => "must not run"), { code: "CONFIRMATION_FACTS_NOT_READY" });
+    await assert.rejects(backgroundWork[method](async () => "must not run"), { code: "CONFIRMATION_FACTS_NOT_READY" });
     assert.equal(stopped, false);
   } finally {
     refreshRelease.resolve();
@@ -5464,6 +5478,18 @@ test("shutdown drains a local confirmation read accepted before initial refresh 
     await stopping;
   }
   assert.equal(await reading, "local history");
+  });
+});
+
+test("internal answers cannot start after shutdown when external confirmations are disabled", async () => {
+  const app = startupApplication({ async refresh() { return healthyRefreshResult(); } });
+  app.confirmationQueue = null;
+  const background = startApplicationBackgroundWork(app, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
+  await background.initialRefresh;
+  await background.stop();
+  let writes = 0;
+  await assert.rejects(background.runAttentionOperation(async () => { writes++; }), { code: "CONFIRMATION_FACTS_NOT_READY" });
+  assert.equal(writes, 0);
 });
 
 test("server rejects an untrusted Host before exposing local data", async () => {
@@ -7837,7 +7863,7 @@ test("internal attention mutations are source-bound and only signal background w
   );
 });
 
-test("internal attention exposes the temporary fact gate for safe browser retry", async () => {
+test("internal attention answers use local admission while external confirmation facts are pending", async () => {
   const requestId = `attention-${"a".repeat(64)}`;
   let mutations = 0;
   await withServer(
@@ -7856,17 +7882,17 @@ test("internal attention exposes the temporary fact gate for safe browser retry"
           answer: { type: "text", text: "继续" },
         }),
       });
-      assert.equal(response.status, 503);
-      assert.equal(JSON.parse(response.body).code, "CONFIRMATION_FACTS_NOT_READY");
-      assert.equal(mutations, 0);
+      assert.equal(response.status, 200);
+      assert.equal(mutations, 1);
     },
     {
       attentionBrowser: {
-        answer() { mutations += 1; },
+        answer() { mutations += 1; return { requestId, status: "answered" }; },
         reject() { mutations += 1; },
         later() { mutations += 1; },
       },
       backgroundWork: {
+        runAttentionOperation(operation) { return operation(); },
         runConfirmationOperation() {
           throw Object.assign(new Error("facts pending"), {
             code: "CONFIRMATION_FACTS_NOT_READY",
