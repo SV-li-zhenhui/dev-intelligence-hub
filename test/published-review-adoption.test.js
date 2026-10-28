@@ -7,6 +7,7 @@ import { verifyReviewPublicationSource, createReviewPublicationCandidate, create
   verifyReviewPublicationAdoption, ReviewPublicationAdoptionStore } from "../src/services/published-review-adoption.js";
 import { ReviewPublicationReuseService, createReviewAdoptionTaskReader } from "../src/services/review-publication-reuse-service.js";
 import { DeliveryEvidenceService } from "../src/services/delivery-evidence-service.js";
+import { createWorkIntentDispatchBinding } from "../src/domain/work-intent-dispatch-binding.js";
 
 async function sourceFixture() {
   const at = "2026-10-26T08:47:13.000Z";
@@ -272,7 +273,8 @@ async function reuseServiceFixture() {
     async write(key, value) { writes++; values.set(key, structuredClone(value)); } };
   const receiptStore = new ReviewPublicationAdoptionStore({ store: stateStore });
   const task = { taskId: f.target.evidenceTarget.taskId, roleId: "pr-engineer", revision: 7, status: "waiting_external", rootStatus: "queued",
-    activeIntentId: f.proposal.proposalId, inputBinding: f.target.inputBinding, event: f.event,
+    activeIntentId: "work-intent-" + "7".repeat(64),
+    inputBinding: f.target.inputBinding, event: f.event,
     acceptanceContract: f.acceptanceContract, requestedAt: f.target.requestedAt };
   const material = { facts: f.facts, feedbackSnapshot: { coverageDigest: f.coverageDigest } };
   const scan = { complete: true, items: [{ proposal: f.source.proposal, result: f.source.result, status: "succeeded", downstreamRef: null }] };
@@ -282,7 +284,22 @@ async function reuseServiceFixture() {
     proposals: scan.items.map(row => ({ proposal: row.proposal, resultId: row.result?.resultId ?? null, status: row.status, downstreamRef: row.downstreamRef })),
     results: scan.items.flatMap(row => row.result ? [row.result] : []),
   }) });
-  const service = new ReviewPublicationReuseService({ taskReader: { async read() { return structuredClone(task); } },
+  const { proposalId, contentDigest, ...boundContent } = f.proposal;
+  const dispatch = { intentId: task.activeIntentId, itemId: task.taskId, inputDigest: task.inputBinding.inputDigest,
+    intent: { type: "propose_github_review" }, status: "delivered",
+    dispatchBinding: createWorkIntentDispatchBinding({ intentId: proposalId, ...boundContent }),
+    outcome: { status: "delivered", details: { downstreamRef: proposalId, proposalDigest: contentDigest } } };
+  const { schemaVersion: _schema, repository: _repo, pullRequestNumber: _number, gitTarget: _git, ...sourceBinding } = task.inputBinding;
+  const ledger = { async readReviewAdoptionContext({ itemId }) {
+    assert.equal(itemId, task.taskId);
+    return { item: { ...task, itemId: task.taskId, kind: "graph_task", sourceQuarantine: null,
+      assignmentId: f.proposal.source.assignmentId, inputDigest: task.inputBinding.inputDigest,
+      currentTarget: { type: "role", id: task.roleId }, assignment: { graphTask: { sourceBinding } },
+      graph: { acceptanceContracts: [task.acceptanceContract] } },
+      root: { itemId: task.inputBinding.rootItemId, sourceQuarantine: null, source: { scope: { active: true } },
+        status: task.rootStatus, createdAt: task.requestedAt }, activeDispatch: structuredClone(dispatch) };
+  } };
+  const service = new ReviewPublicationReuseService({ taskReader: createReviewAdoptionTaskReader(ledger),
     factsReader: { async get() { return material.facts; } }, publicationSourceReader,
     confirmationReader: { async readSettlements({ confirmationIds }) {
       return { queueRevision: f.source.confirmationSnapshot.queueRevision,
@@ -290,11 +307,12 @@ async function reuseServiceFixture() {
     } },
     materialsReader: { async read(input) { captures++; assert.equal(input.taskId, task.taskId); assert.deepEqual(input.gitTarget, task.inputBinding.gitTarget); return material; } },
     receiptStore, inputAuthorityVerifier: { async verify(input) { return input; } }, clock: () => new Date(f.adoptedAt) });
-  return { ...f, service, task, material, scan, settlements, receiptStore, counts: () => ({ writes, captures }) };
+  return { ...f, service, task, ledger, dispatch, material, scan, settlements, receiptStore, counts: () => ({ writes, captures }) };
 }
 
 test("host reuse produces new-task evidence without a GitHub write port and survives a lost result", async () => {
   const f = await reuseServiceFixture();
+  assert.notEqual(f.task.activeIntentId, f.proposal.proposalId, "ledger dispatch identity is distinct from the sealed proposal");
   const catalog = await f.service.listCandidates({ taskId: f.task.taskId, materialDigest: f.candidate.materialDigest });
   assert.equal(catalog.candidates[0].candidateId, f.candidate.candidateId);
   assert.equal(f.counts().captures, 0, "candidate preview uses complete already-cached facts");
@@ -313,6 +331,53 @@ test("host reuse produces new-task evidence without a GitHub write port and surv
   const receipt = await f.receiptStore.getForProposal({ proposalId: f.proposal.proposalId, proposalDigest: f.proposal.contentDigest });
   assert.equal(receipt.source.publishedBody, f.source.proposal.payload.body);
   assert.equal(receipt.assessment.coverageNote, f.proposal.payload.body);
+});
+
+test("reuse follows the sealed proposal through a current dispatch before its acknowledgement", async () => {
+  const f = await reuseServiceFixture();
+  f.task.status = "dispatch_pending";
+  f.dispatch.status = "dispatching";
+  f.dispatch.outcome = null;
+  assert.equal((await f.service.handle({ proposal: f.proposal })).status, "succeeded");
+  assert.equal(f.counts().writes, 1);
+});
+
+test("reuse refuses mismatched or uncertain active dispatch evidence", async t => {
+  const variants = {
+    "outer intent": f => { f.dispatch.intentId = "work-intent-" + "8".repeat(64); },
+    "other task": f => { f.dispatch.itemId = "another-task"; },
+    "wrong intent kind": f => { f.dispatch.intent.type = "propose_code_action"; },
+    "unknown dispatch": f => { f.dispatch.status = "unknown"; },
+    "changed input": f => { f.dispatch.inputDigest = "8".repeat(64); },
+    "changed seal": f => { f.dispatch.dispatchBinding.bindingDigest = "8".repeat(64); },
+    "wrong producer": f => {
+      f.dispatch.dispatchBinding.boundIntent.requestedBy.workItemId = "another-task";
+      f.dispatch.dispatchBinding = createWorkIntentDispatchBinding(f.dispatch.dispatchBinding.boundIntent);
+    },
+    "changed source": f => {
+      f.dispatch.dispatchBinding.boundIntent.source.assignmentId = "another-assignment";
+      f.dispatch.dispatchBinding = createWorkIntentDispatchBinding(f.dispatch.dispatchBinding.boundIntent);
+    },
+    "wrong downstream id": f => { f.dispatch.outcome.details.downstreamRef = "another-proposal"; },
+    "wrong downstream digest": f => { f.dispatch.outcome.details.proposalDigest = "8".repeat(64); },
+    "no active dispatch": f => { f.task.activeIntentId = null; },
+  };
+  for (const [name, mutate] of Object.entries(variants)) await t.test(name, async () => {
+    const f = await reuseServiceFixture(); mutate(f);
+    await assert.rejects(f.service.handle({ proposal: f.proposal }), { code: "REVIEW_PUBLICATION_REUSE_TASK_UNAVAILABLE" });
+    assert.equal(f.counts().writes, 0);
+  });
+});
+
+test("reuse rechecks current dispatch ownership after recording its local receipt", async () => {
+  const f = await reuseServiceFixture();
+  const read = f.ledger.readReviewAdoptionContext; let reads = 0;
+  f.ledger.readReviewAdoptionContext = async input => {
+    if (++reads === 2) f.dispatch.outcome.details.downstreamRef = "another-proposal";
+    return read(input);
+  };
+  await assert.rejects(f.service.handle({ proposal: f.proposal }), { code: "REVIEW_PUBLICATION_REUSE_TARGET_CHANGED" });
+  assert.equal(f.counts().writes, 1);
 });
 
 test("host verification preserves a captured assessment across CI updates and rejects new linked QA coverage", async () => {
@@ -393,8 +458,9 @@ test("task authority uses the original request time and rejects an inactive root
     currentTarget: { type: "role", id: "pr-engineer" }, status: "blocked", revision: 7, activeIntentId: null,
     assignment: { graphTask: { sourceBinding } }, event: f.event,
     graph: { acceptanceContracts: [f.acceptanceContract] }, createdAt: "2026-10-26T09:13:23.000Z" };
-  const reader = createReviewAdoptionTaskReader({ async readItemForReconciliation({ itemId }) {
-    return [child, root].find(item => item.itemId === itemId) ?? null;
+  const reader = createReviewAdoptionTaskReader({ async readReviewAdoptionContext({ itemId }) {
+    assert.equal(itemId, child.itemId);
+    return { item: child, root, activeDispatch: null };
   } });
   const task = await reader.read({ taskId: child.itemId });
   assert.equal(task.requestedAt, root.createdAt);

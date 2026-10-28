@@ -6,6 +6,7 @@ import { createProposalDeliveryEvidenceTarget } from "../domain/delivery-evidenc
 import { requiredReviewDeliverables } from "../domain/pr-review-work-policy.js";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 import { currentWorkItemEvent, currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
+import { createWorkIntentDispatchBinding } from "../domain/work-intent-dispatch-binding.js";
 import { createReviewPublicationCandidate, createReviewPublicationAdoption, verifyReviewPublicationAdoption } from "./published-review-adoption.js";
 
 const failure = code => Object.assign(new Error(code), { code });
@@ -13,16 +14,40 @@ const same = (left, right) => canonicalJsonDigest(left) === canonicalJsonDigest(
 const held = status => ["paused", "cancelled", "superseded"].includes(status);
 const check = signal => signal?.throwIfAborted();
 
+function activeReviewProposal(item, row, inputBinding) {
+  if (item.activeIntentId === null || row?.intentId !== item.activeIntentId) return null;
+  if (row.itemId !== item.itemId || row.intent?.type !== "propose_github_review" ||
+      !["dispatching", "delivered"].includes(row.status) || row.inputDigest !== item.inputDigest) return null;
+  try {
+    const bound = row.dispatchBinding?.boundIntent;
+    if (!bound || createWorkIntentDispatchBinding(bound).bindingDigest !== row.dispatchBinding.bindingDigest) return null;
+    const { intentId, ...content } = bound;
+    const proposal = normalizeBoundWorkProposal({ proposalId: intentId, ...content });
+    if (proposal.kind !== "github_review_proposal" || proposal.requestedBy.workItemId !== item.itemId ||
+        proposal.requestedBy.roleId !== item.currentTarget.id || proposal.source.assignmentId !== item.assignmentId ||
+        proposal.source.eventId !== currentWorkItemEvent(item).eventId ||
+        !samePullRequestExecutionBinding(proposal.binding.inputBinding, inputBinding)) return null;
+    if (row.status === "delivered" && (row.outcome?.status !== "delivered" ||
+        row.outcome.details?.downstreamRef !== proposal.proposalId ||
+        row.outcome.details?.proposalDigest !== proposal.contentDigest)) return null;
+    return { proposalId: proposal.proposalId, contentDigest: proposal.contentDigest };
+  } catch { return null; }
+}
+
+const ownsProposal = (task, proposal) => task.activeProposal?.proposalId === proposal.proposalId &&
+  task.activeProposal.contentDigest === proposal.contentDigest;
+
 export function createReviewAdoptionTaskReader(ledger) {
+  if (typeof ledger?.readReviewAdoptionContext !== "function") throw new TypeError("Invalid Review adoption ledger reader");
   return Object.freeze({ async read({ taskId }) {
-    const item = await ledger.readItemForReconciliation({ itemId: taskId });
+    const { item, root, activeDispatch } = await ledger.readReviewAdoptionContext({ itemId: taskId }) ?? {};
     if (!item || item.sourceQuarantine !== null || item.currentTarget?.type !== "role") return null;
     const inputBinding = currentWorkItemExecutionBinding(item);
     if (inputBinding === null) return null;
-    const root = inputBinding.rootItemId === item.itemId ? item : await ledger.readItemForReconciliation({ itemId: inputBinding.rootItemId });
     if (!root || root.sourceQuarantine !== null || root.source?.scope?.active !== true) return null;
     return { taskId: item.itemId, revision: item.revision, roleId: item.currentTarget.id, status: item.status,
-      activeIntentId: item.activeIntentId, rootStatus: root.status, inputBinding, event: currentWorkItemEvent(item),
+      activeIntentId: item.activeIntentId, activeProposal: activeReviewProposal(item, activeDispatch, inputBinding),
+      rootStatus: root.status, inputBinding, event: currentWorkItemEvent(item),
       acceptanceContract: structuredClone(item.graph?.acceptanceContracts?.at(-1) ?? null), requestedAt: root.createdAt };
   } });
 }
@@ -128,7 +153,7 @@ export class ReviewPublicationReuseService {
   async handle({ proposal: value }, { signal = null } = {}) {
     const proposal = this.#proposal(value);
     const assessment = await this.#assessment(proposal, signal);
-    if (!["dispatch_pending", "waiting_external"].includes(assessment.task.status) || assessment.task.activeIntentId !== proposal.proposalId) throw failure("REVIEW_PUBLICATION_REUSE_TASK_UNAVAILABLE");
+    if (!["dispatch_pending", "waiting_external"].includes(assessment.task.status) || !ownsProposal(assessment.task, proposal)) throw failure("REVIEW_PUBLICATION_REUSE_TASK_UNAVAILABLE");
     let receipt = await this.#ports.receiptStore.getForProposal({ proposalId: proposal.proposalId, proposalDigest: proposal.contentDigest });
     if (receipt !== null) {
       if (!verifyReviewPublicationAdoption({ ...assessment, receipt, proposal })) throw failure("REVIEW_PUBLICATION_REUSE_COVERAGE_CHANGED");
@@ -138,7 +163,7 @@ export class ReviewPublicationReuseService {
       receipt = await this.#ports.receiptStore.record(receipt);
     }
     const current = await this.#task(assessment.task.taskId, signal);
-    if (current.activeIntentId !== proposal.proposalId || !same(this.#target(current, receipt.target.evidenceTarget.deliverables[0].deliverableId).evidenceTarget, receipt.target.evidenceTarget)) throw failure("REVIEW_PUBLICATION_REUSE_TARGET_CHANGED");
+    if (!ownsProposal(current, proposal) || !same(this.#target(current, receipt.target.evidenceTarget.deliverables[0].deliverableId).evidenceTarget, receipt.target.evidenceTarget)) throw failure("REVIEW_PUBLICATION_REUSE_TARGET_CHANGED");
     return { status: "succeeded", summary: "已核实并采用既有 GitHub Review；未重复发布",
       evidence: [`adoption:${receipt.adoptionId}`, `confirmation:${receipt.source.confirmationId}`, `github-review:${receipt.source.receipt.id}`] };
   }

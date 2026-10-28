@@ -2686,7 +2686,7 @@ export async function createApplication({
       } });
       let reuseService = null;
       const getReuseService = () => reuseService ??= new ReviewPublicationReuseService({
-        taskReader: createReviewAdoptionTaskReader(frozenPort(workLedgerRuntime, ["readItemForReconciliation"], "Review adoption task reader")),
+        taskReader: createReviewAdoptionTaskReader(frozenPort(workLedgerRuntime, ["readReviewAdoptionContext"], "Review adoption task reader")),
         factsReader: frozenPort(prEngineerService, ["get"], "Review adoption cached facts"),
         publicationSourceReader: Object.freeze({ listReviewPublicationSources(input) {
           const reader = workProposalRuntime.evidenceReader;

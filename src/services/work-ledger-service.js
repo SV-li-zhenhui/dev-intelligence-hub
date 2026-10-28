@@ -960,6 +960,21 @@ export class WorkLedgerService {
     return item ? cloneLedgerValue(item) : null;
   }
 
+  async readReviewAdoptionContext(input = {}) {
+    this.#assertReady();
+    if (!hasExactLedgerKeys(input, ["itemId"])) throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "Review 采用上下文查询无效");
+    let itemId;
+    try { itemId = boundedLedgerString(input.itemId, "itemId", 192); }
+    catch { throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "Review 采用上下文查询无效"); }
+    const state = await this.#readCommittedAuthorityState();
+    const item = state.items.find(candidate => candidate.itemId === itemId);
+    if (!item) return null;
+    const inputBinding = currentWorkItemExecutionBinding(item);
+    const root = inputBinding === null ? null : state.items.find(candidate => candidate.itemId === inputBinding.rootItemId) ?? null;
+    const activeDispatch = item.activeIntentId === null ? null : state.outbox.find(candidate => candidate.intentId === item.activeIntentId) ?? null;
+    return cloneLedgerValue({ item, root, activeDispatch });
+  }
+
   async readInternalReviewHandoff(input = {}) {
     this.#assertReady();
     if (!hasExactLedgerKeys(input, ["itemId"])) throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "内部复审交接查询无效");

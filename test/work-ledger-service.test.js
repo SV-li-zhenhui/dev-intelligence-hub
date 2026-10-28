@@ -2035,7 +2035,7 @@ test("committed context authority stays readable while candidate validation hold
     const result = await Promise.race([
       Promise.all([fixture.service.getGraphSnapshot(), fixture.service.readItemForReconciliation({ itemId: root.itemId }),
         fixture.service.verifyPullRequestExecutionBinding(binding), fixture.service.readAutomaticReviewAdmission(binding),
-        fixture.service.readPullRequestExecutionContext(binding)]),
+        fixture.service.readPullRequestExecutionContext(binding), fixture.service.readReviewAdoptionContext({ itemId: root.itemId })]),
       new Promise(resolve => setImmediate(() => resolve(blocked))),
     ]);
     assert.notEqual(result, blocked, 'reading committed context must not wait for an unrelated uncommitted candidate');
@@ -2044,10 +2044,39 @@ test("committed context authority stays readable while candidate validation hold
     assert.deepEqual(result[2], binding);
     assert.deepEqual(result[3].inputBinding, binding);
     assert.deepEqual(result[4].inputBinding, binding);
+    assert.deepEqual(result[5], { item: root, root, activeDispatch: null });
     result[1].status = 'cancelled';
     assert.equal((await fixture.service.readItemForReconciliation({ itemId: root.itemId })).status, root.status);
   } finally { release.resolve(); await write; }
   assert.equal((await fixture.service.getGraphSnapshot()).graph.tasks.length, 2);
+});
+
+test("Review adoption reads the committed task and sealed dispatch together without refreshing writer state", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })], store: new ContentVersionMemoryStore() });
+  await fixture.service.intake();
+  const original = (await fixture.service.listItems()).items[0];
+  const other = await createFixture({ source: fixture.source, store: fixture.store });
+  const item = await other.service.claim({ itemId: original.itemId, expectedRevision: original.revision,
+    workerId: "employee-pr-engineer", leaseDurationMs: 30_000 });
+  const staged = await other.service.stageIntent({ itemId: item.itemId, expectedRevision: item.revision,
+    leaseId: item.leaseId, actorId: "employee-pr-engineer", roleId: "pr-engineer", intent: reviewIntent() });
+  const claimed = await other.service.claimIntent({ intentId: staged.outbox.intentId, expectedRevision: staged.outbox.revision,
+    dispatcherId: "work-intent-dispatcher", leaseDurationMs: 30_000 });
+  const sealed = await other.service.bindIntent({ intentId: claimed.intentId, expectedRevision: claimed.revision,
+    itemExpectedRevision: staged.item.revision, dispatcherId: claimed.dispatcherId, dispatchLeaseId: claimed.dispatchLeaseId,
+    boundIntent: boundReviewIntent(staged.item, { requestedBy: { roleId: "pr-engineer", workItemId: item.itemId },
+      binding: { repository: "acme/repo", pullRequestNumber: 42 } }) });
+  assert.deepEqual((await fixture.service.listOutbox()).items, [], "the reader's writer state is deliberately stale");
+  const context = await fixture.service.readReviewAdoptionContext({ itemId: item.itemId });
+  assert.equal(context.item.activeIntentId, sealed.intentId);
+  assert.deepEqual(context.root, context.item);
+  const storedDispatch = fixture.store.stored().outbox.find(row => row.intentId === sealed.intentId);
+  assert.deepEqual(context.activeDispatch, storedDispatch);
+  context.activeDispatch.dispatchBinding.bindingDigest = "0".repeat(64);
+  assert.deepEqual((await fixture.service.readReviewAdoptionContext({ itemId: item.itemId })).activeDispatch, storedDispatch);
+  assert.deepEqual((await fixture.service.listOutbox()).items, [], "a context read must not advance writer bookkeeping");
+  assert.equal(await fixture.service.readReviewAdoptionContext({ itemId: "missing-item" }), null);
+  await assert.rejects(fixture.service.readReviewAdoptionContext({ itemId: item.itemId, extra: true }), { code: "WORK_LEDGER_QUERY_INVALID" });
 });
 
 test("a version observed by a context read also fences later mutations against durable rollback", async () => {
