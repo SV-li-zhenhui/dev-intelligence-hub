@@ -425,7 +425,6 @@ export function successfulProfiles(job, session) {
 }
 
 export function verificationFailure(job) {
-  if (job.grant.operation !== "verify") return null;
   const latestProfiles = new Set();
   let action;
   const observation = job.execution.observations.findLast((entry) => {
@@ -438,6 +437,10 @@ export function verificationFailure(job) {
     if (latestProfiles.has(candidate.profileId)) return false;
     latestProfiles.add(candidate.profileId);
     if (entry.status !== "failed") return false;
+    // Code changes can repair failed assertions, but cannot repair the host's
+    // sandbox or fixed profile configuration by asking the model again.
+    if (job.grant.operation !== "verify" &&
+        !VERIFICATION_ENVIRONMENT_ERRORS.has(safeErrorCode(entry.detail?.result?.error, "ACTION_FAILED"))) return false;
     action = candidate;
     return true;
   });

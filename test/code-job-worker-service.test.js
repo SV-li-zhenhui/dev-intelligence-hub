@@ -4678,6 +4678,82 @@ test("verify jobs wait for audit reconciliation before settling a failed profile
   assert.equal(executor.calls.filter(({ method }) => method === "reconcileAction").length, 1);
 });
 
+test("non-verification jobs stop after a required profile environment failure without another model call", async t => {
+  for (const operation of ["modify", "inspect"]) {
+    for (const code of ["SANDBOX_UNAVAILABLE", "SANDBOX_START_FAILED", "SANDBOX_IMAGE_UNAVAILABLE", "SANDBOX_PROFILE_NOT_FOUND", "INVALID_SANDBOX_CONFIG"]) {
+      await t.test(`${operation}: ${code}`, async () => {
+        const initial = job({ grant: grant({ operation }) });
+        const store = new FakeJobStore([initial]), executor = new FakeExecutor(initial), calls = [];
+        failFirstProfileRun(executor, { exitCode: null, error: { code, message: "environment unavailable" } });
+        const worker = new CodeJobWorkerService({ jobStore: store, executor,
+          brainDirectory: brain([{ type: "run_profile" }, { type: "run_profile" }], calls), grantVerifier: verifier([]) });
+        assert.equal((await worker.runCycle()).outcomes[0].code, "CODE_JOB_VERIFICATION_ENVIRONMENT_UNAVAILABLE");
+        assert.equal((await worker.runCycle()).selected, 0);
+        const current = await store.getForWorker(initial.jobId);
+        assert.equal(current.status, "failed");
+        assert.equal(current.execution.observations.length, 1);
+        assert.equal(current.execution.observations[0].detail.result.error.code, code);
+        assert.equal(calls.length, 1);
+        assert.equal(executor.calls.filter(({ method }) => method === "perform").length, 1);
+      });
+    }
+  }
+});
+
+test("a recovered modify job stops on current environment failure while keeping latest results per profile", () => {
+  const action = { type: "run_profile", actionId: "environment-failure", expectedWorkspaceRevision: REVISION_A, profileId: "node-tests" };
+  const failed = observation(action, { status: "failed", result: { error: { code: "SANDBOX_UNAVAILABLE" } } });
+  const initial = job({ execution: { ...job().execution, workspaceRevision: REVISION_A, observations: [failed] } });
+  assert.equal(verificationFailure(initial)?.code, "CODE_JOB_VERIFICATION_ENVIRONMENT_UNAVAILABLE");
+  initial.execution.observations.push(observation({ ...action, actionId: "passed-retest" }, { result: { exitCode: 0 } }));
+  assert.equal(verificationFailure(initial), null);
+  initial.execution.observations = [failed, observation({ ...action, actionId: "product-failure" },
+    { status: "failed", result: { exitCode: 1, error: { code: "TESTS_FAILED" } } })];
+  assert.equal(verificationFailure(initial), null, "a later executed test failure permits code repair");
+  initial.execution.workspaceRevision = REVISION_B;
+  initial.execution.observations = [failed];
+  assert.equal(verificationFailure(initial), null, "old workspace results do not fail a new workspace");
+});
+
+test("restarted non-verification workers retain prior edits and settle environment failure without replay", async t => {
+  for (const operation of ["modify", "inspect"]) await t.test(operation, async () => {
+    const profile = { type: "run_profile", actionId: "durable-environment-failure", expectedWorkspaceRevision: REVISION_A, profileId: "node-tests" };
+    const observations = operation === "modify" ? [observation({ type: "write_text", actionId: "prior-edit",
+      expectedWorkspaceRevision: REVISION_A, path: "src/new.js", content: "export const fixed = true;\n" })] : [];
+    observations.push(observation(profile, { status: "failed", result: { error: { code: "SANDBOX_UNAVAILABLE" } } }));
+    const initial = job({ grant: grant({ operation }), status: "active", revision: 6,
+      execution: { ...job().execution, sessionId: job().jobId, workspaceRevision: REVISION_A,
+        turn: observations.length, observations } });
+    const store = new FakeJobStore([initial]), executor = new FakeExecutor(initial), calls = [];
+    const worker = new CodeJobWorkerService({ jobStore: store, executor,
+      brainDirectory: brain([{ type: "run_profile" }], calls), grantVerifier: verifier([]) });
+    assert.equal((await worker.runCycle()).outcomes[0].code, "CODE_JOB_VERIFICATION_ENVIRONMENT_UNAVAILABLE");
+    const current = await store.getForWorker(initial.jobId);
+    assert.equal(current.status, "failed");
+    assert.deepEqual(current.execution.observations, observations);
+    assert.equal(current.execution.workspaceRevision, REVISION_A);
+    assert.equal(calls.length, 0);
+    assert.deepEqual(executor.calls, []);
+  });
+});
+
+test("continuous modify stops further tool actions after a profile environment failure", async () => {
+  const initial = job(), store = new FakeJobStore([initial]), executor = new FakeExecutor(initial);
+  failFirstProfileRun(executor, { error: { code: "SANDBOX_UNAVAILABLE" } });
+  const worker = new CodeJobWorkerService({ jobStore: store, executor, grantVerifier: verifier([]),
+    brainDirectory: { describe: () => ({ supportsCodeExecution: true, supportsCodeReading: true }),
+      async decide({ codeExecutionContext }) {
+        const tools = beginCodeExecutionSession(codeExecutionContext);
+        await tools.invoke("perform_action", { decision: continuousDecision({ type: "run_profile" }) });
+        await assert.rejects(tools.invoke("perform_action", { decision: continuousDecision({ type: "run_profile" }) }));
+        await tools.close();
+        return continuousDecision({ type: "complete", outcome: "environment unavailable", evidence: [] });
+      } } });
+  assert.equal((await worker.runCycle()).outcomes[0].status, "failed");
+  assert.equal((await store.getForWorker(initial.jobId)).execution.observations.length, 1);
+  assert.equal(executor.calls.filter(({ method }) => method === "perform").length, 1);
+});
+
 test("modify jobs can repair and retest after a trusted profile failure", async () => {
   const initial = job();
   const store = new FakeJobStore([initial]);
