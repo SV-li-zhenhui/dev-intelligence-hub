@@ -249,6 +249,68 @@ function assertExactKeys(value, expected, error) {
   return value;
 }
 
+function isContentVersion(value) {
+  return value !== null && typeof value === "object" &&
+    Object.getPrototypeOf(value) === Object.prototype &&
+    Reflect.ownKeys(value).length === 0 && Object.isFrozen(value);
+}
+
+function normalizeVersionedRead(result, expectedVersion) {
+  const error = corruptedState();
+  assertExactKeys(result, result?.changed === true
+    ? ["changed", "version", "value"] : ["changed", "version"], error);
+  if (!isContentVersion(result.version) ||
+      (result.changed !== true && result.changed !== false) ||
+      (result.changed === false && result.version !== expectedVersion)) throw error;
+  return result;
+}
+
+class CodeJobStateValidationCache {
+  // Only locally normalized, deeply frozen identities are certified. A caller's
+  // frozen object or matching digest never admits unvalidated persisted input.
+  #jobs = new WeakSet();
+  #deliveries = new WeakSet();
+  #deliveryBindings = new WeakMap();
+  #frozen = new WeakSet();
+
+  freeze(value) {
+    if (value === null || typeof value !== "object" || this.#frozen.has(value)) return value;
+    for (const child of Object.values(value)) this.freeze(child);
+    Object.freeze(value);
+    this.#frozen.add(value);
+    return value;
+  }
+
+  normalizeJob(value) {
+    if (this.#jobs.has(value)) return value;
+    const normalized = this.freeze(normalizeCodeJob(value));
+    this.#jobs.add(normalized);
+    return normalized;
+  }
+
+  normalizeDelivery(value, error) {
+    if (this.#deliveries.has(value)) return value;
+    const normalized = this.freeze(normalizeDeliveredChangePackage(value, error));
+    this.#deliveries.add(normalized);
+    return normalized;
+  }
+
+  matchesDelivery(entry, job) {
+    if (this.#deliveryBindings.get(entry)?.has(job)) return true;
+    if (!deliveredChangePackageMatchesJob(entry, job)) return false;
+    let jobs = this.#deliveryBindings.get(entry);
+    if (!jobs) this.#deliveryBindings.set(entry, jobs = new WeakSet());
+    jobs.add(job);
+    return true;
+  }
+
+  isRetentionEligible(job) {
+    return this.#jobs.has(job)
+      ? isTerminalCodeJobStatus(job.status) && job.execution.memoryProjection !== null
+      : isRetentionEligibleCodeJob(job);
+  }
+}
+
 function denseArray(value, maximumLength, error) {
   if (
     !Array.isArray(value) ||
@@ -478,10 +540,10 @@ function normalizeArchive(value, error) {
   return legacy ? sealArchive(content) : { ...content, checkpointDigest };
 }
 
-function normalizeJobs(value, limits, error) {
+function normalizeJobs(value, limits, error, validationCache = null) {
   return denseArray(value, limits.maximumJobs + limits.maximumArchivedJobs, error).map((entry) => {
     try {
-      return normalizeCodeJob(entry);
+      return validationCache === null ? normalizeCodeJob(entry) : validationCache.normalizeJob(entry);
     } catch {
       throw error;
     }
@@ -810,7 +872,7 @@ function normalizeDeliveredChangePackage(value, error) {
   return { previousDigest, receipt };
 }
 
-function normalizeChangePackageDelivery(value, stateRevision, error) {
+function normalizeChangePackageDelivery(value, stateRevision, error, validationCache = null) {
   assertExactKeys(
     value,
     [
@@ -848,7 +910,8 @@ function normalizeChangePackageDelivery(value, stateRevision, error) {
     value.delivered,
     MAX_CHANGE_PACKAGE_DELIVERIES,
     error,
-  ).map((entry) => normalizeDeliveredChangePackage(entry, error));
+  ).map((entry) => validationCache === null
+    ? normalizeDeliveredChangePackage(entry, error) : validationCache.normalizeDelivery(entry, error));
   const pending = denseArray(
     value.pending,
     MAX_CHANGE_PACKAGE_DELIVERIES,
@@ -1096,7 +1159,7 @@ function normalizeLegacyState(value, limits, error) {
   return state;
 }
 
-function normalizeStateValue(value, limits) {
+function normalizeStateValue(value, limits, validationCache) {
   const error = invalidState();
   if (value?.schemaVersion === 1) {
     return normalizeLegacyState(value, limits, error);
@@ -1152,7 +1215,7 @@ function normalizeStateValue(value, limits) {
   const lastCompaction = value.schemaVersion >= 4
     ? normalizeLastCompaction(value.lastCompaction, archive, archiveIndex, error)
     : null;
-  const jobs = normalizeJobs(value.jobs, limits, error);
+  const jobs = normalizeJobs(value.jobs, limits, error, validationCache);
   validateUniqueJobs(jobs, error);
   const memoryProjection = memoryOutboxVersion
     ? normalizeMemoryProjection(value.memoryProjection, revision, error)
@@ -1162,6 +1225,7 @@ function normalizeStateValue(value, limits) {
         value.changePackageDelivery,
         revision,
         error,
+        validationCache,
       )
     : emptyChangePackageDelivery();
   const knownJobIds = new Set([
@@ -1182,7 +1246,8 @@ function normalizeStateValue(value, limits) {
     (entry) => {
       const live = liveJobsById.get(entry.receipt.jobId);
       if (live) {
-        return !deliveredChangePackageMatchesJob(entry, live);
+        return !(validationCache === null
+          ? deliveredChangePackageMatchesJob(entry, live) : validationCache.matchesDelivery(entry, live));
       }
       const archived = archivedJobsById.get(entry.receipt.jobId);
       return (
@@ -1247,15 +1312,15 @@ function normalizeStateValue(value, limits) {
     changePackageDelivery,
     jobs: ordered,
   };
-  if (stateExceedsLimits(state, limits) && !retainedHistoryBudgetAllows(state, limits)) {
+  if (stateExceedsLimits(state, limits) && !retainedHistoryBudgetAllows(state, limits, 0, validationCache)) {
     throw error;
   }
   return state;
 }
 
-function normalizeState(value, limits) {
+function normalizeState(value, limits, validationCache = null) {
   try {
-    return normalizeStateValue(value, limits);
+    return normalizeStateValue(value, limits, validationCache);
   } catch (error) {
     if (error?.code === "CODE_JOB_STATE_CORRUPTED") throw error;
     throw corruptedState(error);
@@ -2691,9 +2756,9 @@ function prepareArchiveEntry(state, archive, job, revision, limits) {
   return { archive: nextArchive, tombstone, indexes, manifest };
 }
 
-function isStateRetentionEligible(state, job, pendingJobIds = null) {
+function isStateRetentionEligible(state, job, pendingJobIds = null, validationCache = null) {
   return (
-    isRetentionEligibleCodeJob(job) &&
+    (validationCache === null ? isRetentionEligibleCodeJob(job) : validationCache.isRetentionEligible(job)) &&
     !(pendingJobIds === null
       ? state.changePackageDelivery.pending.some(event => event.job.id === job.jobId)
       : pendingJobIds.has(job.jobId))
@@ -2755,14 +2820,14 @@ function stateExceedsLimits(state, limits, requiredHeadroomBytes = 0) {
 // Prefix compaction remains preferred. If an owner-held or unfinished job pins
 // that prefix, already-projectable terminal history may use the historical
 // budget without consuming the space reserved for live action receipts.
-function retainedHistoryBudgetAllows(state, limits, requiredHeadroomBytes = 0) {
+function retainedHistoryBudgetAllows(state, limits, requiredHeadroomBytes = 0, validationCache = null) {
   let liveBytes = Buffer.byteLength(JSON.stringify(state), 'utf8');
   let liveJobs = state.jobs.length;
   let historyBytes = state.archive.storageBytes;
   let historyJobs = state.archive.jobCount;
   const pendingJobIds = new Set(state.changePackageDelivery.pending.map(event => event.job.id));
   for (const job of state.jobs) {
-    if (!isStateRetentionEligible(state, job, pendingJobIds)) continue;
+    if (!isStateRetentionEligible(state, job, pendingJobIds, validationCache)) continue;
     const bytes = Buffer.byteLength(JSON.stringify(job), 'utf8');
     liveBytes -= bytes;
     liveJobs--;
@@ -2807,6 +2872,9 @@ function rotateWorkerCandidates(items, afterSequence, limit) {
 }
 
 export class CodeJobStore {
+  #validationCache = new CodeJobStateValidationCache();
+  #durableSnapshot = null;
+
   constructor({
     store,
     exclusiveLease,
@@ -2848,10 +2916,7 @@ export class CodeJobStore {
     return this.operationQueue.enqueue(async () => {
       this.ready = false;
       return this.exclusiveLease.run(async () => {
-        const durable = await this.store.read(CODE_JOB_STATE_KEY, defaultState());
-        const recovered = normalizeState(durable, this.limits);
-        await this.#validateArchiveArtifacts(recovered);
-        this.#acceptDurableState(recovered);
+        const recovered = await this.#readDurableState({ recovering: true });
         this.ready = true;
         return {
           revision: recovered.revision,
@@ -4584,33 +4649,54 @@ export class CodeJobStore {
           change.protectedSequences ?? new Set(),
           change.requiredHeadroomBytes ?? TERMINAL_HEADROOM_BYTES,
         );
-        const candidate = normalizeState(fitted.state, this.limits);
+        const candidate = normalizeState(fitted.state, this.limits, this.#validationCache);
         const archivedEntries = [
           ...(change.archivedEntries ?? []),
           ...fitted.archivedEntries,
         ];
+        let writtenVersion;
         try {
           await this.#persistArchiveEntries(archivedEntries);
-          await this.store.write(CODE_JOB_STATE_KEY, candidate);
+          writtenVersion = await this.store.write(CODE_JOB_STATE_KEY, candidate);
         } catch (writeError) {
+          this.#durableSnapshot = null;
           await this.#reconcileFailedWrite(writeError);
           throw writeError;
         }
         this.#acceptDurableState(candidate);
+        this.#durableSnapshot = typeof this.store.readVersioned === "function" && isContentVersion(writtenVersion)
+          ? { version: writtenVersion, state: candidate } : null;
         return change.value;
       });
     });
   }
 
-  async #readDurableState() {
+  async #readDurableState({ recovering = false } = {}) {
     try {
+      let stored, version;
+      if (typeof this.store.readVersioned === "function") {
+        // StateStore versions bind exact committed bytes, including existence.
+        // Replacing the public state reference also invalidates this pairing.
+        const snapshot = this.#durableSnapshot?.state === this.state ? this.#durableSnapshot : null;
+        const result = normalizeVersionedRead(await this.store.readVersioned(CODE_JOB_STATE_KEY, defaultState(), {
+          ifVersion: snapshot?.version,
+        }), snapshot?.version);
+        if (!result.changed) {
+          if (recovering) await this.#validateArchiveArtifacts(snapshot.state);
+          return snapshot.state;
+        }
+        stored = result.value;
+        version = result.version;
+      } else stored = await this.store.read(CODE_JOB_STATE_KEY, defaultState());
       const durable = normalizeState(
-        await this.store.read(CODE_JOB_STATE_KEY, defaultState()),
-        this.limits,
+        stored, this.limits, this.#validationCache,
       );
+      if (recovering) await this.#validateArchiveArtifacts(durable);
       this.#acceptDurableState(durable);
+      this.#durableSnapshot = version === undefined ? null : { version, state: durable };
       return durable;
     } catch (error) {
+      this.#durableSnapshot = null;
       this.ready = false;
       throw error;
     }
@@ -4684,7 +4770,7 @@ export class CodeJobStore {
         );
       }
     }
-    this.state = durable;
+    this.state = this.#validationCache.freeze(durable);
     this.archiveManifestLookup = createArchiveManifestLookup(durable);
   }
 
@@ -4699,7 +4785,7 @@ export class CodeJobStore {
         limits: this.limits,
       });
       if (compacted.archived === 0) {
-        if (retainedHistoryBudgetAllows(candidate, this.limits, requiredHeadroomBytes)) break;
+        if (retainedHistoryBudgetAllows(candidate, this.limits, requiredHeadroomBytes, this.#validationCache)) break;
         if (stateExceedsLimits(candidate, this.limits, 0)) {
           throw capacityExceeded();
         }

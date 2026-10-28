@@ -65,6 +65,44 @@ class MemoryStore {
   }
 }
 
+class VersionedMemoryStore extends MemoryStore {
+  constructor(value = null) {
+    super(value);
+    this.contentVersions = new Map();
+    this.codeJobReadCount = 0;
+    this.versionedReadCount = 0;
+  }
+
+  async read(name, fallback) {
+    if (name === CODE_JOB_STATE_KEY) this.codeJobReadCount += 1;
+    return super.read(name, fallback);
+  }
+
+  async readVersioned(name, fallback, { ifVersion } = {}) {
+    this.versionedReadCount += 1;
+    const value = this.values.get(name);
+    const serialized = value === undefined ? null : JSON.stringify(value);
+    let current = this.contentVersions.get(name);
+    if (!current || current.serialized !== serialized) {
+      current = { serialized, version: Object.freeze({}) };
+      this.contentVersions.set(name, current);
+    }
+    return ifVersion === current.version
+      ? { changed: false, version: current.version }
+      : { changed: true, version: current.version,
+          value: structuredClone(value === undefined ? fallback : value) };
+  }
+
+  async write(name, value) {
+    const hadVersion = this.contentVersions.has(name);
+    await super.write(name, value);
+    if (!hadVersion) return undefined;
+    const version = Object.freeze({});
+    this.contentVersions.set(name, { serialized: JSON.stringify(value), version });
+    return version;
+  }
+}
+
 class ExclusiveLease {
   constructor() {
     this.runCount = 0;
@@ -319,6 +357,114 @@ async function readyStore({
   await jobs.recover();
   return { jobs, store, time, exclusiveLease };
 }
+
+test("unchanged versioned code jobs reuse certified state without reading and validating history again", async () => {
+  const store = new VersionedMemoryStore();
+  const fixture = await readyStore({ store });
+  const created = await fixture.jobs.createApprovedJob(approval());
+  const certified = fixture.jobs.state;
+  const repeated = await fixture.jobs.createApprovedJob(approval());
+  assert.equal(repeated.status, "already");
+  assert.equal(store.codeJobReadCount, 0);
+  assert.equal(store.versionedReadCount, 3);
+  assert.equal(fixture.jobs.state, certified);
+  assert.ok(Object.isFrozen(certified.jobs[0].execution));
+  created.job.status = "fenced";
+  assert.notEqual(fixture.jobs.state.jobs[0].status, created.job.status);
+});
+
+test("a code job mutation preserves certified unchanged history while newly changed jobs are validated", async () => {
+  const fixture = await readyStore({ store: new VersionedMemoryStore() });
+  await fixture.jobs.createApprovedJob(approval());
+  const first = fixture.jobs.state.jobs[0];
+  const otherGrant = grant({ proposalId: "work-intent-proposal-cache-2", contentDigest: "d".repeat(64),
+    requestedBy: { roleId: "developer", workItemId: "work-cache-2" },
+    source: { assignmentId: "assignment-cache-2", eventId: "event-cache-2" } });
+  await fixture.jobs.createApprovedJob(approval({ confirmationId: "confirmation-cache-2",
+    requestId: "request-cache-2", displayedPayloadDigest: "2".repeat(64),
+    approvalBindingDigest: "3".repeat(64), grant: otherGrant }));
+  assert.equal(fixture.jobs.state.jobs[0], first);
+  assert.ok(Object.isFrozen(first.grant));
+  assert.throws(() => { first.grant.objective = "forged"; }, TypeError);
+});
+
+test("changed versioned code job bytes are fully validated before cached state can be reused", async () => {
+  const store = new VersionedMemoryStore();
+  const fixture = await readyStore({ store });
+  await fixture.jobs.createApprovedJob(approval());
+  const changed = structuredClone(store.value);
+  changed.jobs[0].grant.objective = "A forged grant has the same job and state revisions.";
+  Object.freeze(changed.jobs[0]);
+  store.value = changed;
+  await assert.rejects(fixture.jobs.createApprovedJob(approval()), { code: "CODE_JOB_STATE_CORRUPTED" });
+});
+
+test("a versioned write with a lost acknowledgement is reread before another job is admitted", async () => {
+  const store = new VersionedMemoryStore();
+  const fixture = await readyStore({ store });
+  store.writeThenFailAt = 1;
+  await assert.rejects(fixture.jobs.createApprovedJob(approval()), /disk acknowledgement unavailable/);
+  const observed = await fixture.jobs.createApprovedJob(approval());
+  assert.equal(observed.status, "already");
+  assert.equal(store.value.jobs.length, 1);
+  assert.equal(store.writeCount, 1);
+});
+
+test("another writer's changed valid version is adopted before a later mutation", async () => {
+  const store = new VersionedMemoryStore();
+  const first = await readyStore({ store });
+  const created = await first.jobs.createApprovedJob(approval());
+  const other = await readyStore({ store });
+  await other.jobs.pause({ jobId: created.job.jobId, expectedRevision: created.job.revision, reason: "Owner paused" });
+  const outcome = await first.jobs.createApprovedJob(approval());
+  assert.equal(outcome.status, "already");
+  assert.equal(first.jobs.state.jobs[0].status, "paused");
+  assert.equal(first.jobs.state.revision, store.value.revision);
+});
+
+test("changed version tokens cannot hide rollback, missing state, or a forged unchanged result", async (t) => {
+  for (const kind of ["rollback", "missing", "forged version"]) await t.test(kind, async () => {
+    const store = new VersionedMemoryStore();
+    const fixture = await readyStore({ store });
+    const created = await fixture.jobs.createApprovedJob(approval());
+    const previous = structuredClone(store.value);
+    await fixture.jobs.pause({ jobId: created.job.jobId, expectedRevision: created.job.revision, reason: "Owner paused" });
+    if (kind === "rollback") store.value = previous;
+    if (kind === "missing") store.value = null;
+    if (kind === "forged version") store.readVersioned = async () => ({ changed: false, version: Object.freeze({}) });
+    await assert.rejects(fixture.jobs.createApprovedJob(approval()), {
+      code: kind === "forged version" ? "CODE_JOB_STATE_CORRUPTED" : "CODE_JOB_STATE_ROLLBACK",
+    });
+    await assert.rejects(fixture.jobs.get(created.job.jobId), { code: "CODE_JOB_STORE_NOT_READY" });
+  });
+});
+
+test("a write without an opaque committed version forces a fresh durable read", async () => {
+  const store = new VersionedMemoryStore();
+  const write = store.write.bind(store);
+  store.write = async (...args) => { await write(...args); };
+  const fixture = await readyStore({ store });
+  await fixture.jobs.createApprovedJob(approval());
+  const written = fixture.jobs.state;
+  assert.equal((await fixture.jobs.createApprovedJob(approval())).status, "already");
+  assert.notEqual(fixture.jobs.state, written);
+});
+
+test("a valid same-revision fork and replacement of the public state reference remain fail closed", async (t) => {
+  for (const kind of ["durable fork", "public state replacement"]) await t.test(kind, async () => {
+    const store = new VersionedMemoryStore();
+    const fixture = await readyStore({ store });
+    await fixture.jobs.createApprovedJob(approval());
+    const changed = structuredClone(store.value);
+    const job = changed.jobs[0];
+    job.updatedAt = "2026-08-02T06:00:01.000Z";
+    delete job.recordDigest;
+    job.recordDigest = digestValue(job);
+    if (kind === "durable fork") store.value = changed;
+    else fixture.jobs.state = changed;
+    await assert.rejects(fixture.jobs.createApprovedJob(approval()), { code: "CODE_JOB_STATE_FORKED" });
+  });
+});
 
 async function activeTimeoutStore() {
   const fixture = await readyStore();
