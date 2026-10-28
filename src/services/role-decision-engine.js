@@ -1,3 +1,4 @@
+import { structuredPrTriage, isExternalRereview, requiredReviewDeliverables, requiresReviewDelivery } from "../domain/pr-review-work-policy.js";
 import { readFileSync } from "node:fs";
 import { permitsReviewPublicationSettlementIntent } from "./review-publication-settlement.js";
 import { NATIVE_REVIEW_SKILL_NAME } from "../lib/native-review-skill.js";
@@ -269,24 +270,9 @@ function normalizeTrigger(value) {
 }
 
 function structuredInitialPrTriage(context, roleId) {
-  const event = context?.code?.sourceEvent ?? context?.code?.event;
   const directChildren = context?.requirements?.coordination?.directChildren;
-  if (
-    roleId !== "orchestrator" ||
-    event?.eventType !== "pull_request.owner_requested" ||
-    event?.source?.provider !== "local-owner" ||
-    event?.payload?.workType !== "general" ||
-    !["development", "pr-review"].includes(
-      event?.payload?.suggestedCapability,
-    ) ||
-    typeof event?.payload?.nextAction !== "string" ||
-    typeof event?.payload?.expectedHeadRefOid !== "string" ||
-    !Array.isArray(directChildren) ||
-    directChildren.length !== 0
-  ) {
-    return null;
-  }
-  return event.payload;
+  return roleId === "orchestrator" && Array.isArray(directChildren) && directChildren.length === 0
+    ? structuredPrTriage(context) : null;
 }
 
 function assertInitialPrTriageDecision(context, roleId, decision) {
@@ -305,27 +291,13 @@ function assertInitialPrTriageDecision(context, roleId, decision) {
   }
 }
 
-function isExternalRereview(context) {
-  const event = context.code?.sourceEvent ?? context.code?.event;
-  return event?.eventType === "pull_request.owner_requested" &&
-    event.source?.provider === "local-owner" && event.payload?.workType === "general" &&
-    event.payload.nextAction === "rereview" && event.payload.suggestedCapability === "pr-review" &&
-    typeof event.payload.expectedHeadRefOid === "string" &&
-    context.code?.internalReview?.kind !== "developer_handoff";
-}
-
-function requiredReviewDeliverables(contract) {
-  return (contract?.expectedDeliverables ?? []).filter(({ kind, required }) =>
-    required && ["review-report", "github-review"].includes(kind));
-}
-
 function assertExternalRereviewDecision(context, roleId, decision) {
   if (!isExternalRereview(context)) return;
   const intent = decision.intent;
   const reject = () => { throw engineError("ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION",
     "External rereview requires a required authoritative Review delivery and verified publication before completion", 409); };
   if (roleId === "orchestrator") {
-    if (intent.type === "orchestrate" && intent.action.type === "decompose" && intent.action.capability === "pr-review" &&
+    if (intent.type === "orchestrate" && requiresReviewDelivery(context, intent.action) &&
         requiredReviewDeliverables(intent.action.acceptanceContract).length === 0) reject();
     if (intent.type === "complete" && !(context.requirements?.coordination?.directChildren ?? []).some((child) =>
       child.status === "completed" && child.responsibility?.type === "role" && child.responsibility.id === "pr-engineer" &&

@@ -1,3 +1,4 @@
+import { structuredPrTriage, isExternalRereview, hasRequiredReviewDeliverable, requiresReviewDelivery } from "../domain/pr-review-work-policy.js";
 import { createHash } from "node:crypto";
 import { permitsReviewPublicationSettlementIntent } from "./review-publication-settlement.js";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
@@ -619,34 +620,6 @@ function directChildIds(packet) {
   return new Set(coordination.directChildren.map(({ taskId }) => taskId));
 }
 
-function structuredPrTriage(packet) {
-  const event = packet.context?.code?.sourceEvent ?? packet.context?.code?.event;
-  if (
-    event?.eventType !== "pull_request.owner_requested" ||
-    event?.source?.provider !== "local-owner" ||
-    event?.payload?.workType !== "general" ||
-    !["development", "pr-review"].includes(
-      event?.payload?.suggestedCapability,
-    ) ||
-    typeof event?.payload?.nextAction !== "string" ||
-    typeof event?.payload?.expectedHeadRefOid !== "string"
-  ) {
-    return null;
-  }
-  return event.payload;
-}
-
-function isExternalRereview(packet) {
-  const triage = structuredPrTriage(packet);
-  return triage?.nextAction === "rereview" && triage.suggestedCapability === "pr-review" &&
-    packet.context.code?.internalReview?.kind !== "developer_handoff";
-}
-
-function requiredReviewDeliverable(contract) {
-  return contract.expectedDeliverables.some(({ kind, required }) =>
-    required && ["review-report", "github-review"].includes(kind));
-}
-
 function reviewChildResponsibility(task) {
   return task.responsibility.type === "role" &&
     ["pr-engineer", "orchestrator"].includes(task.responsibility.id);
@@ -671,7 +644,7 @@ function cancelledConflictChildWithoutDelivery(task) {
 }
 
 function assertStructuredPrTriageAction(packet, children, action, tasksById, automaticMode, capabilityRoles) {
-  const triage = structuredPrTriage(packet);
+  const triage = structuredPrTriage(packet.context);
   if (triage === null) return;
   if (!automaticMode && children.size === 0 && action.type !== "decompose") {
     throw denied("Initial structured PR triage must be decomposed");
@@ -679,12 +652,12 @@ function assertStructuredPrTriageAction(packet, children, action, tasksById, aut
   const controlledChild = children.has(action.sourceTaskId) ? tasksById.get(action.sourceTaskId) : null;
   const childLedgerStatus = packet.context.requirements.coordination.directChildren.find(
     ({ taskId }) => taskId === action.sourceTaskId)?.ledgerStatus;
-  if (!automaticMode && isExternalRereview(packet) && action.type === "pause" && controlledChild &&
+  if (!automaticMode && isExternalRereview(packet.context) && action.type === "pause" && controlledChild &&
       ["queued", "retry_wait", "blocked"].includes(childLedgerStatus) &&
       malformedReviewChildWithSettledDeliveries(controlledChild)) {
     throw denied("A settled malformed external rereview child must be cancelled before authoritative replacement");
   }
-  if (isExternalRereview(packet) && action.type === "cancel" && controlledChild?.status === "paused" &&
+  if (isExternalRereview(packet.context) && action.type === "cancel" && controlledChild?.status === "paused" &&
       reviewChildResponsibility(controlledChild)) {
     throw denied("Automatic rereview correction must preserve an intentionally paused Review child");
   }
@@ -700,15 +673,15 @@ function assertStructuredPrTriageAction(packet, children, action, tasksById, aut
   const replaceCancelledConflict = !automaticMode && triage.nextAction === "resolve_conflict" &&
     triage.suggestedCapability === "development" &&
     [...children].every((taskId) => cancelledConflictChildWithoutDelivery(tasksById.get(taskId)));
-  if (!automaticMode && children.size !== 0 && !replaceCancelledConflict && !(isExternalRereview(packet) &&
+  if (!automaticMode && children.size !== 0 && !replaceCancelledConflict && !(isExternalRereview(packet.context) &&
       [...children].every((taskId) => cancelledMalformedReviewChild(tasksById.get(taskId))))) {
     throw denied("Structured PR triage permits only one direct child");
   }
   if (!automaticMode && action.capability !== triage.suggestedCapability) {
     throw denied("Structured PR triage capability does not match trusted intake");
   }
-  if (isExternalRereview(packet) && (!automaticMode || action.capability === "pr-review") &&
-      !requiredReviewDeliverable(action.acceptanceContract)) {
+  if (requiresReviewDelivery(packet.context, action) &&
+      !hasRequiredReviewDeliverable(action.acceptanceContract)) {
     throw denied("External rereview requires a required authoritative Review delivery");
   }
 }
@@ -1317,8 +1290,8 @@ async function planDeliveryDecision({
   const submitted = latestSubmitted(source, action.submittedDeliveryRevision);
   let verifiedEvidence = false;
   if (action.type === "accept_delivery") {
-    if (isExternalRereview(packet) && reviewChildResponsibility(source) &&
-        !requiredReviewDeliverable(latestContract(source))) {
+    if (isExternalRereview(packet.context) && reviewChildResponsibility(source) &&
+        !hasRequiredReviewDeliverable(latestContract(source))) {
       throw denied("External rereview cannot be accepted from a local report");
     }
     const acceptedInputs = deriveAcceptedInputs(source, tasksById);
