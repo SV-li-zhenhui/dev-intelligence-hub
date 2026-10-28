@@ -130,6 +130,7 @@ const CHECK_CONCLUSIONS = new Set([
 ]);
 const CHECK_REQUIREMENTS = new Set(["required", "optional", "unknown"]);
 const MAX_COLLECTION_ENTRIES = 100;
+export const PULL_REQUEST_READ_BODY_BYTES = 64 * 1024;
 const MAX_THREAD_COMMENTS = 20;
 const MAX_FACT_BYTES = 512 * 1024;
 const MAX_CONTEXT_BYTES = 64 * 1024;
@@ -520,7 +521,7 @@ function normalizeComment(value, name, keys = COMMENT_KEYS) {
     author: displayText(fields.get("author"), `${name}.author`, 64, {
       empty: true,
     }),
-    body: text(fields.get("body"), `${name}.body`, 16 * 1024, { empty: true }),
+    body: text(fields.get("body"), `${name}.body`, PULL_REQUEST_READ_BODY_BYTES, { empty: true }),
     bodyTruncated: booleanValue(
       fields.get("bodyTruncated"),
       `${name}.bodyTruncated`,
@@ -543,7 +544,7 @@ function normalizeReview(value, name) {
       nullable: true,
     }),
     commitOid: optionalOid(fields.get("commitOid"), `${name}.commitOid`),
-    body: text(fields.get("body"), `${name}.body`, 16 * 1024, { empty: true }),
+    body: text(fields.get("body"), `${name}.body`, PULL_REQUEST_READ_BODY_BYTES, { empty: true }),
     bodyTruncated: booleanValue(
       fields.get("bodyTruncated"),
       `${name}.bodyTruncated`,

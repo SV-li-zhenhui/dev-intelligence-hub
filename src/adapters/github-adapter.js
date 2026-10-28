@@ -15,6 +15,7 @@ import {
 } from "../domain/git-tool-contract.js";
 import {
   createPullRequestReadIdentity,
+  PULL_REQUEST_READ_BODY_BYTES,
 } from "../domain/pull-request-read-facts.js";
 import { normalizeEffectivePullRequestUpdatedWindow } from "../domain/pull-request-updated-window.js";
 import {
@@ -821,8 +822,8 @@ export class GitHubAdapter {
       ),
       bodyBytes: boundedPositiveInteger(
         maxReadBodyBytes,
-        4_096,
-        16 * 1024,
+        PULL_REQUEST_READ_BODY_BYTES,
+        PULL_REQUEST_READ_BODY_BYTES,
         "maxReadBodyBytes",
       ),
       factBytes: boundedPositiveInteger(

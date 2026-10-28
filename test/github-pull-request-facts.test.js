@@ -4,6 +4,7 @@ import test from "node:test";
 import { GitHubAdapter } from "../src/adapters/github-adapter.js";
 import { createPullRequestExecutionBinding } from "../src/domain/pull-request-execution-binding.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { projectPullRequestReadFactsContext } from "../src/domain/pull-request-read-facts.js";
 
 const BASE_OID = "a".repeat(40);
 const HEAD_OID = "b".repeat(40);
@@ -518,6 +519,37 @@ test("unknown GitHub enums and nullable facts are explicit and fail-safe", async
   assert.equal(facts.checks[0].status, "UNKNOWN");
   assert.equal(facts.checks[0].conclusion, "UNKNOWN");
   assert.equal(facts.checks[0].requirement, "optional");
+});
+
+test("default reads retain long discussion bodies and prove unchanged material without enlarging model context", async () => {
+  const body = '原始评审说明'.repeat(2_400), reviewBody = 'r'.repeat(32_000);
+  const graph = graphResponse({ comments: page([comment({ body })]), reviews: page([review({ body: reviewBody })]) });
+  let now = '2026-08-08T01:02:00.000Z';
+  const adapter = new GitHubAdapter({ run: fakeRun({ graph }).run, clock: () => now });
+  const first = await adapter.loadPullRequestFacts(readRequest());
+  assert.equal(first.comments[0].body === body, true);
+  assert.equal(first.comments[0].bodyTruncated, false);
+  assert.equal(first.reviews[0].body === reviewBody, true);
+  assert.equal(first.reviews[0].bodyTruncated, false);
+  const original = projectPullRequestReadFactsContext(first);
+  assert.match(original.materialDigest, /^[a-f0-9]{64}$/);
+  assert.ok(Buffer.byteLength(JSON.stringify(original)) <= 64 * 1024);
+  now = '2026-08-08T01:03:00.000Z';
+  const refreshed = projectPullRequestReadFactsContext(await adapter.loadPullRequestFacts(readRequest()));
+  assert.notEqual(original.contentDigest, refreshed.contentDigest);
+  assert.equal(original.materialDigest, refreshed.materialDigest);
+  graph.data.repository.pullRequest.comments.nodes[0].body = body.slice(0, -1) + '改';
+  const changed = projectPullRequestReadFactsContext(await adapter.loadPullRequestFacts(readRequest()));
+  assert.deepEqual(changed.comments, refreshed.comments);
+  assert.notEqual(changed.materialDigest, refreshed.materialDigest, 'a hidden tail edit must invalidate the material proof');
+});
+
+test("bodies above the bounded source limit still disclose truncation and cannot prove complete material", async () => {
+  const graph = graphResponse({ comments: page([comment({ body: 'x'.repeat(70_000) })]) });
+  const facts = await new GitHubAdapter({ run: fakeRun({ graph }).run }).loadPullRequestFacts(readRequest());
+  assert.equal(facts.comments[0].bodyTruncated, true);
+  assert.ok(Buffer.byteLength(facts.comments[0].body) <= 64 * 1024);
+  assert.equal(Object.hasOwn(projectPullRequestReadFactsContext(facts), 'materialDigest'), false);
 });
 
 test("server pagination, body limits, and the total byte budget remain visible", async () => {
