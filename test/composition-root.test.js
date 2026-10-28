@@ -688,14 +688,14 @@ test("automatic Review publication and final execution share the trusted ledger 
   } finally { await application.close(); }
 });
 
-async function within(milliseconds, promise) {
+async function within(milliseconds, promise, phase = "operation") {
   let timer;
   try {
     return await Promise.race([
       promise,
       new Promise((_, reject) => {
         timer = setTimeout(
-          () => reject(new Error("operation exceeded its test bound")),
+          () => reject(new Error(`${phase} exceeded its test bound (${milliseconds} ms)`)),
           milliseconds,
         );
       }),
@@ -1077,7 +1077,7 @@ async function createOfflineProductionCliFixture(t, name) {
   });
 }
 
-function defaultCodeJobConfiguration() {
+function defaultCodeJobConfiguration({ offlineCliTimeoutMs = 30_000 } = {}) {
   const value = structuredClone(COMMITTED_CONFIGURATION);
   value.trackedRepositories = ["acme/repo"];
   value.codeExecutor = {
@@ -1119,7 +1119,7 @@ function defaultCodeJobConfiguration() {
     "offline-cli": {
       kind: "codex-cli",
       remote: true,
-      timeoutMs: 30_000,
+      timeoutMs: offlineCliTimeoutMs,
       maxResponseBytes: 128 * 1024,
       maxRequestBytes: 256 * 1024,
     },
@@ -6113,7 +6113,11 @@ async function assertDefaultCodeJobLifecycle(t, {
       ? "versioned-default-code-job-cli"
       : "default-code-job-cli",
   );
-  const config = defaultCodeJobConfiguration();
+  const config = defaultCodeJobConfiguration({ offlineCliTimeoutMs: 60_000 });
+  // This fixture holds the real CLI until release to test lifecycle ownership.
+  // Its settlement bound covers the request plus the provider's 30s recovery
+  // window; provider deadline behavior has separate deterministic tests.
+  const decisionSettlementBoundMs = 90_000;
   const calls = {};
   const closeCalls = [];
   const lifecycle = createApplicationRuntimeLifecycle();
@@ -6139,7 +6143,7 @@ async function assertDefaultCodeJobLifecycle(t, {
         });
       }
       if (decisionOutcome !== null) {
-        await attempt(() => within(10_000, decisionOutcome));
+        await attempt(() => within(decisionSettlementBoundMs, decisionOutcome, "fixture teardown decision"));
       }
       if (application !== null) {
         let applicationCleanupFailure = null;
@@ -6241,7 +6245,7 @@ async function assertDefaultCodeJobLifecycle(t, {
 
     const firstClose = application.close();
     assert.strictEqual(application.close(), firstClose);
-    const firstFailure = await within(1_000, firstClose).then(
+    const firstFailure = await within(1_000, firstClose, "first application close").then(
       () => null,
       (error) => error,
     );
@@ -6256,7 +6260,7 @@ async function assertDefaultCodeJobLifecycle(t, {
 
     await fixture.release(invocation);
     released = true;
-    const decision = await within(10_000, decisionOutcome);
+    const decision = await within(decisionSettlementBoundMs, decisionOutcome, "decision after release");
     if (versioned) {
       assert.equal(decision.error?.code, "INVALID_CODE_JOB_AUTHORITY");
     } else {
@@ -6268,7 +6272,7 @@ async function assertDefaultCodeJobLifecycle(t, {
 
     const retry = application.close();
     assert.strictEqual(application.close(), retry);
-    await within(1_000, retry);
+    await within(1_000, retry, "retry application close");
     const countsAfterRecovery = observedCloses.length;
     await application.close();
     assert.equal(observedCloses.length, countsAfterRecovery);
