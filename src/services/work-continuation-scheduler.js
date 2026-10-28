@@ -28,6 +28,10 @@ function sourceFor(item) {
   return { rootItemId: binding?.rootItemId ?? (item.kind === 'source_root' ? item.itemId : null),
     parentItemId: item.graph?.parentItemId ?? null, inputRevision: binding?.inputRevision ?? null, itemRevision: item.revision };
 }
+function lastRoleWakeAt(record) {
+  return record.receipts.reduce((latest, receipt) => receipt.roleId === record.roleId
+    ? Math.max(latest, Date.parse(receipt.startedAt)) : latest, -Infinity);
+}
 
 // Wake records describe delivery, never execution authority. Roles retain their
 // own claims, PR bindings, permissions, pause checks and external-effect receipts.
@@ -125,7 +129,7 @@ export class WorkContinuationScheduler {
         if (record && canRun && !this.#active.has(roleId) && ['pending', 'retry_wait', 'stalled'].includes(record.status) &&
             (record.nextAttemptAt === null || Date.parse(record.nextAttemptAt) <= Date.parse(now))) ready.push(record);
       }
-      const selected = this.#select(ready);
+      const selected = this.#select(await this.#orderReady(ready));
       const coordination = config.workCoordination;
       const budget = Math.max(1_000, (coordination?.leaseDurationMs ?? 120_000) +
         (coordination?.resolveTimeoutMs ?? 0) + (coordination?.decisionTimeoutMs ?? 0));
@@ -221,6 +225,16 @@ export class WorkContinuationScheduler {
     }
     if (record.source.itemRevision === null) Object.assign(record, { source: sourceFor(item), condition });
     return record;
+  }
+
+  async #orderReady(ready) {
+    if (ready.length === 0) return ready;
+    // Receipts carry scheduling history across input changes, never execution authority.
+    ready.sort((left, right) => {
+      const leftAt = lastRoleWakeAt(left), rightAt = lastRoleWakeAt(right);
+      return leftAt === rightAt ? 0 : leftAt - rightAt;
+    });
+    return this.#ports.taskRuns ? this.#ports.taskRuns.order(ready, 'work-item', 'itemId') : ready;
   }
 
   #select(ready) {

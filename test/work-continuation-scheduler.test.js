@@ -4,6 +4,7 @@ import { WorkContinuationScheduler } from '../src/services/work-continuation-sch
 import { WORK_CONTINUATION_STATE_KEY, normalizeWorkContinuationState, migrateWorkContinuationState } from '../src/services/work-continuation-state.js';
 import { continuationFingerprint, normalizeContinuationTarget } from '../src/services/work-continuation-state.js';
 import { indexWorkLedgerGraphProgress } from '../src/services/work-ledger-graph-progress.js';
+import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 
 const clone = value => structuredClone(value);
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
@@ -212,6 +213,109 @@ test('repeated unchanged inputs back off and remain recoverable after stalled di
   f.advance(300_000);
   await scheduler.runCycle(f); await f.drain();
   assert.equal(f.state().records[0].status, 'delivered');
+});
+
+test('slow unchanged retries cannot keep a third ready item from its role', async () => {
+  const f = fixture();
+  f.config.workCoordination = { leaseDurationMs: 20 * 60_000 };
+  f.items.push(...['work-two', 'work-three'].map(itemId => ({ ...clone(f.items[0]), itemId })));
+  const scheduler = new WorkContinuationScheduler(f.options), starts = [];
+  for (let cycle = 0; cycle < 16; cycle++) {
+    await scheduler.runCycle({ ...f, dispatch: async ({ continuationTarget }) => {
+      starts.push(continuationTarget.itemId);
+      f.advance(6 * 60_000);
+    } });
+    await f.drain(); await new Promise(resolve => setImmediate(resolve)); f.advance(10_000);
+  }
+  assert.deepEqual(starts.slice(0, 3), ['work-one', 'work-two', 'work-three']);
+  assert.ok(f.items.every(item => starts.filter(itemId => itemId === item.itemId).length >= 5));
+  assert.ok(f.state().records.every(record => record.receipts.at(-1).outcome === 'no_progress'));
+});
+
+test('same-role execution history survives restart and a new input fingerprint', async () => {
+  const f = fixture(), starts = [];
+  f.config.workCoordination = { leaseDurationMs: 20 * 60_000 };
+  f.items.push(...['work-two', 'work-three'].map(itemId => ({ ...clone(f.items[0]), itemId })));
+  const input = { ...f, dispatch: async ({ continuationTarget }) => {
+    starts.push(continuationTarget.itemId); f.advance(6 * 60_000);
+  } };
+  await new WorkContinuationScheduler(f.options).runCycle(input); await f.drain();
+  const originalReceipt = f.state().records[0].receipts[0];
+  f.items[0].revision++;
+  for (let cycle = 0; cycle < 2; cycle++) {
+    await new WorkContinuationScheduler(f.options).runCycle(input); await f.drain();
+  }
+  assert.deepEqual(starts, ['work-one', 'work-two', 'work-three']);
+  const record = f.state().records.find(record => record.itemId === 'work-one');
+  assert.notEqual(record.fingerprint, originalReceipt.fingerprint);
+  assert.deepEqual(record.receipts, [originalReceipt], 'a new Head does not erase its previous execution opportunity');
+});
+
+test('a receipt from another role does not remove a new role assignment from its FIFO turn', async () => {
+  const f = fixture(), scheduler = new WorkContinuationScheduler(f.options), starts = [];
+  await scheduler.runCycle({ ...f, dispatch: async () => {} }); await f.drain();
+  f.advance(60_000);
+  f.items[0].currentTarget.id = 'tester'; f.items[0].revision++;
+  f.items.push({ ...clone(f.items[0]), itemId: 'work-test-peer' });
+  await scheduler.runCycle({ ...f, dispatch: async ({ roleId, continuationTarget }) => {
+    starts.push([roleId, continuationTarget.itemId]);
+  } });
+  await f.drain();
+  assert.deepEqual(starts, [['tester', 'work-one']]);
+});
+
+test('manual task priority wins before same-priority execution history rotates', async () => {
+  const f = fixture(), values = new Map(), starts = [];
+  const taskRuns = new TaskRunRegistry({ clock: f.options.clock, settleControl: async () => {}, store: {
+    async read(key, fallback) { return clone(values.get(key) ?? fallback); },
+    async write(key, value) { values.set(key, clone(value)); },
+  } });
+  f.options.taskRuns = taskRuns;
+  f.config.workCoordination = { leaseDurationMs: 20 * 60_000 };
+  f.items.push(...['high-one', 'high-two'].map(itemId => ({ ...clone(f.items[0]), itemId })));
+  for (const item of f.items.slice(1)) {
+    await taskRuns.run({ kind: 'work-item', taskId: item.itemId, roleId: 'developer',
+      title: item.itemId, subject: 'fairness regression', revision: item.revision }, async () => {
+      const view = await taskRuns.get('work-item', item.itemId);
+      await taskRuns.control('work-item', item.itemId, { command: 'priority', priority: 'high',
+        runId: view.runId, expectedRevision: view.revision });
+    });
+  }
+  const scheduler = new WorkContinuationScheduler(f.options);
+  for (let cycle = 0; cycle < 3; cycle++) {
+    await scheduler.runCycle({ ...f, dispatch: async ({ continuationTarget }) => {
+      starts.push(continuationTarget.itemId); f.advance(6 * 60_000);
+    } });
+    await f.drain(); await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.deepEqual(starts, ['high-one', 'high-two', 'high-one']);
+  assert.equal(f.state().records.find(record => record.itemId === 'work-one').receipts.length, 0);
+});
+
+test('a fair same-role peer waits for actual settlement while another role can advance', async () => {
+  const f = fixture(), release = deferred(), began = deferred(), starts = [];
+  f.config.workCoordination = { leaseDurationMs: 1_000 };
+  f.items.push({ ...clone(f.items[0]), itemId: 'work-peer' });
+  f.items.push({ ...clone(f.items[0]), itemId: 'work-test', currentTarget: { type: 'role', id: 'tester' } });
+  const scheduler = new WorkContinuationScheduler(f.options);
+  const input = { ...f, dispatch: async ({ roleId, signal, continuationTarget }) => {
+    starts.push(continuationTarget.itemId);
+    if (roleId === 'developer') { began.resolve(); await release.promise; signal.throwIfAborted(); }
+    else f.items.find(item => item.itemId === continuationTarget.itemId).revision++;
+  } };
+  await scheduler.runCycle(input); await began.promise;
+  f.items[0].revision++; f.advance(1_001);
+  await scheduler.runCycle(input); await scheduler.runCycle(input);
+  assert.equal(starts.filter(itemId => itemId === 'work-one').length, 1);
+  assert.equal(starts.includes('work-peer'), false, 'timeout or a changed Head cannot release the active role');
+  assert.ok(starts.includes('work-test'));
+  assert.equal(f.state().records.find(record => record.itemId === 'work-one').receipts[0].outcome, 'running');
+  release.resolve(); await f.drain(); await new Promise(resolve => setImmediate(resolve));
+  await scheduler.runCycle({ ...f, dispatch: async ({ continuationTarget }) => { starts.push(continuationTarget.itemId); } });
+  await f.drain();
+  assert.equal(starts.filter(itemId => itemId === 'work-one').length, 1);
+  assert.ok(starts.includes('work-peer'));
+  assert.equal(f.state().records.find(record => record.itemId === 'work-one').receipts[0].outcome, 'timed_out');
 });
 
 test('automatic mode, role pause, task pause and graph dependencies retain their boundaries', async () => {
