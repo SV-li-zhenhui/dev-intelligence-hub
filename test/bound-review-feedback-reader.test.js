@@ -45,6 +45,15 @@ test("changed target and material are internal read failures, not an incomplete 
   await assert.rejects(f.reader.read({ ...f.request, materialDigest: "0".repeat(64) }), { code: "PR_REVIEW_READ_MATERIAL_CHANGED" });
 });
 
+test("parent verification may capture fresh facts while model reading still requires an exact material digest", async () => {
+  const f = fixture(); const { materialDigest, ...currentRequest } = f.request;
+  assert.deepEqual(await f.reader.readCurrent(currentRequest), f.facts);
+  await assert.rejects(f.reader.read(currentRequest));
+  await assert.rejects(f.reader.readCurrent({ ...currentRequest, gitTarget: { ...currentRequest.gitTarget, headRefOid: "0".repeat(40) } }),
+    { code: "PR_REVIEW_READ_HEAD_CHANGED" });
+  assert.equal(f.counts().reads, 1);
+});
+
 test("the production ledger adapter resolves an inherited review binding and rejects paused work", async () => {
   const f = fixture();
   const { schemaVersion, repository, pullRequestNumber, gitTarget, ...sourceBinding } = f.task.inputBinding;

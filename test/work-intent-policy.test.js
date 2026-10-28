@@ -952,7 +952,7 @@ test("rejects untrusted context fields, inherited data, and post-bind mutation",
 
 
 test("seals explicit Review publication reuse into the new proposal without changing its trusted target", () => {
-  const publicationReuse = { candidateId: "review-publication-candidate-" + "a".repeat(64), materialDigest: "b".repeat(64) };
+  const publicationReuse = { candidateId: "review-publication-candidate-" + "a".repeat(64), materialDigest: "b".repeat(64), coverageDigest: "d".repeat(64) };
   const bound = policy().bind({ context: context(), intent: { ...common("propose_github_review"),
     verdict: "approve", body: "Current coverage note, not a newly published body", evidence: ["head:abc123"], publicationReuse } });
   assert.deepEqual(bound.payload.publicationReuse, publicationReuse);

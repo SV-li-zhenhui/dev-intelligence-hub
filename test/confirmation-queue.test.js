@@ -423,6 +423,28 @@ test("internal settlement preserves evidence that an executed stale confirmation
   assert.equal(snapshot.item.invalidation, null);
 });
 
+test("batch settlement reads use one current durable snapshot and stay private and immutable", async () => {
+  const store = new MemoryStore();
+  const queue = await readyQueue({ store });
+  const item = await queue.enqueue(actionPlan());
+  const other = await readyQueue({ store });
+  await other.invalidate(item.id, producerInvalidation(item));
+  const beforeReads = store.readCount, beforeWrites = store.writeCount;
+  const snapshot = await queue.readSettlements({ confirmationIds: [item.id, "missing-item"] });
+  assert.equal(store.readCount - beforeReads, 1);
+  assert.equal(store.writeCount, beforeWrites);
+  assert.equal(snapshot.queueRevision, store.value.revision);
+  assert.equal(snapshot.items.length, 1);
+  assert.equal(snapshot.items[0].status, "stale");
+  assert.equal(snapshot.items[0].execution, null);
+  assert.equal(Object.isFrozen(snapshot.items[0].action), true);
+  for (const confirmationIds of [[item.id, item.id], ["bad/id"], new Array(1), new Array(1001)]) {
+    await assert.rejects(queue.readSettlements({ confirmationIds }), { code: "INVALID_CONFIRMATION_REQUEST" });
+  }
+  store.failReadAt = store.readCount + 1;
+  await assert.rejects(queue.readSettlements({ confirmationIds: [item.id] }), /disk read unavailable/);
+});
+
 test("the queue stays closed until durable recovery succeeds", async () => {
   const queue = new ConfirmationQueue({
     store: new MemoryStore(),

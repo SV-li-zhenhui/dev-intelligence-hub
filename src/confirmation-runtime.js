@@ -599,6 +599,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
       ),
       confirmationSettlementReader: Object.freeze({
         read: (input) => queue.readSettlement(input),
+        readMany: (input) => queue.readSettlements(input),
       }),
       close,
     });

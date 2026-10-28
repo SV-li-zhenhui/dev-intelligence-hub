@@ -299,10 +299,10 @@ export class WorkProposalEvidenceReader {
       } catch { return false; }
     });
     checkAbort(signal);
-    return cloneWorkProposalValue({ complete: matches.length <= maximum, items: matches.slice(-maximum).reverse().map(entry => ({
+    return { complete: matches.length <= maximum, items: matches.slice(-maximum).reverse().map(entry => cloneWorkProposalValue({
       proposal: entry.proposal, result: results.get(entry.resultId) ?? null,
       status: entry.status, downstreamRef: entry.downstreamRef,
-    })) });
+    })) };
   }
 
   listEvidenceCandidates(value) {

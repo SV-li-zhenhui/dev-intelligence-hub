@@ -488,12 +488,13 @@ function normalizeIntentVariant(value) {
       const entries = exactObject(value, keys);
       let publicationReuse;
       if (entries.has("publicationReuse")) {
-        const reuse = exactObject(entries.get("publicationReuse"), ["candidateId", "materialDigest"]);
+        const reuse = exactObject(entries.get("publicationReuse"), ["candidateId", "materialDigest", "coverageDigest"]);
         const candidateId = text(reuse.get("candidateId"), "publicationReuse.candidateId", 128);
         const materialDigest = text(reuse.get("materialDigest"), "publicationReuse.materialDigest", 64);
+        const coverageDigest = text(reuse.get("coverageDigest"), "publicationReuse.coverageDigest", 64);
         if (!/^review-publication-candidate-[a-f0-9]{64}$/.test(candidateId) ||
-            !/^[a-f0-9]{64}$/.test(materialDigest)) invalid("publicationReuse binding is invalid");
-        publicationReuse = { candidateId, materialDigest };
+            !/^[a-f0-9]{64}$/.test(materialDigest) || !/^[a-f0-9]{64}$/.test(coverageDigest)) invalid("publicationReuse binding is invalid");
+        publicationReuse = { candidateId, materialDigest, coverageDigest };
       }
       const verdict = entries.get("verdict");
       if (!REVIEW_VERDICTS.has(verdict)) invalid("verdict 无效");

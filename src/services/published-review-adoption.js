@@ -5,7 +5,7 @@ import { normalizeBoundWorkProposal, normalizeWorkProposalResult, cloneWorkPropo
 import { normalizePullRequestExecutionBinding, samePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { normalizeDeliveryEvidenceTarget } from "../domain/delivery-evidence-contract.js";
 import { samePullRequestGitTarget } from "../domain/git-tool-contract.js";
-import { normalizePullRequestReadFacts, projectPullRequestReadFactsContext } from "../domain/pull-request-read-facts.js";
+import { normalizePullRequestReadFacts, projectPullRequestReadFactsContext, pullRequestReviewFeedbackDigest } from "../domain/pull-request-read-facts.js";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 
 const same = (left, right) => canonicalJsonDigest(left) === canonicalJsonDigest(right);
@@ -48,17 +48,6 @@ export function verifyReviewPublicationSource({ proposal: stored, result: stored
 
 const reviewStates = { approve: "APPROVED", request_changes: "CHANGES_REQUESTED", comment: "COMMENTED" };
 const timestampAfter = (value, at) => !Number.isFinite(Date.parse(value)) || Date.parse(value) > at;
-
-export function reviewFeedbackDigest(value) {
-  try {
-    const facts = normalizePullRequestReadFacts(value);
-    if (["comments", "reviews", "reviewThreads", "byteBudget"].some(key => facts.truncation[key]) ||
-        facts.comments.some(comment => comment.bodyTruncated) || facts.reviews.some(review => review.bodyTruncated) ||
-        facts.reviewThreads.some(thread => thread.commentsTruncated || thread.comments.some(comment => comment.bodyTruncated))) return null;
-    return canonicalJsonDigest({ domain: "review-publication-feedback/v1", identity: facts.identity,
-      reviewDecision: facts.reviewDecision, comments: facts.comments, reviews: facts.reviews, reviewThreads: facts.reviewThreads });
-  } catch { return null; }
-}
 
 function publicationCandidateId(content) {
   const { materialDigest: _snapshot, ...coverage } = content.coverage;
@@ -105,7 +94,7 @@ export function createReviewPublicationCandidate({ source: sourceRecords, target
           (other.author?.toLowerCase() === source.actorAccountId.toLowerCase() && Date.parse(other.submittedAt) === publicationAt)))) return null;
     const content = { schemaVersion: 1, policy: "current_review_adopts_verified_publication/v1", source,
       target: { inputBinding, evidenceTarget, requestedAt: target.requestedAt },
-      coverage: { materialDigest, feedbackDigest: reviewFeedbackDigest(facts), reviewNodeId: review.id, publishedReviewUrl: review.url,
+      coverage: { materialDigest, feedbackDigest: pullRequestReviewFeedbackDigest(facts), reviewNodeId: review.id, publishedReviewUrl: review.url,
         publishedBodyDigest: canonicalJsonDigest(review.body), requiresCurrentReview: true } };
     return { ...structuredClone(content), candidateId: publicationCandidateId(content),
       materialDigest, requiresCurrentReview: true, observedAt: facts.observedAt };
@@ -131,23 +120,24 @@ function candidateContent(candidate) {
   return content;
 }
 
-export function createReviewPublicationAdoption({ candidate, proposal: stored, adoptedAt } = {}) {
+export function createReviewPublicationAdoption({ candidate, proposal: stored, adoptedAt, coverageDigest } = {}) {
   try {
     const content = candidateContent(candidate);
     const { contentDigest, ...raw } = stored;
     const proposal = normalizeBoundWorkProposal(raw);
     const target = content.target;
-    if (!validInstant(adoptedAt) || proposal.contentDigest !== contentDigest || proposal.kind !== "github_review_proposal" ||
+    if (!validInstant(adoptedAt) || typeof coverageDigest !== "string" || !/^[a-f0-9]{64}$/.test(coverageDigest) ||
+        proposal.contentDigest !== contentDigest || proposal.kind !== "github_review_proposal" ||
         !same(proposal.binding.inputBinding, target.inputBinding) || !same(proposal.binding.evidenceTarget, target.evidenceTarget) ||
         proposal.requestedBy.workItemId !== target.evidenceTarget.taskId || proposal.requestedBy.roleId !== target.evidenceTarget.roleId ||
         proposal.binding.headRefOid !== target.inputBinding.headRefOid || proposal.binding.repository !== target.inputBinding.repository ||
         proposal.binding.pullRequestNumber !== target.inputBinding.pullRequestNumber ||
         proposal.source.eventId !== target.inputBinding.eventId || proposal.binding.eventId !== target.inputBinding.eventId ||
         proposal.payload.verdict !== content.source.publishedVerdict || typeof proposal.payload.body !== "string" || !proposal.payload.body.trim() ||
-        !same(proposal.payload.publicationReuse, { candidateId: candidate.candidateId, materialDigest: candidate.materialDigest })) return null;
+        !same(proposal.payload.publicationReuse, { candidateId: candidate.candidateId, materialDigest: candidate.materialDigest, coverageDigest })) return null;
     const receipt = { ...content, outcome: "adopted_existing_review", candidateId: candidate.candidateId,
       assessment: { proposalId: proposal.proposalId, proposalDigest: proposal.contentDigest, roleId: proposal.requestedBy.roleId,
-        verdict: proposal.payload.verdict, coverageNote: proposal.payload.body, coverageNoteDigest: canonicalJsonDigest(proposal.payload.body) } };
+        verdict: proposal.payload.verdict, coverageNote: proposal.payload.body, coverageNoteDigest: canonicalJsonDigest(proposal.payload.body), coverageDigest } };
     return { ...structuredClone(receipt), adoptedAt, adoptionId: `review-publication-adoption-${canonicalJsonDigest(receipt)}` };
   } catch { return null; }
 }
@@ -161,6 +151,7 @@ function normalizedAdoption(value) {
   const core = { schemaVersion: receipt.schemaVersion, policy: receipt.policy, source: receipt.source, target: receipt.target, coverage: receipt.coverage };
   if (receipt.candidateId !== publicationCandidateId(core) ||
       !/^[a-f0-9]{64}$/.test(receipt.coverage.feedbackDigest) ||
+      typeof receipt.assessment.coverageDigest !== "string" || !/^[a-f0-9]{64}$/.test(receipt.assessment.coverageDigest) ||
       receipt.assessment.coverageNoteDigest !== canonicalJsonDigest(receipt.assessment.coverageNote)) throw adoptionError("Adoption source or coverage changed");
   normalizePullRequestExecutionBinding(receipt.target.inputBinding);
   normalizeDeliveryEvidenceTarget(receipt.target.evidenceTarget);
@@ -169,10 +160,16 @@ function normalizedAdoption(value) {
   return receipt;
 }
 
-export function verifyReviewPublicationAdoption({ receipt, candidate, proposal } = {}) {
+export function verifyReviewPublicationAdoption({ receipt, candidate, proposal, coverageDigest } = {}) {
   try {
     const normalized = normalizedAdoption(receipt);
-    const expected = createReviewPublicationAdoption({ candidate, proposal, adoptedAt: normalized.adoptedAt });
+    if (normalized.assessment.coverageDigest !== coverageDigest || normalized.candidateId !== candidate.candidateId) return false;
+    // CI-only observations may change the raw material hash after adoption. The
+    // retained assessment still binds that original hash; current feedback and
+    // linked-material coverage must remain identical.
+    const retainedCandidate = { ...candidate, materialDigest: normalized.coverage.materialDigest,
+      coverage: { ...candidate.coverage, materialDigest: normalized.coverage.materialDigest } };
+    const expected = createReviewPublicationAdoption({ candidate: retainedCandidate, proposal, adoptedAt: normalized.adoptedAt, coverageDigest });
     return expected !== null && same(normalized, expected);
   } catch { return false; }
 }
@@ -200,6 +197,12 @@ export class ReviewPublicationAdoptionStore {
   async get(adoptionId) {
     if (!/^review-publication-adoption-[a-f0-9]{64}$/.test(adoptionId ?? "")) throw adoptionError("Invalid adoption reference");
     return structuredClone((await this.#state()).records.find(record => record.adoptionId === adoptionId) ?? null);
+  }
+  async getForProposal({ proposalId, proposalDigest }) {
+    if (typeof proposalId !== "string" || typeof proposalDigest !== "string" || !/^[a-f0-9]{64}$/.test(proposalDigest)) throw adoptionError("Invalid adoption proposal");
+    const matches = (await this.#state()).records.filter(record => record.assessment.proposalId === proposalId && record.assessment.proposalDigest === proposalDigest);
+    if (matches.length > 1) throw adoptionError("Ambiguous adoption proposal", "REVIEW_PUBLICATION_ADOPTION_CORRUPTED");
+    return structuredClone(matches[0] ?? null);
   }
   record(value) {
     return this.#queue.enqueue(async () => {

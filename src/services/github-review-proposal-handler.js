@@ -56,6 +56,7 @@ const FACTORY_KEYS = new Set([
   "runner",
   "confirmationProducer",
   "automaticReviewPublisher",
+  "publicationAdopter",
   "inputAuthorityVerifier",
   "pullRequestContextReader",
   "actorAccountId",
@@ -308,6 +309,7 @@ export class GitHubReviewProposalHandler {
   #clock;
   #pollIntervalMs;
   #automaticReviewPublisher;
+  #adoptPublication;
 
   constructor({
     confirmationProducer,
@@ -317,6 +319,7 @@ export class GitHubReviewProposalHandler {
     clock = () => new Date(),
     pollIntervalMs = 15_000,
     automaticReviewPublisher = null,
+    publicationAdopter = null,
   } = {}) {
     const producer = requirePort(
       confirmationProducer,
@@ -347,10 +350,15 @@ export class GitHubReviewProposalHandler {
       MAX_POLL_INTERVAL_MS,
     );
     this.#automaticReviewPublisher = automaticReviewPublisher;
+    this.#adoptPublication = publicationAdopter === null ? null : requirePort(publicationAdopter, ["handle"], "publicationAdopter").handle;
   }
 
-  async handle(value) {
+  async handle(value, options = {}) {
     const input = normalizeHandlerInput(value);
+    if (Object.hasOwn(input.proposal.payload, "publicationReuse")) {
+      if (this.#adoptPublication === null) throw workProposalError("REVIEW_PUBLICATION_REUSE_UNAVAILABLE", "既有 Review 复用验证器不可用");
+      return this.#adoptPublication(input, options);
+    }
     const initialPlan = createGitHubReviewProposalConfirmationPlan(input.proposal, {
       actorAccountId: this.#actorAccountId,
       legacyRecovery: true,
@@ -664,6 +672,7 @@ export function createGitHubReviewProposalRunnerService(value = {}) {
     clock: options.clock,
     pollIntervalMs: options.pollIntervalMs,
     automaticReviewPublisher: options.automaticReviewPublisher,
+    publicationAdopter: options.publicationAdopter,
   });
   return new WorkProposalRunnerService({
     runner: options.runner,

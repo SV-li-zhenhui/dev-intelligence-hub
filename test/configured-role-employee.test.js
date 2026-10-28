@@ -1802,3 +1802,20 @@ test("PR decisions send the pinned target and complete feedback binding to a CLI
   await assert.rejects(engine.decide({ item: assignedTask(), context }), { code: "PR_REVIEW_READ_FEEDBACK_UNAVAILABLE" });
   assert.equal(request, null, "incomplete feedback fails before another model call");
 });
+
+test("Review reuse requires a host candidate and the complete native material reading boundary", async () => {
+  const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "reviewer", baseRepository: "acme/repo", baseRefName: "main",
+    baseRefOid: "a".repeat(40), headRepository: "acme/repo", headRefName: "fix", headRefOid: "b".repeat(40) };
+  const publicationReuse = { candidateId: "review-publication-candidate-" + "c".repeat(64), materialDigest: "d".repeat(64), coverageDigest: "e".repeat(64) };
+  const decision = completeDecision({ intent: { schemaVersion: 1, type: "propose_github_review", summary: "Adopt verified Review",
+    reason: "Current materials assessed", verdict: "approve", body: "Local current coverage assessment", evidence: ["head:bbbbbbbb"], publicationReuse } });
+  const engine = fixedDecisionEngine("pr-engineer", decision);
+  const context = { requirements: { currentTask: { taskId: "review-task" } }, code: { sourceEvent: { subject: { number: 42 } },
+    pullRequest: { materialDigest: publicationReuse.materialDigest, reviewMaterial: { gitTarget } } } };
+  await assert.rejects(engine.decide({ item: assignedTask(), context }), { code: "ROLE_DECISION_REVIEW_REUSE_UNAVAILABLE" });
+  context.code.reviewPublicationReuse = { complete: true, candidates: [{ ...publicationReuse, verdict: "approve" }] };
+  assert.equal((await engine.decide({ item: assignedTask(), context })).intent.publicationReuse.candidateId, publicationReuse.candidateId);
+  const noRead = new RoleDecisionEngine({ definition: definition("pr-engineer"), permissions: permissions("propose_github_review"), brain: brain(),
+    brainRouter: { describe: () => ({ singleAttempt: true }), generate: async () => JSON.stringify(decision) } });
+  await assert.rejects(noRead.decide({ item: assignedTask(), context }), { code: "ROLE_DECISION_REVIEW_REUSE_UNAVAILABLE" });
+});

@@ -805,6 +805,22 @@ export class ConfirmationQueue {
     }));
   }
 
+  async readSettlements(input) {
+    this.#assertReady();
+    const invalid = queueError("INVALID_CONFIRMATION_REQUEST", "确认 ID 无效", 400);
+    exactDataFields(input, ["confirmationIds"], invalid);
+    if (!Array.isArray(input.confirmationIds) || input.confirmationIds.length > MAX_ITEMS) throw invalid;
+    const ids = Array.from(input.confirmationIds);
+    if (
+        ids.some(id => typeof id !== "string" || !HISTORY_ITEM_ID.test(id)) || new Set(ids).size !== ids.length) throw invalid;
+    const requested = new Set(ids);
+    return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
+      await this.#reload();
+      return deepFreeze({ queueRevision: this.state.revision,
+        items: this.state.items.filter(item => requested.has(item.id)).map(item => clone(item)) });
+    }));
+  }
+
   async list(options) {
     this.#assertReady();
     const query = normalizeHistoryQuery(options);

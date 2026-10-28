@@ -309,3 +309,28 @@ test("linked product issue text is mandatory and changes during review invalidat
   extraResult = "; QA has now added actual execution results";
   await assert.rejects(session.assertComplete(), { code: "PR_REVIEW_READ_MATERIAL_CHANGED" });
 });
+
+test("semantic feedback coverage survives CI observations and changes with the PR description", async () => {
+  const { readGitHubReviewFeedbackSnapshot } = await import("../src/adapters/github-review-feedback-snapshot.js");
+  const { createPullRequestReadFacts, projectPullRequestReadFactsContext } = await import("../src/domain/pull-request-read-facts.js");
+  const initial = await fullFeedbackFixture("Complete author evidence");
+  const { reader } = fixture({ changed: 1 });
+  let facts = initial.facts, description = "";
+  const capture = () => readGitHubReviewFeedbackSnapshot({
+    target: { ...TARGET, feedbackSnapshot: { taskId: "review-child", materialDigest: projectPullRequestReadFactsContext(facts).materialDigest } },
+    factsReader: { async read() { return facts; } }, run: async (...args) => {
+      const value = await reader.run(...args);
+      return args[1][3] === "repos/acme/repo/pulls/42" ? { ...value, body: description } : value;
+    },
+  });
+  const first = await capture();
+  const { contentDigest: _digest, schemaVersion: _schema, ...content } = facts;
+  facts = createPullRequestReadFacts({ ...content, observedAt: "2026-10-28T05:02:00.000Z", checks: [{
+    kind: "check_run", name: "CI", status: "COMPLETED", conclusion: "SUCCESS", url: "https://ci.example/run/1",
+    requirement: "required", startedAt: "2026-10-28T05:00:00.000Z", completedAt: "2026-10-28T05:01:00.000Z" }] });
+  const afterCI = await capture();
+  assert.notEqual(afterCI.feedbackSnapshot.snapshotDigest, first.feedbackSnapshot.snapshotDigest);
+  assert.equal(afterCI.feedbackSnapshot.coverageDigest, first.feedbackSnapshot.coverageDigest);
+  description = "QA added execution results";
+  assert.notEqual((await capture()).feedbackSnapshot.coverageDigest, first.feedbackSnapshot.coverageDigest);
+});

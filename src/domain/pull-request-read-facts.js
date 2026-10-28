@@ -7,6 +7,18 @@ import {
   samePullRequestExecutionBinding,
 } from "./pull-request-execution-binding.js";
 import { normalizeStoredWorkflowEvent } from "./workflow-events.js";
+import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
+
+export function pullRequestReviewFeedbackDigest(value) {
+  try {
+    const facts = normalizePullRequestReadFacts(value);
+    if (["comments", "reviews", "reviewThreads", "byteBudget"].some(key => facts.truncation[key]) ||
+        facts.comments.some(comment => comment.bodyTruncated) || facts.reviews.some(review => review.bodyTruncated) ||
+        facts.reviewThreads.some(thread => thread.commentsTruncated || thread.comments.some(comment => comment.bodyTruncated))) return null;
+    return canonicalJsonDigest({ domain: "review-publication-feedback/v1", identity: facts.identity,
+      reviewDecision: facts.reviewDecision, comments: facts.comments, reviews: facts.reviews, reviewThreads: facts.reviewThreads });
+  } catch { return null; }
+}
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;

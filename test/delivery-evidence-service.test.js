@@ -903,7 +903,7 @@ test("adopted publication results require the persistent adoption verifier for c
   const fixture = createFixture();
   const { contentDigest: _oldDigest, ...old } = fixture.proposals.get("review-proposal-42");
   const adopted = normalizeBoundWorkProposal({ ...old, payload: { ...old.payload,
-    publicationReuse: { candidateId: "review-publication-candidate-" + "a".repeat(64), materialDigest: "b".repeat(64) } } });
+    publicationReuse: { candidateId: "review-publication-candidate-" + "a".repeat(64), materialDigest: "b".repeat(64), coverageDigest: "d".repeat(64) } } });
   fixture.proposals.set(adopted.proposalId, adopted);
   const result = reviewResult(adopted, 4);
   fixture.results.clear(); fixture.results.set(result.resultId, result);

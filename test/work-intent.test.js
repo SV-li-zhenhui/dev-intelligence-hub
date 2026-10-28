@@ -465,7 +465,7 @@ test("rejects inherited, accessor, symbol, sparse, cyclic, and mutable decision 
 test("review adoption remains an explicit proposal with a complete material binding", () => {
   const intent = { ...common("propose_github_review"), deliverableId: "review-result", verdict: "approve",
     body: "Current coverage assessment; this text has not been published", evidence: ["head:" + "a".repeat(40)],
-    publicationReuse: { candidateId: "review-publication-candidate-" + "b".repeat(64), materialDigest: "c".repeat(64) } };
+    publicationReuse: { candidateId: "review-publication-candidate-" + "b".repeat(64), materialDigest: "c".repeat(64), coverageDigest: "d".repeat(64) } };
   const parsed = parseStructuredWorkDecision(JSON.stringify({ schemaVersion: 1, confidence: 95,
     summary: "Adopt the verified existing publication after current review", intent }));
   assert.deepEqual(parsed.intent.publicationReuse, intent.publicationReuse);
@@ -474,6 +474,8 @@ test("review adoption remains an explicit proposal with a complete material bind
   for (const publicationReuse of [null, {}, { candidateId: "review-publication-candidate-" + "b".repeat(64) },
     { ...intent.publicationReuse, candidateId: "arbitrary-review" },
     { ...intent.publicationReuse, materialDigest: "c".repeat(63) },
+    { candidateId: intent.publicationReuse.candidateId, materialDigest: intent.publicationReuse.materialDigest },
+    { ...intent.publicationReuse, coverageDigest: "d".repeat(63) },
     { ...intent.publicationReuse, forcePublish: true }]) assertInvalid({ ...intent, publicationReuse });
   const { publicationReuse: _reuse, ...ordinary } = intent;
   assert.equal(Object.hasOwn(normalizeWorkIntent(ordinary), "publicationReuse"), false);

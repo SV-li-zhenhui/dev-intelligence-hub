@@ -2,6 +2,7 @@ import { isInternalRepairReviewEvent } from "../domain/internal-repair-review.js
 import { createHash } from "node:crypto";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 import { deliveryAcceptanceContractDigest, deliveryEvidenceKindsForProposal } from "../domain/delivery-evidence-contract.js";
+import { hasRequiredReviewDeliverable } from "../domain/pr-review-work-policy.js";
 
 import {
   normalizePullRequestGitTarget,
@@ -1311,6 +1312,7 @@ export class RoleContextAssembler {
   #ciDiagnosticReader;
   #settlementInputAuthorityVerifier;
   #settlementEvidenceVerifier;
+  #publicationReuseReader;
 
   constructor({
     graphReader,
@@ -1325,12 +1327,15 @@ export class RoleContextAssembler {
     ciDiagnosticReader,
     settlementInputAuthorityVerifier,
     settlementEvidenceVerifier,
+    publicationReuseReader,
   } = {}) {
     this.#graphReader = requireGraphReader(graphReader);
     this.#settlementInputAuthorityVerifier = settlementInputAuthorityVerifier == null ? null :
       bindPortMethod(settlementInputAuthorityVerifier, "verify", "settlementInputAuthorityVerifier");
     this.#settlementEvidenceVerifier = settlementEvidenceVerifier == null ? null :
       bindPortMethod(settlementEvidenceVerifier, "verify", "settlementEvidenceVerifier");
+    this.#publicationReuseReader = publicationReuseReader == null ? null :
+      bindPortMethod(publicationReuseReader, "listCandidates", "publicationReuseReader");
     this.#factSource = optionalFactSource(factSource);
     this.#pullRequestContextReader = optionalPullRequestContextReader(
       pullRequestContextReader,
@@ -1473,6 +1478,13 @@ export class RoleContextAssembler {
           originalRepairFeedback.feedbackDigest !== item.event.payload.internalReview.feedbackDigest) throw contextError("ROLE_CONTEXT_STALE", "原始反馈与内部复审绑定不一致", 409);
     }
     const isPullRequest = item.eventType.startsWith("pull_request.");
+    let reviewPublicationReuse = null;
+    if (roleId === "pr-engineer" && isPullRequest && item.eventType !== "pull_request.internal_review_requested" && internalReview === null &&
+        this.#publicationReuseReader !== null && hasRequiredReviewDeliverable(currentAcceptanceContract) && typeof pullRequest?.materialDigest === "string") {
+      reviewPublicationReuse = canonicalValue(await this.#publicationReuseReader({ taskId: currentTask.taskId, materialDigest: pullRequest.materialDigest },
+        signal === null ? {} : { signal }));
+      signal?.throwIfAborted();
+    }
 
     const binding = {
       roleId,
@@ -1545,6 +1557,7 @@ export class RoleContextAssembler {
         ...(isPullRequest ? { sourceEvent: item.event } : {}),
         ...(pullRequest === null ? {} : { pullRequest }),
         ...(reviewPublicationSettlement === null ? {} : { reviewPublicationSettlement }),
+        ...(reviewPublicationReuse === null ? {} : { reviewPublicationReuse }),
         acceptedDependencies: dependencies.code,
         facts: isPullRequest ? facts : [],
         ...(proposalDecisionContext === null

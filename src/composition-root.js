@@ -87,6 +87,11 @@ import { FailedCodeJobContextReader } from "./services/failed-code-job-context-r
 import { ProactivePrEmployeeService } from "./services/proactive-pr-employee.js";
 import { PrEngineerService } from "./services/pr-engineer-service.js";
 import { BoundReviewFeedbackReader } from "./services/bound-review-feedback-reader.js";
+import { ReviewPublicationAdoptionStore } from "./services/published-review-adoption.js";
+import { ReviewPublicationReuseService, createReviewAdoptionTaskReader } from "./services/review-publication-reuse-service.js";
+import { readGitHubReviewFeedbackSnapshot } from "./adapters/github-review-feedback-snapshot.js";
+import { projectPullRequestReadFactsContext } from "./domain/pull-request-read-facts.js";
+import { runJson } from "./lib/command-runner.js";
 import { RefreshService } from "./services/refresh-service.js";
 import { OwnPrRepairProgressReader } from "./services/own-pr-repair-progress-reader.js";
 import { RoleWorkerDirectory } from "./services/role-worker-directory.js";
@@ -1118,6 +1123,7 @@ export async function createApplication({
   let obsoleteCodeJobSettler = null;
   let inputAuthorityVerifier = null;
   let currentReviewFeedbackReader = null;
+  let reviewPublicationReuse = null;
   let codeJobDeliveryEvidenceReader = null;
   let codeJobControl = null;
   const taskRuns = new TaskRunRegistry({store,receiptStore:store,...(workCoordinationDependencies.clock ? {clock:workCoordinationDependencies.clock} : {}),
@@ -2336,6 +2342,10 @@ export async function createApplication({
     if (githubProposalExecutionEnabled) {
       reviewProposalRunner = githubReviewProposalRunnerFactory({
           enabled: true,
+          publicationAdopter: Object.freeze({ async handle(input, options) {
+            if (reviewPublicationReuse === null) throw Object.assign(new Error("REVIEW_PUBLICATION_REUSE_UNAVAILABLE"), { code: "REVIEW_PUBLICATION_REUSE_UNAVAILABLE" });
+            return reviewPublicationReuse.handle(input, options);
+          } }),
           runner:
             workProposalRuntime.runners[GITHUB_REVIEW_PROPOSAL_RUNNER_ID],
           confirmationProducer: confirmationRuntime.producerQueue,
@@ -2670,10 +2680,41 @@ export async function createApplication({
       // Deferred construction keeps this capability private to review invocations;
       // no ledger or refresh authority is passed to the CLI.
       let boundReviewReader = null;
+      const getBoundReviewReader = () => boundReviewReader ??= new BoundReviewFeedbackReader({ ledger: workLedgerRuntime, factsReader: prEngineerService, inputAuthorityVerifier });
       currentReviewFeedbackReader = Object.freeze({ async read(input, options) {
-        boundReviewReader ??= new BoundReviewFeedbackReader({ ledger: workLedgerRuntime, factsReader: prEngineerService, inputAuthorityVerifier });
-        return boundReviewReader.read(input, options);
+        return getBoundReviewReader().read(input, options);
       } });
+      let reuseService = null;
+      const getReuseService = () => reuseService ??= new ReviewPublicationReuseService({
+        taskReader: createReviewAdoptionTaskReader(frozenPort(workLedgerRuntime, ["readItemForReconciliation"], "Review adoption task reader")),
+        factsReader: frozenPort(prEngineerService, ["get"], "Review adoption cached facts"),
+        publicationSourceReader: Object.freeze({ listReviewPublicationSources(input) {
+          const reader = workProposalRuntime.evidenceReader;
+          if (typeof reader?.listReviewPublicationSources !== "function") throw Object.assign(new Error("REVIEW_PUBLICATION_REUSE_UNAVAILABLE"), { code: "REVIEW_PUBLICATION_REUSE_UNAVAILABLE" });
+          return reader.listReviewPublicationSources(input);
+        } }),
+        confirmationReader: Object.freeze({ readSettlements(input) {
+          const reader = confirmationRuntime?.confirmationSettlementReader;
+          if (typeof reader?.readMany !== "function") throw Object.assign(new Error("REVIEW_PUBLICATION_REUSE_UNAVAILABLE"), { code: "REVIEW_PUBLICATION_REUSE_UNAVAILABLE" });
+          return reader.readMany(input);
+        } }),
+        materialsReader: Object.freeze({ async read(input, options = {}) {
+          const facts = await getBoundReviewReader().readCurrent(input, options);
+          const materialDigest = projectPullRequestReadFactsContext(facts).materialDigest;
+          if (typeof materialDigest !== "string") throw Object.assign(new Error("PR_REVIEW_READ_MATERIAL_CHANGED"), { code: "PR_REVIEW_READ_MATERIAL_CHANGED" });
+          return readGitHubReviewFeedbackSnapshot({ target: { gitTarget: input.gitTarget, pullRequestNumber: input.pullRequestNumber,
+            feedbackSnapshot: { taskId: input.taskId, materialDigest } }, factsReader: Object.freeze({ async read() { return facts; } }),
+            run: runJson, options: { ...options, env: { ...process.env, GH_HOST: "github.com" } } });
+        } }),
+        receiptStore: new ReviewPublicationAdoptionStore({ store: frozenPort(store, ["read", "write"], "Review adoption receipt store") }),
+        inputAuthorityVerifier: frozenPort(inputAuthorityVerifier, ["verify"], "Review adoption input verifier"),
+        ...clockOptions,
+      });
+      reviewPublicationReuse = Object.freeze({
+        listCandidates: (input, options) => getReuseService().listCandidates(input, options),
+        handle: (input, options) => getReuseService().handle(input, options),
+        verifyProposal: input => getReuseService().verifyProposal(input),
+      });
       const pullRequestFacts = frozenPort(
         prEngineerService,
         ["context"],
@@ -2721,6 +2762,7 @@ export async function createApplication({
           )
         : null;
       const deliveryEvidenceService = deliveryEvidenceServiceFactory({
+        publicationAdoptionVerifier: frozenPort(reviewPublicationReuse, ["verifyProposal"], "Review publication adoption verifier"),
         ...(changePackageReader === null ? {} : { changePackageReader }),
         ...(codeJobDeliveryEvidenceReader === null
           ? {}
@@ -2735,6 +2777,7 @@ export async function createApplication({
       const automaticMode = config.githubActions?.enabled === true &&
         (config.githubActions.automaticReview === true || config.githubActions.automaticOwnPrRepair === true);
       const roleContextAssembler = roleContextAssemblerFactory({
+        publicationReuseReader: frozenPort(reviewPublicationReuse, ["listCandidates"], "Review publication candidate reader"),
         graphReader: frozenPort(
           workLedgerRuntime.graphReader,
           ["getSnapshot"],

@@ -4,10 +4,8 @@ import { runCommand, runJson } from "../lib/command-runner.js";
 import { normalizeReviewReadTarget } from "../domain/review-read-target.js";
 import { samePullRequestGitTarget } from "../domain/git-tool-contract.js";
 import { readGitHubCurrentPullRequestTarget } from "./github-current-pull-request-target.js";
-import { normalizePullRequestReadFacts, projectPullRequestReadFactsContext } from "../domain/pull-request-read-facts.js";
 import { normalizeOriginalRepairFeedbackSnapshot } from "../domain/original-repair-feedback.js";
-import { readGitHubReferencedMaterials } from "./github-referenced-materials.js";
-import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
+import { readGitHubReviewFeedbackSnapshot } from "./github-review-feedback-snapshot.js";
 
 function failure(code) {
   return Object.assign(new Error(code), { code });
@@ -125,49 +123,18 @@ export class GitHubReviewReader {
         "repair-feedback.json": JSON.stringify(snapshot, null, 2) };
     }
     let feedbackSnapshot = null;
-    const readCurrentFeedback = async () => {
-      if (!target.feedbackSnapshot) return null;
-      const feedbackDocuments = {};
-      if (typeof this.currentReviewFeedbackReader?.read !== "function") throw failure("PR_REVIEW_READ_FEEDBACK_UNAVAILABLE");
-      const facts = normalizePullRequestReadFacts(await this.currentReviewFeedbackReader.read({ ...target.feedbackSnapshot,
-        gitTarget: git, pullRequestNumber: target.pullRequestNumber }, { signal: requestSignal }));
-      if (facts.identity.executionBinding.pullRequestNumber !== target.pullRequestNumber ||
-          !samePullRequestGitTarget(facts.identity.executionBinding.gitTarget, git) ||
-          projectPullRequestReadFactsContext(facts).materialDigest !== target.feedbackSnapshot.materialDigest) throw failure("PR_REVIEW_READ_MATERIAL_CHANGED");
-      feedbackDocuments["review-feedback.json"] = JSON.stringify(facts, null, 2);
-      const description = await this.run("gh", api(prEndpoint), options);
-      let descriptionUrl;
-      try { descriptionUrl = new URL(description.html_url); } catch { throw failure("PR_REVIEW_READ_DESCRIPTION_INVALID"); }
-      if (description.number !== target.pullRequestNumber || description.head?.sha !== git.headRefOid ||
-          description.base?.repo?.full_name?.toLowerCase() !== git.baseRepository.toLowerCase() ||
-          typeof description.title !== "string" || (description.body !== null && typeof description.body !== "string") ||
-          descriptionUrl.protocol !== "https:" || descriptionUrl.hostname !== "github.com" || descriptionUrl.username || descriptionUrl.password ||
-          descriptionUrl.port || descriptionUrl.search || descriptionUrl.hash ||
-          descriptionUrl.pathname.toLowerCase() !== `/${git.baseRepository}/pull/${target.pullRequestNumber}`.toLowerCase()) {
-        throw failure("PR_REVIEW_READ_DESCRIPTION_INVALID");
-      }
-      const descriptionSnapshot = { title: description.title, body: description.body ?? "", url: description.html_url,
-        headRefOid: git.headRefOid, scope: "Untrusted PR description; attachment URLs do not prove their contents were read." };
-      feedbackDocuments["review-description.json"] = JSON.stringify(descriptionSnapshot, null, 2);
-      const linked = await readGitHubReferencedMaterials({ run: this.run, repository: git.baseRepository,
-        pullRequestNumber: target.pullRequestNumber, options, bodies: [descriptionSnapshot.body,
-          ...facts.comments.map(value => value.body), ...facts.reviews.map(value => value.body),
-          ...facts.reviewThreads.flatMap(thread => thread.comments.map(value => value.body))] });
-      Object.assign(feedbackDocuments, linked.documents);
-      const feedbackSnapshot = { ...target.feedbackSnapshot, document: "review-feedback.json", descriptionDocument: "review-description.json",
-        linkedMaterials: linked.references, referencedMaterialDigest: linked.digest,
-        snapshotDigest: canonicalJsonDigest({ materialDigest: target.feedbackSnapshot.materialDigest,
-          description: descriptionSnapshot, referencedMaterialDigest: linked.digest }) };
-      return { feedbackDocuments, feedbackSnapshot };
-    };
+    const readCurrentFeedback = async () => target.feedbackSnapshot
+      ? readGitHubReviewFeedbackSnapshot({ target, factsReader: this.currentReviewFeedbackReader, run: this.run, options }) : null;
     const currentFeedback = await readCurrentFeedback();
     if (currentFeedback) {
       Object.assign(feedbackDocuments, currentFeedback.feedbackDocuments);
       feedbackSnapshot = currentFeedback.feedbackSnapshot;
     }
-    await checkTarget();
-    const finalAccount = await this.run("gh", api("user"), options);
-    if (finalAccount.login?.toLowerCase() !== git.sourceAccountId) throw failure("PR_REVIEW_READ_ACCOUNT_CHANGED");
+    if (!feedbackSnapshot) {
+      await checkTarget();
+      const finalAccount = await this.run("gh", api("user"), options);
+      if (finalAccount.login?.toLowerCase() !== git.sourceAccountId) throw failure("PR_REVIEW_READ_ACCOUNT_CHANGED");
+    }
     const manifestText = JSON.stringify({ repository: git.baseRepository, pullRequestNumber: target.pullRequestNumber, base: git.baseRefOid, head: git.headRefOid, changedFiles: files.length, files,
       ...(target.repairFeedback ? { repairFeedback: target.repairFeedback } : {}),
       ...(feedbackSnapshot ? { feedbackSnapshot } : {}) }, null, 2);
@@ -289,8 +256,7 @@ export class GitHubReviewReader {
         if (feedbackSnapshot) {
           const current = await readCurrentFeedback();
           if (current.feedbackSnapshot.snapshotDigest !== feedbackSnapshot.snapshotDigest) throw failure("PR_REVIEW_READ_MATERIAL_CHANGED");
-        }
-        await checkTarget();
+        } else await checkTarget();
       },
       close,
     };

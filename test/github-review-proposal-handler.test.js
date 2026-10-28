@@ -14,6 +14,26 @@ import { AutomaticReviewPublisher } from "../src/services/automatic-review-publi
 
 const HEAD_REF_OID = "b".repeat(40);
 
+test("explicit publication reuse bypasses every GitHub publishing path and cannot fall back", async () => {
+  const input = handlerInput();
+  const { contentDigest, ...content } = input.proposal;
+  input.proposal = normalizeBoundWorkProposal({ ...content, payload: { ...content.payload,
+    publicationReuse: { candidateId: "review-publication-candidate-" + "c".repeat(64), materialDigest: "d".repeat(64), coverageDigest: "e".repeat(64) } } });
+  const forbidden = () => assert.fail("reuse must not enter normal confirmation/publication authority");
+  const options = { confirmationProducer: { enqueue: forbidden, get: forbidden, invalidate: forbidden },
+    inputAuthorityVerifier: { verify: forbidden }, actorAccountId: "review-account", automaticReviewPublisher: { publish: forbidden } };
+  const transition = { status: "succeeded", summary: "Existing Review adopted locally", evidence: ["adoption:verified"] };
+  let calls = 0;
+  const handler = new GitHubReviewProposalHandler({ ...options, publicationAdopter: { async handle(value) {
+    calls++; assert.deepEqual(value.proposal, input.proposal); return transition;
+  } } });
+  assert.deepEqual(await handler.handle(input), transition);
+  assert.equal(calls, 1);
+  await assert.rejects(new GitHubReviewProposalHandler(options).handle(input), { code: "REVIEW_PUBLICATION_REUSE_UNAVAILABLE" });
+  const changed = Object.assign(new Error("Coverage changed"), { code: "REVIEW_PUBLICATION_REUSE_COVERAGE_CHANGED" });
+  await assert.rejects(new GitHubReviewProposalHandler({ ...options, publicationAdopter: { async handle() { throw changed; } } }).handle(input), error => error === changed);
+});
+
 test('a lost Review downstream reference recovers the completed receipt after assignment leaves scope', async () => {
   const clock = () => new Date('2026-10-09T10:00:00.000Z');
   const store = new MemoryStore(); let writes = 0;

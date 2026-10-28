@@ -384,6 +384,7 @@ async function assemble(fixture, options = {}) {
     ...(options.internalReviewHandoffReader ? { internalReviewHandoffReader: options.internalReviewHandoffReader } : {}),
     ...(options.conflictInspectionReader ? { conflictInspectionReader: options.conflictInspectionReader } : {}),
     ...(options.ciDiagnosticReader ? { ciDiagnosticReader: options.ciDiagnosticReader } : {}),
+    ...(options.publicationReuseReader ? { publicationReuseReader: options.publicationReuseReader } : {}),
   });
   const roleId = options.roleId ?? "developer";
   return assembler.assemble({
@@ -886,6 +887,25 @@ function atomicPullRequestFixture() {
   };
   return { fixture, gitTarget, pullRequestContext };
 }
+
+test("required external Review context exposes reuse candidates without treating them as accepted evidence", async () => {
+  const { fixture, pullRequestContext } = atomicPullRequestFixture();
+  const current = fixture.snapshot.graph.tasks.find(value => value.taskId === fixture.item.itemId);
+  current.acceptanceContracts = [contract(1, [expected("reuse-review", "review-report")])];
+  pullRequestContext.materialDigest = DIGEST_C;
+  let requests = 0;
+  const candidate = { candidateId: "review-publication-candidate-" + DIGEST_A, materialDigest: DIGEST_C,
+    deliverableId: "reuse-review", verdict: "approve", requiresCurrentReview: true };
+  const packet = await assemble(fixture, { roleId: "pr-engineer", pullRequestContextReader: { async read() { return pullRequestContext; } },
+    publicationReuseReader: { async listCandidates(input) {
+      requests++; assert.deepEqual(input, { taskId: fixture.item.itemId, materialDigest: DIGEST_C });
+      return { complete: true, candidates: [candidate] };
+    } } });
+  assert.equal(requests, 1);
+  assert.deepEqual(packet.context.code.reviewPublicationReuse.candidates, [candidate]);
+  assert.equal(packet.context.code.authoritativeEvidence?.some(value => value.referenceId === candidate.candidateId) ?? false, false);
+  assert.equal(Object.isFrozen(packet.context.code.reviewPublicationReuse), true);
+});
 
 test("CI diagnostics retain the GitHub digest and bind the complete role context to the current Head", async () => {
   const { fixture, gitTarget, pullRequestContext } = atomicPullRequestFixture();

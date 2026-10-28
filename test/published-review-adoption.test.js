@@ -5,6 +5,8 @@ import { createGitHubReviewProposalConfirmationPlan } from "../src/domain/github
 import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
 import { verifyReviewPublicationSource, createReviewPublicationCandidate, createReviewPublicationAdoption,
   verifyReviewPublicationAdoption, ReviewPublicationAdoptionStore } from "../src/services/published-review-adoption.js";
+import { ReviewPublicationReuseService, createReviewAdoptionTaskReader } from "../src/services/review-publication-reuse-service.js";
+import { DeliveryEvidenceService } from "../src/services/delivery-evidence-service.js";
 
 async function sourceFixture() {
   const at = "2026-10-26T08:47:13.000Z";
@@ -78,9 +80,9 @@ async function candidateFixture() {
     payload: { headRefOid: inputBinding.headRefOid, gitTargetAvailable: true, gitTarget: inputBinding.gitTarget } });
   inputBinding.eventId = event.eventId;
   inputBinding.eventDigest = event.contentDigest;
-  const evidenceTarget = createDeliveryEvidenceTarget({ taskId: "new-review-child", roleId: "pr-engineer",
-    acceptanceContract: { revision: 1, acceptanceCriteria: [{ criterionId: "published", description: "A verified published result" }],
-      expectedDeliverables: [{ deliverableId: "review-result", kind: "review-report", description: "Published Review", required: true }] } });
+  const acceptanceContract = { revision: 1, acceptanceCriteria: [{ criterionId: "published", description: "A verified published result" }],
+    expectedDeliverables: [{ deliverableId: "review-result", kind: "review-report", description: "Published Review", required: true }] };
+  const evidenceTarget = createDeliveryEvidenceTarget({ taskId: "new-review-child", roleId: "pr-engineer", acceptanceContract });
   const target = { inputBinding, evidenceTarget, requestedAt: "2026-10-26T08:22:22.000Z" };
   const factsInput = { identity: createPullRequestReadIdentity({ executionBinding: inputBinding, event }), observedAt: "2026-10-28T05:00:00.000Z",
     reviewDecision: "APPROVED", comments: [], reviewThreads: [], checks: [],
@@ -88,7 +90,7 @@ async function candidateFixture() {
       commitOid: inputBinding.headRefOid, body: source.proposal.payload.body, bodyTruncated: false,
       url: "https://github.com/acme/repo/pull/42#pullrequestreview-12345" }],
     truncation: { comments: false, reviews: false, reviewThreads: false, checks: false, byteBudget: false } };
-  return { source, target, factsInput, facts: createPullRequestReadFacts(factsInput), createFacts: createPullRequestReadFacts };
+  return { source, target, event, acceptanceContract, factsInput, facts: createPullRequestReadFacts(factsInput), createFacts: createPullRequestReadFacts };
 }
 
 test("publication candidates bind complete current material and the new contract without claiming delivery", async () => {
@@ -173,6 +175,7 @@ test("publication source discovery retains outstanding work and reports an incom
 async function adoptionFixture() {
   const f = await candidateFixture();
   const candidate = createReviewPublicationCandidate(f);
+  const coverageDigest = "9".repeat(64);
   const { contentDigest: _sourceDigest, ...content } = structuredClone(f.source.proposal);
   const proposal = normalizeBoundWorkProposal({ ...content, proposalId: "work-intent-" + "e".repeat(64),
     requestedBy: { roleId: f.target.evidenceTarget.roleId, workItemId: f.target.evidenceTarget.taskId },
@@ -180,8 +183,8 @@ async function adoptionFixture() {
     binding: { ...content.binding, eventId: f.target.inputBinding.eventId, inputBinding: f.target.inputBinding,
       evidenceTarget: f.target.evidenceTarget },
     payload: { ...content.payload, body: "Current complete feedback was reviewed; this note is local, not a new GitHub body",
-      publicationReuse: { candidateId: candidate.candidateId, materialDigest: candidate.materialDigest } } });
-  return { ...f, candidate, proposal, adoptedAt: "2026-10-28T05:50:00.000Z" };
+      publicationReuse: { candidateId: candidate.candidateId, materialDigest: candidate.materialDigest, coverageDigest } } });
+  return { ...f, candidate, proposal, coverageDigest, adoptedAt: "2026-10-28T05:50:00.000Z" };
 }
 
 test("adoption receipts bind the new assessment while preserving the original published body", async () => {
@@ -191,9 +194,18 @@ test("adoption receipts bind the new assessment while preserving the original pu
   assert.equal(receipt.outcome, "adopted_existing_review");
   assert.equal(receipt.source.publishedBody, f.source.proposal.payload.body);
   assert.equal(receipt.assessment.coverageNote, f.proposal.payload.body);
+  assert.equal(receipt.assessment.coverageDigest, f.coverageDigest);
   assert.notEqual(receipt.source.publishedBodyDigest, receipt.assessment.coverageNoteDigest);
   assert.equal(receipt.target.evidenceTarget.taskId, "new-review-child");
   assert.equal(verifyReviewPublicationAdoption({ ...f, receipt }), true);
+  assert.equal(createReviewPublicationAdoption({ ...f, coverageDigest: "8".repeat(64) }), null);
+  assert.equal(verifyReviewPublicationAdoption({ ...f, receipt, coverageDigest: "8".repeat(64) }), false);
+  const current = createReviewPublicationCandidate({ ...f, facts: f.createFacts({ ...f.factsInput,
+    checks: [{ kind: "check_run", name: "CI", status: "COMPLETED", conclusion: "SUCCESS", url: "https://ci.example/run/1", requirement: "required",
+      startedAt: "2026-10-28T05:00:00.000Z", completedAt: "2026-10-28T05:05:00.000Z" }] }) });
+  assert.notEqual(current.materialDigest, f.candidate.materialDigest);
+  assert.equal(verifyReviewPublicationAdoption({ ...f, candidate: current, receipt }), true,
+    "CI-only changes do not erase a verified current feedback assessment");
   const later = createReviewPublicationAdoption({ ...f, adoptedAt: "2026-10-28T06:00:00.000Z" });
   assert.equal(later.adoptionId, receipt.adoptionId);
   const changed = structuredClone(receipt); changed.assessment.coverageNote = "An unsealed note";
@@ -204,6 +216,21 @@ test("adoption receipts bind the new assessment while preserving the original pu
     { ...content.payload, publicationReuse: { ...content.payload.publicationReuse, materialDigest: "0".repeat(64) } },
   ]) assert.equal(createReviewPublicationAdoption({ ...f, proposal: normalizeBoundWorkProposal({ ...content, payload }) }), null);
   assert.equal(createReviewPublicationAdoption({ ...f, proposal: undefined }), null);
+});
+
+test("a full bounded source page does not share a single-proposal node budget", async () => {
+  const f = await candidateFixture();
+  const { WorkProposalEvidenceReader } = await import("../src/services/work-proposal-evidence-reader.js");
+  const { contentDigest: _digest, ...content } = f.source.proposal;
+  const proposals = Array.from({ length: 100 }, (_, index) => ({ status: "failed", resultId: null, downstreamRef: null,
+    proposal: normalizeBoundWorkProposal({ ...content, proposalId: "work-intent-" + index.toString(16).padStart(64, "0") }) }));
+  const reader = new WorkProposalEvidenceReader({ readState: () => ({ proposals, results: [] }) });
+  const page = reader.listReviewPublicationSources({ inputBinding: f.target.inputBinding, limit: 100 });
+  assert.equal(page.complete, true);
+  assert.equal(page.items.length, 100);
+  page.items[0].proposal.payload.body = "Changed projection";
+  assert.equal(proposals.at(-1).proposal.payload.body, f.source.proposal.payload.body);
+  assert.equal(reader.listReviewPublicationSources({ inputBinding: f.target.inputBinding, limit: 99 }).complete, false);
 });
 
 test("adoption persistence is restart-safe and does not rewrite source or duplicate the receipt", async () => {
@@ -237,4 +264,142 @@ test("adoption recovery validates each retained receipt without applying a singl
   const receipts = new ReviewPublicationAdoptionStore({ store });
   assert.equal((await receipts.recover()).records, 60);
   assert.deepEqual(await receipts.get(records[59].adoptionId), records[59]);
+});
+
+async function reuseServiceFixture() {
+  const f = await adoptionFixture(); const values = new Map(); let writes = 0, captures = 0;
+  const stateStore = { async read(key, fallback) { return structuredClone(values.get(key) ?? fallback); },
+    async write(key, value) { writes++; values.set(key, structuredClone(value)); } };
+  const receiptStore = new ReviewPublicationAdoptionStore({ store: stateStore });
+  const task = { taskId: f.target.evidenceTarget.taskId, roleId: "pr-engineer", revision: 7, status: "waiting_external", rootStatus: "queued",
+    activeIntentId: f.proposal.proposalId, inputBinding: f.target.inputBinding, event: f.event,
+    acceptanceContract: f.acceptanceContract, requestedAt: f.target.requestedAt };
+  const material = { facts: f.facts, feedbackSnapshot: { coverageDigest: f.coverageDigest } };
+  const scan = { complete: true, items: [{ proposal: f.source.proposal, result: f.source.result, status: "succeeded", downstreamRef: null }] };
+  const settlements = new Map([[f.source.confirmationSnapshot.item.id, f.source.confirmationSnapshot]]);
+  const { WorkProposalEvidenceReader } = await import("../src/services/work-proposal-evidence-reader.js");
+  const publicationSourceReader = new WorkProposalEvidenceReader({ readState: () => ({
+    proposals: scan.items.map(row => ({ proposal: row.proposal, resultId: row.result?.resultId ?? null, status: row.status, downstreamRef: row.downstreamRef })),
+    results: scan.items.flatMap(row => row.result ? [row.result] : []),
+  }) });
+  const service = new ReviewPublicationReuseService({ taskReader: { async read() { return structuredClone(task); } },
+    factsReader: { async get() { return material.facts; } }, publicationSourceReader,
+    confirmationReader: { async readSettlements({ confirmationIds }) {
+      return { queueRevision: f.source.confirmationSnapshot.queueRevision,
+        items: confirmationIds.flatMap(id => settlements.has(id) ? [settlements.get(id).item] : []) };
+    } },
+    materialsReader: { async read(input) { captures++; assert.equal(input.taskId, task.taskId); assert.deepEqual(input.gitTarget, task.inputBinding.gitTarget); return material; } },
+    receiptStore, inputAuthorityVerifier: { async verify(input) { return input; } }, clock: () => new Date(f.adoptedAt) });
+  return { ...f, service, task, material, scan, settlements, receiptStore, counts: () => ({ writes, captures }) };
+}
+
+test("host reuse produces new-task evidence without a GitHub write port and survives a lost result", async () => {
+  const f = await reuseServiceFixture();
+  const catalog = await f.service.listCandidates({ taskId: f.task.taskId, materialDigest: f.candidate.materialDigest });
+  assert.equal(catalog.candidates[0].candidateId, f.candidate.candidateId);
+  assert.equal(f.counts().captures, 0, "candidate preview uses complete already-cached facts");
+  const transition = await f.service.handle({ proposal: f.proposal });
+  assert.equal(transition.status, "succeeded");
+  assert.equal(transition.evidence.filter(value => value.startsWith("adoption:")).length, 1);
+  assert.equal(f.counts().writes, 1);
+  const again = await f.service.handle({ proposal: f.proposal });
+  assert.deepEqual(again, transition);
+  assert.equal(f.counts().writes, 1);
+  const result = createWorkProposalResult({ proposal: f.proposal, sequence: 1, at: f.adoptedAt, downstreamRef: null, transition });
+  const authority = { taskId: f.task.taskId, roleId: f.task.roleId, contractRevision: f.target.evidenceTarget.contractRevision,
+    contractDigest: f.target.evidenceTarget.contractDigest, inputBinding: f.task.inputBinding };
+  assert.equal(await f.service.verifyProposal({ proposal: f.proposal, result, authority }), true);
+  assert.equal(await f.service.verifyProposal({ proposal: f.proposal, result, authority: { ...authority, taskId: "another-task" } }), false);
+  const receipt = await f.receiptStore.getForProposal({ proposalId: f.proposal.proposalId, proposalDigest: f.proposal.contentDigest });
+  assert.equal(receipt.source.publishedBody, f.source.proposal.payload.body);
+  assert.equal(receipt.assessment.coverageNote, f.proposal.payload.body);
+});
+
+test("host verification preserves a captured assessment across CI updates and rejects new linked QA coverage", async () => {
+  const f = await reuseServiceFixture();
+  const transition = await f.service.handle({ proposal: f.proposal });
+  const result = createWorkProposalResult({ proposal: f.proposal, sequence: 1, at: f.adoptedAt, downstreamRef: null, transition });
+  f.material.facts = f.createFacts({ ...f.factsInput, checks: [{ kind: "check_run", name: "CI", status: "COMPLETED", conclusion: "SUCCESS",
+    url: "https://ci.example/run/1", requirement: "required", startedAt: "2026-10-28T05:00:00.000Z", completedAt: "2026-10-28T05:05:00.000Z" }] });
+  assert.equal(await f.service.verifyProposal({ proposal: f.proposal, result }), true);
+  assert.deepEqual(await f.service.handle({ proposal: f.proposal }), transition, "a lost handler result can recover its receipt after CI changed");
+  f.material.feedbackSnapshot.coverageDigest = "0".repeat(64);
+  assert.equal(await f.service.verifyProposal({ proposal: f.proposal, result }), false);
+  assert.equal(f.counts().writes, 1);
+});
+
+test("adopted publication flows through the normal new-task authoritative delivery catalog", async () => {
+  const f = await reuseServiceFixture();
+  const transition = await f.service.handle({ proposal: f.proposal });
+  const result = createWorkProposalResult({ proposal: f.proposal, sequence: 1, at: f.adoptedAt, downstreamRef: null, transition });
+  const evidence = new DeliveryEvidenceService({ publicationAdoptionVerifier: f.service, proposalResultReader: {
+    async getResult() { return result; }, async getProposalForEvidence() { return f.proposal; }, async getResultForProposal() { return result; },
+    async listEvidenceCandidates() { return { items: [{ proposal: f.proposal, result }], nextBeforeSequence: null }; },
+  } });
+  const target = f.target.evidenceTarget;
+  const authority = { taskId: target.taskId, roleId: target.roleId, contractRevision: target.contractRevision, contractDigest: target.contractDigest };
+  const catalog = await evidence.listForTask({ ...authority, kinds: ["review-report"] });
+  assert.equal(catalog.length, 1);
+  assert.equal(catalog[0].deliverableId, "review-result");
+  assert.equal(catalog[0].evidence.referenceId, result.resultId);
+  assert.deepEqual(await evidence.verify({ ...authority, inputBinding: f.task.inputBinding, deliverableId: "review-result", evidence: catalog[0].evidence }), catalog[0].evidence);
+  f.material.feedbackSnapshot.coverageDigest = "0".repeat(64);
+  assert.deepEqual(await evidence.listForTask({ ...authority, kinds: ["review-report"] }), []);
+  assert.equal(await evidence.verify({ ...authority, deliverableId: "review-result", evidence: catalog[0].evidence }), false);
+  assert.equal(f.counts().writes, 1);
+});
+
+test("host reuse rejects changed linked coverage, current contract, manual pause and unsettled publication", async () => {
+  const f = await reuseServiceFixture();
+  f.material.feedbackSnapshot.coverageDigest = "0".repeat(64);
+  await assert.rejects(f.service.handle({ proposal: f.proposal }), { code: "REVIEW_PUBLICATION_REUSE_COVERAGE_CHANGED" });
+  assert.equal(f.counts().writes, 0);
+  f.material.feedbackSnapshot.coverageDigest = f.coverageDigest;
+  f.task.acceptanceContract.revision++;
+  await assert.rejects(f.service.handle({ proposal: f.proposal }), { code: "REVIEW_PUBLICATION_REUSE_TARGET_CHANGED" });
+  f.task.acceptanceContract.revision--;
+  f.task.status = "paused";
+  await assert.rejects(f.service.handle({ proposal: f.proposal }), { code: "REVIEW_PUBLICATION_REUSE_TASK_UNAVAILABLE" });
+  f.task.status = "waiting_external";
+  f.scan.items.push({ proposal: f.source.proposal, result: null, status: "waiting_confirmation", downstreamRef: "pending" });
+  await assert.rejects(f.service.handle({ proposal: f.proposal }), { code: "REVIEW_PUBLICATION_REUSE_UNSETTLED_SOURCE" });
+  assert.equal(f.counts().writes, 0);
+});
+
+test("terminal proposal status cannot hide a still-actionable or uncertain confirmation", async (t) => {
+  for (const [name, change] of [
+    ["retryable absent publication", item => { item.status = "failed"; item.receipt = null; item.failure = { outcome: "absent", retryable: true }; }],
+    ["unknown publication", item => { item.status = "failed"; item.receipt = null; item.failure = { outcome: "unknown", retryable: false }; }],
+    ["owner rejected unknown outcome", item => { item.status = "rejected"; item.failure = null; item.execution.outcome = "unknown"; }],
+    ["publication completed after handler failed", () => {}],
+  ]) await t.test(name, async () => {
+    const f = await reuseServiceFixture();
+    f.scan.items[0].status = "failed";
+    const snapshot = structuredClone(f.source.confirmationSnapshot);
+    change(snapshot.item);
+    f.settlements.set(snapshot.item.id, snapshot);
+    await assert.rejects(f.service.listCandidates({ taskId: f.task.taskId, materialDigest: f.candidate.materialDigest }),
+      { code: "REVIEW_PUBLICATION_REUSE_UNSETTLED_SOURCE" });
+    assert.deepEqual(f.counts(), { writes: 0, captures: 0 });
+  });
+});
+
+test("task authority uses the original request time and rejects an inactive root", async () => {
+  const f = await candidateFixture();
+  const root = { itemId: f.target.inputBinding.rootItemId, sourceQuarantine: null, source: { scope: { active: true } },
+    status: "queued", createdAt: f.target.requestedAt };
+  const { schemaVersion: _schema, repository: _repo, pullRequestNumber: _number, gitTarget: _git, ...sourceBinding } = f.target.inputBinding;
+  const child = { itemId: f.target.evidenceTarget.taskId, kind: "graph_task", sourceQuarantine: null,
+    currentTarget: { type: "role", id: "pr-engineer" }, status: "blocked", revision: 7, activeIntentId: null,
+    assignment: { graphTask: { sourceBinding } }, event: f.event,
+    graph: { acceptanceContracts: [f.acceptanceContract] }, createdAt: "2026-10-26T09:13:23.000Z" };
+  const reader = createReviewAdoptionTaskReader({ async readItemForReconciliation({ itemId }) {
+    return [child, root].find(item => item.itemId === itemId) ?? null;
+  } });
+  const task = await reader.read({ taskId: child.itemId });
+  assert.equal(task.requestedAt, root.createdAt);
+  assert.notEqual(task.requestedAt, child.createdAt);
+  assert.deepEqual(task.inputBinding, f.target.inputBinding);
+  root.source.scope.active = false;
+  assert.equal(await reader.read({ taskId: child.itemId }), null);
 });

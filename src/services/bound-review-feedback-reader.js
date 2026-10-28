@@ -32,12 +32,18 @@ export class BoundReviewFeedbackReader {
     this.#authority = inputAuthorityVerifier;
   }
   async read(value, options = {}) {
+    return this.#read(value, options, true);
+  }
+  async readCurrent(value, options = {}) {
+    return this.#read(value, options, false);
+  }
+  async #read(value, options, requireDigest) {
     const signal = normalizeAbortSignal(options.signal ?? null);
     signal?.throwIfAborted();
     const request = cloneWorkProposalValue(value);
-    assertWorkProposalExactKeys(request, ["taskId", "materialDigest", "gitTarget", "pullRequestNumber"]);
+    assertWorkProposalExactKeys(request, ["taskId", "gitTarget", "pullRequestNumber", ...(requireDigest ? ["materialDigest"] : [])]);
     if (typeof request.taskId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,191}$/.test(request.taskId) ||
-        typeof request.materialDigest !== "string" || !/^[a-f0-9]{64}$/.test(request.materialDigest)) throw failure("PR_REVIEW_READ_ARGUMENT_INVALID");
+        (requireDigest && (typeof request.materialDigest !== "string" || !/^[a-f0-9]{64}$/.test(request.materialDigest)))) throw failure("PR_REVIEW_READ_ARGUMENT_INVALID");
     const task = await this.#tasks.read({ taskId: request.taskId });
     signal?.throwIfAborted();
     if (!task || task.taskId !== request.taskId || !["pr-engineer", "pr-reviewer"].includes(task.roleId) ||
@@ -55,7 +61,7 @@ export class BoundReviewFeedbackReader {
       signal === null ? undefined : { signal }));
     signal?.throwIfAborted();
     if (!samePullRequestExecutionBinding(facts.identity.executionBinding, binding) ||
-        projectPullRequestReadFactsContext(facts).materialDigest !== request.materialDigest) throw failure("PR_REVIEW_READ_MATERIAL_CHANGED");
+        (requireDigest && projectPullRequestReadFactsContext(facts).materialDigest !== request.materialDigest)) throw failure("PR_REVIEW_READ_MATERIAL_CHANGED");
     await verify();
     return facts;
   }
