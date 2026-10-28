@@ -30,6 +30,7 @@ const MAX_JSON_ENTRIES = 1_000;
 const MAX_JSON_DEPTH = 16;
 const MAX_STRING_BYTES = 16 * 1024;
 const MAX_STATE_ITEMS = 1_000;
+const DEFAULT_CONFIRMATION_ERROR = Symbol("defaultConfirmationError");
 
 export class ConfirmationQueueError extends Error {
   constructor(code, message, statusCode = 400, { cause } = {}) {
@@ -48,6 +49,10 @@ function invalidRequest(message = "确认请求无效") {
   );
 }
 
+function resolvedConfirmationError(error) {
+  return error === DEFAULT_CONFIRMATION_ERROR ? invalidRequest() : error;
+}
+
 function isPlainObject(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return false;
@@ -56,35 +61,35 @@ function isPlainObject(value) {
   return prototype === Object.prototype || prototype === null;
 }
 
-function ownDataKeys(value, error = invalidRequest()) {
-  if (!isPlainObject(value)) throw error;
+function ownDataKeys(value, error = DEFAULT_CONFIRMATION_ERROR) {
+  if (!isPlainObject(value)) throw resolvedConfirmationError(error);
   const keys = Reflect.ownKeys(value);
   for (const key of keys) {
-    if (typeof key !== "string" || DANGEROUS_KEYS.has(key)) throw error;
+    if (typeof key !== "string" || DANGEROUS_KEYS.has(key)) throw resolvedConfirmationError(error);
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor?.enumerable || !("value" in descriptor)) throw error;
+    if (!descriptor?.enumerable || !("value" in descriptor)) throw resolvedConfirmationError(error);
   }
   return keys;
 }
 
-function assertExactKeys(value, expected, error = invalidRequest()) {
+function assertExactKeys(value, expected, error = DEFAULT_CONFIRMATION_ERROR) {
   const keys = ownDataKeys(value, error);
   if (
     keys.length !== expected.length ||
     expected.some((key) => !keys.includes(key))
   ) {
-    throw error;
+    throw resolvedConfirmationError(error);
   }
   return value;
 }
 
-function assertAllowedKeys(value, allowed, required, error = invalidRequest()) {
+function assertAllowedKeys(value, allowed, required, error = DEFAULT_CONFIRMATION_ERROR) {
   const keys = ownDataKeys(value, error);
   if (
     keys.some((key) => !allowed.includes(key)) ||
     required.some((key) => !keys.includes(key))
   ) {
-    throw error;
+    throw resolvedConfirmationError(error);
   }
   return value;
 }
