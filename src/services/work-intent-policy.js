@@ -496,6 +496,7 @@ export function createWorkIntentPolicy({
         {
           verdict: intent.verdict,
           body: intent.body,
+          ...(intent.publicationReuse === undefined ? {} : { publicationReuse: intent.publicationReuse }),
           evidence: intent.evidence,
           ...commonPayload,
         },

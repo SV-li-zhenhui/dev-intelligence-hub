@@ -949,3 +949,18 @@ test("rejects untrusted context fields, inherited data, and post-bind mutation",
   }, TypeError);
   assert.equal(bound.binding.subject.repository, "acme/repo");
 });
+
+
+test("seals explicit Review publication reuse into the new proposal without changing its trusted target", () => {
+  const publicationReuse = { candidateId: "review-publication-candidate-" + "a".repeat(64), materialDigest: "b".repeat(64) };
+  const bound = policy().bind({ context: context(), intent: { ...common("propose_github_review"),
+    verdict: "approve", body: "Current coverage note, not a newly published body", evidence: ["head:abc123"], publicationReuse } });
+  assert.deepEqual(bound.payload.publicationReuse, publicationReuse);
+  assert.equal(bound.requestedBy.workItemId, context().workItemId);
+  assert.deepEqual(bound.binding.inputBinding, context().inputBinding);
+  assert.equal(bound.binding.repository, "acme/repo");
+  const changed = policy().bind({ context: context(), intent: { ...common("propose_github_review"),
+    verdict: "approve", body: bound.payload.body, evidence: ["head:abc123"],
+    publicationReuse: { ...publicationReuse, materialDigest: "c".repeat(64) } } });
+  assert.notEqual(changed.intentId, bound.intentId, "coverage changes must invalidate the sealed proposal identity");
+});

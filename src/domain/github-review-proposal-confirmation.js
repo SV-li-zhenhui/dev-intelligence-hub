@@ -293,3 +293,12 @@ export function createGitHubReviewProposalConfirmationPlan(
     },
   });
 }
+
+
+// All historical proof consumers reconstruct the same supported plan variants.
+// These plans prove past publication only; they do not grant current authority.
+export function historicalGitHubReviewConfirmationPlans(proposal, actorAccountId) {
+  return [{}, { selfAuthored: true }, { legacySelfAuthored: true }, { legacyUnversionedSelfAuthored: true }]
+    .map(variant => normalizeConfirmationPlan(createGitHubReviewProposalConfirmationPlan(proposal,
+      { actorAccountId, legacyRecovery: true, ...variant })));
+}

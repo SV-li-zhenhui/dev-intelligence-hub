@@ -839,6 +839,10 @@ export class WorkProposalStore {
     return this.#evidenceReader.getResultForProposal(value);
   }
 
+  listReviewPublicationSources(value) {
+    return this.#evidenceReader.listReviewPublicationSources(value);
+  }
+
   listEvidenceCandidates(value) {
     return this.#evidenceReader.listEvidenceCandidates(value);
   }

@@ -209,7 +209,14 @@ const intentVariants = [
     },
     body: stringSchema(16 * 1_024),
     evidence,
-  }, { optional: ["deliverableId"] }),
+    publicationReuse: {
+      type: "object", additionalProperties: false, required: ["candidateId", "materialDigest"],
+      properties: {
+        candidateId: stringSchema(128, { ascii: true, pattern: "^review-publication-candidate-[a-f0-9]{64}$" }),
+        materialDigest: stringSchema(64, { ascii: true, pattern: "^[a-f0-9]{64}$" }),
+      },
+    },
+  }, { optional: ["deliverableId", "publicationReuse"] }),
   intentSchema("propose_github_pull_request_action", {
     action: pullRequestExternalAction,
     evidence,

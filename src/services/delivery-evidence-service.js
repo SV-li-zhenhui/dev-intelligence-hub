@@ -428,8 +428,9 @@ export class DeliveryEvidenceService {
   #changePackages;
   #codeJobs;
   #proposalResults;
+  #publicationAdoptions;
 
-  constructor({ changePackageReader, codeJobReader, proposalResultReader } = {}) {
+  constructor({ changePackageReader, codeJobReader, proposalResultReader, publicationAdoptionVerifier } = {}) {
     this.#changePackages = bindOptionalPort(
       changePackageReader,
       ["get"],
@@ -450,7 +451,18 @@ export class DeliveryEvidenceService {
       ],
       "proposalResultReader",
     );
+    this.#publicationAdoptions = bindOptionalPort(publicationAdoptionVerifier, ["verifyProposal"], "publicationAdoptionVerifier");
     Object.freeze(this);
+  }
+
+  async #verifyAdoption(proposal, result, authority, signal) {
+    if (!Object.hasOwn(proposal.payload, "publicationReuse")) return true;
+    if (this.#publicationAdoptions === null) return false;
+    checkAbort(signal);
+    const verified = await this.#publicationAdoptions.verifyProposal({ proposal, result, authority,
+      ...(signal === null ? {} : { signal }) });
+    checkAbort(signal);
+    return verified === true;
   }
 
   async listForTask(value) {
@@ -580,9 +592,8 @@ export class DeliveryEvidenceService {
       const evidence = proposalEvidence(proposal, result, expected).find(
         ({ kind }) => kind === deliverable.kind,
       );
-      const descriptor = evidence === undefined
-        ? null
-        : evidenceDescriptor(proposal, expected, evidence);
+      if (evidence === undefined || !await this.#verifyAdoption(proposal, result, expected, signal)) return [];
+      const descriptor = evidenceDescriptor(proposal, expected, evidence);
       return descriptor === null ? [] : [descriptor];
     }
     if (this.#codeJobs === null || proposal.kind !== "code_action_proposal") {
@@ -754,9 +765,10 @@ export class DeliveryEvidenceService {
     ) {
       return null;
     }
-    return proposalEvidence(proposal, result, expected).find(
+    const record = proposalEvidence(proposal, result, expected).find(
       ({ kind }) => kind === evidence.kind,
     ) ?? null;
+    return record !== null && await this.#verifyAdoption(proposal, result, expected, signal) ? record : null;
   }
 
   async #proposalForJob(job, signal) {

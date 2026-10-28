@@ -1,5 +1,5 @@
-import { normalizeConfirmationPlan, normalizeConfirmationState } from "../domain/confirmation-contract.js";
-import { createGitHubReviewProposalConfirmationPlan } from "../domain/github-review-proposal-confirmation.js";
+import { normalizeConfirmationState } from "../domain/confirmation-contract.js";
+import { historicalGitHubReviewConfirmationPlans } from "../domain/github-review-proposal-confirmation.js";
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
 import { createWorkIntentDispatchBinding } from "../domain/work-intent-dispatch-binding.js";
 import { normalizePullRequestExecutionBinding, samePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
@@ -90,9 +90,7 @@ function matchingDeliveredProposal(item, outboxById) {
 function historicalPlans(delivered, actorAccountId = delivered.binding.gitTarget.sourceAccountId) {
   const { proposal, binding } = delivered;
   if (actorAccountId.toLowerCase() !== binding.gitTarget.sourceAccountId.toLowerCase()) return [];
-  const options = { actorAccountId, legacyRecovery: true };
-  return [{}, { selfAuthored: true }, { legacySelfAuthored: true }, { legacyUnversionedSelfAuthored: true }]
-    .map((variant) => normalizeConfirmationPlan(createGitHubReviewProposalConfirmationPlan(proposal, { ...options, ...variant })));
+  return historicalGitHubReviewConfirmationPlans(proposal, actorAccountId);
 }
 
 export function reviewConfirmationSettlementIds(item, outboxById) {
