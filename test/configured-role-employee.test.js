@@ -855,6 +855,23 @@ test("external rereview requires a required authoritative contract and accepted 
   assert.equal((await oneResponseEngine("orchestrator", completeDecision()).decide({ context: externalRereviewContext([accepted]) })).intent.type, "complete");
 });
 
+test("external rereview permits an internal coordination child while preserving authoritative completion", async () => {
+  const original = { taskId: "existing-review", status: "in_progress",
+    responsibility: { type: "role", id: "pr-engineer" }, hasAcceptedRequiredReview: false };
+  const context = externalRereviewContext([original]);
+  const result = triageDecompositionDecision("coordination");
+  result.intent.action.acceptanceContract.expectedDeliverables[0].kind = "text-report";
+  const decision = await oneResponseEngine("orchestrator", result).decide({ context });
+  assert.equal(decision.intent.action.capability, "coordination");
+  assert.deepEqual(context.requirements.coordination.directChildren, [original]);
+  await assert.rejects(oneResponseEngine("orchestrator", completeDecision()).decide({ context }),
+    { code: "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION" });
+  const review = triageDecompositionDecision("pr-review");
+  review.intent.action.acceptanceContract.expectedDeliverables[0].kind = "text-report";
+  await assert.rejects(oneResponseEngine("orchestrator", review).decide({ context }),
+    { code: "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION" });
+});
+
 test("contracted external reviewer proposes publication with its exact deliverable and Head", async () => {
   const context = externalRereviewContext();
   delete context.requirements.coordination;

@@ -325,7 +325,7 @@ function assertExternalRereviewDecision(context, roleId, decision) {
   const reject = () => { throw engineError("ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION",
     "External rereview requires a required authoritative Review delivery and verified publication before completion", 409); };
   if (roleId === "orchestrator") {
-    if (intent.type === "orchestrate" && intent.action.type === "decompose" &&
+    if (intent.type === "orchestrate" && intent.action.type === "decompose" && intent.action.capability === "pr-review" &&
         requiredReviewDeliverables(intent.action.acceptanceContract).length === 0) reject();
     if (intent.type === "complete" && !(context.requirements?.coordination?.directChildren ?? []).some((child) =>
       child.status === "completed" && child.responsibility?.type === "role" && child.responsibility.id === "pr-engineer" &&
