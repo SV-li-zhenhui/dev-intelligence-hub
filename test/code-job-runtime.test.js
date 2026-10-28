@@ -192,6 +192,7 @@ async function runtimeFixture({
   controlledCommitDelivery,
   taskRuns,
   automaticPauseRecovery,
+  clock = () => new Date("2026-08-02T06:00:01.000Z"),
 } = {}) {
   const runtime = await createCodeJobRuntime({
     store,
@@ -199,7 +200,7 @@ async function runtimeFixture({
     automaticPauseRecovery,
     grantVerifier: { async verify(value) { return structuredClone(value); } },
     operationQueue: new OperationQueue(),
-    clock: () => new Date("2026-08-02T06:00:01.000Z"),
+    clock,
     createGuard({ name }) {
       guard.name = name;
       return guard;
@@ -796,6 +797,24 @@ test("pause control is admitted while a worker cycle is still running", async ()
 
   assert.equal(observed.kind, "pause");
   assert.equal(paused.job.status, "paused");
+});
+
+test("a queued job remains readable after pause and resume advance its lifecycle timestamps", async () => {
+  let now = Date.parse("2026-08-02T06:00:01.000Z");
+  const { runtime } = await runtimeFixture({ clock: () => new Date(now) });
+  try {
+    const created = await runtime.confirmationExecutor.execute(envelope());
+    const queued = await runtime.reader.get(created.receipt.id);
+    now += 1_000;
+    const paused = await runtime.control.pause({ jobId: queued.jobId, expectedRevision: queued.revision, reason: "maintenance" });
+    now += 1_000;
+    const resumed = await runtime.control.resume({ jobId: queued.jobId, expectedRevision: paused.job.revision });
+    assert.equal(resumed.job.status, "queued");
+    assert.equal(resumed.job.createdAt, queued.createdAt);
+    assert.equal(resumed.job.updatedAt, new Date(now).toISOString());
+    assert.equal((await runtime.reader.get(queued.jobId)).status, "queued");
+    assert.equal((await runtime.reader.list({})).items[0].status, "queued");
+  } finally { await runtime.close(); }
 });
 
 test("control transitions share the worker session-transition lease", async () => {

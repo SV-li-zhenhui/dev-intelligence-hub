@@ -711,8 +711,7 @@ function assertProjectionLifecycle(projection, progress, error) {
       (Date.parse(latestRecordedAt) < Date.parse(createdAt) ||
         Date.parse(latestRecordedAt) > Date.parse(updatedAt))) ||
     (projection.status === "queued" &&
-      (updatedAt !== createdAt ||
-        turn !== 0 ||
+      (turn !== 0 ||
         pendingActionType !== null ||
         terminalResult !== null ||
         pause !== null ||
