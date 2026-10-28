@@ -855,14 +855,14 @@ test("external rereview requires a required authoritative contract and accepted 
   assert.equal((await oneResponseEngine("orchestrator", completeDecision()).decide({ context: externalRereviewContext([accepted]) })).intent.type, "complete");
 });
 
-test("external rereview permits an internal coordination child while preserving authoritative completion", async () => {
+test("external rereview permits an auxiliary specialist child while preserving authoritative completion", async () => {
   const original = { taskId: "existing-review", status: "in_progress",
     responsibility: { type: "role", id: "pr-engineer" }, hasAcceptedRequiredReview: false };
   const context = externalRereviewContext([original]);
-  const result = triageDecompositionDecision("coordination");
+  const result = triageDecompositionDecision("testing");
   result.intent.action.acceptanceContract.expectedDeliverables[0].kind = "text-report";
   const decision = await oneResponseEngine("orchestrator", result).decide({ context });
-  assert.equal(decision.intent.action.capability, "coordination");
+  assert.equal(decision.intent.action.capability, "testing");
   assert.deepEqual(context.requirements.coordination.directChildren, [original]);
   await assert.rejects(oneResponseEngine("orchestrator", completeDecision()).decide({ context }),
     { code: "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION" });
@@ -870,6 +870,18 @@ test("external rereview permits an internal coordination child while preserving 
   review.intent.action.acceptanceContract.expectedDeliverables[0].kind = "text-report";
   await assert.rejects(oneResponseEngine("orchestrator", review).decide({ context }),
     { code: "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION" });
+});
+
+test("a legacy coordinator child does not inherit the root Review completion rule", async () => {
+  const context = externalRereviewContext();
+  delete context.requirements.coordination;
+  context.requirements.currentTask = { parentTaskId: "review-root", acceptanceContract: {
+    expectedDeliverables: [{ deliverableId: "diagnosis", kind: "text-report", required: true }],
+  } };
+  // Decision scope is distinct from delivery acceptance. The ledger still
+  // requires the child's accepted delivery before completing its contract.
+  const decision = await oneResponseEngine("orchestrator", completeDecision()).decide({ context });
+  assert.equal(decision.intent.type, "complete");
 });
 
 test("contracted external reviewer proposes publication with its exact deliverable and Head", async () => {

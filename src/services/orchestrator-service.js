@@ -729,10 +729,15 @@ function assertActionSource(action, graph, tasksById, bindingTask, children) {
   return source;
 }
 
-function roleForCapability(capabilityRoles, capability) {
+function specialistRoleForCapability(capabilityRoles, capability) {
   const targetRoleId = capabilityRoles.get(capability);
   if (!targetRoleId) {
     throw denied(`No trusted role is configured for capability ${capability}`);
+  }
+  // Root coordination has no specialist delivery path. Reject before creating
+  // or assigning a child whose required contract this role cannot fulfill.
+  if (targetRoleId === ORCHESTRATOR_ROLE_ID) {
+    throw denied("The root orchestrator cannot be assigned a specialist child contract");
   }
   return targetRoleId;
 }
@@ -1224,7 +1229,7 @@ function planDecomposition({
       work: action.work,
       target: {
         type: "role",
-        id: roleForCapability(capabilityRoles, action.capability),
+        id: specialistRoleForCapability(capabilityRoles, action.capability),
       },
       dependsOnTaskIds: dependencyIds,
       acceptanceContract: action.acceptanceContract,
@@ -1252,7 +1257,7 @@ function planAssignment({ action, source, rootId, children, capabilityRoles }) {
       taskId: source.taskId,
       target: {
         type: "role",
-        id: roleForCapability(capabilityRoles, action.capability),
+        id: specialistRoleForCapability(capabilityRoles, action.capability),
       },
       reason: action.reason,
       expectedGraphRevision: action.expectedGraphRevision,

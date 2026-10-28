@@ -708,6 +708,45 @@ test('automatic coordination can replace cancelled Review work and delegate a fo
   assert.deepEqual(fakes.calls.planner[0].command.target, { type: 'role', id: 'tester' });
 });
 
+test("root coordination cannot delegate specialist contracts back to the root role", async (t) => {
+  for (const type of ["decompose", "assign"]) {
+    for (const capability of ["coordination", "requirements"]) {
+      await t.test(`${type} ${capability} mapped to orchestrator`, async () => {
+        const root = task({ taskId: "root-only" });
+        const child = task({ taskId: "root-only/child", parentTaskId: root.taskId, role: "tester" });
+        const view = graphView([root, child], 3);
+        const packet = packetFor(view, root, { directChildren: [child] });
+        const fakes = fakePorts({ packet, views: view });
+        const service = new OrchestratorService({ ...fakes.ports, automaticMode: true,
+          capabilityRoles: { [capability]: "orchestrator" } });
+        const action = { ...commonAction(type, type === "decompose" ? root : child, view), capability,
+          ...(type === "decompose" ? { childKey: "diagnosis", dependsOn: [],
+            work: { title: "Internal diagnosis", description: "A text report must have a deliverable specialist" },
+            acceptanceContract: contract({ kind: "text-report" }) } : {}) };
+        await assert.rejects(service.execute({ worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+          item: itemFor(root), contextPacket: packet, intent: orchestrate(action) }),
+        { code: "ORCHESTRATOR_AUTHORITY_DENIED", message: /root orchestrator.*specialist/i });
+        assertNoTrustedMutation(fakes.calls);
+      });
+    }
+  }
+});
+
+test("coordination mapped to a specialist can still create a text-report task", async () => {
+  const root = task({ taskId: "specialist-root" });
+  const view = graphView([root]);
+  const packet = packetFor(view, root, { directChildren: [] });
+  const fakes = fakePorts({ packet, views: view });
+  const service = new OrchestratorService({ ...fakes.ports, automaticMode: true,
+    capabilityRoles: { coordination: "requirements-analyst" } });
+  await service.execute({ worker: { roleId: "orchestrator", workerId: "employee-orchestrator" },
+    item: itemFor(root), contextPacket: packet,
+    intent: orchestrate({ ...commonAction("decompose", root, view), capability: "coordination", childKey: "diagnosis",
+      dependsOn: [], work: { title: "Internal diagnosis", description: "Produce a scoped prose report" },
+      acceptanceContract: contract({ kind: "text-report" }) }) });
+  assert.deepEqual(fakes.calls.planner[0].command.target, { type: "role", id: "requirements-analyst" });
+});
+
 test('automatic coordination preserves a paused Review when creating a fresh child', async () => {
   const root = task({ taskId: 'paused-root' });
   const child = task({ taskId: 'paused-root/old', parentTaskId: root.taskId, role: 'pr-engineer', status: 'paused' });
