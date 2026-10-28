@@ -25,6 +25,7 @@ const RUNTIME_METHODS = Object.freeze([
   "listOutbox",
   "readItemForReconciliation",
   "readAutomaticRoleHandoffCandidates",
+  "canReconnectOwnPullRequest",
   "isAttentionRequestCurrent",
   "areAttentionRequestsCurrent",
   "readAttentionRequestRetirement",

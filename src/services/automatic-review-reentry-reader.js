@@ -9,13 +9,14 @@ import { normalizeWorkflowEvent } from '../domain/workflow-events.js';
 export class AutomaticReviewReentryReader {
   #cursor = null;
 
-  constructor({ ledger, account }) {
-    Object.assign(this, { ledger, account });
+  constructor({ ledger, account, github = null, automaticReview = true, automaticOwnPrRepair = false }) {
+    Object.assign(this, { ledger, account, github, automaticReview, automaticOwnPrRepair });
   }
 
   async read({ events }) {
     const current = new Map(events.filter(event => event.source.provider === 'github' &&
-      automaticReviewEligibility({ ...event.payload, kind: 'pull_request' }, this.account, event.occurredAt) === null)
+      ((this.automaticReview && automaticReviewEligibility({ ...event.payload, kind: 'pull_request' }, this.account, event.occurredAt) === null) ||
+        this.#ownConflictEvent(event)))
       .map(event => [event.subject.id, event]));
     if (current.size === 0) return [];
     const readPage = () => this.ledger.listItems({ roleId: 'pr-engineer', status: 'blocked', order: 'newest', limit: 100,
@@ -49,6 +50,9 @@ export class AutomaticReviewReentryReader {
       const before = pullRequestGitTargetFromEvent(previous), after = pullRequestGitTargetFromEvent(event);
       if (!before || !after || !['provider', 'sourceAccountId', 'baseRepository']
         .every(key => before[key] === after[key]) || after.sourceAccountId.toLowerCase() !== this.account.toLowerCase()) continue;
+      if (this.#ownConflictEvent(event) && (!await this.#verifyOwnConflict(event, after) ||
+          typeof this.ledger.canReconnectOwnPullRequest !== 'function' ||
+          !await this.ledger.canReconnectOwnPullRequest({ itemId: item.itemId, expectedRevision: item.revision, event }))) continue;
       const latest = await this.ledger.readItemForReconciliation({ itemId: item.itemId });
       if (!isDeepStrictEqual(latest, item)) continue;
       recovered.push(normalizeWorkflowEvent({ schemaVersion: 1, eventType: 'pull_request.updated',
@@ -58,5 +62,27 @@ export class AutomaticReviewReentryReader {
         occurredAt: event.occurredAt, source: event.source, subject: event.subject, payload: event.payload }));
     }
     return recovered;
+  }
+
+  #ownConflictEvent(event) {
+    const payload = event.payload;
+    return this.automaticOwnPrRepair && payload.relation === 'authored' &&
+      payload.author?.toLowerCase() === this.account.toLowerCase() &&
+      payload.state === 'open' && payload.isDraft === false &&
+      payload.actionState === 'action_now' && payload.nextAction === 'resolve_conflict' && payload.gitTargetAvailable === true;
+  }
+
+  async #verifyOwnConflict(event, target) {
+    if (typeof this.github?.readPullRequestRoleHandoffFacts !== 'function') return false;
+    try {
+      const facts = await this.github.readPullRequestRoleHandoffFacts({ repository: event.subject.repository,
+        number: event.subject.number, account: this.account });
+      return facts.state === 'open' && facts.isDraft === false &&
+        facts.author.toLowerCase() === this.account.toLowerCase() && isDeepStrictEqual(facts.gitTarget, target) &&
+        isDeepStrictEqual(facts.assignees.map(login => login.toLowerCase()).sort(),
+          (event.payload.assignees ?? []).map(login => login.toLowerCase()).sort());
+    } catch {
+      return false;
+    }
   }
 }

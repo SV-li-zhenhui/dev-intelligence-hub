@@ -3,7 +3,7 @@ import test from 'node:test';
 import { AutomaticReviewReentryReader } from '../src/services/automatic-review-reentry-reader.js';
 import { normalizeWorkflowEvent } from '../src/domain/workflow-events.js';
 
-function fixture() {
+function fixture(options = {}) {
   const target = { schemaVersion: 1, provider: 'github', sourceAccountId: 'reviewer',
     baseRepository: 'acme/repo', baseRefName: 'main', baseRefOid: 'd'.repeat(40),
     headRepository: 'acme/repo', headRefName: 'fix/report', headRefOid: 'a'.repeat(40) };
@@ -22,9 +22,10 @@ function fixture() {
       relation: 'review_requested', nextAction: 'rereview', headRefOid: 'b'.repeat(40), gitTargetAvailable: true,
       gitTarget: { ...target, headRefOid: 'b'.repeat(40) } } });
   let latest;
-  const reader = new AutomaticReviewReentryReader({ account: 'reviewer', ledger: {
+  const reader = new AutomaticReviewReentryReader({ account: 'reviewer', ...options, ledger: {
     async listItems() { return { items: [structuredClone(item)], nextCursor: null }; },
     async readItemForReconciliation() { return structuredClone(latest ?? item); },
+    async canReconnectOwnPullRequest() { return true; },
   } });
   return { item, event: structuredClone(event), reader, changedDuringRead() { latest = { ...item, status: 'paused' }; } };
 }
@@ -39,6 +40,48 @@ test('returning review emits a causal update before scope reentry without modify
   assert.deepEqual(events[1].payload.gitTarget, f.event.payload.gitTarget);
   assert.deepEqual(f.item, before);
 });
+
+function authoredFixture({ automaticOwnPrRepair = true, facts = null } = {}) {
+  let observed;
+  const f = fixture({ automaticReview: false, automaticOwnPrRepair,
+    github: { async readPullRequestRoleHandoffFacts(request) {
+      observed = request;
+      return facts ?? { state: 'open', isDraft: false, author: 'reviewer',
+        assignees: ['reviewer'], gitTarget: structuredClone(f.event.payload.gitTarget) };
+    } } });
+  Object.assign(f.event.payload, { author: 'reviewer', relation: 'authored', actionState: 'action_now', nextAction: 'resolve_conflict' });
+  return { ...f, observed: () => observed };
+}
+
+test('automatic own conflict recovery reconnects a former review provenance through ordinary causal events', async () => {
+  const f = authoredFixture(), before = structuredClone(f.item);
+  const events = await f.reader.read({ events: [f.event] });
+  assert.deepEqual(events.map(event => event.eventType), ['pull_request.updated', 'pull_request.created']);
+  assert.equal(events[0].payload.previousHeadRefOid, 'a'.repeat(40));
+  assert.equal(events[0].payload.headRefOid, 'b'.repeat(40));
+  assert.equal(events[0].payload.relation, 'authored');
+  assert.deepEqual(f.observed(), { repository: 'acme/repo', number: 24823, account: 'reviewer' });
+  assert.deepEqual(f.item, before);
+});
+
+for (const variant of ['disabled', 'closed', 'draft', 'other-author', 'changed-target', 'changed-assignees', 'other-action', 'concurrent-pause']) {
+  test(`own conflict recovery preserves current remote facts and controls (${variant})`, async () => {
+    const f = authoredFixture({ automaticOwnPrRepair: variant !== 'disabled' });
+    if (variant === 'other-action') f.event.payload.nextAction = 'wait_author';
+    if (variant === 'closed' || variant === 'draft' || variant === 'other-author' || variant === 'changed-target' || variant === 'changed-assignees') {
+      const facts = { state: 'open', isDraft: false, author: 'reviewer', assignees: ['reviewer'],
+        gitTarget: structuredClone(f.event.payload.gitTarget) };
+      if (variant === 'closed') facts.state = 'closed';
+      if (variant === 'draft') facts.isDraft = true;
+      if (variant === 'other-author') facts.author = 'somebody';
+      if (variant === 'changed-target') facts.gitTarget.headRefOid = 'c'.repeat(40);
+      if (variant === 'changed-assignees') facts.assignees = ['someone'];
+      f.reader.github = { async readPullRequestRoleHandoffFacts() { return facts; } };
+    }
+    if (variant === 'concurrent-pause') f.changedDuringRead();
+    assert.deepEqual(await f.reader.read({ events: [f.event] }), []);
+  });
+}
 
 function historicalScopeExit(f) {
   const lifecycle = { ...f.item.source.revisions[0], eventId: f.item.source.current.event.eventId,
@@ -83,8 +126,8 @@ for (const [key, value] of [['baseRefName', 'release'], ['headRefName', 'renamed
 for (const variant of ['paused', 'cancelled', 'owner', 'lease', 'intent', 'quarantine', 'deliveries', 'pending',
   'owner-request', 'active', 'not-exit', 'same-head', 'closed', 'draft', 'self', 'unassigned', 'scope', 'account',
   'repository', 'number', 'unavailable-target', 'stale', 'newer-observation', 'concurrent-pause']) {
-  test(`review reentry preserves controls and fresh target evidence (${variant})`, async () => {
-    const f = fixture(), { item, event } = f;
+  for (const own of [false, true]) test(`${own ? 'own conflict' : 'review'} reentry preserves controls and fresh target evidence (${variant})`, async () => {
+    const f = own ? authoredFixture() : fixture(), { item, event } = f;
     if (variant === 'paused' || variant === 'cancelled') item.status = variant;
     if (variant === 'owner') item.ownerId = 'owner';
     if (variant === 'lease') item.leaseId = 'lease';
@@ -98,7 +141,7 @@ for (const variant of ['paused', 'cancelled', 'owner', 'lease', 'intent', 'quara
     if (variant === 'same-head') event.payload.headRefOid = item.source.current.headRefOid;
     if (variant === 'closed') event.payload.state = 'closed';
     if (variant === 'draft') event.payload.isDraft = true;
-    if (variant === 'self') event.payload.author = 'reviewer';
+    if (variant === 'self') event.payload.author = own ? 'somebody-else' : 'reviewer';
     if (variant === 'unassigned') event.payload.assignees = [];
     if (variant === 'scope') event.source.scopeId = 'other-scope';
     if (variant === 'account') event.payload.gitTarget.sourceAccountId = 'other-reviewer';
@@ -109,5 +152,16 @@ for (const variant of ['paused', 'cancelled', 'owner', 'lease', 'intent', 'quara
     if (variant === 'newer-observation') item.source.revisions.push({ occurredAt: '2026-10-26T04:00:00.000Z' });
     if (variant === 'concurrent-pause') f.changedDuringRead();
     assert.deepEqual(await f.reader.read({ events: [event] }), []);
+  });
+}
+
+for (const variant of ['missing-remote', 'remote-failure', 'missing-causal-reader', 'causal-proof-unavailable']) {
+  test(`own conflict reentry requires remote and retained causal proof (${variant})`, async () => {
+    const f = authoredFixture();
+    if (variant === 'missing-remote') f.reader.github = null;
+    if (variant === 'remote-failure') f.reader.github = { async readPullRequestRoleHandoffFacts() { throw new Error('not available'); } };
+    if (variant === 'missing-causal-reader') delete f.reader.ledger.canReconnectOwnPullRequest;
+    if (variant === 'causal-proof-unavailable') f.reader.ledger.canReconnectOwnPullRequest = async () => false;
+    assert.deepEqual(await f.reader.read({ events: [f.event] }), []);
   });
 }

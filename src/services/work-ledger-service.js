@@ -27,6 +27,8 @@ import {
 import { isChangedReviewConfirmationDecision, reviewConfirmationSettlementIds,
   createCompletedReviewConfirmationSettlement, hasReviewConfirmationSettlement } from "./work-ledger-review-confirmation-settlement.js";
 import { OperationQueue } from "../lib/operation-queue.js";
+import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
+import { samePullRequestGitTarget } from "../domain/git-tool-contract.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import {
   isTrustedPullRequestScopeLifecycleAssignment,
@@ -802,6 +804,45 @@ export class WorkLedgerService {
       const after = afterSubjectId === null ? 0 : candidates.findIndex(candidate => candidate.event.subject.id.localeCompare(afterSubjectId, "en") > 0);
       const start = after < 0 ? 0 : after;
       return cloneLedgerValue([...candidates.slice(start), ...candidates.slice(0, start)].slice(0, 10));
+    }));
+  }
+
+  async canReconnectOwnPullRequest({ itemId, expectedRevision, event }) {
+    this.#assertReady();
+    event = normalizeStoredWorkflowEvent(event);
+    return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
+      this.state = await this.#readDurableState();
+      const previous = this.state.items.find(item => item.itemId === itemId);
+      if (!previous || previous.revision !== expectedRevision || previous.kind !== "source_root" ||
+          previous.source?.kind !== "pull_request" || previous.source.scope.kind !== "automatic" ||
+          previous.source.scope.active !== false || previous.source.pendingRevision !== null ||
+          previous.status !== "blocked" || previous.statusReason !== "pr_source_left_scope" ||
+          previous.sourceQuarantine !== null || previous.activeIntentId !== null ||
+          previous.ownerId !== null || previous.leaseId !== null || previous.leaseUntil !== null ||
+          previous.source.identity.subjectId !== event.subject.id ||
+          previous.source.identity.repository !== event.subject.repository ||
+          previous.source.identity.pullRequestNumber !== event.subject.number) return false;
+      // This only supplies discovery lineage; normal intake still owns cutover.
+      // The live Base may have advanced while the missing Head bridge was fenced.
+      const target = this.state.items.find(item => samePullRequestSubject(previous, item) &&
+        item.source.scope.kind === "automatic" && item.source.scope.active === true &&
+        item.currentTarget.id === "developer" && item.status === "blocked" &&
+        item.statusReason === PR_SOURCE_AUTHORITY_FENCED_REASON && item.source.pendingRevision === null &&
+        item.sourceQuarantine === null && item.activeIntentId === null && item.decisionContext === null &&
+        item.ownerId === null && item.leaseId === null && item.leaseUntil === null &&
+        item.source.current.headRefOid === event.payload.headRefOid &&
+        item.source.current.event.source.provider === event.source.provider &&
+        item.source.current.event.source.scopeId === event.source.scopeId &&
+        samePullRequestGitTarget({ ...item.source.current.event.payload.gitTarget,
+          baseRefOid: event.payload.gitTarget.baseRefOid }, event.payload.gitTarget));
+      if (!target) return false;
+      const authority = pullRequestTrustedPredecessor(this.state, target);
+      if (authority?.canonicalRootItemId !== null || authority.authorityFenced !== true ||
+          authority.sourceRootItemId !== previous.itemId || authority.headRefOid !== previous.source.current.headRefOid) return false;
+      const participants = this.state.items.filter(item =>
+        [previous.itemId, target.itemId].includes(currentWorkItemInputBinding(item)?.rootItemId));
+      return !participants.some(item => item.itemId !== previous.itemId && item.itemId !== target.itemId &&
+        !CLAIM_CHILD_SETTLED_STATUSES.has(item.status));
     }));
   }
 

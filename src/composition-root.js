@@ -1310,10 +1310,15 @@ export async function createApplication({
               ...(workCoordinationDependencies.clock ? { clock: workCoordinationDependencies.clock } : {}) });
             return automaticReviewScopeExitReader.read(options);
           } }),
+        } : {}),
+        ...(config.githubActions?.enabled === true &&
+          (config.githubActions.automaticReview === true || config.githubActions.automaticOwnPrRepair === true) ? {
           scopeReentryReader: Object.freeze({ async read(options) {
             if (!workLedgerRuntime) return [];
             automaticReviewReentryReader ??= new AutomaticReviewReentryReader({ ledger: workLedgerRuntime,
-              account: config.githubActions.actorAccountId });
+              account: config.githubActions.actorAccountId, github,
+              automaticReview: config.githubActions.automaticReview === true,
+              automaticOwnPrRepair: config.githubActions.automaticOwnPrRepair === true });
             return automaticReviewReentryReader.read(options);
           } }),
         } : {}),

@@ -19870,6 +19870,93 @@ test("a sealed historical code confirmation settles after an intervening source 
   assert.deepEqual(await f.jobs.get(job.jobId), before);
 });
 
+async function ownConflictRecoveryFixture({ sealedChild = false } = {}) {
+  const f = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  await f.service.intake();
+  const sealed = sealedChild ? await stageSealedPrChildReview(f) : null;
+  const left = prAssignment(2, { eventType: 'pull_request.left_scope', occurredAt: '2026-08-02T01:05:00.000Z',
+    gitFacts: prGitFacts(PR_HEAD_A) }).event;
+  const returned = prAssignment(3, { eventType: 'pull_request.created', headRefOid: PR_HEAD_B,
+    occurredAt: '2026-08-02T01:20:00.000Z', gitFacts: { ...prGitFacts(PR_HEAD_B), state: 'open', isDraft: false,
+      author: 'runtime-user', assignees: ['runtime-user'], relation: 'authored', actionState: 'action_now', nextAction: 'resolve_conflict' } });
+  returned.assignment.target.id = 'developer';
+  returned.assignment.ruleId = AUTHORED_PR_SELF_FIX_RULE_ID;
+  f.source.records.push(prScopeLifecycleAssignment(2, left), returned); f.source.highWatermark = 3;
+  await f.service.intake();
+  const recovered = await createFixture({ source: f.source, store: f.store });
+  const roots = (await recovered.service.listItems()).items;
+  const previous = roots.find(item => item.currentTarget.id === 'pr-engineer');
+  const fenced = roots.find(item => item.currentTarget.id === 'developer');
+  return { f, recovered, previous, fenced, returned, sealed };
+}
+
+test('own conflict reconnection preserves an independently current owner request', async () => {
+  const { f, recovered, previous, returned } = await ownConflictRecoveryFixture();
+  const owner = ownerRequestedPrAssignment(4, { headRefOid: PR_HEAD_B, gitFacts: prGitFacts(PR_HEAD_B),
+    occurredAt: '2026-08-02T01:25:00.000Z' });
+  f.source.records.push(owner); f.source.highWatermark = 4;
+  await recovered.service.intake();
+  const latest = await recovered.service.readItemForReconciliation({ itemId: previous.itemId });
+  assert.equal(await recovered.service.canReconnectOwnPullRequest({ itemId: latest.itemId,
+    expectedRevision: latest.revision, event: returned.event }), false);
+  const current = (await recovered.service.listItems()).items.find(item => item.source?.scope.kind === 'owner_requested');
+  assert.equal(pullRequestHeadAdmission(f.store.stored(), current).current, true);
+});
+
+test('own conflict reconnection preserves a sealed unresolved predecessor child', async () => {
+  const { f, recovered, previous, returned, sealed } = await ownConflictRecoveryFixture({ sealedChild: true });
+  const before = f.store.stored().outbox.find(entry => entry.intentId === sealed.outbox.intentId);
+  assert.equal(await recovered.service.canReconnectOwnPullRequest({ itemId: previous.itemId,
+    expectedRevision: previous.revision, event: returned.event }), false);
+  assert.deepEqual(f.store.stored().outbox.find(entry => entry.intentId === sealed.outbox.intentId), before);
+});
+
+for (const limit of [1, 100]) test(`a fresh verified own conflict reconnects a fenced developer root through normal intake (limit=${limit})`, async () => {
+  const { f, recovered, previous, fenced, returned } = await ownConflictRecoveryFixture();
+  assert.equal(previous.source.scope.active, false);
+  assert.equal(fenced.statusReason, 'pr_source_authority_fenced');
+  assert.equal(fenced.source.pendingRevision, null);
+  assert.equal(pullRequestHeadAdmission(f.store.stored(), fenced).current, false);
+  const { AutomaticReviewReentryReader } = await import('../src/services/automatic-review-reentry-reader.js');
+  const reader = new AutomaticReviewReentryReader({ ledger: recovered.service, account: 'runtime-user',
+    automaticReview: false, automaticOwnPrRepair: true,
+    github: { async readPullRequestRoleHandoffFacts() { return { state: 'open', isDraft: false, author: 'runtime-user',
+      assignees: ['runtime-user'], gitTarget: { ...returned.event.payload.gitTarget, baseRefOid: 'e'.repeat(40) } }; } } });
+  const values = new Map();
+  const runtime = await createWorkflowRoutingRuntime({ workflowRouting: { schemaVersion: 1, enabled: true, maxHops: 8,
+    rules: [{ id: 'own-conflict-route', source: 'root', enabled: true, priority: 1, fallback: false,
+      condition: { op: 'equals', path: 'payload.relation', value: 'authored' },
+      targets: [{ type: 'role', id: 'developer' }], onMatch: 'stop' }] } }, {
+    store: { async read(name, fallback) { return clone(values.get(name) ?? fallback); }, async write(name, value) { values.set(name, clone(value)); } },
+    clock: () => '2026-08-02T01:30:00.000Z', createGuard: () => ({ async acquire() {}, run: operation => operation(), async close() {} }),
+    scopeReentryReader: reader,
+  });
+  try {
+    const snapshot = { refreshedAt: '2026-08-02T01:30:00.000Z',
+      sourceStatus: { githubPullRequests: { ok: true, complete: true, stale: false }, githubIssues: { ok: true } },
+      items: [{ ...returned.event.payload, gitTarget: { ...returned.event.payload.gitTarget, baseRefOid: 'e'.repeat(40) },
+        kind: 'pull_request', id: returned.event.subject.id, repo: 'acme/repo', number: 42 }] };
+    await runtime.ingestSnapshot({ snapshot });
+    const feed = await runtime.readAssignmentBatch({ afterSequence: 0, limit: 100 });
+    assert.ok(feed.items.some(record => record.event.eventType === 'pull_request.updated' &&
+      record.event.payload.previousHeadRefOid === PR_HEAD_A && record.assignment.target.id === 'developer'));
+    f.source.records.push(...feed.items.map((record, index) => ({ ...record, sequence: 4 + index })));
+    f.source.highWatermark = 3 + feed.items.length;
+    while (f.store.stored().intakeCursor < f.source.highWatermark) await recovered.service.intake({ limit });
+    const current = await recovered.service.readItemForReconciliation({ itemId: fenced.itemId });
+    assert.equal(current.status, 'queued');
+    assert.equal(current.source.current.headRefOid, PR_HEAD_B);
+    assert.equal(current.source.current.event.payload.gitTarget.baseRefOid, 'e'.repeat(40));
+    await recovered.service.verifyPullRequestExecutionBinding(prExecutionBinding(current));
+    assert.equal((await recovered.service.readItemForReconciliation({ itemId: previous.itemId })).source.scope.active, false);
+    const restarted = await createFixture({ source: f.source, store: f.store });
+    await restarted.service.verifyPullRequestExecutionBinding(prExecutionBinding(current));
+    const stableFeed = await runtime.readAssignmentBatch({ afterSequence: 0, limit: 100 });
+    await runtime.ingestSnapshot({ snapshot });
+    assert.deepEqual(await runtime.readAssignmentBatch({ afterSequence: 0, limit: 100 }), stableFeed);
+  } finally { await runtime.close(); }
+});
+
 for (const limit of [1, 100]) test(`a fresh complete snapshot reconnects a reassigned PR whose new created Head was unproven (limit=${limit})`, async () => {
   const f = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
   await f.service.intake();

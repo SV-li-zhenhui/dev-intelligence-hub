@@ -200,6 +200,7 @@ test("runtime owns one named process guard and exposes least-authority graph por
     "readItemForReconciliation",
     "canRecoverUnstartedReviewProposal",
     "readAutomaticRoleHandoffCandidates",
+    "canReconnectOwnPullRequest",
     "verifyPullRequestExecutionBindings",
     "reconcilePullRequestSourceBatch",
     "intake",
