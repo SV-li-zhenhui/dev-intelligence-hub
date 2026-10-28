@@ -1784,15 +1784,21 @@ test("persisted failures and public state never contain provider secrets", async
 });
 
 
-test("PR decisions send the pinned target to a CLI reader instead of treating preview truncation as final", async () => {
+test("PR decisions send the pinned target and complete feedback binding to a CLI reader instead of treating preview truncation as final", async () => {
   const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "reviewer", baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "a".repeat(40), headRepository: "acme/repo", headRefName: "feature", headRefOid: "b".repeat(40) };
   let request;
   const engine = new RoleDecisionEngine({ definition: definition("pr-engineer"), permissions: permissions("complete", "propose_github_review"), brain: brain(), brainRouter: {
     describe() { return { ...brain(), remote: false, supportsReviewReading: true }; },
     async generate(value) { request = value; return JSON.stringify(completeDecision()); },
   } });
-  await engine.decide({ item: assignedTask(), context: { requirements: {}, code: { sourceEvent: { subject: { number: 42 } }, pullRequest: { reviewMaterial: { gitTarget, patchTruncated: true, filesTruncated: true } } } } });
-  assert.deepEqual(request.reviewTarget, { gitTarget, pullRequestNumber: 42 });
+  const context = { requirements: { currentTask: { taskId: "review-task" } }, code: { sourceEvent: { subject: { number: 42 } },
+    pullRequest: { materialDigest: "c".repeat(64), reviewMaterial: { gitTarget, patchTruncated: true, filesTruncated: true } } } };
+  await engine.decide({ item: assignedTask(), context });
+  assert.deepEqual(request.reviewTarget, { gitTarget, pullRequestNumber: 42, feedbackSnapshot: { taskId: "review-task", materialDigest: "c".repeat(64) } });
   assert.match(request.messages[0].content, /Use the pr_review read-only tools/);
   normalizeStructuredBrainRequest({ model: request.brain.model, messages: request.messages, schema: request.schema, reviewTarget: request.reviewTarget }, { maxRequestBytes: 2 * 1024 * 1024 });
+  request = null;
+  delete context.code.pullRequest.materialDigest;
+  await assert.rejects(engine.decide({ item: assignedTask(), context }), { code: "PR_REVIEW_READ_FEEDBACK_UNAVAILABLE" });
+  assert.equal(request, null, "incomplete feedback fails before another model call");
 });

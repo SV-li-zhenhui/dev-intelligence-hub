@@ -28,6 +28,8 @@ function fixture({ changed = 117, moved = false, movedBase = false, missingFile 
       headRepository: { nameWithOwner: "contributor/repo" },
     } } } }; }
     if (endpoint === "user") return { login: "reviewer" };
+    if (endpoint === "repos/acme/repo/pulls/42") return { number: 42, title: "Fixture PR", body: "", html_url: "https://github.com/acme/repo/pull/42",
+      head: { sha: TARGET.gitTarget.headRefOid }, base: { repo: { full_name: "acme/repo" } } };
     if (endpoint === "repos/acme/repo/pulls/42/files?per_page=100") {
       assert.ok(args.includes("--paginate"));
       return [files.slice(0, 100), files.slice(100, missingFile ? -1 : undefined)];
@@ -239,4 +241,71 @@ test("source paging reuses the decoded immutable blob and retries a failed fetch
   } while (offset !== null);
   assert.equal(text, source);
   assert.equal(blobs, 2);
+});
+
+
+async function fullFeedbackFixture(body = "Full author evidence " + "证据".repeat(10000)) {
+  const { normalizeWorkflowEvent } = await import("../src/domain/workflow-events.js");
+  const { createPullRequestExecutionBinding } = await import("../src/domain/pull-request-execution-binding.js");
+  const { createPullRequestReadIdentity, createPullRequestReadFacts, projectPullRequestReadFactsContext } = await import("../src/domain/pull-request-read-facts.js");
+  const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.updated", occurredAt: "2026-10-28T05:00:00.000Z",
+    source: { provider: "github", scopeId: "github-account:reviewer" }, subject: { id: "github:pr:acme/repo#42", repository: "acme/repo", number: 42 },
+    payload: { gitTarget: TARGET.gitTarget, gitTargetAvailable: true, headRefOid: TARGET.gitTarget.headRefOid } });
+  const executionBinding = createPullRequestExecutionBinding({ event, sourceBinding: { kind: "pull_request", rootItemId: "review-root", workKey: "review-42",
+    inputRevision: 1, headRevision: 1, headRefOid: TARGET.gitTarget.headRefOid, eventId: event.eventId, eventDigest: event.contentDigest, inputDigest: "c".repeat(64) } });
+  const facts = createPullRequestReadFacts({ identity: createPullRequestReadIdentity({ executionBinding, event }),
+    observedAt: "2026-10-28T05:01:00.000Z", reviewDecision: "APPROVED", comments: [{ id: "IC_evidence", author: "developer", body, bodyTruncated: false,
+      createdAt: "2026-10-28T05:00:00.000Z", updatedAt: "2026-10-28T05:00:00.000Z", url: "https://github.com/acme/repo/pull/42#issuecomment-1" }],
+    reviews: [], reviewThreads: [], checks: [], truncation: { comments: false, reviews: false, reviewThreads: false, checks: false, byteBudget: false } });
+  const materialDigest = projectPullRequestReadFactsContext(facts).materialDigest;
+  return { facts, materialDigest, body };
+}
+
+test("current author discussion is a required paged document rather than an inline preview", async (t) => {
+  const { facts, materialDigest, body } = await fullFeedbackFixture();
+  const { reader } = fixture({ changed: 1 }); let reads = 0;
+  const run = reader.run;
+  reader.run = async (command, args, options) => {
+    const value = await run(command, args, options);
+    return args[3] === "repos/acme/repo/pulls/42" ? { ...value, html_url: "https://github.com/Acme/Repo/pull/42" } : value;
+  };
+  reader.currentReviewFeedbackReader = { async read(input) { reads++; assert.equal(input.taskId, "review-child"); assert.equal(input.materialDigest, materialDigest); return facts; } };
+  const session = await reader.open({ ...TARGET, feedbackSnapshot: { taskId: "review-child", materialDigest } });
+  t.after(() => session.close());
+  for (const document of ["review-manifest.json", "review.diff", "review-description.json"]) await tool(session, "read_document", { document, offset: 0, length: 48000 });
+  await assert.rejects(session.assertComplete(), { code: "PR_REVIEW_READ_INCOMPLETE" });
+  let text = "", offset = 0;
+  while (offset !== null) { const next = await tool(session, "read_document", { document: "review-feedback.json", offset, length: 4000 }); text += next.text; offset = next.nextOffset; }
+  assert.equal(JSON.parse(text).comments[0].body, body);
+  await session.assertComplete(); assert.equal(reads, 2);
+});
+
+
+test("linked product issue text is mandatory and changes during review invalidate the snapshot", async (t) => {
+  const root = "https://github.com/acme/product/issues/7";
+  const { facts, materialDigest } = await fullFeedbackFixture(`I supplemented validation: ${root}#issuecomment-9`);
+  const { reader } = fixture({ changed: 1 }); const original = reader.run;
+  reader.currentReviewFeedbackReader = { async read() { return facts; } };
+  let extraResult = "";
+  reader.run = async (command, args, options) => {
+    if (args[3] === "repos/acme/product/issues/7") return { number: 7, title: "Hardware validation", body: "Bug context", state: "open",
+      user: { login: "qa" }, comments: 1, created_at: "2026-10-28T04:00:00Z", updated_at: "2026-10-28T05:00:00Z", html_url: root };
+    if (args[3] === "repos/acme/product/issues/7/comments?per_page=20&page=1") return [{ id: 9, node_id: "IC_9", body: "Validation procedure; actual hardware result is still pending QA" + extraResult,
+      user: { login: "developer" }, created_at: "2026-10-28T05:00:00Z", updated_at: "2026-10-28T05:00:00Z",
+      html_url: `${root}#issuecomment-9`, issue_url: "https://api.github.com/repos/acme/product/issues/7" }];
+    return original(command, args, options);
+  };
+  const session = await reader.open({ ...TARGET, feedbackSnapshot: { taskId: "review-child", materialDigest } });
+  t.after(() => session.close());
+  for (const document of ["review-manifest.json", "review.diff", "review-description.json", "review-feedback.json"]) {
+    let offset = 0; while (offset !== null) offset = (await tool(session, "read_document", { document, offset, length: 48000 })).nextOffset;
+  }
+  await assert.rejects(session.assertComplete(), { code: "PR_REVIEW_READ_INCOMPLETE" });
+  const manifest = JSON.parse(session.manifestText);
+  const reference = manifest.feedbackSnapshot.linkedMaterials[0];
+  const linked = JSON.parse((await tool(session, "read_document", { document: reference.document, offset: 0, length: 48000 })).text);
+  assert.match(linked.comments[0].body, /still pending QA/);
+  await session.assertComplete();
+  extraResult = "; QA has now added actual execution results";
+  await assert.rejects(session.assertComplete(), { code: "PR_REVIEW_READ_MATERIAL_CHANGED" });
 });

@@ -671,3 +671,20 @@ test("constructor and recovery reject accessor or proxy boundaries without execu
   );
   assert.equal(getterCalls, 0);
 });
+
+
+test("review reading can force fresh facts while concurrent refreshes share one read", async () => {
+  const fixture = executionFixture(); const store = new MemoryStore();
+  let calls = 0; const gate = deferred();
+  const old = factsFixture(fixture); const current = factsFixture(fixture, { observedAt: NOW });
+  const engineer = service({ store, load: async () => { calls++; if (calls > 1) await gate.promise; return calls === 1 ? old : current; } });
+  assert.deepEqual(await engineer.observe(fixture.input), old);
+  assert.deepEqual(await engineer.observe(fixture.input), old);
+  assert.equal(calls, 1);
+  const first = engineer.refresh(fixture.input); const second = engineer.refresh(fixture.input);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 2);
+  gate.resolve();
+  assert.deepEqual(await first, current); assert.deepEqual(await second, current);
+  assert.deepEqual(await engineer.get(fixture.input), current);
+});

@@ -542,7 +542,6 @@ export class PrEngineerService {
   async observe(input, options) {
     const signal = operationSignal(options);
     signal?.throwIfAborted();
-    const identity = createPullRequestReadIdentity(input);
     const stored = await this.get(input);
     signal?.throwIfAborted();
     const now = timestamp(this.#clock(), "clock");
@@ -552,6 +551,15 @@ export class PrEngineerService {
     ) {
       return stored;
     }
+    return this.refresh(input, options);
+  }
+
+  // A review publication boundary needs a current read even while ordinary
+  // background observations are within their cache window.
+  async refresh(input, options) {
+    const signal = operationSignal(options);
+    signal?.throwIfAborted();
+    const identity = createPullRequestReadIdentity(input);
     const key = identity.identityDigest;
     const running = this.#inFlight.get(key);
     if (running) return running;

@@ -5784,6 +5784,7 @@ test("production native grants keep captured feedback read-only when automatic r
     context: { schemaVersion: 1, headRefOid: head, reviewFeedbackDigest: ownReviewFeedbackDigest(feedback), feedback },
     provenance: { kind: "captured_before_repair", observedHeadRefOid: head, observedAt: "2026-10-15T00:00:00.000Z" } });
   let privateReader;
+  let currentFeedbackReader;
   let feedbackWrites = 0;
   const application = await createApplication({
     ...defaultCodeJobApplicationOptions({ config, calls: {}, closeCalls: [],
@@ -5796,6 +5797,9 @@ test("production native grants keep captured feedback read-only when automatic r
     nativeCodexStatusProviderFactory(_options, grant) {
       const facts = grant.consume((value) => value);
       privateReader = facts.originalRepairFeedbackReader;
+      currentFeedbackReader = facts.currentReviewFeedbackReader;
+      assert.deepEqual(Object.keys(currentFeedbackReader), ["read"]);
+      assert.equal(Object.isFrozen(currentFeedbackReader), true);
       assert.deepEqual(Object.keys(privateReader), ["read"]);
       assert.equal(Object.isFrozen(privateReader), true);
       return { async readStatus() { return { state: "available" }; }, async close() {} };
@@ -5804,6 +5808,7 @@ test("production native grants keep captured feedback read-only when automatic r
   try {
     assert.notEqual(config.githubActions?.automaticOwnPrRepair, true);
     assert.equal("originalRepairFeedbackReader" in application, false);
+    assert.equal("currentReviewFeedbackReader" in application, false);
     const query = { snapshotId: snapshot.snapshotId, repository: snapshot.repository, number: snapshot.number,
       feedbackDigest: snapshot.feedbackDigest, originalHeadRefOid: snapshot.originalHeadRefOid };
     assert.deepEqual(await privateReader.read(query), snapshot);

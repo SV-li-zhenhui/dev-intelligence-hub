@@ -86,6 +86,7 @@ import { RoleContextAssembler } from "./services/role-context-assembler.js";
 import { FailedCodeJobContextReader } from "./services/failed-code-job-context-reader.js";
 import { ProactivePrEmployeeService } from "./services/proactive-pr-employee.js";
 import { PrEngineerService } from "./services/pr-engineer-service.js";
+import { BoundReviewFeedbackReader } from "./services/bound-review-feedback-reader.js";
 import { RefreshService } from "./services/refresh-service.js";
 import { OwnPrRepairProgressReader } from "./services/own-pr-repair-progress-reader.js";
 import { RoleWorkerDirectory } from "./services/role-worker-directory.js";
@@ -469,11 +470,12 @@ function productionCliRuntimeFacts(value) {
     "codexLoginCredentialBroker",
     "supervisedCliTemporaryRoot",
     "originalRepairFeedbackReader",
+    "currentReviewFeedbackReader",
   ]);
   if (
     !Object.hasOwn(descriptors, "protectedRoots") ||
     keys.length < 1 ||
-    keys.length > 4 ||
+    keys.length > 5 ||
     keys.some(
       (key) =>
         typeof key !== "string" ||
@@ -521,6 +523,7 @@ function productionCliRuntimeFacts(value) {
   if (feedbackReader !== undefined && typeof feedbackReader?.read !== "function") {
     throw new TypeError("Production CLI original feedback reader is invalid");
   }
+  const currentFeedbackReader = descriptors.currentReviewFeedbackReader?.value;
   return Object.freeze({
     protectedRoots: distinctAbsolutePaths(protectedRoots),
     ...(broker === undefined ? {} : { codexLoginCredentialBroker: broker }),
@@ -529,6 +532,9 @@ function productionCliRuntimeFacts(value) {
       : { supervisedCliTemporaryRoot: path.resolve(supervisedCliTemporaryRoot) }),
     ...(feedbackReader === undefined ? {} : {
       originalRepairFeedbackReader: frozenPort(feedbackReader, ["read"], "originalRepairFeedbackReader"),
+    }),
+    ...(currentFeedbackReader === undefined ? {} : {
+      currentReviewFeedbackReader: frozenPort(currentFeedbackReader, ["read"], "currentReviewFeedbackReader"),
     }),
   });
 }
@@ -1111,6 +1117,7 @@ export async function createApplication({
   let codeJobReader = null;
   let obsoleteCodeJobSettler = null;
   let inputAuthorityVerifier = null;
+  let currentReviewFeedbackReader = null;
   let codeJobDeliveryEvidenceReader = null;
   let codeJobControl = null;
   const taskRuns = new TaskRunRegistry({store,receiptStore:store,...(workCoordinationDependencies.clock ? {clock:workCoordinationDependencies.clock} : {}),
@@ -1214,6 +1221,10 @@ export async function createApplication({
       protectedRoots: cliAndCredentialProtectedRoots,
       codexLoginCredentialBroker,
       originalRepairFeedbackReader: frozenPort(originalRepairFeedbackReader, ["read"], "originalRepairFeedbackReader"),
+      currentReviewFeedbackReader: Object.freeze({ async read(input, options) {
+        if (currentReviewFeedbackReader === null) throw Object.assign(new Error("PR_REVIEW_READ_FEEDBACK_UNAVAILABLE"), { code: "PR_REVIEW_READ_FEEDBACK_UNAVAILABLE" });
+        return currentReviewFeedbackReader.read(input, options);
+      } }),
       ...(typeof privateRuntimeDirectory === "string" &&
           path.isAbsolute(privateRuntimeDirectory) &&
           path.resolve(privateRuntimeDirectory) ===
@@ -2656,6 +2667,13 @@ export async function createApplication({
         ["recover"],
         "PR engineer fact recovery",
       ).recover();
+      // Deferred construction keeps this capability private to review invocations;
+      // no ledger or refresh authority is passed to the CLI.
+      let boundReviewReader = null;
+      currentReviewFeedbackReader = Object.freeze({ async read(input, options) {
+        boundReviewReader ??= new BoundReviewFeedbackReader({ ledger: workLedgerRuntime, factsReader: prEngineerService, inputAuthorityVerifier });
+        return boundReviewReader.read(input, options);
+      } });
       const pullRequestFacts = frozenPort(
         prEngineerService,
         ["context"],
