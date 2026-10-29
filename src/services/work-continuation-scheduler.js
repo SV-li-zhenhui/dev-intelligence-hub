@@ -3,6 +3,7 @@ import { OperationQueue } from '../lib/operation-queue.js';
 import { canonicalJsonDigest } from '../lib/canonical-json-digest.js';
 import { currentWorkItemInputBinding } from './work-ledger-pr-source.js';
 import { automaticReviewWorkEligibility } from '../domain/automatic-review-policy.js';
+import { hasExactLedgerKeys } from './work-ledger-values.js';
 import {
   WORK_CONTINUATION_STATE_KEY, CONTINUATION_MAX_RECORDS, CONTINUATION_ROLES,
   continuationFingerprint, emptyWorkContinuations, migrateWorkContinuationState, normalizeWorkContinuationState,
@@ -11,6 +12,7 @@ import {
 const WAITING = new Set(['waiting_external', 'waiting_condition', 'dispatch_pending', 'retry_wait', 'paused']);
 const TERMINAL = new Set(['completed', 'cancelled', 'superseded']);
 const DETERMINISTIC_DECISION_FAILURES = new Set(['ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION', 'STRUCTURED_BRAIN_RESPONSE_INVALID']);
+const UNCHANGED_INPUT_FAILURES = new Set([...DETERMINISTIC_DECISION_FAILURES, 'PR_FACTS_STALE']);
 const timeout = () => Object.assign(new Error('Work continuation execution exceeded its lease budget'), { code: 'WORK_CONTINUATION_TIMEOUT' });
 const recovery = (action, reason, dueAt = null) => ({ action, reason, dueAt });
 const graphProgress = value => typeof value?.graphProgressDigest === 'string' && /^[a-f0-9]{64}$/.test(value.graphProgressDigest)
@@ -286,10 +288,14 @@ export class WorkContinuationScheduler {
             relatedProgressed = beforeProgress !== null && afterProgress !== null && beforeProgress !== afterProgress;
           }
           result = latest === null ? 'input_changed' : observedRevision !== item.revision || relatedProgressed ? 'role_woken' : 'no_progress';
-          if (result === 'no_progress' && this.#ports.taskRuns?.get) {
+          const outcome = dispatched?.continuationOutcome;
+          if (result === 'no_progress' && hasExactLedgerKeys(outcome, ['itemId', 'fingerprint', 'status', 'code']) &&
+              outcome.itemId === claim.itemId && outcome.fingerprint === claim.fingerprint &&
+              outcome.status === 'decision_deferred' && outcome.code === 'PR_FACTS_STALE') errorCode = outcome.code;
+          if (result === 'no_progress' && errorCode === null && this.#ports.taskRuns?.get) {
             try {
               const run = await this.#ports.taskRuns.get('work-item', claim.itemId), receipt = run?.receipt;
-              if (run.active === false && receipt?.taskRevision === item.revision &&
+              if (run?.active === false && receipt?.taskRevision === item.revision &&
                   receipt.roleId === claim.roleId && receipt.taskId === claim.itemId &&
                   Date.parse(receipt.registeredAt) >= Date.parse(claim.receipts.at(-1).startedAt) &&
                   receipt.phase === 'failed' && DETERMINISTIC_DECISION_FAILURES.has(receipt.outcomeCode)) errorCode = receipt.outcomeCode;
@@ -318,7 +324,7 @@ export class WorkContinuationScheduler {
           if (result === 'runtime_deferred') record.attempt = Math.max(0, record.attempt - 1);
           const done = ['role_woken', 'input_changed'].includes(result);
           const rejected = record.receipts.slice(-3);
-          const waitForChange = record.attempt >= 3 && DETERMINISTIC_DECISION_FAILURES.has(errorCode) && rejected.length === 3 &&
+          const waitForChange = record.attempt >= 3 && UNCHANGED_INPUT_FAILURES.has(errorCode) && rejected.length === 3 &&
             rejected.every(entry => entry.fingerprint === claim.fingerprint && entry.outcome === 'no_progress' && entry.errorCode === errorCode);
           const nextAttemptAt = done || waitForChange ? null : new Date(Date.parse(now) + (record.attempt >= 3 ? 300_000 : 30_000 * Math.max(1, record.attempt))).toISOString();
           const status = done ? (result === 'role_woken' ? 'delivered' : 'superseded') : record.attempt >= 3 ? 'stalled' : 'retry_wait';

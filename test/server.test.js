@@ -131,6 +131,40 @@ test('a durable continuation executes its exact lower-ranked item through the co
 test('a targeted wake waits for an existing ordinary role cycle and executes afterwards without coalescing it away', { timeout: 5_000 },
   () => targetedContinuationChain({ holdOrdinary: true }));
 
+test('the automatic configured role chain returns its exact preclaim deferral to the continuation', async () => {
+  let dispatch;
+  const values = new Map(), target = { itemId: 'work-stale', fingerprint: 'a'.repeat(64) };
+  const employee = new ConfiguredRoleEmployee({
+    definition: { id: 'orchestrator', name: 'Orchestrator', mission: 'Coordinate work', enabled: true, scheduleMinutes: 0 },
+    permissions: { allowedIntents: ['complete'] },
+    brain: { provider: 'local-test', model: 'test', remoteData: { requirements: false, code: false, memory: false } },
+    decisionEngine: { view() { return {}; }, async decide() { assert.fail('stale facts must precede a model decision'); } },
+    store: { async read(key, fallback) { return structuredClone(values.get(key) ?? fallback); },
+      async write(key, value) { values.set(key, structuredClone(value)); } },
+    onRun: async ({ continuationTarget }) => {
+      assert.deepEqual(continuationTarget, target);
+      return { stages: { work: { ok: true, result: { scanned: 1, workAttempts: 0,
+        outcomes: [{ itemId: target.itemId, status: 'decision_deferred', code: 'PR_FACTS_STALE', privateDetails: 'private material' }] } } } };
+    },
+  });
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    refreshService: { async refresh() {} },
+    employeeRegistry: { schedules: () => [], async runSelected(ids, options) {
+      return ids.includes('orchestrator') ? [await employee.run(options)] : [];
+    } },
+    workContinuationScheduler: { async runCycle(options) { dispatch = options.dispatch; return { started: 0 }; } },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError(error) { throw error; } });
+  try {
+    await background.initialRefresh;
+    for (let i = 0; i < 10 && !dispatch; i++) await new Promise(resolve => setImmediate(resolve));
+    const result = await dispatch({ roleId: 'orchestrator', continuationTarget: target, signal: new AbortController().signal });
+    assert.deepEqual(result, { skipped: null, continuationOutcome: { ...target, status: 'decision_deferred', code: 'PR_FACTS_STALE' } });
+    assert.equal(JSON.stringify(await employee.view()).includes('work-stale'), false);
+    assert.equal(JSON.stringify(result).includes('private material'), false);
+  } finally { await background.stop(); }
+});
+
 test('automatic continuation timeout reaches the role and keeps shutdown waiting for late work', { timeout: 5_000 }, async () => {
   const started = deferred(), cancelled = deferred(), release = deferred();
   const item = { itemId: 'work-timeout', revision: 1, status: 'queued', currentTarget: { type: 'role', id: 'developer' } };

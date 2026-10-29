@@ -150,6 +150,17 @@ function runSummary(value) {
   return recovery && Buffer.byteLength(summary, 'utf8') > 512 ? `${prefix}${recovery}` : summary;
 }
 
+function continuationWorkOutcome(value, target) {
+  const stages = dataObject(dataObject(value)?.stages);
+  const stage = dataObject(stages?.work);
+  const work = stage?.ok === true ? dataObject(stage.result) : null;
+  if (!Array.isArray(work?.outcomes)) return null;
+  const matches = work.outcomes.map(dataObject).filter(entry => entry?.itemId === target.itemId);
+  if (matches.length !== 1 || typeof matches[0].status !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(matches[0].status) ||
+      typeof matches[0].code !== 'string' || !/^[A-Z][A-Z0-9_]{0,127}$/.test(matches[0].code)) return null;
+  return { ...target, status: matches[0].status, code: matches[0].code };
+}
+
 function stableErrorCode(error) {
   try {
     const descriptor = Object.getOwnPropertyDescriptor(error, "code");
@@ -532,7 +543,8 @@ export class ConfiguredRoleEmployee {
         lastRun: state.lastRun ? { ...state.lastRun } : null,
         lastErrorCode: state.lastErrorCode,
       }),
-      run: async ({ state, trigger = "scheduled", signal = null, continuationTarget = null }) => {
+      run: async ({ state, trigger = "scheduled", signal = null, continuationTarget = null, onContinuationOutcome = null }) => {
+        if (onContinuationOutcome !== null && typeof onContinuationOutcome !== 'function') throw new TypeError('Invalid continuation outcome observer');
         signal = normalizeAbortSignal(signal);
         throwIfDecisionAborted(signal);
         const normalizedTrigger = safeTrigger(trigger);
@@ -564,6 +576,7 @@ export class ConfiguredRoleEmployee {
           lastErrorCode: failure ? stableErrorCode(failure) : "",
         });
         if (failure) throw failure;
+        if (continuationTarget !== null && onContinuationOutcome !== null) onContinuationOutcome(continuationWorkOutcome(outcome, continuationTarget));
         return next;
       },
     });

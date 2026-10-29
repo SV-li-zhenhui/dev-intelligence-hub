@@ -1573,6 +1573,23 @@ test("a configured role exposes a bounded work-cycle outcome summary", async () 
   assert.equal(JSON.stringify(view).includes("private-item"), false);
 });
 
+test('a continuation observer cannot attribute another task or ambiguous work outcomes to its target', async t => {
+  for (const variant of ['other-task', 'duplicate', 'failed-stage', 'missing-code']) await t.test(variant, async () => {
+    const target = { itemId: 'work-target', fingerprint: 'a'.repeat(64) };
+    const entry = { itemId: target.itemId, status: 'decision_deferred', code: 'PR_FACTS_STALE' };
+    if (variant === 'other-task') entry.itemId = 'other-task';
+    if (variant === 'missing-code') delete entry.code;
+    const employee = new ConfiguredRoleEmployee({ definition: definition('orchestrator'), permissions: permissions('complete'),
+      brain: brain(), decisionEngine: fakeDecisionEngine('orchestrator'), store: new MemoryStore(),
+      onRun: async () => ({ stages: { work: { ok: variant !== 'failed-stage', result: {
+        outcomes: variant === 'duplicate' ? [entry, { ...entry }] : [entry] } } } }) });
+    const observed = [];
+    await employee.run({ continuationTarget: target, onContinuationOutcome: value => { observed.push(value); } });
+    assert.deepEqual(observed, [null]);
+    await employee.run({ onContinuationOutcome: () => { assert.fail('routine work has no continuation target'); } });
+  });
+});
+
 test('a role exposes automatic verification recovery failures even when its work scan is empty', async () => {
   const employee = new ConfiguredRoleEmployee({ definition: definition('developer'), permissions: permissions('complete'),
     brain: brain(), decisionEngine: fakeDecisionEngine('developer'), store: new MemoryStore(),

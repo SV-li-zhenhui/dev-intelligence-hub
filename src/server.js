@@ -4299,13 +4299,15 @@ export function startApplicationBackgroundWork(
       return { skipped: "facts_not_ready" };
     }
     const employeeId = options.employeeIds[0];
+    let continuationOutcome = null;
     activeIndependentEmployeeCycles += 1;
     try {
       // Each role keeps its scoped coordination and execution checks. General
       // code jobs and memory projection must not delay role handoffs or Reviews.
       await runDrainParticipant(DRAIN_PARTICIPANTS.employeeExecution, () => {
         const runOptions = backgroundOperationOptions({ trigger: options.trigger,
-          ...(options.continuationTarget == null ? {} : { continuationTarget: options.continuationTarget }) }, options.signal);
+          ...(options.continuationTarget == null ? {} : { continuationTarget: options.continuationTarget,
+            onContinuationOutcome: outcome => { continuationOutcome = outcome; } }) }, options.signal);
         if (typeof employeeRegistry.runSelected === "function") return employeeRegistry.runSelected([employeeId], runOptions);
         if (typeof employeeRegistry.run === "function") return employeeRegistry.run(employeeId, runOptions);
         if (employeeId === "pr-reviewer" && typeof employeeRegistry.runAll === "function") return employeeRegistry.runAll(runOptions);
@@ -4314,7 +4316,7 @@ export function startApplicationBackgroundWork(
       options.signal.throwIfAborted();
       if (employeeId === "pr-engineer") await recoverReviewHandoffs(options.signal);
       signalWorkContinuations();
-      return { skipped: null };
+      return { skipped: null, ...(continuationOutcome === null ? {} : { continuationOutcome }) };
     } finally {
       activeIndependentEmployeeCycles -= 1;
     }

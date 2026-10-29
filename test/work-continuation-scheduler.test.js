@@ -313,6 +313,56 @@ test('unchanged deterministic decision failures stop model retries across restar
   });
 });
 
+test('unchanged preclaim stale facts wait across restart and rearm on effective changes', async t => {
+  for (const change of ['task', 'related-child', 'configuration', 'runtime']) await t.test(change, async () => {
+    const f = relatedProgressFixture(); let runtimeRevision = 'a'.repeat(64), calls = 0;
+    let scheduler = new WorkContinuationScheduler(f.options);
+    const dispatch = async ({ continuationTarget }) => {
+      calls++;
+      return { skipped: null, continuationOutcome: { ...continuationTarget, status: 'decision_deferred', code: 'PR_FACTS_STALE' } };
+    };
+    const run = async () => { await scheduler.runCycle({ ...f, dispatch, runtimeRevision }); await f.drain(); };
+    for (let i = 0; i < 3; i++) { await run(); f.advance(90_000); }
+    assert.equal(calls, 3);
+    assert.equal(f.state().records[0].recovery.action, 'await_condition');
+    assert.equal(f.state().records[0].nextAttemptAt, null);
+    assert.equal(f.state().records[0].receipts.at(-1).errorCode, 'PR_FACTS_STALE');
+    scheduler = new WorkContinuationScheduler(f.options);
+    f.advance(3600_000); await run();
+    assert.equal(calls, 3);
+    if (change === 'task') f.items[0].revision++;
+    if (change === 'related-child') f.items[1].revision++;
+    if (change === 'configuration') f.config.workCoordination = { leaseDurationMs: 180_000 };
+    if (change === 'runtime') runtimeRevision = 'b'.repeat(64);
+    await run(); assert.equal(calls, 4);
+  });
+});
+
+test('unmatched and transient preclaim observations retain retry without a model receipt', async t => {
+  for (const variant of ['other-item', 'old-fingerprint', 'wrong-status', 'timeout', 'capacity', 'extra-field', 'accessor', 'missing']) await t.test(variant, async () => {
+    const f = fixture(); let calls = 0, accessorReads = 0;
+    f.options.taskRuns = { async order(items) { return items; }, async get() { return null; } };
+    const scheduler = new WorkContinuationScheduler(f.options);
+    const dispatch = async ({ continuationTarget }) => {
+      calls++;
+      const outcome = { ...continuationTarget, status: 'decision_deferred', code: 'PR_FACTS_STALE' };
+      if (variant === 'other-item') outcome.itemId = 'another-work-item';
+      if (variant === 'old-fingerprint') outcome.fingerprint = 'f'.repeat(64);
+      if (variant === 'wrong-status') outcome.status = 'waiting_model';
+      if (variant === 'timeout') outcome.code = 'ROLE_CONTEXT_TIMEOUT';
+      if (variant === 'capacity') outcome.code = 'STRUCTURED_PROVIDER_MODEL_CAPACITY';
+      if (variant === 'extra-field') outcome.extra = true;
+      if (variant === 'accessor') Object.defineProperty(outcome, 'code', { enumerable: true, get() { accessorReads++; return 'PR_FACTS_STALE'; } });
+      return { skipped: null, continuationOutcome: variant === 'missing' ? null : outcome };
+    };
+    for (let i = 0; i < 4; i++) { await scheduler.runCycle({ ...f, dispatch }); await f.drain(); f.advance(3600_000); }
+    assert.equal(calls, 4);
+    assert.equal(f.state().records[0].recovery.action, 'retry');
+    assert.equal(scheduler.readStatus().lastError, null);
+    assert.equal(accessorReads, 0);
+  });
+});
+
 test('real task-run failure receipts bound repeated automatic model decisions without losing restart recovery', async () => {
   const f = fixture(), values = new Map(); let modelCalls = 0;
   const runStore = { async read(key, fallback) { return clone(values.get(key) ?? fallback); },
