@@ -30,7 +30,7 @@ function detailFor(url) {
     headRepository: { name: "repo" },
     headRepositoryOwner: { login: "acme" },
     reviews: [],
-    assignees: [],
+    assignees: [{ login: 'runtime-user' }],
     labels: [],
     statusCheckRollup: [],
   };
@@ -122,7 +122,7 @@ test("finite PR search uses official updated sorting and filters locally before 
 
   assert.deepEqual(items.map(({ number }) => number), [3, 1]);
   assert.deepEqual(detailCalls.sort(), [records[0].url, records[2].url].sort());
-  assert.equal(searchCalls.length, 3);
+  assert.equal(searchCalls.length, 2);
   for (const args of searchCalls) {
     assert.equal(
       updatedArgument(args),
@@ -402,7 +402,7 @@ test("aborting after a saturated segment prevents every child search", async () 
     }),
     /stop segmented search/u,
   );
-  assert.equal(searchCalls, 3);
+  assert.equal(searchCalls, 2);
 });
 
 test("an impossible calendar timestamp is rejected before details", async () => {

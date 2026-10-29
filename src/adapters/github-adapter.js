@@ -1,4 +1,5 @@
 import { types as utilTypes } from "node:util";
+import { isPersonalPullRequest } from '../domain/pr-responsibility.js';
 
 import { runCommand, runJson } from "../lib/command-runner.js";
 import { INCOMING_REVIEW_QUERY, projectIncomingReview } from "./github-incoming-review.js";
@@ -571,7 +572,7 @@ function discoveryOptions(options) {
   };
 }
 
-export function combinePullRequestRecords(assigned, authored, currentUser, requested = []) {
+export function combinePullRequestRecords(assigned, authored, currentUser) {
   const records = new Map();
   const addRecords = (items, source) => {
     for (const item of items) {
@@ -589,7 +590,6 @@ export function combinePullRequestRecords(assigned, authored, currentUser, reque
 
   addRecords(assigned, "assignee");
   addRecords(authored, "author");
-  addRecords(requested, "reviewer");
 
   return [...records.values()]
     .map((record) => {
@@ -965,6 +965,9 @@ export class GitHubAdapter {
       throw new Error("GitHub PR identity changed during refresh");
     }
     const author = record.author?.login || "";
+    if (!Array.isArray(detail.assignees) || detail.assignees.some(user => typeof user?.login !== 'string' || !user.login)) {
+      throw new Error('GitHub PR assignment facts are incomplete');
+    }
     const gitFacts = pullRequestGitFacts(targetAvailable ? detail : {}, {
       repository: repo,
       account: currentUser,
@@ -1041,7 +1044,7 @@ export class GitHubAdapter {
   async searchRelevantPullRequests(options = {}) {
     const { commandOptions, effectiveUpdatedWindow } = discoveryOptions(options);
     const currentUser = await this.currentUser(commandOptions);
-    const [assigned, authored, requested] = await Promise.all([
+    const [assigned, authored] = await Promise.all([
       this.#searchPullRequestRecords(
         "assigned",
         effectiveUpdatedWindow,
@@ -1052,16 +1055,14 @@ export class GitHubAdapter {
         effectiveUpdatedWindow,
         commandOptions,
       ),
-      this.#searchPullRequestRecords("requested", effectiveUpdatedWindow, commandOptions),
     ]);
     if (effectiveUpdatedWindow && effectiveUpdatedWindow.mode !== "unlimited") {
-      mergeSearchRecords([assigned, authored, requested]);
+      mergeSearchRecords([assigned, authored]);
     }
     const records = combinePullRequestRecords(
       assigned,
       authored,
       currentUser,
-      requested,
     );
     const targets = await this.#currentDiscoveryTargets(records, currentUser, commandOptions);
     const items = await mapWithConcurrency(records, 4, (record, index) =>
@@ -1071,7 +1072,7 @@ export class GitHubAdapter {
     if (finalUser.toLowerCase() !== currentUser.toLowerCase()) {
       throw new Error("GitHub account changed during PR refresh");
     }
-    return items;
+    return items.filter(isPersonalPullRequest);
   }
 
   async readIncomingReviewRequest({ repository, number, account }, options = {}) {
@@ -1184,7 +1185,7 @@ export class GitHubAdapter {
     if (finalUser.toLowerCase() !== currentUser.toLowerCase()) {
       throw new Error("GitHub account changed during PR refresh");
     }
-    return items;
+    return items.filter(isPersonalPullRequest);
   }
 
   async #currentDiscoveryTargets(records, currentUser, options) {

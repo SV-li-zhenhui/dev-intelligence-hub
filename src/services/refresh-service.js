@@ -3,6 +3,7 @@ import { mergeMailNotifications } from "../domain/dingtalk-mail.js";
 import {
   ACTION_STATES,
   assessPullRequestResponsibility,
+  isPersonalPullRequest,
 } from "../domain/pr-responsibility.js";
 import { prioritize } from "../domain/prioritizer.js";
 import { diffSnapshots } from "../domain/snapshot-diff.js";
@@ -40,6 +41,11 @@ function dashboardOptions(config) {
   return {
     issueActiveWindowDays: config.githubRead?.issueActiveWindowDays ?? 14,
   };
+}
+
+function personalSnapshot(snapshot) {
+  return snapshot == null ? snapshot : { ...snapshot,
+    items: snapshot.items.filter(item => item.kind !== 'pull_request' || isPersonalPullRequest(item)) };
 }
 
 function serviceError(statusCode, message) {
@@ -385,7 +391,7 @@ export class RefreshService {
         .filter((item) => item.kind === "pull_request")
         .map((item) => [item.id, item]),
     );
-    let pullRequests = githubValues[0].map(({ reviewRepairProgress: _previous, ...item }) => item);
+    let pullRequests = githubValues[0].filter(isPersonalPullRequest).map(({ reviewRepairProgress: _previous, ...item }) => item);
     if (githubCalls[0].status === "fulfilled" && this.config.githubRead?.enabled !== false && this.repairProgressReader !== null) {
       pullRequests = await this.repairProgressReader.enrich(pullRequests, { signal });
     }
@@ -517,7 +523,7 @@ export class RefreshService {
       0,
       clockMilliseconds(this.clock) - startedAt,
     );
-    const diff = diffSnapshots(previous, snapshot);
+    const diff = diffSnapshots(personalSnapshot(previous), snapshot);
     const dashboard = buildDashboard(
       snapshot,
       previous,
@@ -582,7 +588,7 @@ export class RefreshService {
     let notification = { sent: false, reason: "disabled" };
     let notificationDiff = null;
     if (notify && this.config.dingtalk.enabled && !errors.length) {
-      notificationDiff = diffSnapshots(notificationBaseline, snapshot);
+      notificationDiff = diffSnapshots(personalSnapshot(notificationBaseline), snapshot);
       try {
         notification = await this.notifier.send(
           notificationDiff,

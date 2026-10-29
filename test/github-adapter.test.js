@@ -18,6 +18,7 @@ function currentTargetPr(overrides = {}) {
     url: "https://github.com/acme/repo/pull/42",
     state: "OPEN",
     author: { login: "contributor" },
+    assignees: [{ login: 'runtime-user' }],
     changedFiles: 1,
     baseRefName: "main",
     baseRefOid: "a".repeat(40),
@@ -139,6 +140,46 @@ test("assigned and authored searches combine before detail lookup", () => {
     combined.find((record) => record.number === 8).relation,
     "review_requested",
   );
+});
+
+test('personal PR discovery searches only assignments and authorship', async () => {
+  const searches = [];
+  const adapter = new GitHubAdapter({ run: async (_command, args) => {
+    if (args[0] === 'api') return { login: 'runtime-user' };
+    if (args[0] === 'search') { searches.push(args); return []; }
+    assert.fail('empty personal searches require no PR detail reads');
+  } });
+  assert.deepEqual(await adapter.searchRelevantPullRequests(), []);
+  assert.equal(searches.length, 2);
+  assert.ok(searches.every(args => args.includes('--assignee=@me') || args.includes('--author=@me')));
+});
+
+test('fresh assignment facts remove reassigned search hits but preserve authored PRs', async t => {
+  for (const owned of [false, true]) await t.test(owned ? 'authored' : 'reassigned', async () => {
+    const record = { number: 42, title: 'PR', url: 'https://github.com/acme/repo/pull/42',
+      repository: { nameWithOwner: 'acme/repo' }, author: { login: owned ? 'runtime-user' : 'contributor' } };
+    const adapter = new GitHubAdapter({ run: async (_command, args) => {
+      if (isCurrentTargetBatchCall(args)) return currentTargetBatchResponse(args);
+      if (args[0] === 'api') return { login: 'runtime-user' };
+      if (args[0] === 'search') return args.includes('--assignee=@me') ? [record] : [];
+      if (args[0] === 'pr') return { ...currentTargetPr(), assignees: [], labels: [], reviews: [], statusCheckRollup: [] };
+      assert.fail('Unexpected command');
+    } });
+    assert.equal((await adapter.searchRelevantPullRequests()).length, owned ? 1 : 0);
+    assert.equal((await adapter.searchPullRequests('assigned', 'runtime-user')).length, owned ? 1 : 0);
+  });
+});
+
+test('incomplete assignment facts fail discovery instead of retiring a previously assigned PR', async () => {
+  const record = { number: 42, title: 'PR', url: 'https://github.com/acme/repo/pull/42',
+    repository: { nameWithOwner: 'acme/repo' }, author: { login: 'contributor' } };
+  const adapter = new GitHubAdapter({ run: async (_command, args) => {
+    if (isCurrentTargetBatchCall(args)) return currentTargetBatchResponse(args);
+    if (args[0] === 'api') return { login: 'runtime-user' };
+    if (args[0] === 'search') return args.includes('--assignee=@me') ? [record] : [];
+    const detail = currentTargetPr(); delete detail.assignees; return detail;
+  } });
+  await assert.rejects(adapter.searchRelevantPullRequests(), /assignment facts are incomplete/);
 });
 
 test("review facts retain the commit reviewed by each responsible person", () => {
@@ -310,7 +351,7 @@ test("refresh-facing GitHub reads forward one shutdown signal to every command",
   await adapter.searchIssues(options);
   await adapter.versions(["acme/repo"], options);
 
-  assert.equal(calls.length, 8);
+  assert.equal(calls.length, 7);
   assert.ok(calls.every((call) => call.command === "gh"));
   assert.ok(calls.every((call) => call.options.signal === controller.signal));
 });
@@ -591,7 +632,7 @@ test("relevant PR search uses the active account, returns every result, and fetc
           login: "acme",
         },
         reviews: [],
-        assignees: [],
+        assignees: [{ login: 'runtime-user' }],
         labels: [],
         statusCheckRollup: [],
       };
@@ -659,7 +700,7 @@ test("relevant PR search uses the live base Ref instead of historical CLI and PR
           mergeStateStatus: "CLEAN",
           isDraft: false,
           labels: [],
-          assignees: [],
+          assignees: [{ login: 'runtime-user' }],
           milestone: null,
           baseRefName: "main",
           baseRefOid: "d".repeat(40),
@@ -718,7 +759,7 @@ test("discovery reads current PR targets in bounded batches of 25", async () => 
       const number = Number(args[2].split("/").at(-1));
       return { ...currentTargetPr({ number, url: `https://github.com/acme/repo/pull/${number}` }),
         headRepository: { name: "repo" }, headRepositoryOwner: { login: "contributor" },
-        reviews: [], assignees: [], labels: [], statusCheckRollup: [],
+        reviews: [], assignees: [{ login: 'runtime-user' }], labels: [], statusCheckRollup: [],
       };
     }
     assert.fail(`Unexpected command: ${args.join(" ")}`);
@@ -791,7 +832,7 @@ test("a deleted live Ref disables only that PR while healthy discovery keeps its
         headRepository: number === 8 ? null : { name: "repo", nameWithOwner: "contributor/repo" },
         headRepositoryOwner: number === 8 ? null : { login: "contributor" },
         reviews: [],
-        assignees: [],
+        assignees: [{ login: 'runtime-user' }],
         labels: [],
         statusCheckRollup: [],
       };
@@ -819,7 +860,7 @@ test("stale open search results enrich terminal PRs with deleted refs without ex
       if (args[0] === "api") return { login: "runtime-user" };
       if (args[0] === "search") return args.includes("--assignee=@me") ? [record] : [];
       if (args[0] === "pr") return { number: 42, url: record.url, headRefOid: "b".repeat(40),
-        headRepository: null, reviews: [], assignees: [], labels: [], statusCheckRollup: [] };
+        headRepository: null, reviews: [], assignees: [{ login: 'runtime-user' }], labels: [], statusCheckRollup: [] };
       assert.fail("unexpected terminal enrichment request");
     } });
     const [item] = await adapter.searchRelevantPullRequests();

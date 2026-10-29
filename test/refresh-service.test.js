@@ -27,6 +27,7 @@ function pullRequest(overrides = {}) {
     relation: "review_requested",
     author: "someone-else",
     currentUser: "local-owner",
+    assignees: ['local-owner'],
     state: "open",
     updatedAt: "2026-07-31T08:00:00.000Z",
     reviewFactsAvailable: true,
@@ -37,6 +38,27 @@ function pullRequest(overrides = {}) {
     ...overrides,
   };
 }
+
+test('refresh and retained fallback keep only authored or currently assigned PRs', async () => {
+  const outside = pullRequest({ id: 'reviewer-only', assignmentSource: 'reviewer', assignees: [], reviewRecipient: 'local-owner' });
+  const assigned = pullRequest({ id: 'assigned', assignees: ['LOCAL-OWNER'] });
+  const authored = pullRequest({ id: 'authored', relation: 'authored', author: 'local-owner', assignees: ['qa'] });
+  const store = new MemoryStore({ snapshot: { refreshedAt: REFRESH_STARTED_AT, items: [outside], versions: [] } }); let fail = false;
+  const service = new RefreshService({ github: { async searchRelevantPullRequests() {
+    if (fail) throw new Error('GitHub unavailable'); return [outside, assigned, authored];
+  }, async searchIssues() { return []; }, async versions() { return []; } },
+    brain: null, dingtalk: {}, store, notifier: {}, clock: () => new Date(REFRESH_STARTED_AT),
+    config: { trackedRepositories: [], dingtalk: { enabled: false }, brain: { enabled: false }, prResponsibility: { historicalAfterDays: 60 } } });
+  const first = await service.refresh();
+  assert.deepEqual(first.diff.removed, [], 'excluded review requests are not reported as completed work');
+  assert.deepEqual((await store.read('snapshot')).items.map(item => item.id).sort(), ['assigned', 'authored']);
+  const snapshot = await store.read('snapshot'); snapshot.items.push(outside);
+  await store.write('snapshot', snapshot); fail = true;
+  await service.refresh();
+  const retained = await store.read('snapshot');
+  assert.deepEqual(retained.items.map(item => item.id).sort(), ['assigned', 'authored']);
+  assert.equal(retained.sourceStatus.githubPullRequests.complete, false);
+});
 
 test("an explicitly disabled GitHub read boundary makes no adapter call", async () => {
   let githubCalls = 0;

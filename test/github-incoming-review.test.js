@@ -90,7 +90,7 @@ test("bounded timeline without a matching event cannot invent a receipt time", (
   const pr = { reviews: { nodes: [] }, assignees: { nodes: [{ login: "me" }] }, reviewRequests: { nodes: [] }, timelineItems: { nodes: [], pageInfo: { hasPreviousPage: true } } };
   assert.equal(projectIncomingReview(pr, "me").reviewReceivedAt, null);
 });
-test("reviewer-only PRs are discovered and enriched once even if also assigned", async () => {
+test("reviewer-only PRs are excluded from personal discovery before enrichment", async () => {
   let details = 0;
   const record = { number: 1, title: "fix", url: "https://github.com/acme/repo/pull/1", repository: { nameWithOwner: "acme/repo" }, author: { login: "dev" }, state: "open" };
   const target = { number: 1, url: record.url, state: "OPEN", author: record.author, changedFiles: 1,
@@ -108,8 +108,6 @@ test("reviewer-only PRs are discovered and enriched once even if also assigned",
     details++;
     return { ...target, reviews: [], labels: [], assignees: [], statusCheckRollup: [] };
   } });
-  const [pr] = await adapter.searchRelevantPullRequests();
-  assert.equal(pr.relation, "review_requested");
-  assert.equal(pr.assignmentSource, "reviewer");
-  assert.equal(details, 1);
+  assert.deepEqual(await adapter.searchRelevantPullRequests(), []);
+  assert.equal(details, 0);
 });

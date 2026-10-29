@@ -2,6 +2,13 @@ import { hasLaterIncomingAssignment } from "./automatic-review-policy.js";
 
 const DAY = 86_400_000;
 
+export function isPersonalPullRequest(item) {
+  if (typeof item?.currentUser !== 'string' || !item.currentUser) return false;
+  const account = item.currentUser.toLowerCase();
+  return (typeof item.author === 'string' && item.author.toLowerCase() === account) ||
+    (Array.isArray(item.assignees) && item.assignees.some(login => typeof login === 'string' && login.toLowerCase() === account));
+}
+
 export const ACTION_STATES = Object.freeze({
   ACTION_NOW: "action_now",
   WAITING_OTHER: "waiting_other",
