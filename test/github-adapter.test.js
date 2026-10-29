@@ -154,19 +154,24 @@ test('personal PR discovery searches only assignments and authorship', async () 
   assert.ok(searches.every(args => args.includes('--assignee=@me') || args.includes('--author=@me')));
 });
 
-test('fresh assignment facts remove reassigned search hits but preserve authored PRs', async t => {
-  for (const owned of [false, true]) await t.test(owned ? 'authored' : 'reassigned', async () => {
+test('fresh assignment takes precedence over authorship in both discovery methods', async t => {
+  for (const { name, owned, assignees, expected } of [
+    { name: 'unassigned non-author', owned: false, assignees: [], expected: 0 },
+    { name: 'unassigned author', owned: true, assignees: [], expected: 1 },
+    { name: 'author assigned elsewhere', owned: true, assignees: ['qa'], expected: 0 },
+    { name: 'author still assigned', owned: true, assignees: ['RUNTIME-USER', 'qa'], expected: 1 },
+  ]) await t.test(name, async () => {
     const record = { number: 42, title: 'PR', url: 'https://github.com/acme/repo/pull/42',
       repository: { nameWithOwner: 'acme/repo' }, author: { login: owned ? 'runtime-user' : 'contributor' } };
     const adapter = new GitHubAdapter({ run: async (_command, args) => {
       if (isCurrentTargetBatchCall(args)) return currentTargetBatchResponse(args);
       if (args[0] === 'api') return { login: 'runtime-user' };
       if (args[0] === 'search') return args.includes('--assignee=@me') ? [record] : [];
-      if (args[0] === 'pr') return { ...currentTargetPr(), assignees: [], labels: [], reviews: [], statusCheckRollup: [] };
+      if (args[0] === 'pr') return { ...currentTargetPr(), assignees: assignees.map(login => ({ login })), labels: [], reviews: [], statusCheckRollup: [] };
       assert.fail('Unexpected command');
     } });
-    assert.equal((await adapter.searchRelevantPullRequests()).length, owned ? 1 : 0);
-    assert.equal((await adapter.searchPullRequests('assigned', 'runtime-user')).length, owned ? 1 : 0);
+    assert.equal((await adapter.searchRelevantPullRequests()).length, expected);
+    assert.equal((await adapter.searchPullRequests('assigned', 'runtime-user')).length, expected);
   });
 });
 

@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   ACTION_STATES,
   assessPullRequestResponsibility,
+  isPersonalPullRequest,
 } from "../src/domain/pr-responsibility.js";
 
 const now = "2026-07-31T09:00:00.000Z";
@@ -38,6 +39,29 @@ function assess(overrides) {
     historicalAfterDays: 60,
   });
 }
+
+test("current assignees take precedence over PR authorship", () => {
+  assert.equal(isPersonalPullRequest(pullRequest({ assignees: ['reviewer'] })), false);
+  assert.equal(isPersonalPullRequest(pullRequest({ assignees: [] })), true);
+  assert.equal(isPersonalPullRequest(pullRequest({ assignees: ['LOCAL-OWNER', 'reviewer'] })), true);
+  assert.equal(isPersonalPullRequest(pullRequest({ author: 'contributor', assignees: [] })), false);
+});
+
+test("a PR assigned elsewhere cannot create author work from feedback or failed checks", async t => {
+  for (const overrides of [
+    { reviewDecision: 'CHANGES_REQUESTED', reviewFeedbackAvailable: true, reviewFeedbackCount: 1 },
+    { mergeStateStatus: 'DIRTY' },
+    { ciStatus: 'FAILURE' },
+    { isDraft: true },
+    { reviewFactsAvailable: false, headRefOid: null, ciStatus: 'UNKNOWN' },
+  ]) await t.test(JSON.stringify(overrides), () => {
+    const result = assess({ ...overrides, assignees: ['reviewer'] });
+    assert.equal(result.actionState, ACTION_STATES.WAITING_OTHER);
+    assert.equal(result.nextActor, 'assignee');
+    assert.equal(result.requiresConfirmation, false);
+  });
+  assert.equal(assess({ assignees: ['LOCAL-OWNER'], ciStatus: 'FAILURE' }).actionState, ACTION_STATES.ACTION_NOW);
+});
 
 test("a recent assigned PR without my review needs my review now", () => {
   const result = assess({

@@ -2,8 +2,15 @@ import { hasLaterIncomingAssignment } from "./automatic-review-policy.js";
 
 const DAY = 86_400_000;
 
+function assignedElsewhere(item) {
+  return typeof item?.currentUser === 'string' && Boolean(item.currentUser) &&
+    Array.isArray(item.assignees) && item.assignees.length > 0 &&
+    !item.assignees.some(login => typeof login === 'string' && login.toLowerCase() === item.currentUser.toLowerCase());
+}
+
 export function isPersonalPullRequest(item) {
   if (typeof item?.currentUser !== 'string' || !item.currentUser) return false;
+  if (assignedElsewhere(item)) return false;
   const account = item.currentUser.toLowerCase();
   return (typeof item.author === 'string' && item.author.toLowerCase() === account) ||
     (Array.isArray(item.assignees) && item.assignees.some(login => typeof login === 'string' && login.toLowerCase() === account));
@@ -276,6 +283,11 @@ export function assessPullRequestResponsibility(
       "closed",
       `PR 已${item.state}`,
     );
+  }
+
+  if (assignedElsewhere(item)) {
+    return assessment(ACTION_STATES.WAITING_OTHER, 'assignee', 'wait_assignee',
+      '当前已分配给他人，等待当前负责人推进');
   }
 
   const inactiveDays = ageInDays(item.updatedAt, now);

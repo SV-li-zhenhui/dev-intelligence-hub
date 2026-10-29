@@ -6,7 +6,8 @@ test('personal work excludes reviewer-only and reassigned PRs from every current
   const pr = (id, overrides) => ({ id, kind: 'pull_request', relation: 'review_requested', actionState: 'action_now',
     currentUser: 'reviewer', author: 'contributor', assignees: [], updatedAt: '2026-07-30T09:00:00.000Z', ...overrides });
   const dashboard = buildDashboard({ refreshedAt: '2026-07-30T09:00:00.000Z', versions: [],
-    items: [pr('assigned', { assignees: ['REVIEWER'] }), pr('authored', { relation: 'authored', author: 'Reviewer', assignees: ['qa'] }),
+    items: [pr('assigned', { assignees: ['REVIEWER'] }), pr('authored', { relation: 'authored', author: 'Reviewer', assignees: [] }),
+      pr('authored-transferred', { relation: 'authored', author: 'Reviewer', assignees: ['qa'] }),
       pr('reviewer-only', { assignmentSource: 'reviewer', reviewRecipient: 'reviewer' }),
       pr('reassigned', { assignmentSource: 'assignee', assignees: ['other-user'] }),
       pr('missing-account', { currentUser: undefined }),
@@ -16,6 +17,7 @@ test('personal work excludes reviewer-only and reassigned PRs from every current
   assert.deepEqual(dashboard.groups.actionNow.map(item => item.id).sort(), ['assigned', 'authored']);
   assert.equal(JSON.stringify(dashboard).includes('reviewer-only'), false);
   assert.equal(JSON.stringify(dashboard).includes('reassigned'), false);
+  assert.equal(JSON.stringify(dashboard).includes('authored-transferred'), false);
   assert.equal(dashboard.groups.recentlyCompleted.length, 0);
   assert.equal(dashboard.groups.myIssues.length, 1);
 });
