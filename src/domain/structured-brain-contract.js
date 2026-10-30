@@ -305,8 +305,29 @@ export const WORK_DECISION_JSON_SCHEMA = deepFreeze({
   },
 });
 
-// The model supplies the command's reason once. Persisted/internal decisions
-// still carry the identical wrapper reason required by the domain contract.
+const CHILD_WORK_FIELDS = ["capability", "dependsOn", "acceptanceContract"];
+const modelOrchestrationSchema = {
+  ...ORCHESTRATION_INTENT_JSON_SCHEMA,
+  oneOf: ORCHESTRATION_INTENT_JSON_SCHEMA.oneOf.map((variant) => {
+    if (variant.properties.type.const !== "decompose") return variant;
+    const { capability, dependsOn, acceptanceContract, ...properties } = variant.properties;
+    return {
+      ...variant,
+      required: variant.required.filter(key => !CHILD_WORK_FIELDS.includes(key)),
+      properties: {
+        ...properties,
+        work: {
+          ...variant.properties.work,
+          required: [...variant.properties.work.required, ...CHILD_WORK_FIELDS],
+          properties: { ...variant.properties.work.properties, capability, dependsOn, acceptanceContract },
+        },
+      },
+    };
+  }),
+};
+
+// Models describe each child in one work object and supply the reason once.
+// Persisted commands retain the exact existing domain shape and validation.
 export const MODEL_WORK_DECISION_JSON_SCHEMA = deepFreeze({
   ...WORK_DECISION_JSON_SCHEMA,
   properties: {
@@ -316,8 +337,8 @@ export const MODEL_WORK_DECISION_JSON_SCHEMA = deepFreeze({
         variant.properties?.type?.const !== "orchestrate" ? variant : {
           ...variant,
           required: variant.required.filter((key) => key !== "reason"),
-          properties: Object.fromEntries(Object.entries(variant.properties)
-            .filter(([key]) => key !== "reason")),
+          properties: { ...Object.fromEntries(Object.entries(variant.properties)
+            .filter(([key]) => key !== "reason")), action: modelOrchestrationSchema },
         }),
     },
   },
@@ -395,6 +416,16 @@ export function parseStructuredWorkDecision(text, options = {}) {
 
 export function parseModelWorkDecision(text, options = {}) {
   return parseWorkDecision(text, options, (value) => {
+    const action = value?.intent?.type === "orchestrate" ? value.intent.action : null;
+    if (action?.type === "decompose" && action.work &&
+        CHILD_WORK_FIELDS.some(key => Object.hasOwn(action.work, key))) {
+      if (CHILD_WORK_FIELDS.some(key => Object.hasOwn(action, key) || !Object.hasOwn(action.work, key))) {
+        throw new Error("Ambiguous or incomplete model child work");
+      }
+      const { capability, dependsOn, acceptanceContract, ...work } = action.work;
+      value = { ...value, intent: { ...value.intent,
+        action: { ...action, work, capability, dependsOn, acceptanceContract } } };
+    }
     if (value?.intent?.type === "orchestrate" && !Object.hasOwn(value.intent, "reason")) {
       value = { ...value, intent: { ...value.intent, reason: value.intent.action?.reason } };
     }

@@ -928,6 +928,29 @@ test("RoleDecisionEngine asks for one orchestration reason and derives the inter
   assert.ok(schema.properties.action.oneOf.every(action => action.required.includes("reason")));
 });
 
+test("RoleDecisionEngine accepts the model child work shape without another model call", async () => {
+  const expected = triageDecompositionDecision();
+  const response = structuredClone(expected);
+  const action = response.intent.action;
+  delete response.intent.reason;
+  for (const key of ["capability", "dependsOn", "acceptanceContract"]) {
+    action.work[key] = action[key]; delete action[key];
+  }
+  const requests = [];
+  const engine = new RoleDecisionEngine({
+    definition: definition("orchestrator"), permissions: permissions("orchestrate"), brain: brain(),
+    brainRouter: { describe: () => ({ singleAttempt: true }), async generate(request) {
+      requests.push(request); return JSON.stringify(response);
+    } },
+  });
+  assert.deepEqual(await engine.decide(), expected);
+  assert.equal(requests.length, 1);
+  const orchestration = requests[0].schema.properties.intent.oneOf.find(v => v.properties?.type?.const === "orchestrate");
+  const decompose = orchestration.properties.action.oneOf.find(v => v.properties.type.const === "decompose");
+  assert.ok(decompose.properties.work.required.includes("acceptanceContract"));
+  assert.match(requests[0].messages[0].content, /title, description, capability, dependsOn and acceptanceContract together in intent\.action\.work/);
+});
+
 test("RoleDecisionEngine explains and repairs the orchestration reason binding", async () => {
   const invalid = orchestrationDecision();
   invalid.intent.reason = "wrapper reason differs";
