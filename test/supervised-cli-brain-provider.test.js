@@ -522,6 +522,7 @@ test("Codex runs once with fixed no-authority flags and an isolated environment"
       argumentValue(invocation.args, "-c"),
       'model_reasoning_effort="high"',
     );
+    assert.ok(invocation.args.includes('service_tier="default"'));
     assert.equal(argumentValue(invocation.args, "-C"), invocation.cwd);
     assert.equal(invocation.args.at(-1), "-");
     for (const forbidden of [

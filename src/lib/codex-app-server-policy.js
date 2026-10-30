@@ -21,7 +21,7 @@ const REVIEW_TOOLS = Object.freeze(['read_document', 'read_source', 'list_direct
 
 function overrides(request, instructionsFile, review) {
   return [
-    `model=${JSON.stringify(request.model)}`, 'model_provider="openai"',
+    `model=${JSON.stringify(request.model)}`, 'model_provider="openai"', 'service_tier="default"',
     ...(request.reasoningEffort ? [`model_reasoning_effort=${JSON.stringify(request.reasoningEffort)}`] : []),
     'approval_policy="never"', 'sandbox_mode="read-only"', 'web_search="disabled"',
     'project_doc_max_bytes=0', 'notify=[]', 'developer_instructions=""',
@@ -85,5 +85,5 @@ export function threadConfiguration(config,{reader,execution,channel='review',na
     tools:Object.fromEntries(tools.map(tool=>[tool,{approval_mode:'approve',output_token_limit:65536}]))};
   const agents=Object.fromEntries(inventory(config.agents).filter(([,value])=>value && typeof value==='object' && !Array.isArray(value))
     .map(([name])=>[name,{config_file:agentConfigPath,description:'Trusted read-only independent reviewer; follow the host task and current permissions.'}]));
-  return {mcp_servers,agents:channel === 'code-job' ? { ...agents, enabled: false } : agents};
+  return {service_tier:'default',mcp_servers,agents:channel === 'code-job' ? { ...agents, enabled: false } : agents};
 }

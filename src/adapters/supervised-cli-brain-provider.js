@@ -1762,6 +1762,7 @@ function codexArguments({
     ...(request.reasoningEffort
       ? ["-c", `model_reasoning_effort="${request.reasoningEffort}"`]
       : []),
+    "-c", 'service_tier="default"',
     "-C",
     invocation.path,
     ...(sessionId === null ? [] : ["resume", sessionId]),

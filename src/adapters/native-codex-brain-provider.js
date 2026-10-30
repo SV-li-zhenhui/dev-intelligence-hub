@@ -127,6 +127,7 @@ function argumentsFor(request, directory, threadId, reader, nativeSkill = false)
     "-c", "project_doc_max_bytes=0",
     "-c", 'model_provider="openai"',
     ...(request.reasoningEffort ? ["-c", `model_reasoning_effort="${request.reasoningEffort}"`] : []),
+    "-c", 'service_tier="default"',
     ...["apps", "browser_use", "computer_use", "image_generation", ...(!nativeSkill ? ["multi_agent"] : []), "hooks", "plugins", "remote_plugin", "plugin_sharing", "skill_search", "goals"].flatMap((name) => ["--disable", name]),
     ...(nativeSkill ? ["--enable", "multi_agent", "-c", "skills.include_instructions=false", "-c", "skills.bundled.enabled=false"] : []),
     ...(reader ? ["-c", `mcp_servers.pr_review.url=${JSON.stringify(reader.url)}`, "-c", "mcp_servers.pr_review.required=true",

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { appServerArguments, threadConfiguration, assertEffectiveAppServerPolicy } from '../src/lib/codex-app-server-policy.js';
+import { appServerArguments, threadConfiguration, reviewerConfiguration, assertEffectiveAppServerPolicy } from '../src/lib/codex-app-server-policy.js';
 
 test('app-server policy uses supported overrides without moving native home',()=>{
   const args=appServerArguments({model:'gpt-6.1-sol',reasoningEffort:'high'},'D:/private/instructions.txt',true);
@@ -10,6 +10,29 @@ test('app-server policy uses supported overrides without moving native home',()=
   assert.ok(args.includes('features.code_mode_host=true'));
   assert.ok(args.includes('features.multi_agent_v2=false'));
   assert.ok(args.includes('agents.max_concurrent_threads_per_session=3'));
+});
+
+test('native requests and reviewer agents use standard service for both models', () => {
+  for (const request of [{model:'gpt-6-luna',reasoningEffort:'medium'}, {model:'gpt-6.1-sol',reasoningEffort:'high'}]) {
+    for (const review of [true, false]) {
+      const args = appServerArguments(request, 'D:/private/instructions.txt', review);
+      assert.ok(args.includes('service_tier="default"'));
+      assert.ok(args.includes(`model=${JSON.stringify(request.model)}`));
+      assert.ok(args.includes(`model_reasoning_effort=${JSON.stringify(request.reasoningEffort)}`));
+    }
+    assert.match(reviewerConfiguration(request, 'D:/private/instructions.txt'), /^service_tier="default"$/m);
+  }
+});
+
+test('thread resume overrides inherited accelerated tiers without changing home settings', () => {
+  for (const service_tier of [undefined, 'auto', 'fast', 'priority', 'ultrafast', 'default']) {
+    for (const channel of ['review', 'code-job']) {
+      const inherited = {service_tier};
+      const options = channel === 'code-job' ? {channel, namespace:'dih_code_job_0123456789abcdef', execution:{url:'http://127.0.0.1:1234/execution'}} : {channel};
+      assert.equal(threadConfiguration(inherited, options).service_tier, 'default');
+      assert.equal(inherited.service_tier, service_tier);
+    }
+  }
 });
 
 test('thread policy disables each inherited MCP without copying private configuration',()=>{

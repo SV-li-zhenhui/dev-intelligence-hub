@@ -802,6 +802,7 @@ test("native process uses read-only native login with scrubbed environment and s
   assert.equal(call.args[call.args.indexOf("--sandbox") + 1], "read-only");
   assert.ok(call.args.includes('approval_policy="never"'));
   assert.ok(call.args.includes('model_reasoning_effort="high"'));
+  assert.ok(call.args.includes('service_tier="default"'));
   assert.ok(call.args.includes("project_doc_max_bytes=0"));
   assert.ok(!call.args.includes("shell_tool"));
   await assert.rejects(provider.generate(request({ model: "--dangerous-argument" })), TypeError);
