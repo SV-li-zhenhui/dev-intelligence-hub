@@ -9,6 +9,8 @@ import {
 import { deliveryAcceptanceContractDigest } from "../src/domain/delivery-evidence-contract.js";
 import { createWorkGraphSnapshot } from "../src/domain/work-graph-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { createPullRequestExecutionBinding } from "../src/domain/pull-request-execution-binding.js";
+import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import {
   appendPullRequestWorkSource,
   createPullRequestWorkSource,
@@ -2669,4 +2671,80 @@ test("development receives conflict materials after a typed internal repair hand
   await assert.rejects(assemble(f, { conflictInspectionReader: { async read() { calls++; throw new Error("sealed material unavailable"); } } }),
     { code: "ROLE_CONTEXT_CONFLICT_INSPECTION_UNAVAILABLE" });
   assert.equal(calls, 1);
+});
+
+test("owner CI development receives sealed conflict material with the original fix_ci action", async () => {
+  const { fixture: f, gitTarget } = atomicPullRequestFixture();
+  const { eventId, contentDigest, ...old } = f.item.event;
+  const event = normalizeWorkflowEvent({ ...old, eventType: "pull_request.owner_requested",
+    source: { provider: "local-owner", scopeId: "owner-request:123e4567-e89b-42d3-a456-426614174000" },
+    payload: { ...old.payload, workType: "general", nextAction: "fix_ci", suggestedCapability: "development",
+      expectedHeadRefOid: gitTarget.headRefOid } });
+  const source = createPullRequestWorkSource(pullRequestAssignment(1, event)).source;
+  f.item = { ...f.item, currentTarget: { type: "role", id: "developer" }, event, source, inputDigest: source.current.inputDigest };
+  f.snapshot.graph.tasks.find(t => t.taskId === f.item.itemId).responsibility.id = "developer";
+  const inputBinding = createPullRequestExecutionBinding({ sourceBinding: currentWorkItemInputBinding(f.item), event });
+  const preparationBinding = createConflictPreparationBinding({ gitTarget, preparation: {
+    schemaVersion: 1, preparationId: DIGEST_A, status: "conflicted",
+    baseCommitOid: gitTarget.baseRefOid, headCommitOid: gitTarget.headRefOid,
+    mergeBaseOid: "c".repeat(40), resultTreeOid: "d".repeat(40),
+    conflicts: [{ path: "src/review.js", mode: "100644" }], boundaryDigest: DIGEST_B,
+    evidenceDigest: DIGEST_C, resultObjectDigest: DIGEST_D, materialization: "full-tree",
+  } });
+  const inspection = { inputBinding, preparationBinding, files: [{ path: "src/review.js", content: "sealed conflict bytes" }] };
+  let calls = 0;
+  let material = inspection;
+  const options = { conflictInspectionReader: { async read(input) {
+    calls++;
+    assert.deepEqual(input, { itemId: f.item.itemId, itemRevision: f.item.revision, inputDigest: f.item.inputDigest });
+    if (material instanceof Error) throw material;
+    return material;
+  } } };
+  const packet = await assemble(f, options);
+  assert.equal(calls, 1);
+  assert.deepEqual(packet.context.code.conflictInspection, inspection);
+  assert.equal(packet.context.code.sourceEvent.payload.nextAction, "fix_ci");
+  material = null;
+  assert.equal((await assemble(f, options)).context.code.conflictInspection, undefined);
+  material = new Error("sealed material unavailable");
+  await assert.rejects(assemble(f, options), { code: "ROLE_CONTEXT_CONFLICT_INSPECTION_UNAVAILABLE" });
+  material = { ...inspection, inputBinding: { ...inputBinding, headRefOid: "e".repeat(40) } };
+  await assert.rejects(assemble(f, options), { code: "ROLE_CONTEXT_CONFLICT_INSPECTION_UNAVAILABLE" });
+  material = { ...inspection, preparationBinding: { ...preparationBinding,
+    gitTarget: { ...gitTarget, baseRefOid: "e".repeat(40) } } };
+  await assert.rejects(assemble(f, options), { code: "ROLE_CONTEXT_CONFLICT_INSPECTION_UNAVAILABLE" });
+  const sourceBinding = currentWorkItemInputBinding(f.item);
+  f.item = { ...f.item, kind: "graph_task", source: null, assignment: { graphTask: { sourceBinding } } };
+  material = inspection;
+  assert.deepEqual((await assemble(f, options)).context.code.conflictInspection, inspection);
+  assert.equal(calls, 6);
+});
+
+test("owner CI conflict materials remain limited to development and exact repair provenance", async (t) => {
+  for (const variant of ["other-role", "other-action", "other-capability", "stale-head", "other-relation"]) {
+    await t.test(variant, async () => {
+      const { fixture: f, gitTarget } = atomicPullRequestFixture();
+      const { eventId, contentDigest, ...old } = f.item.event;
+      const payload = { ...old.payload, workType: "general", nextAction: "fix_ci", suggestedCapability: "development",
+        expectedHeadRefOid: gitTarget.headRefOid };
+      if (variant === "other-action") payload.nextAction = "address_review";
+      if (variant === "other-capability") payload.suggestedCapability = "pr-review";
+      if (variant === "stale-head") payload.expectedHeadRefOid = "e".repeat(40);
+      if (variant === "other-relation") payload.relation = "assigned";
+      const rawEvent = { ...old, eventType: "pull_request.owner_requested",
+        source: { provider: "local-owner", scopeId: "owner-request:123e4567-e89b-42d3-a456-426614174000" }, payload };
+      if (variant === "stale-head") {
+        assert.throws(() => normalizeWorkflowEvent(rawEvent), { code: "INVALID_WORKFLOW_EVENT" });
+        return;
+      }
+      const event = normalizeWorkflowEvent(rawEvent);
+      const source = createPullRequestWorkSource(pullRequestAssignment(1, event)).source;
+      const roleId = variant === "other-role" ? "pr-engineer" : "developer";
+      f.item = { ...f.item, currentTarget: { type: "role", id: roleId }, event, source, inputDigest: source.current.inputDigest };
+      f.snapshot.graph.tasks.find(task => task.taskId === f.item.itemId).responsibility.id = roleId;
+      let calls = 0;
+      await assemble(f, { roleId, conflictInspectionReader: { async read() { calls++; throw new Error("must not read"); } } });
+      assert.equal(calls, 0);
+    });
+  }
 });
