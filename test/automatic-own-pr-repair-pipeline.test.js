@@ -1794,6 +1794,7 @@ for (const needsRepair of [false, true]) {
     const packet = await new RoleContextAssembler({ graphReader: f.reviewLedger.graphReader,
       originalRepairFeedbackReader: new OriginalRepairFeedbackReader({ store: f.store, executionContextReader: f.reviewLedger }),
       pullRequestContextReader: { async read() { return { schemaVersion: 1, identityDigest: "a".repeat(64), contentDigest: "b".repeat(64),
+        materialDigest: "c".repeat(64),
         observedAt: CREATED_AT, summary: {}, comments: [], reviews: [], reviewThreads: [], checks: [], contextTruncated: false,
         reviewMaterial: { schemaVersion: 1, gitTarget: { ...f.binding.gitTarget, headRefOid: request.request.internalReview.headRefOid },
           additions: 0, deletions: 0, changedFiles: 0, files: [], filesTruncated: false, patch: "", patchTruncated: false } }; } },
@@ -1809,7 +1810,8 @@ for (const needsRepair of [false, true]) {
       definition: { id: "pr-engineer", name: "PR engineer", mission: "Assess repair", enabled: true },
       permissions: { allowedIntents: ["complete", "handoff", "propose_github_review"] },
       brain: { provider: "synthetic", model: "fixture", remoteData: { code: false, memory: false, requirements: false } },
-      brainRouter: { describe: () => ({ singleAttempt: true, supportsReviewReading: true }), async generate() {
+      brainRouter: { describe: () => ({ singleAttempt: true, supportsReviewReading: true }), async generate(input) {
+        assert.deepEqual(input.reviewTarget.feedbackSnapshot, { taskId: claimed.itemId, materialDigest: "c".repeat(64) });
         return JSON.stringify({ schemaVersion: 1, summary: intent.summary, confidence: 90, intent });
       } },
     });
