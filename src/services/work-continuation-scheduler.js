@@ -11,7 +11,7 @@ import {
 
 const WAITING = new Set(['waiting_external', 'waiting_condition', 'dispatch_pending', 'retry_wait', 'paused']);
 const TERMINAL = new Set(['completed', 'cancelled', 'superseded']);
-const DETERMINISTIC_DECISION_FAILURES = new Set(['ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION', 'STRUCTURED_BRAIN_RESPONSE_INVALID']);
+const DETERMINISTIC_DECISION_FAILURES = new Set(['ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION', 'STRUCTURED_BRAIN_RESPONSE_INVALID', 'STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED']);
 const UNCHANGED_INPUT_FAILURES = new Set([...DETERMINISTIC_DECISION_FAILURES, 'PR_FACTS_STALE']);
 const timeout = () => Object.assign(new Error('Work continuation execution exceeded its lease budget'), { code: 'WORK_CONTINUATION_TIMEOUT' });
 const recovery = (action, reason, dueAt = null) => ({ action, reason, dueAt });

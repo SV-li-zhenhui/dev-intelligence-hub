@@ -3727,7 +3727,7 @@ test("a specialist closes a terminal PR task without consuming retry attempts", 
   });
 });
 
-test("automatic infrastructure recovery retries both role paths without questions or business exhaustion", async (t) => {
+test("infrastructure failures retain role retries and defer root session recovery without business exhaustion", async (t) => {
   for (const roleId of ["developer", "orchestrator"]) {
     for (const { code, failurePoint } of [...STRUCTURED_BRAIN_ATTENTION_CASES,
       { code: 'STRUCTURED_PROVIDER_MODEL_CAPACITY', failurePoint: 'brain' }]) {
@@ -3748,13 +3748,21 @@ test("automatic infrastructure recovery retries both role paths without question
         });
         for (let turn = 0; turn < 5; turn += 1) {
           const cycle = await loop.runCycle({ roleId });
-          assert.equal(cycle.retried, 1);
+          const deferred = roleId === 'orchestrator' && code === 'STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED';
+          assert.equal(cycle.retried, deferred ? 0 : 1);
           assert.equal(cycle.outcomes[0].code, code);
-          assert.equal(ledger.items[0].status, "retry_wait");
+          assert.equal(ledger.items[0].status, deferred ? 'queued' : 'retry_wait');
           assert.equal(ledger.items[0].attempt, 0);
-          assert.equal(ledger.calls.scheduleRetry.at(-1).consumeAttempt, false);
-          assert.equal(Date.parse(ledger.items[0].availableAt) > Date.parse(time.clock()), true);
-          assert.equal((await loop.runCycle({ roleId })).claimed, 0);
+          if (deferred) {
+            assert.equal(cycle.outcomes[0].status, 'decision_deferred');
+            assert.equal(ledger.items[0].revision, source.revision);
+            assert.equal(ledger.calls.claim.length, 0);
+            assert.equal(ledger.calls.scheduleRetry.length, 0);
+          } else {
+            assert.equal(ledger.calls.scheduleRetry.at(-1).consumeAttempt, false);
+            assert.equal(Date.parse(ledger.items[0].availableAt) > Date.parse(time.clock()), true);
+            assert.equal((await loop.runCycle({ roleId })).claimed, 0);
+          }
           time.advance(60_000);
         }
         assert.equal(ledger.outbox.length, 0);
@@ -3782,7 +3790,7 @@ test("automatic root recovery tolerates a lost claim acknowledgement", async () 
   assert.equal(ledger.outbox.length, 0);
 });
 
-test("unclassified structured failures preserve generic specialist behavior and defer invalid root output", async (t) => {
+test("structured failures preserve specialist retries and root preclaim deferral", async (t) => {
   await t.test("specialist retries a provider timeout", async () => {
     const time = controlledClock();
     const source = workItem(87, { type: "role", id: "developer" });
@@ -3819,6 +3827,7 @@ test("unclassified structured failures preserve generic specialist behavior and 
     "STRUCTURED_BRAIN_RESPONSE_INVALID",
     "STRUCTURED_PROVIDER_RESPONSE_INVALID",
     "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION",
+    "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
   ]) {
     await t.test(`root defers ${code} without failing the employee`, async () => {
       const time = controlledClock();

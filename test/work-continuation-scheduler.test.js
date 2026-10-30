@@ -286,7 +286,8 @@ test('repeated unchanged inputs back off and remain recoverable after stalled di
 });
 
 test('unchanged deterministic decision failures stop model retries across restart and rearm on effective input changes', async t => {
-  for (const status of ['queued', 'retry_wait']) for (const change of ['task', 'related-child', 'configuration', 'runtime']) await t.test(`${status}: ${change}`, async () => {
+  for (const code of ['ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION', 'STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED'])
+    for (const status of ['queued', 'retry_wait']) for (const change of ['task', 'related-child', 'configuration', 'runtime']) await t.test(`${code}: ${status}: ${change}`, async () => {
     const f = relatedProgressFixture();
     f.items[0].status = status;
     let runtimeRevision = 'a'.repeat(64), calls = 0, receipt;
@@ -295,7 +296,7 @@ test('unchanged deterministic decision failures stop model retries across restar
     const dispatch = async () => {
       calls++;
       receipt = { roleId: f.items[0].currentTarget.id, taskId: f.items[0].itemId, taskRevision: f.items[0].revision, registeredAt: f.options.clock().toISOString(),
-        phase: 'failed', outcomeCode: 'ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION' };
+        phase: 'failed', outcomeCode: code };
     };
     const run = async () => { await scheduler.runCycle({ ...f, dispatch, runtimeRevision }); await f.drain(); };
     for (let i = 0; i < 3; i++) { await run(); f.advance(90_000); }
@@ -363,8 +364,11 @@ test('unmatched and transient preclaim observations retain retry without a model
   });
 });
 
-test('real task-run failure receipts bound repeated automatic model decisions without losing restart recovery', async () => {
+test('real task-run failure receipts bound repeated automatic model decisions without losing restart recovery', async t => {
+  for (const [code, roleId] of [['ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION', 'developer'],
+    ['STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED', 'orchestrator']]) await t.test(code, async () => {
   const f = fixture(), values = new Map(); let modelCalls = 0;
+  f.items[0].currentTarget.id = roleId;
   const runStore = { async read(key, fallback) { return clone(values.get(key) ?? fallback); },
     async write(key, value) { values.set(key, clone(value)); } };
   const taskRuns = new TaskRunRegistry({ store: runStore, receiptStore: runStore, clock: f.options.clock,
@@ -372,11 +376,11 @@ test('real task-run failure receipts bound repeated automatic model decisions wi
   f.options.taskRuns = taskRuns;
   let scheduler = new WorkContinuationScheduler(f.options);
   const dispatch = async () => {
-    await assert.rejects(taskRuns.run({ kind: 'work-item', taskId: 'work-one', roleId: 'developer',
+    await assert.rejects(taskRuns.run({ kind: 'work-item', taskId: 'work-one', roleId,
       title: 'Resolve a task', subject: 'Test work', revision: f.items[0].revision }, async () => {
       modelCalls++;
-      throw Object.assign(new Error('invalid decision contract'), { code: 'ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION' });
-    }), { code: 'ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION' });
+      throw Object.assign(new Error('decision cannot complete'), { code });
+    }), { code });
   };
   for (let i = 0; i < 3; i++) { await scheduler.runCycle({ ...f, dispatch }); await f.drain(); f.advance(90_000); }
   assert.equal(modelCalls, 3);
@@ -387,6 +391,7 @@ test('real task-run failure receipts bound repeated automatic model decisions wi
   f.items[0].revision++;
   await scheduler.runCycle({ ...f, dispatch }); await f.drain();
   assert.equal(modelCalls, 4);
+  });
 });
 
 test('transient or stale decision failure receipts keep automatic backoff', async t => {
