@@ -1953,6 +1953,51 @@ test("restart reconstructs a durably saved push intent after a crash before enqu
 });
 
 
+test("admitted owner CI repair prepares and publishes current conflicts without changing its requested action", async () => {
+  let reads = 0;
+  const f = await fixture({ conflict: true, ownerRequestedCi: true, objectSync: { async prepare() {} },
+    conflictInspectionReader: { async read(inputBinding) {
+      reads++;
+      return { inputBinding, preparationBinding: externalActionControlledCommit(inputBinding).executionSource.preparationBinding,
+        conflicts: [{ path: "src/conflict.txt" }] };
+    } },
+  });
+  const b = f.binding, event = f.item.source.current.event;
+  Object.assign(f.item, { revision: 3, inputDigest: b.inputDigest });
+  Object.assign(f.item.source, { workKey: b.workKey, activeRevision: b.inputRevision, pendingRevision: null,
+    revisions: Array.from({ length: b.inputRevision }, () => ({ headRevision: b.headRevision })),
+    current: { event, headRefOid: b.headRefOid, eventId: b.eventId, eventDigest: b.eventDigest, inputDigest: b.inputDigest } });
+  assert.equal(await f.service.shouldRun(f.item), true);
+  assert.equal(reads, 1, "a conflicting owner CI task needs the same sealed conflict material as other repair work");
+  const request = { itemId: f.item.itemId, itemRevision: f.item.revision, inputDigest: f.item.inputDigest };
+  for (const variant of ["author", "head", "base", "clean", "context-author", "paused", "blocked", "scope", "inactive", "pending", "quarantined"]) {
+    const facts = clone(f.facts), item = clone(f.item), author = f.context.author;
+    if (variant === "author") f.facts.author = "another-author";
+    if (variant === "head") f.facts.headRefOid = "9".repeat(40);
+    if (variant === "base") f.facts.baseRefOid = "9".repeat(40);
+    if (variant === "clean") f.facts.mergeStateStatus = "CLEAN";
+    if (variant === "context-author") f.context.author = "another-author";
+    if (variant === "paused") f.item.status = "paused";
+    if (variant === "blocked") f.item.status = "blocked";
+    if (variant === "scope") f.item.source.scope.kind = "automatic";
+    if (variant === "inactive") f.item.source.scope.active = false;
+    if (variant === "pending") f.item.source.pendingRevision = 2;
+    if (variant === "quarantined") f.item.sourceQuarantine = { reason: "source_changed" };
+    assert.equal(await f.service.conflictRepair.prepareInspection(request), null, variant);
+    Object.assign(f.facts, facts); Object.assign(f.item, item); f.context.author = author;
+  }
+  assert.equal(reads, 1, "rejected targets cannot prepare or replace conflict material");
+  const source = await f.service.prepare({ item: f.item, intent: { type: "propose_code_action", operation: "modify" },
+    inputBinding: b, roleId: "developer" });
+  assert.equal(source.kind, "conflict_preparation");
+  assert.equal(f.item.source.current.event.payload.nextAction, "fix_ci");
+  assert.equal((await f.deliver()).status, "running");
+  const evidence = f.completeJob();
+  await f.service.runCycle();
+  assert.equal(f.pushes.length, 1);
+  assert.equal(f.pushes[0].action.controlledCommitEvidence.evidenceId, evidence.evidenceId);
+});
+
 test("internal repair review handed to development prepares and publishes sealed conflicts without a copied nextAction", async () => {
   const f = await fixture({ conflict: true, objectSync: { async prepare() {} } });
   const b = f.binding;

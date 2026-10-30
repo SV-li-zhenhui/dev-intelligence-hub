@@ -11,6 +11,7 @@ import { currentWorkItemEvent, currentWorkItemExecutionBinding } from "./work-le
 import { approveOwnPrAction, repairCommitMatchesJob, planOwnPrPushRetry, retryOwnPrPush, validateOwnPrPushRetry } from "./automatic-own-pr-repair-authorization.js";
 import { AutomaticOwnPrInspectionRecovery } from "./automatic-own-pr-inspection-recovery.js";
 import { AutomaticOwnPrConflictRecovery } from "./automatic-own-pr-conflict-recovery.js";
+import { isOwnerRequestedCiRepairEvent } from "./ci-repair-context-reader.js";
 
 const STATE_KEY = "automatic-own-pr-conflict-state";
 const STATUSES = new Set(["working", "pushing", "published", "failed", "stale"]);
@@ -18,7 +19,7 @@ const sameLogin = (left, right) => typeof left === "string" && typeof right === 
 const digest = value => createHash("sha256").update(value).digest("hex");
 const samePr = (left, right) => left.repository === right.repository && left.pullRequestNumber === right.pullRequestNumber;
 const active = record => ["working", "pushing"].includes(record.status);
-const conflictTask = event => isInternalRepairReviewEvent(event) || event?.payload?.nextAction === "resolve_conflict" && (
+const conflictTask = event => isInternalRepairReviewEvent(event) || isOwnerRequestedCiRepairEvent(event) || event?.payload?.nextAction === "resolve_conflict" && (
   event.payload.relation === "authored" ||
   (event.source?.provider === "local-owner" && event.eventType === "pull_request.owner_requested")
 );
@@ -163,7 +164,7 @@ export class AutomaticOwnPrConflict {
 
   async prepare({ item, intent, inputBinding, roleId }) {
     if (roleId !== "developer" || intent.type !== "propose_code_action" || intent.operation !== "modify" ||
-        !isInternalRepairReviewEvent(currentWorkItemEvent(item))) return undefined;
+        (!isInternalRepairReviewEvent(currentWorkItemEvent(item)) && !isOwnerRequestedCiRepairEvent(currentWorkItemEvent(item)))) return undefined;
     try {
       const inspection = await this.prepareInspection({ itemId: item.itemId, itemRevision: item.revision, inputDigest: item.inputDigest });
       if (inspection === null) return undefined;
@@ -187,10 +188,12 @@ export class AutomaticOwnPrConflict {
     const root = await this.ledger.readItemForReconciliation({ itemId: binding.rootItemId });
     const event = currentWorkItemEvent(root);
     const internal = isInternalRepairReviewEvent(event);
-    if (internal && (root.source?.scope.kind !== "internal_review" || root.source.scope.active !== true ||
-        root.source.identity.provider !== "internal-review-repair" || root.source.identity.scopeId !== event.source.scopeId ||
+    const ownerCi = isOwnerRequestedCiRepairEvent(event);
+    if ((internal || ownerCi) && (root.source?.scope.kind !== (internal ? "internal_review" : "owner_requested") || root.source.scope.active !== true ||
+        root.source.identity.provider !== (internal ? "internal-review-repair" : "local-owner") || root.source.identity.scopeId !== event.source.scopeId ||
         root.source.pendingRevision != null || root.sourceQuarantine != null || ["paused", "cancelled", "superseded"].includes(root.status) ||
         (context.author !== null && !sameLogin(context.author, config.githubActions.actorAccountId)))) return null;
+    if (ownerCi && !["queued", "working", "dispatch_pending", "retry_wait", "waiting_condition", "waiting_external", "completed"].includes(root.status)) return null;
     if (!conflictTask(event) || (event.payload.relation === "authored" && !sameLogin(context.author, config.githubActions.actorAccountId))) return null;
     const facts = await this.github.readOwnPullRequestConflict({ repository: binding.repository,
       number: binding.pullRequestNumber, account: config.githubActions.actorAccountId });
