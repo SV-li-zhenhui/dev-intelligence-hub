@@ -1060,6 +1060,85 @@ for (const variant of [
   });
 }
 
+for (const variant of ["base-changed", "head-changed", "queued-child", "working-child", "same-target", "paused", "concurrent-pause", "unavailable", "branch-changed", "account-changed"]) {
+  test(`admitted orchestrated repair refreshes its existing source through ordinary intake (${variant})`, async t => {
+    const directory = await mkdtemp(path.join(tmpdir(), "owner-repair-refresh-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const store = new StateStore(path.join(directory, "state")), clock = clockFixture();
+    const { routing, ledger } = await createRoutingAndLedger(store, clock);
+    let target = { schemaVersion: 1, provider: "github", sourceAccountId: "runtime-user",
+      baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "d".repeat(40),
+      headRepository: "contributor/repo", headRefName: "fix/owner-request", headRefOid: "a".repeat(40) };
+    let unavailable = false, duringResolve = async () => {};
+    const owner = await createOwnerWorkRequestRuntime({ store, workflowRouting: routing, ledger,
+      roleReadiness: roleReadiness(), capabilityReadiness: capabilityReadiness(), clock, createGuard: guardFactory,
+      // Existing repair authorization does not depend on a personal Review assignment.
+      pullRequestResolver: { async resolvePullRequestTarget(input) {
+        if (unavailable) throw new Error("GitHub unavailable");
+        await duringResolve();
+        return { ...input, title: "PR 42", state: "open", gitTarget: target };
+      } },
+    });
+    t.after(async () => { await owner.close(); await ledger.close(); await routing.close(); });
+    const request = createPrTriageWorkRequest({ requestKey: "existing-ci-repair", repository: "acme/repo",
+      number: 42, targetRoleId: "developer", nextAction: "fix_ci", expectedHeadRefOid: target.headRefOid });
+    const submitted = await owner.submit(request);
+    const before = await ledger.readItemForReconciliation({ itemId: submitted.workItemId });
+    let child;
+    if (["queued-child", "working-child"].includes(variant)) {
+      await ledger.scopedGraphPlannerFactory.forRoot({ scopeRootTaskId: before.itemId }).createChild({
+        parentTaskId: before.itemId, childKey: "continue-ci-repair", leaseId: null,
+        work: { title: "Continue the existing repair", description: "Use the bound PR snapshot" },
+        target: { type: "role", id: "developer" }, dependsOnTaskIds: [],
+        acceptanceContract: { revision: 1, acceptanceCriteria: [], expectedDeliverables: [{
+          deliverableId: "repair", kind: "change-package", description: "Validated repair", required: true }] },
+        expectedGraphRevision: (await ledger.graphReader.getSnapshot()).graph.revision,
+        expectedTaskRevisions: [{ taskId: before.itemId, revision: before.revision }],
+      });
+      child = (await ledger.listItems()).items.find(item => item.kind === "graph_task");
+      if (variant === "working-child") child = await ledger.claim({ itemId: child.itemId,
+        expectedRevision: child.revision, workerId: "employee-developer", leaseDurationMs: 30_000 });
+    }
+    const pause = async () => {
+      const item = await ledger.readItemForReconciliation({ itemId: before.itemId });
+      await ledger.scopedGraphPlannerFactory.forRoot({ scopeRootTaskId: item.itemId }).pauseTask({
+        taskId: item.itemId, expectedTaskRevision: item.revision,
+        expectedGraphRevision: (await ledger.getSummary()).revision, reason: "owner_paused" });
+    };
+    if (variant !== "same-target") target = { ...target, baseRefOid: "e".repeat(40) };
+    if (variant === "head-changed") target.headRefOid = "b".repeat(40);
+    if (variant === "branch-changed") target.headRefName = "different-branch";
+    if (variant === "account-changed") target.sourceAccountId = "different-user";
+    if (variant === "paused") await pause();
+    if (variant === "concurrent-pause") duringResolve = pause;
+    if (variant === "unavailable") unavailable = true;
+    const shouldRefresh = ["base-changed", "head-changed", "queued-child", "working-child"].includes(variant);
+    assert.equal((await owner.refreshBlockedPullRequestSources()).refreshed, shouldRefresh ? 1 : 0);
+    const pending = (await ledger.listPendingPullRequestSources()).items.find(item => item.itemId === before.itemId);
+    if (pending) await ledger.reconcilePullRequestSource({ itemId: pending.itemId,
+      expectedRevision: pending.revision, expectedPendingRevision: pending.source.pendingRevision,
+      expectedGraphRevision: (await ledger.getSummary()).revision });
+    const after = await ledger.readItemForReconciliation({ itemId: before.itemId });
+    assert.equal(after.itemId, before.itemId);
+    if (child) {
+      const retained = await ledger.readItemForReconciliation({ itemId: child.itemId });
+      assert.equal(retained.assignment.graphTask.sourceBinding.headRefOid, before.source.current.headRefOid);
+      assert.deepEqual(retained.graph.acceptanceContracts, child.graph.acceptanceContracts);
+    }
+    assert.equal(after.source.current.event.payload.gitTarget.baseRefOid,
+      shouldRefresh ? target.baseRefOid : before.source.current.event.payload.gitTarget.baseRefOid);
+    assert.equal(after.source.current.headRefOid, shouldRefresh ? target.headRefOid : before.source.current.headRefOid);
+    assert.deepEqual((await owner.get(submitted.requestId)).request, submitted.request,
+      "the original owner request remains immutable");
+    assert.equal((await owner.get(submitted.requestId)).eventId, submitted.eventId);
+    assert.equal((await ledger.listItems()).items.filter(item => item.kind === "source_root").length, 1);
+    if (shouldRefresh) {
+      assert.equal(after.source.current.event.payload.expectedHeadRefOid, target.headRefOid);
+      assert.equal((await owner.refreshBlockedPullRequestSources()).refreshed, 0);
+    }
+  });
+}
+
 test("an explicit PR request resolves one immutable target before staging a PR engineer root", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "owner-pr-request-"));
   t.after(() => rm(root, { recursive: true, force: true }));
