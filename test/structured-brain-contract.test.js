@@ -3,7 +3,9 @@ import test from "node:test";
 import {
   StructuredBrainContractError,
   WORK_DECISION_JSON_SCHEMA,
+  MODEL_WORK_DECISION_JSON_SCHEMA,
   parseStructuredWorkDecision,
+  parseModelWorkDecision,
 } from "../src/domain/structured-brain-contract.js";
 
 function decision(overrides = {}) {
@@ -114,6 +116,43 @@ test("the structured brain schema is finite and parses one exact WorkDecision", 
     WORK_DECISION_JSON_SCHEMA.properties.summary.maxLength,
     1_024,
   );
+});
+
+test("model orchestration has one reason while the internal decision remains exact", () => {
+  const value = decision({ intent: { schemaVersion: 1, type: "orchestrate", summary: "Pause dependent work",
+    action: { schemaVersion: 1, type: "pause", sourceTaskId: "work-root", sourceTaskRevision: 2,
+      expectedGraphRevision: 4, reason: "Wait for the current dependency" } } });
+  const parsed = parseModelWorkDecision(JSON.stringify(value));
+  assert.equal(parsed.intent.reason, value.intent.action.reason);
+  assert.deepEqual(parsed.intent.action, value.intent.action);
+  assert.throws(() => parseStructuredWorkDecision(JSON.stringify(value)), StructuredBrainContractError);
+  assert.deepEqual(parseStructuredWorkDecision(JSON.stringify(parsed)), parsed);
+  assert.deepEqual(parseModelWorkDecision(JSON.stringify(parsed)), parsed, "valid legacy decisions remain accepted");
+  const model = MODEL_WORK_DECISION_JSON_SCHEMA.properties.intent.oneOf.find(v => v.properties?.type?.const === "orchestrate");
+  const internal = WORK_DECISION_JSON_SCHEMA.properties.intent.oneOf.find(v => v.properties?.type?.const === "orchestrate");
+  assert.equal(Object.hasOwn(model.properties, "reason"), false);
+  assert.ok(internal.required.includes("reason"));
+  assert.equal(Object.isFrozen(MODEL_WORK_DECISION_JSON_SCHEMA), true);
+});
+
+test("model reason expansion cannot hide conflicting reasons or invalid command fields", () => {
+  const value = decision({ intent: { schemaVersion: 1, type: "orchestrate", summary: "Pause dependent work",
+    action: { schemaVersion: 1, type: "pause", sourceTaskId: "work-root", sourceTaskRevision: 2,
+      expectedGraphRevision: 4, reason: "Wait for the current dependency" } } });
+  const conflicting = structuredClone(value); conflicting.intent.reason = "A different reason";
+  const nullWrapper = structuredClone(value); nullWrapper.intent.reason = null;
+  const missingCommandReason = structuredClone(value); delete missingCommandReason.intent.action.reason;
+  const extraCommandField = structuredClone(value); extraCommandField.intent.action.permission = "owner";
+  const invalidRevision = structuredClone(value); invalidRevision.intent.action.sourceTaskRevision = 0;
+  const invalidAction = structuredClone(value); invalidAction.intent.action.type = "push";
+  const missingOtherReason = decision(); delete missingOtherReason.intent.reason;
+  for (const invalid of [conflicting, nullWrapper, missingCommandReason, extraCommandField,
+    invalidRevision, invalidAction, missingOtherReason]) {
+    assert.throws(() => parseModelWorkDecision(JSON.stringify(invalid)),
+      error => error.code === "STRUCTURED_BRAIN_RESPONSE_INVALID");
+  }
+  assert.throws(() => parseModelWorkDecision(JSON.stringify(value), { maximumBytes: 1 }),
+    error => error.code === "STRUCTURED_BRAIN_RESPONSE_TOO_LARGE");
 });
 
 test("parsing rejects wrappers, extra fields, invalid variants, and oversized text", () => {

@@ -908,6 +908,26 @@ test("contracted external reviewer proposes publication with its exact deliverab
   assert.equal((await oneResponseEngine("pr-engineer", local).decide({ context })).intent.type, "complete");
 });
 
+test("RoleDecisionEngine asks for one orchestration reason and derives the internal wrapper", async () => {
+  const response = orchestrationDecision();
+  delete response.intent.reason;
+  const requests = [];
+  const engine = new RoleDecisionEngine({
+    definition: definition("orchestrator"), permissions: permissions("orchestrate"), brain: brain(),
+    brainRouter: { describe: () => ({ singleAttempt: true }), async generate(request) {
+      requests.push(request);
+      return JSON.stringify(response);
+    } },
+  });
+  const result = await engine.decide();
+  assert.deepEqual(result, orchestrationDecision());
+  assert.equal(requests.length, 1);
+  const schema = requests[0].schema.properties.intent.oneOf.find(variant => variant.properties?.type?.const === "orchestrate");
+  assert.equal(Object.hasOwn(schema.properties, "reason"), false);
+  assert.equal(schema.required.includes("reason"), false);
+  assert.ok(schema.properties.action.oneOf.every(action => action.required.includes("reason")));
+});
+
 test("RoleDecisionEngine explains and repairs the orchestration reason binding", async () => {
   const invalid = orchestrationDecision();
   invalid.intent.reason = "wrapper reason differs";
@@ -932,8 +952,8 @@ test("RoleDecisionEngine explains and repairs the orchestration reason binding",
 
   assert.equal(result.intent.action.type, "pause");
   assert.equal(requests.length, 2);
-  assert.match(requests[0].messages[0].content, /exactly identical/);
-  assert.match(requests[1].messages.at(-1).content, /exactly equal/);
+  assert.match(requests[0].messages[0].content, /reason once in intent\.action\.reason/);
+  assert.match(requests[1].messages.at(-1).content, /omit intent\.reason/);
 });
 
 test("RoleDecisionEngine retries one invalid structured response without replaying it", async () => {

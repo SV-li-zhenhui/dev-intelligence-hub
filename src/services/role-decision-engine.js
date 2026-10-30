@@ -4,8 +4,8 @@ import { permitsReviewPublicationSettlementIntent } from "./review-publication-s
 import { NATIVE_REVIEW_SKILL_NAME } from "../lib/native-review-skill.js";
 import { taskInstructionMessages } from '../lib/task-execution-context.js';
 import {
-  parseStructuredWorkDecision,
-  WORK_DECISION_JSON_SCHEMA,
+  parseModelWorkDecision,
+  MODEL_WORK_DECISION_JSON_SCHEMA,
 } from "../domain/structured-brain-contract.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { githubEntitySessionKey } from "../lib/session-key.js";
@@ -419,7 +419,7 @@ function systemPrompt(definition, permissions, reviewReading = false, nativeRevi
     "When query_memory is allowed and authoritative history is needed, request one bounded cited-memory query. Use local mode unless the task specifically needs the configured memory brain. After memory appears in a later context, continue the original work and do not request another memory query for that work iteration.",
     "For the requirements-analyst role, an answered attention decisionContext is the owner's authoritative clarification for the current task. Do not return ask_user again for that task. Treat a family or series answer as an inclusive scope boundary, continue with explicit assumptions where details remain open, and finish or hand off the requirements work instead of repeatedly narrowing the same question.",
     "Every choice id and workflow fact token must use only lowercase letters, digits, and hyphens; never use underscores.",
-    "For an orchestrate intent, intent.reason and intent.action.reason must be exactly identical.",
+    "For an orchestrate intent, provide the reason once in intent.action.reason and omit intent.reason; the host derives the internal wrapper reason.",
     "Use decompose to create each new specialist child under the current root. In decompose, dependsOn may reference only completed visible direct children at the exact supplied revision; while ordinary child work is unfinished, use an empty dependsOn list. Use assign only to change an existing safe queued task to a different responsibility; never assign a task to its current role and never use assign as a substitute for creating a corrected child.",
     "When a direct child has blockingCondition delivery-evidence-incompatible with downstreamCreated false, its proposed action cannot produce the existing contract's deliverable kind. Preserve that child, its package, delivery contract and failure history. For a fix_ci root still lacking a controlled repaired Head, decompose one corrected development child to continue the existing repair through current host-verified CI repair. Create a testing child with a required test-report only when the modified snapshot can be pinned by the host, and reuse matching unfinished work. Do not replay verify as a change-package, ask the owner for routine permission, or let a developer rewrite its own contract. An original-Head test or unavailable snapshot does not verify the repair.",
     "When an orchestrator receives a local-owner pull_request.owner_requested root whose workType is general, treat the triage text's suggested capability as a recommendation, verify it against the current PR facts, and use decompose to create one matching specialist child instead of completing the root or doing specialist work itself. Preserve the exact repository, PR number, bound Head, and requested next action in the child work. Keep coordination on the root: the root orchestrator cannot receive specialist child contracts or submit specialist deliveries. Decompose or assign only to a capability mapped to a specialist role; do not delegate an internal diagnostic report back to the orchestrator.",
@@ -445,7 +445,7 @@ function systemPrompt(definition, permissions, reviewReading = false, nativeRevi
       : []),
     `Role definition: ${JSON.stringify(definition)}.`,
     `Allowed intents: ${JSON.stringify(permissions.allowedIntents)}.`,
-    `WorkDecision schema: ${JSON.stringify(WORK_DECISION_JSON_SCHEMA)}.`,
+    `WorkDecision schema: ${JSON.stringify(MODEL_WORK_DECISION_JSON_SCHEMA)}.`,
   ].join(" ");
 }
 
@@ -567,7 +567,7 @@ export class RoleDecisionEngine {
     ];
     const request = {
       brain: this.#brain,
-      schema: WORK_DECISION_JSON_SCHEMA,
+      schema: MODEL_WORK_DECISION_JSON_SCHEMA,
       dataClasses: [...new Set(["requirements", ...Object.keys(context), ...(feedbackMessages.length ? ["code"] : [])])],
       ...(sessionKey === null ? {} : { sessionKey }),
       ...(signal === null ? {} : { signal }),
@@ -589,7 +589,7 @@ export class RoleDecisionEngine {
                     {
                       role: "user",
                       content:
-                        "The previous response was rejected by the local validator. Return only one corrected JSON object. Recheck every required field, allowed intent, token pattern, date, unique array, and non-empty string. For orchestrate, intent.reason must exactly equal intent.action.reason. If requirements.decisionContext records an answered attention request, treat that answer as authoritative and do not return ask_user again for the same task; continue, complete, or hand off with explicit assumptions. Do not include markdown fences or commentary.",
+                        "The previous response was rejected by the local validator. Return only one corrected JSON object. Recheck every required field, allowed intent, token pattern, date, unique array, and non-empty string. For orchestrate, provide the reason once in intent.action.reason and omit intent.reason; the host derives it. If requirements.decisionContext records an answered attention request, treat that answer as authoritative and do not return ask_user again for the same task; continue, complete, or hand off with explicit assumptions. Do not include markdown fences or commentary.",
                     },
                   ],
           }),
@@ -601,7 +601,7 @@ export class RoleDecisionEngine {
       const response = await admitted.response;
       throwIfAborted(signal);
       try {
-        decision = parseStructuredWorkDecision(response);
+        decision = parseModelWorkDecision(response);
         assertNoRepeatedRequirementsConsultation(
           this.#definition,
           context,

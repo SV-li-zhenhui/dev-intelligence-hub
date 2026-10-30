@@ -305,6 +305,24 @@ export const WORK_DECISION_JSON_SCHEMA = deepFreeze({
   },
 });
 
+// The model supplies the command's reason once. Persisted/internal decisions
+// still carry the identical wrapper reason required by the domain contract.
+export const MODEL_WORK_DECISION_JSON_SCHEMA = deepFreeze({
+  ...WORK_DECISION_JSON_SCHEMA,
+  properties: {
+    ...WORK_DECISION_JSON_SCHEMA.properties,
+    intent: {
+      oneOf: intentVariants.map((variant) =>
+        variant.properties?.type?.const !== "orchestrate" ? variant : {
+          ...variant,
+          required: variant.required.filter((key) => key !== "reason"),
+          properties: Object.fromEntries(Object.entries(variant.properties)
+            .filter(([key]) => key !== "reason")),
+        }),
+    },
+  },
+});
+
 function maximumBytesFrom(options) {
   if (
     options === null ||
@@ -337,7 +355,7 @@ function maximumBytesFrom(options) {
   return maximumBytes;
 }
 
-export function parseStructuredWorkDecision(text, options = {}) {
+function parseWorkDecision(text, options, normalize) {
   const maximumBytes = maximumBytesFrom(options);
   if (typeof text !== "string") {
     throw new StructuredBrainContractError(
@@ -362,11 +380,26 @@ export function parseStructuredWorkDecision(text, options = {}) {
     );
   }
   try {
-    return normalizeWorkDecision(value);
+    return normalize(value);
   } catch {
     throw new StructuredBrainContractError(
       "STRUCTURED_BRAIN_RESPONSE_INVALID",
       "Structured brain response is invalid",
     );
   }
+}
+
+export function parseStructuredWorkDecision(text, options = {}) {
+  return parseWorkDecision(text, options, normalizeWorkDecision);
+}
+
+export function parseModelWorkDecision(text, options = {}) {
+  return parseWorkDecision(text, options, (value) => {
+    if (value?.intent?.type === "orchestrate" && !Object.hasOwn(value.intent, "reason")) {
+      value = { ...value, intent: { ...value.intent, reason: value.intent.action?.reason } };
+    }
+    // Legacy decisions with both fields remain subject to exact equality;
+    // never overwrite a conflicting model-supplied value.
+    return normalizeWorkDecision(value);
+  });
 }
