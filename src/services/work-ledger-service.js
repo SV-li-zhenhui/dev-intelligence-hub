@@ -11,7 +11,7 @@ import { hostContextRecoveryCandidate, planHostContextRecovery, hostContextRetir
 import { automaticRoleHandoffCandidate } from "./work-ledger-role-handoff.js";
 import { currentPrRoleHandoffProof } from './work-ledger-role-handoff-evidence.js';
 import { completedRepairEvidenceRecoveryProof, repairDecisionAttemptBudget } from "./work-ledger-inspection-continuation.js";
-import { automaticReviewWorkAdmission } from "../domain/automatic-review-policy.js";
+import { automaticReviewWorkAdmission, automaticReviewContinuationEligibility } from "../domain/automatic-review-policy.js";
 import { inactivePullRequestTakeoverRecoveryProof, sameHeadInternalReviewTakeoverRecoveryProof } from "./work-ledger-pr-retirement-recovery.js";
 import { createWorkIntentDispatchBinding } from "../domain/work-intent-dispatch-binding.js";
 import { planWorkItemRunControl } from './work-ledger-run-control.js';
@@ -28,7 +28,7 @@ import { isChangedReviewConfirmationDecision, reviewConfirmationSettlementIds,
   createCompletedReviewConfirmationSettlement, hasReviewConfirmationSettlement } from "./work-ledger-review-confirmation-settlement.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
-import { samePullRequestGitTarget } from "../domain/git-tool-contract.js";
+import { samePullRequestGitTarget, normalizePullRequestGitTarget } from "../domain/git-tool-contract.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import {
   isTrustedPullRequestScopeLifecycleAssignment,
@@ -1192,6 +1192,33 @@ export class WorkLedgerService {
     const inputBinding = verifyPullRequestExecutionAuthority(state, input);
     const root = state.items.find(item => item.itemId === inputBinding.rootItemId);
     return cloneLedgerValue({ inputBinding, admission: automaticReviewWorkAdmission(root, inputBinding.inputRevision) });
+  }
+
+  // The low-risk promoter may point to work already admitted by the GitHub
+  // source. Reusing this pointer creates no owner request or execution authority.
+  async readCurrentAutomaticReviewWork({ repository, number, headRefOid, gitTarget }) {
+    this.#assertReady();
+    const target = normalizePullRequestGitTarget(gitTarget);
+    if (!Number.isSafeInteger(number) || number < 1 || typeof repository !== "string" ||
+        target.baseRepository !== repository || target.headRefOid !== headRefOid) return null;
+    const state = await this.#readCommittedAuthorityState();
+    for (const root of state.items) {
+      if (root.kind !== "source_root" || root.currentTarget?.id !== "pr-engineer" ||
+          root.graph.parentItemId !== null || ["completed", "cancelled", "superseded"].includes(root.status) ||
+          root.source?.scope.kind !== "automatic" || root.source.scope.active !== true ||
+          root.sourceQuarantine !== null || root.source.pendingRevision !== null ||
+          root.source.identity.repository !== repository || root.source.identity.pullRequestNumber !== number) continue;
+      const event = root.source.current.event;
+      const admission = automaticReviewWorkAdmission(root);
+      if (event.source.provider !== "github" || event.payload.relation !== "review_requested" || admission === null ||
+          automaticReviewContinuationEligibility({ ...event.payload, kind: "pull_request" }, target.sourceAccountId, this.#now(), admission) !== null) continue;
+      const binding = currentWorkItemExecutionBinding(root);
+      if (!binding?.gitTarget || !samePullRequestGitTarget(binding.gitTarget, target)) continue;
+      try { verifyPullRequestExecutionAuthority(state, binding); }
+      catch (error) { if (error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE") continue; throw error; }
+      return { workItemId: root.itemId };
+    }
+    return null;
   }
 
   async readPullRequestExecutionContext(input = {}) {

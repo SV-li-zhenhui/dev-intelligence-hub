@@ -169,7 +169,7 @@ export class ProductionCliCompositionGrant {
   }
 }
 
-export function createPrTriageHandoff(readOwnerWorkRequests) {
+export function createPrTriageHandoff(readOwnerWorkRequests, readWorkLedger = () => null) {
   if (typeof readOwnerWorkRequests !== "function") {
     throw new TypeError("PR triage handoff runtime reader is invalid");
   }
@@ -181,7 +181,17 @@ export function createPrTriageHandoff(readOwnerWorkRequests) {
           code: "PR_TRIAGE_HANDOFF_NOT_READY",
         });
       }
-      return runtime.submit(createPrTriageWorkRequest(input));
+      const request = createPrTriageWorkRequest(input);
+      if (input.targetRoleId === "pr-engineer" && input.gitTarget &&
+          ["review", "rereview", "complete_review"].includes(input.nextAction)) {
+        const ledger = readWorkLedger();
+        if (ledger) {
+          const existing = await ledger.readCurrentAutomaticReviewWork({ repository: input.repository,
+            number: input.number, headRefOid: input.expectedHeadRefOid, gitTarget: input.gitTarget });
+          if (existing !== null) return existing;
+        }
+      }
+      return runtime.submit(request);
     },
   });
 }
@@ -2497,7 +2507,7 @@ export async function createApplication({
           ? { enabled: config.githubActions.automaticReview, account: config.githubActions.actorAccountId } : null,
       },
       operationQueue,
-      triageHandoff: createPrTriageHandoff(() => ownerWorkRequests),
+      triageHandoff: createPrTriageHandoff(() => ownerWorkRequests, () => workLedgerRuntime),
       producerQueue: confirmationRuntime
         ? frozenPort(
             confirmationRuntime.producerQueue,

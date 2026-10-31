@@ -137,6 +137,36 @@ test("composition triage handoff creates durable orchestrator-bound PR work", as
   );
 });
 
+test("triage reuses current automatic Review work instead of creating a competing owner root", async () => {
+  const reads = [];
+  const input = { requestKey: "review-triage", targetRoleId: "pr-engineer", repository: "acme/repo", number: 42,
+    nextAction: "review", expectedHeadRefOid: "a".repeat(40), gitTarget: { marker: "trusted-snapshot-target" } };
+  const existing = { workItemId: "work-item-existing-review" };
+  const handoff = createPrTriageHandoff(() => ({ submit() { assert.fail("must not create another source root"); } }),
+    () => ({ async readCurrentAutomaticReviewWork(query) { reads.push(query); return existing; } }));
+  assert.deepEqual(await handoff.submit(input), existing);
+  assert.deepEqual(reads, [{ repository: input.repository, number: input.number,
+    headRefOid: input.expectedHeadRefOid, gitTarget: input.gitTarget }]);
+});
+
+test("triage falls back only when no current automatic Review matches and preserves read failures", async () => {
+  const input = { requestKey: "review-triage", targetRoleId: "pr-engineer", repository: "acme/repo", number: 42,
+    nextAction: "review", expectedHeadRefOid: "a".repeat(40), gitTarget: { marker: "trusted-snapshot-target" } };
+  let submissions = 0, reads = 0;
+  const owner = { async submit() { submissions++; return { workItemId: "work-item-new-owner" }; } };
+  let fail = false;
+  const handoff = createPrTriageHandoff(() => owner, () => ({ async readCurrentAutomaticReviewWork() {
+    reads++; if (fail) throw Object.assign(new Error("read unavailable"), { code: "EIO" }); return null;
+  } }));
+  assert.deepEqual(await handoff.submit(input), { workItemId: "work-item-new-owner" });
+  fail = true;
+  await assert.rejects(handoff.submit(input), { code: "EIO" });
+  assert.equal(submissions, 1);
+  assert.deepEqual(await handoff.submit({ ...input, targetRoleId: "developer", nextAction: "fix_ci" }),
+    { workItemId: "work-item-new-owner" });
+  assert.equal(reads, 2, "repair handoffs never reuse a Review task");
+});
+
 test("application exposes one operations runtime bound to explicit local directories", async () => {
   const calls = {};
   const marker = Object.freeze({

@@ -1,4 +1,5 @@
 import { digestValue } from "../src/domain/code-executor-contract.js";
+import { currentWorkItemExecutionBinding } from "../src/services/work-ledger-pr-source.js";
 import { indexRecordedProposalFailures } from '../src/services/work-ledger-proposal-failure.js';
 import { createPrTriageWorkRequest, ownerWorkRequestDigest } from '../src/domain/owner-work-request.js';
 import { triageRetirementCandidate, matchRetiredTriageSource, publishedTriageReview, planTriageRetirement, automaticTriageRetirement } from '../src/services/work-ledger-triage-retirement.js';
@@ -2012,6 +2013,55 @@ async function createFixture({
   await service.recover();
   return { service, source, store, lease, time };
 }
+
+test("automatic Review lookup binds the existing root and survives a same-target metadata refresh", async () => {
+  const facts = { ...prGitFacts(PR_HEAD_A), relation: "review_requested", state: "open", isDraft: false,
+    author: "contributor", assignees: ["runtime-user", "contributor"] };
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: facts })] });
+  await fixture.service.intake();
+  const root = (await fixture.service.listItems()).items[0];
+  const query = { repository: "acme/repo", number: 42, headRefOid: PR_HEAD_A, gitTarget: facts.gitTarget };
+  const binding = currentWorkItemExecutionBinding(root);
+  assert.deepEqual(await fixture.service.readCurrentAutomaticReviewWork(query), { workItemId: root.itemId });
+  fixture.source.records.push(prAssignment(2, { occurredAt: "2026-08-02T01:01:00.000Z",
+    changedFields: ["assignees"], gitFacts: { ...facts, assignees: ["runtime-user"] } }));
+  fixture.source.highWatermark = 2;
+  await fixture.service.intake();
+  assert.deepEqual(await fixture.service.readCurrentAutomaticReviewWork(query), { workItemId: root.itemId });
+  assert.deepEqual(await fixture.service.verifyPullRequestExecutionBinding(binding), binding);
+  const items = (await fixture.service.listItems()).items;
+  assert.equal(items.length, 1, "no competing owner source is needed");
+  const claimed = await fixture.service.claim({ itemId: root.itemId, expectedRevision: items[0].revision,
+    workerId: "employee-pr-engineer", leaseDurationMs: 30000 });
+  assert.equal(claimed.status, "working");
+  assert.deepEqual(await fixture.service.readCurrentAutomaticReviewWork(query), { workItemId: root.itemId });
+});
+
+test("automatic Review lookup rejects changed targets, revoked ownership and already reviewed work", async () => {
+  for (const change of ["base", "head", "account", "repository", "number", "base-ref", "head-ref", "fork",
+    "unassigned", "self", "published", "closed", "legacy"]) {
+    const facts = { ...prGitFacts(PR_HEAD_A), relation: "review_requested", state: "open", isDraft: false,
+      author: "contributor", assignees: ["runtime-user"] };
+    if (change === "unassigned") facts.assignees = ["contributor"];
+    if (change === "self") facts.author = "runtime-user";
+    if (change === "published") { facts.myReviewState = "APPROVED"; facts.myReviewCommitOid = PR_HEAD_A; }
+    if (change === "closed") facts.state = "closed";
+    const sourceFacts = structuredClone(facts);
+    if (change === "legacy") { delete sourceFacts.gitTarget; delete sourceFacts.gitTargetAvailable; }
+    const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: sourceFacts })] });
+    await fixture.service.intake();
+    const query = { repository: "acme/repo", number: 42, headRefOid: PR_HEAD_A, gitTarget: structuredClone(facts.gitTarget) };
+    if (change === "base") query.gitTarget.baseRefOid = "e".repeat(40);
+    if (change === "head") { query.headRefOid = PR_HEAD_B; query.gitTarget.headRefOid = PR_HEAD_B; }
+    if (change === "account") query.gitTarget.sourceAccountId = "another-user";
+    if (change === "base-ref") query.gitTarget.baseRefName = "release";
+    if (change === "head-ref") query.gitTarget.headRefName = "other-feature";
+    if (change === "fork") query.gitTarget.headRepository = "other/repo";
+    if (change === "repository") { query.repository = "acme/other"; query.gitTarget.baseRepository = "acme/other"; }
+    if (change === "number") query.number = 43;
+    assert.equal(await fixture.service.readCurrentAutomaticReviewWork(query), null, change);
+  }
+});
 
 test("committed context authority stays readable while candidate validation holds the writer lease", async () => {
   const entered = deferred(), release = deferred();

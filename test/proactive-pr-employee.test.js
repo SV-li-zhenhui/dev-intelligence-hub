@@ -1392,6 +1392,7 @@ test("triage-only PR promoter classifies work without reading patches or draftin
     number: 42,
     nextAction: "review",
     expectedHeadRefOid: HEAD_42,
+    gitTarget: pullRequest().gitTarget,
   });
   assert.equal(result.jobs[0].reviewVerdict, "none");
   assert.equal(result.jobs[0].reviewBody, "");

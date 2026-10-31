@@ -35,6 +35,7 @@ const RUNTIME_METHODS = Object.freeze([
   "verifyPullRequestExecutionBindings",
   "readPullRequestExecutionContext",
   "readAutomaticReviewAdmission",
+  "readCurrentAutomaticReviewWork",
   "intake",
   "retireInactiveIssues",
   "retireAutomaticReviewTestingWork",

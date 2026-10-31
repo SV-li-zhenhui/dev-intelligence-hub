@@ -1616,6 +1616,7 @@ export class ProactivePrEmployeeService {
             number: item.number,
             nextAction: item.nextAction,
             expectedHeadRefOid: claimed.headRefOid,
+            ...(policy.targetRoleId === "pr-engineer" && current.gitTarget ? { gitTarget: current.gitTarget } : {}),
           })
         : null;
       if (
