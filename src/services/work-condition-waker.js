@@ -1,4 +1,6 @@
 import { AUTO_RESUME_ON_CHILD_DELIVERY } from "./work-graph-wait-marker.js";
+import { normalizeRecordedDecisionFailure } from "./work-ledger-decision-failure.js";
+import { normalizeRecordedProposalFailure } from "./work-ledger-proposal-failure.js";
 import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
 
 const PAGE_SIZE = 100;
@@ -253,7 +255,20 @@ export class WorkConditionWaker {
     if (!graph || !Array.isArray(graph.tasks) || !Number.isSafeInteger(graph.revision)) {
       throw new TypeError("graphReader returned an invalid snapshot");
     }
-    const wakeCandidateParents = new Set(
+    const states = new Map((snapshot.taskStates ?? []).map(state => [state.taskId, state]));
+    // A retained failure wakes coordination, never the failed child's execution.
+    const failedParents = new Map();
+    for (const task of graph.tasks) {
+      const state = states.get(task.taskId);
+      // The graph projects blocked ledger tasks as in_progress.
+      if (task.parentTaskId === null || task.status !== "in_progress" || state?.ledgerStatus !== "blocked" ||
+          state.taskRevision !== task.revision) continue;
+      const failure = normalizeRecordedDecisionFailure(state.decisionFailure, task.revision) ??
+        normalizeRecordedProposalFailure(state.proposalFailure, task.revision);
+      if (failure !== null) failedParents.set(task.parentTaskId,
+        Math.max(failedParents.get(task.parentTaskId) ?? 0, Date.parse(failure.recordedAt)));
+    }
+    const deliveryParents = new Set(
       graph.tasks
         .filter((task) =>
           task?.parentTaskId !== null &&
@@ -262,6 +277,7 @@ export class WorkConditionWaker {
         )
         .map(({ parentTaskId }) => parentTaskId),
     );
+    const wakeCandidateParents = new Set([...deliveryParents, ...failedParents.keys()]);
     const candidates = graph.tasks.filter((task) =>
       wakeCandidateParents.has(task?.taskId) &&
       task?.status === "paused" &&
@@ -276,14 +292,17 @@ export class WorkConditionWaker {
     const parent = candidates.find((task) => {
       const item = pausedById.get(task.taskId);
       // The graph projection omits statusReason. Only a durable wait marker,
-      // at the same revision, permits automatic resume after child delivery.
-      return item?.revision === task.revision &&
-        item.statusReason === AUTO_RESUME_ON_CHILD_DELIVERY;
+      // at the same revision, permits automatic resume after child progress.
+      // A failure from before this wait has already been considered.
+      return item?.revision === task.revision && item.statusReason === AUTO_RESUME_ON_CHILD_DELIVERY &&
+        (deliveryParents.has(task.taskId) || failedParents.get(task.taskId) > Date.parse(item.updatedAt));
     });
     if (!parent) return;
     const command = {
       taskId: parent.taskId,
-      reason: "直属子任务已提交交付，恢复主脑验收",
+      reason: deliveryParents.has(parent.taskId)
+        ? "直属子任务已提交交付，恢复主脑验收"
+        : "直属子任务发生已记录失败，恢复主脑协调",
       expectedGraphRevision: graph.revision,
       expectedTaskRevision: parent.revision,
     };

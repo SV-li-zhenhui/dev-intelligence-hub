@@ -517,7 +517,7 @@ for (const drift of ['author', 'head', 'base', 'actor', 'paused', 'rejected', 'i
   });
 }
 
-test("real owner triage and graph dispatch generate CI provenance before automatic publication", async () => {
+for (const waitForChildren of [false, true]) test(`real owner triage and graph dispatch generate CI provenance before automatic publication (child wait=${waitForChildren})`, async () => {
   const store = new MemoryStore(), initial = await fixture({ ci: true, store });
   const request = await initial.ownerWorkRequests.submit(createPrTriageWorkRequest({ requestKey: "owner-ci-real-dispatch",
     targetRoleId: "developer", repository: initial.binding.repository, number: initial.binding.pullRequestNumber,
@@ -539,6 +539,14 @@ test("real owner triage and graph dispatch generate CI provenance before automat
         expectedDeliverables: [{ deliverableId: "implementation", kind: "change-package", description: "Controlled repair", required: true }] },
     } } });
   const child = (await initial.reviewLedger.listItems({ limit: 100 })).items.find(item => item.graph.parentItemId === root.itemId);
+  if (waitForChildren) {
+    const parent = await initial.reviewLedger.readItemForReconciliation({ itemId: root.itemId });
+    await initial.reviewLedger.scopedGraphPlannerFactory.forRoot({ scopeRootTaskId: root.itemId }).pauseTask({
+      taskId: root.itemId, expectedTaskRevision: parent.revision,
+      expectedGraphRevision: (await initial.reviewLedger.getSummary()).revision,
+      reason: "Wait for the existing repair child", waitForChildren: true,
+    });
+  }
   const binding = currentWorkItemExecutionBinding(child);
   assert.equal(Object.hasOwn(originalEvent.payload, "relation"), false);
   assert.equal((await initial.reviewLedger.readPullRequestExecutionContext(binding)).author, null);
