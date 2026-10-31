@@ -382,16 +382,16 @@ test("RoleDecisionEngine classifies context, routes the configured brain, and no
 });
 
 test("Review Skill prompts pass provider input validation and preserve Markdown", async () => {
-  const body = "## 结论\n\n**暂无法判断**：代码差异读取范围不完整。\n\n## 下一步\n\n- 继续检查尚未覆盖的年龄来源逻辑。";
+  const body = "## 结论\n\n**通过**：完整检查当前代码，未发现阻塞缺陷。\n\n## QA 待验\n\n- 在界面确认年龄来源及边界值显示。";
   const decision = completeDecision({
     intent: {
       schemaVersion: 1,
       type: "propose_github_review",
-      verdict: "comment",
-      summary: "需继续检查年龄来源",
-      reason: "系统读取范围有限",
+      verdict: "approve",
+      summary: "年龄来源代码评审通过，交 QA 验证",
+      reason: "未发现阻塞缺陷，界面回归由 QA 完成",
       body,
-      evidence: ["reviewMaterial.patchTruncated=true"],
+      evidence: ["完整检查当前变更和年龄来源调用链，界面实测未执行"],
     },
   });
   let request;

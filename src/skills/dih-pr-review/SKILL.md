@@ -45,11 +45,12 @@ description: Review a pinned GitHub PR in the dashboard using native CLI skill i
 
 ## 输出和交接
 
-QuickTest、CodeTest 或其他 CI 失败仍须继续评审。在正文中列明失败项和已有结果链接，
-提醒作者，并结合当前代码、失败原因、作者解释和测试证据判断。解释合理且相关风险
-已有覆盖时可以通过，同时保留失败事实；有已证实的阻塞缺陷才要求修改，缺少关键
-证据则评论说明具体缺口。笼统的“已测试”不能自动解释所有失败；通过 Review 不代表
-失败检查已通过，也不授权合并。
+完整读取并完成代码审查后，没有发现有依据的阻塞缺陷就 approve，由系统交给 QA；
+已证实的阻塞缺陷才 request_changes，交回作者。未完成的业务实测列为具体 QA 待验项，
+不因此改用 comment 或宣称整个 PR“暂无法判断”。评审者未运行测试不等于代码评审失败。
+QuickTest、CodeTest 或其他 CI 失败仍须继续评审，在正文保留失败项、已有结果链接和
+作者解释；只有能证实代码阻塞缺陷才要求修改，否则通过代码评审并列明待核实项。
+笼统的“已测试”不能自动解释所有失败；通过 Review 不代表检查已通过或允许合并。
 
 沿用 quick-review 的中文正文及结论规则，外层输出遵守本次提供的 WorkDecision
 schema。`intent.evidence` 记录技能名称、manifest 的包摘要、实际 T1/T2/T3、
