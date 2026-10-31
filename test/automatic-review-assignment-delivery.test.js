@@ -124,7 +124,8 @@ async function fixture({ reviewEvent = "REQUEST_CHANGES", automatic = true, lega
     async restart() { queue = makeQueue(); await queue.recover(); } };
 }
 
-test("a later Assign on the same Head passes the real queue after an earlier automatic Review", async () => {
+for (const assigner of ["developer", "review-account"]) {
+test(`a later Assign by ${assigner} on the same Head passes the real queue after an earlier automatic Review`, async () => {
   const store = new MemoryStore();
   let at = NOW, publications = 0;
   const facts = { kind: "pull_request", state: "open", isDraft: false, author: "developer", headRefOid: HEAD,
@@ -140,7 +141,8 @@ test("a later Assign on the same Head passes the real queue after an earlier aut
   const first = await queue.enqueue(plan("COMMENT"));
   assert.equal((await publisher.publish(first)).status, "completed");
   Object.assign(facts, { myLatestPublishedReviewCommitOid: HEAD, myLatestPublishedReviewState: "COMMENTED",
-    myLatestPublishedReviewAt: NOW, reviewRequestEventId: "assign-later", reviewReceivedAt: "2026-10-15T02:05:00Z" });
+    myLatestPublishedReviewAt: NOW, reviewRequestEventId: "assign-later", reviewReceivedAt: "2026-10-15T02:05:00Z",
+    reviewReceivedFrom: assigner });
   at = "2026-10-15T02:10:00.000Z";
   const nextPlan = plan("COMMENT"); nextPlan.id = "review-delivery-42-later";
   const second = await queue.enqueue(nextPlan);
@@ -148,6 +150,7 @@ test("a later Assign on the same Head passes the real queue after an earlier aut
   assert.equal(publications, 2);
   assert.equal((await queue.get(first.id)).status, "completed");
 });
+}
 
 for (const continuation of ["assigned", "owner_requested", "orchestrated_rereview"]) {
   test(`system ${continuation} continuation publishes failed-CI Review and hands off automatically after restart`, async () => {

@@ -59,10 +59,26 @@ test("a later incoming Assign reopens the same Head exactly until that Assign is
     assert.equal(automaticReviewEligibility({ ...facts, myLatestPublishedReviewAt: "2026-10-09T09:50:00Z" },
       "reviewer", now), "HEAD_ALREADY_REVIEWED");
     for (const patch of [{ incomingReviewFactsAvailable: false }, { reviewRecipient: "other" },
-      { reviewReceivedFrom: "reviewer" }, { reviewRequestEventId: null }, { reviewReceivedVia: "reviewer" },
+      { reviewRequestEventId: null }, { reviewReceivedVia: "reviewer" },
       { reviewReceivedAt: "2026-10-09T10:01:00Z" }, { myLatestPublishedReviewAt: null }]) {
       assert.equal(automaticReviewEligibility({ ...facts, ...patch }, "reviewer", now), "HEAD_ALREADY_REVIEWED");
     }
+  }
+});
+
+test("a reviewer taking current responsibility again reopens the same Head after publication", () => {
+  for (const state of ["COMMENTED", "APPROVED", "CHANGES_REQUESTED"]) {
+    const facts = { ...item, assignees: ["reviewer", "developer"], reviewReceivedFrom: "REVIEWER",
+      reviewReceivedAt: "2026-10-09T09:45:00Z", myReviewState: state, myReviewCommitOid: item.headRefOid,
+      myLatestPublishedReviewCommitOid: item.headRefOid, myLatestPublishedReviewAt: "2026-10-09T09:30:00Z" };
+    assert.equal(automaticReviewEligibility(facts, "reviewer", now), null);
+    assert.equal(automaticReviewEligibility({ ...facts, myLatestPublishedReviewAt: "2026-10-09T09:50:00Z" }, "reviewer", now), "HEAD_ALREADY_REVIEWED");
+    for (const patch of [{ assignees: ["developer"] }, { assignees: undefined },
+      { reviewReceivedAt: "2026-10-09T09:00:00Z" }, { reviewReceivedAt: "2026-10-09T10:01:00Z" },
+      { reviewRequestEventId: null }, { incomingReviewFactsAvailable: false }, { reviewRecipient: "other" }]) {
+      assert.ok(automaticReviewEligibility({ ...facts, ...patch }, "reviewer", now));
+    }
+    assert.equal(automaticReviewEligibility({ ...facts, author: "reviewer" }, "reviewer", now), "SELF_AUTHORED");
   }
 });
 

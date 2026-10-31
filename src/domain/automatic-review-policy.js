@@ -4,8 +4,11 @@ const sameLogin = (left, right) => typeof left === "string" && typeof right === 
 const assignmentProofs = new WeakMap();
 
 export function hasLaterIncomingAssignment(item, account, now) {
+  const currentlyAssigned = Array.isArray(item?.assignees) && item.assignees.some(login => sameLogin(login, account));
+  // Taking live responsibility again is a fresh Assign. Legacy projections
+  // without current assignees still need an assignment from another account.
   if (item.incomingReviewFactsAvailable !== true || !sameLogin(item.reviewRecipient, account) ||
-      !LOGIN.test(item.reviewReceivedFrom || "") || sameLogin(item.reviewReceivedFrom, account) ||
+      !LOGIN.test(item.reviewReceivedFrom || "") || (!currentlyAssigned && sameLogin(item.reviewReceivedFrom, account)) ||
       item.reviewReceivedVia !== "assignee" || !item.reviewRequestEventId) return false;
   const received = Date.parse(item.reviewReceivedAt || "");
   const published = Date.parse(item.myLatestPublishedReviewAt || "");

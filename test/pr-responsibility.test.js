@@ -110,6 +110,18 @@ test("a later incoming Assign starts a new review round even when the Head did n
   }
 });
 
+test("taking live responsibility again after a published Review requests rereview on the same Head", () => {
+  const facts = { relation: "review_requested", author: "contributor", assignees: [currentUser],
+    myReviewState: "CHANGES_REQUESTED", myReviewCommitOid: "head-2", myLatestPublishedReviewState: "CHANGES_REQUESTED",
+    myLatestPublishedReviewCommitOid: "head-2", myLatestPublishedReviewAt: "2026-07-30T10:00:00Z",
+    incomingReviewFactsAvailable: true, reviewRecipient: currentUser, reviewReceivedFrom: currentUser,
+    reviewReceivedVia: "assignee", reviewRequestEventId: "self-assign-again", reviewReceivedAt: "2026-07-31T08:00:00Z" };
+  const result = assess(facts);
+  assert.equal(result.nextAction, "rereview");
+  assert.equal(result.nextActor, "me");
+  assert.notEqual(assess({ ...facts, assignees: ["contributor"] }).nextAction, "rereview");
+});
+
 test("a later Comment cannot undo a decisive verdict on the same Head", () => {
   for (const state of ["APPROVED", "CHANGES_REQUESTED"]) {
     const result = assess({ relation: "review_requested", author: "contributor",
