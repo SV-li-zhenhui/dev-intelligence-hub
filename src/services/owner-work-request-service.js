@@ -33,6 +33,17 @@ function isOrchestratedRepairRequest(request) {
     ["fix_ci", "resolve_conflict", "address_review"].includes(request.triage.nextAction);
 }
 
+function isInternalRepairReviewRequest(request) {
+  return request.schemaVersion === 7 && request.workType === "pull_request";
+}
+
+function isRefreshableInternalReviewRoot(item) {
+  return item?.kind === "source_root" && ["queued", "retry_wait"].includes(item.status) &&
+    item.currentTarget?.type === "role" && item.currentTarget.id === "pr-engineer" &&
+    item.graph.parentItemId === null && item.graph.deliveries.length === 0 &&
+    item.source?.scope.kind === "internal_review" && item.source.scope.active === true;
+}
+
 function isRefreshableRepairRoot(item) {
   return item?.kind === "source_root" && (["queued", "retry_wait"].includes(item.status) || isAutomaticChildWait(item)) &&
     item.currentTarget?.type === "role" && item.currentTarget.id === "orchestrator" &&
@@ -319,7 +330,8 @@ export class OwnerWorkRequestService {
   }
 
   // Continue admitted work through ordinary source intake. Repair roots retain
-  // their original authorization; Review recovery still checks current assignment.
+  // their original authorization, as do host-issued repair reviews. Ordinary
+  // owner Review recovery still checks current assignment.
   async refreshBlockedPullRequestSources({ limit = 10, signal = null } = {}) {
     limit = listOptions({ limit }).limit;
     normalizeAbortSignal(signal);
@@ -332,7 +344,7 @@ export class OwnerWorkRequestService {
         const records = await this.#withRequestLease(async () => {
           this.state = await this.#readState();
           const eligible = this.state.records.filter(record => record.phase === "intaken" &&
-            (isOrchestratedRepairRequest(record.request) ||
+            (isOrchestratedRepairRequest(record.request) || isInternalRepairReviewRequest(record.request) ||
               (this.incomingReviewReader !== null && [2, 3, 4].includes(record.request.schemaVersion) &&
                 record.request.workType === "pull_request")))
             .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || left.requestId.localeCompare(right.requestId));
@@ -347,13 +359,15 @@ export class OwnerWorkRequestService {
           this.refreshCursor = record.requestId;
           const item = await this.ledger.readItemForReconciliation({ itemId: record.workItemId });
           const repair = isOrchestratedRepairRequest(record.request);
-          const eligible = repair ? isRefreshableRepairRoot(item) :
+          const internalReview = isInternalRepairReviewRequest(record.request);
+          const continuation = repair || internalReview;
+          const eligible = repair ? isRefreshableRepairRoot(item) : internalReview ? isRefreshableInternalReviewRoot(item) :
             item?.kind === "source_root" && item.status === "blocked" && item.currentTarget?.id === "pr-engineer" &&
               item.statusReason === "decision_attempts_exhausted" && item.graph.deliveries.length === 0;
           if (!eligible ||
               item.decisionContext !== null || item.activeIntentId !== null || item.leaseId !== null || item.ownerId !== null ||
               item.sourceQuarantine !== null || item.source?.pendingRevision !== null ||
-              item.source.current.event.source.provider !== "local-owner" ||
+              item.source.current.event.source.provider !== record.event.source.provider ||
               item.source.current.event.source.scopeId !== record.event.source.scopeId) continue;
           try {
             const binding = currentWorkItemExecutionBinding(item);
@@ -361,8 +375,8 @@ export class OwnerWorkRequestService {
             await this.ledger.verifyPullRequestExecutionBinding(binding);
             if (!repair && (await this.ledger.listOutbox({ itemId: item.itemId, limit: 1 })).items.length !== 0) continue;
             remoteAttempts++;
-            if (!repair && !await this.#hasCurrentReviewAssignment(binding, null)) continue;
-            let event = await this.#createPullRequestEvent(record.request, this.#now(), signal, repair ? binding : null);
+            if (!continuation && !await this.#hasCurrentReviewAssignment(binding, null)) continue;
+            let event = await this.#createPullRequestEvent(record.request, this.#now(), signal, continuation ? binding : null);
             const previous = item.source.current.event.payload;
             if (event.payload.headRefOid === previous.headRefOid &&
                 isDeepStrictEqual(event.payload.gitTarget, previous.gitTarget)) continue;
@@ -391,7 +405,7 @@ export class OwnerWorkRequestService {
         await this.#preflight(event);
         return { ownerRevision: this.state.revision, requestEpoch: this.#requestEpoch };
       });
-      if (observation === null || (!isOrchestratedRepairRequest(record.request) &&
+      if (observation === null || (!isOrchestratedRepairRequest(record.request) && !isInternalRepairReviewRequest(record.request) &&
           !await this.#hasCurrentReviewAssignment(binding, event.payload.headRefOid))) return false;
       const applied = await this.#withRequestLease(async () => {
         this.state = await this.#readState();
@@ -615,13 +629,15 @@ export class OwnerWorkRequestService {
       if (continuationBinding !== null) {
         const previous = continuationBinding.gitTarget;
         const identityFields = ["provider", "sourceAccountId", "baseRepository", "baseRefName", "headRepository", "headRefName"];
-        if (!isOrchestratedRepairRequest(request) ||
+        const internalReview = isInternalRepairReviewRequest(request);
+        if ((!isOrchestratedRepairRequest(request) && !internalReview) ||
+            (internalReview && resolved.gitTarget?.headRefOid !== previous.headRefOid) ||
             identityFields.some(field => resolved.gitTarget?.[field] !== previous[field])) {
           throw ownerRequestError("OWNER_WORK_REQUEST_INVALID", "修复续接不能改变原 PR 的账号、仓库或分支");
         }
         // Only this new source event follows the current Head. The persisted
         // request and its original frozen event are never rewritten.
-        request = normalizeOwnerWorkRequest({ ...request,
+        if (!internalReview) request = normalizeOwnerWorkRequest({ ...request,
           triage: { ...request.triage, expectedHeadRefOid: resolved.gitTarget.headRefOid } });
       }
       return createOwnerPullRequestEvent(request, resolved, createdAt);

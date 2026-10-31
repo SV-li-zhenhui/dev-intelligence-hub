@@ -143,6 +143,60 @@ function roleReadiness(overrides = {}) {
   };
 }
 
+for (const kind of ["own_pr_repair", "own_pr_ci_repair"])
+for (const variant of ["changed-base", "same-target", "changed-head", "changed-ref", "changed-account", "paused", "concurrent-pause", "unavailable"]) {
+  test(`internal repair review follows a new Base while retaining its published Head (${kind}, ${variant})`, async t => {
+    const root = await mkdtemp(path.join(tmpdir(), "internal-review-refresh-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const store = new StateStore(path.join(root, "state")), clock = clockFixture();
+    const { routing, ledger } = await createRoutingAndLedger(store, clock);
+    let head = "a".repeat(40), base = "b".repeat(40), ref = "main", account = "runtime-user", unavailable = false;
+    let duringResolve = async () => {};
+    const owner = await createOwnerWorkRequestRuntime({ store, workflowRouting: routing, ledger,
+      roleReadiness: roleReadiness(), clock, createGuard: guardFactory,
+      pullRequestResolver: { async resolvePullRequestTarget(target) {
+        if (unavailable) throw new Error("GitHub unavailable");
+        await duringResolve();
+        return { ...target, title: "Published repair", state: "open", gitTarget: { schemaVersion: 1, provider: "github",
+          sourceAccountId: account, baseRepository: target.repository, baseRefName: ref, baseRefOid: base,
+          headRepository: target.repository, headRefName: "repair", headRefOid: head } };
+      } },
+    });
+    t.after(async () => { await owner.close(); await ledger.close(); await routing.close(); });
+    const submitted = await owner.submitInternalReview(pullRequest({ schemaVersion: 7, internalReview: { kind, headRefOid: head,
+      feedbackDigest: "c".repeat(64), publicationConfirmationId: "confirmed-publication", controlledCommitEvidenceId: "controlled-commit" } }));
+    const original = await owner.get(submitted.requestId);
+    let item = await ledger.readItemForReconciliation({ itemId: submitted.workItemId });
+    item = await ledger.claim({ itemId: item.itemId, expectedRevision: item.revision,
+      workerId: "employee-pr-engineer", leaseDurationMs: 30_000 });
+    await ledger.scheduleRetry({ itemId: item.itemId, expectedRevision: item.revision, leaseId: item.leaseId,
+      actorId: "employee-pr-engineer", reason: "system_maintenance_auto_retry", details: { code: "ROLE_CONTEXT_PR_FACT_UNAVAILABLE" },
+      availableAt: new Date(clock().getTime() + 2_000).toISOString(), consumeAttempt: false });
+    const pause = async () => {
+      let current = await ledger.readItemForReconciliation({ itemId: item.itemId });
+      if (current.status === "retry_wait") current = await ledger.transition({ itemId: current.itemId,
+        expectedRevision: current.revision, leaseId: null, actorId: "work-ledger-system", toStatus: "queued", reason: "test_ready" });
+      await ledger.scopedGraphPlannerFactory.forRoot({ scopeRootTaskId: item.itemId }).pauseTask({ taskId: item.itemId,
+        expectedTaskRevision: current.revision, expectedGraphRevision: (await ledger.getSummary()).revision, reason: "owner_paused" });
+    };
+    if (variant !== "same-target") base = "d".repeat(40);
+    if (variant === "changed-head") head = "e".repeat(40);
+    if (variant === "changed-ref") ref = "other";
+    if (variant === "changed-account") account = "other-user";
+    if (variant === "paused") await pause();
+    if (variant === "concurrent-pause") duringResolve = pause;
+    if (variant === "unavailable") unavailable = true;
+    assert.equal((await owner.refreshBlockedPullRequestSources()).refreshed, variant === "changed-base" ? 1 : 0);
+    const current = await ledger.readItemForReconciliation({ itemId: item.itemId });
+    assert.equal(current.source.current.headRefOid, original.request.internalReview.headRefOid);
+    assert.deepEqual(current.source.current.event.payload.internalReview, original.request.internalReview);
+    assert.equal(current.source.current.event.payload.gitTarget.baseRefOid, variant === "changed-base" ? base : "b".repeat(40));
+    assert.equal(current.status, ["paused", "concurrent-pause"].includes(variant) ? "paused" : variant === "changed-base" ? "queued" : "retry_wait");
+    assert.deepEqual((await owner.get(submitted.requestId)).request, original.request);
+    assert.deepEqual((await owner.get(submitted.requestId)).event, original.event);
+  });
+}
+
 function capabilityReadiness(overrides = {}) {
   return {
     async read(capability) {
