@@ -57,6 +57,7 @@ const DEFINITIONS = {
   PR_REVIEW_READ_INCOMPLETE: [503, "PR review did not finish reading the complete change set"],
   PR_REVIEW_READ_UNAVAILABLE: [503, "PR review source is unavailable"],
   PR_REVIEW_READ_HEAD_CHANGED: [409, "PR changed while its review source was being read"],
+  PR_REVIEW_READ_MATERIAL_CHANGED: [409, "PR review materials changed while they were being read"],
   CODE_ARTIFACT_READ_INCOMPLETE: [503, "Controlled code source was not fully read before writing or completing"],
   CODE_ARTIFACT_READ_INVALID: [503, "Controlled code source is invalid"],
   CODE_EXECUTION_UNAVAILABLE: [503, "Continuous controlled code execution is unavailable"],

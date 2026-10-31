@@ -3367,6 +3367,25 @@ test("specialist context contention never exhausts the business attempt budget",
   }
 });
 
+test("changed review materials retry as context contention without spending business attempts", async () => {
+  const time = controlledClock();
+  const source = workItem(403, { type: "role", id: "pr-engineer" });
+  source.attempt = 2;
+  const ledger = new FakeLedger({ source: [source], time });
+  const loop = createLoop({ ledger, time,
+    directory: new FakeRoleDirectory({ "pr-engineer": worker({ roleId: "pr-engineer", decide: async () => {
+      throw Object.assign(new Error("review materials changed"), { code: "PR_REVIEW_READ_MATERIAL_CHANGED" });
+    } }) }),
+  });
+  const cycle = await loop.runCycle({ roleId: "pr-engineer" });
+  assert.equal(cycle.retried, 1);
+  assert.equal(ledger.items[0].attempt, 2);
+  assert.equal(ledger.items[0].status, "retry_wait");
+  assert.equal(ledger.calls.scheduleRetry.at(-1).consumeAttempt, false);
+  assert.equal(ledger.calls.scheduleRetry.at(-1).reason, "context_changed");
+  assert.equal(ledger.calls.transition.length, 0);
+});
+
 test("only authentic pre-write graph conflicts defer root decisions", async (t) => {
   for (const authentic of [true, false]) {
     await t.test(`authentic: ${authentic}`, async () => {

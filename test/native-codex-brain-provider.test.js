@@ -1463,7 +1463,8 @@ test('idle native status probes recover login and notice credential loss while a
   await provider.close();
 });
 
-for(const intentType of ['propose_github_review','complete','handoff'])test(`native review requires immutable reader completeness before ${intentType}`, async (t) => {
+for (const failureCode of ['PR_REVIEW_READ_INCOMPLETE', 'PR_REVIEW_READ_MATERIAL_CHANGED'])
+for(const intentType of ['propose_github_review','complete','handoff'])test(`native review preserves ${failureCode} before ${intentType}`, async (t) => {
   const f = await fixture(t);
   const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "owner", baseRepository: "owner/repo", headRepository: "owner/repo", baseRefName: "main", headRefName: "feature", baseRefOid: "a".repeat(40), headRefOid: "b".repeat(40) };
   let closed = 0; let checked = 0;
@@ -1473,8 +1474,8 @@ for(const intentType of ['propose_github_review','complete','handoff'])test(`nat
     assert.equal(call.maxStdoutBytes, 64 * 1024 * 1024);
     return result(call, { intent: { type: intentType } });
   }, {}, { reviewReaderFactory: async () => ({ url: "http://127.0.0.1:12345/fixture", diffText: "complete-diff", manifestText: "{}",
-    async assertComplete() { checked += 1; throw error("PR_REVIEW_READ_INCOMPLETE"); }, async close() { closed += 1; } }) });
-  await assert.rejects(provider.generate(request({ reviewTarget: { gitTarget, pullRequestNumber: 42 } })), { code: "PR_REVIEW_READ_INCOMPLETE" });
+    async assertComplete() { checked += 1; throw error(failureCode); }, async close() { closed += 1; } }) });
+  await assert.rejects(provider.generate(request({ reviewTarget: { gitTarget, pullRequestNumber: 42 } })), { code: failureCode });
   assert.equal(checked, 1); assert.equal(closed, 1);
   assert.deepEqual(await readdir(f.runtime), ["sessions"]);
 });
