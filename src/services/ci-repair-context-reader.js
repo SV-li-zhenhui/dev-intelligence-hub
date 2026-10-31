@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { createPullRequestReadIdentity, normalizePullRequestReadFacts } from '../domain/pull-request-read-facts.js';
 import { createCiRepairEvidence, normalizeCiRepairEvidence, FAILED_CI_CONCLUSIONS } from '../domain/ci-repair-evidence.js';
+import { isInternalCiRepairReviewEvent } from '../domain/internal-repair-review.js';
 
 const unavailable = () => Object.assign(new Error('当前 CI 修复证据暂不可用'), { code: 'CODE_CI_REPAIR_CONTEXT_UNAVAILABLE' });
 
@@ -31,7 +32,8 @@ export class CiRepairContextReader {
     try {
       signal?.throwIfAborted();
       const identity = createPullRequestReadIdentity({ executionBinding: inputBinding, event });
-      if ((event.payload.relation !== 'authored' && !isOwnerRequestedCiRepairEvent(event)) || event.payload.nextAction !== 'fix_ci') return null;
+      if (!isInternalCiRepairReviewEvent(event) &&
+          ((event.payload.relation !== 'authored' && !isOwnerRequestedCiRepairEvent(event)) || event.payload.nextAction !== 'fix_ci')) return null;
       const actor = inputBinding.gitTarget.sourceAccountId;
       const currentFacts = () => this.github.readPullRequestLocalWorkFacts({ repository: inputBinding.repository,
         number: inputBinding.pullRequestNumber, account: actor, authorAccountId: actor }, signal ? { signal } : {});

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
-import { createPrTriageWorkRequest } from "../src/domain/owner-work-request.js";
+import { createPrTriageWorkRequest, createOwnerPullRequestEvent } from "../src/domain/owner-work-request.js";
 import { OrchestratorService } from "../src/services/orchestrator-service.js";
 import { CiRepairContextReader } from "../src/services/ci-repair-context-reader.js";
 import { createPullRequestReadFacts, createPullRequestReadIdentity } from "../src/domain/pull-request-read-facts.js";
@@ -299,7 +299,7 @@ async function fixture({ enabled = true, conflict = false, ci = false, ownerRequ
     store, binding, config, item, facts, context, jobs, pushes, ownerWorkRequests, reviewLedger, details, verified,
     get proposal() { return proposal; }, get grant() { return grant; },
     adoptProposal(value) { proposal = normalizeBoundWorkProposal(value); grant = grantFor(proposal);
-      observedCiEvidence = grant.executionSource.ciEvidence ? clone(grant.executionSource.ciEvidence) : null; },
+      observedCiEvidence = grant.executionSource?.ciEvidence ? clone(grant.executionSource.ciEvidence) : null; },
     get service() { return service; }, get queue() { return queue; },
     get codeJobApprovalCount() { return codeJobApprovalCount; },
     async deliver() { return handler().handle({ proposal, status: "pending_delivery", attempt: 1, downstreamRef: null }); },
@@ -358,6 +358,67 @@ test('CI failure repairs automatically publish a controlled commit and hand off 
   assert.equal(f.pushes.length, 1);
   assert.equal(await f.service.shouldRun(f.item), false);
 });
+
+async function publishedInternalCiFollowup() {
+  const f = await fixture({ ci: true });
+  await f.deliver(); f.completeJob();
+  await f.service.runCycle(); await f.service.runCycle();
+  const published = (await f.store.read(STATE_KEY)).published[0];
+  const request = published.reviewDelivery.request;
+  const event = clone(createOwnerPullRequestEvent(request, { repository: f.binding.repository, number: f.binding.pullRequestNumber,
+    title: 'Review published repair', state: 'open', gitTarget: { ...f.binding.gitTarget, headRefOid: published.commitOid } }, CREATED_AT));
+  const binding = { ...f.binding, rootItemId: published.reviewDelivery.workItemId,
+    headRefOid: published.commitOid, eventId: event.eventId, eventDigest: event.contentDigest,
+    gitTarget: { ...f.binding.gitTarget, headRefOid: published.commitOid } };
+  Object.assign(f.context, { inputBinding: binding, author: null });
+  Object.assign(f.item, { itemId: binding.rootItemId, kind: 'source_root', status: 'working', sourceQuarantine: null,
+    currentTarget: { type: 'role', id: 'developer' }, event,
+    source: { kind: 'pull_request', pendingRevision: null, scope: { kind: 'internal_review', active: true },
+      identity: { provider: event.source.provider, scopeId: event.source.scopeId }, current: { event } } });
+  const { contentDigest, ...proposal } = codeProposal(binding, false, 'modify', true);
+  f.adoptProposal({ ...proposal, proposalId: 'internal-ci-followup' });
+  return { f, binding };
+}
+
+test('a published internal CI review can continue a developer fix with fresh sealed CI provenance', async () => {
+  const { f, binding } = await publishedInternalCiFollowup();
+  const prepared = await f.service.prepare({ item: f.item, inputBinding: binding,
+    intent: { type: 'propose_code_action', operation: 'modify' }, roleId: 'developer' });
+  assert.deepEqual(prepared, f.grant.executionSource);
+  await f.deliver();
+  assert.equal(f.codeJobApprovalCount, 2);
+  assert.equal((await f.store.read(STATE_KEY)).repairs.at(-1).sourceKind, 'ci_repair');
+});
+
+test('an unstarted internal CI modify grant without provenance is retired rather than manually approved', async () => {
+  const { f } = await publishedInternalCiFollowup();
+  const proposal = clone(f.proposal);
+  delete proposal.binding.executionSource;
+  delete proposal.contentDigest;
+  f.adoptProposal(proposal);
+  assert.equal((await f.deliver()).status, 'stale');
+  assert.equal(f.codeJobApprovalCount, 1, 'the unsealed followup never starts');
+});
+
+for (const variant of ['disabled', 'paused', 'author', 'head', 'base', 'feedback', 'publication', 'commit']) {
+  test(`internal CI followup retains publication, remote target and owner controls (${variant})`, async () => {
+    const { f, binding } = await publishedInternalCiFollowup();
+    if (variant === 'disabled') f.config.githubActions.automaticOwnPrRepair = false;
+    if (variant === 'paused') f.item.status = 'paused';
+    if (variant === 'author') f.facts.author = 'other';
+    if (variant === 'head') f.facts.headRefOid = 'f'.repeat(40);
+    if (variant === 'base') f.facts.baseRefOid = 'f'.repeat(40);
+    const metadata = f.item.source.current.event.payload.internalReview;
+    if (variant === 'feedback') metadata.feedbackDigest = 'f'.repeat(64);
+    if (variant === 'publication') metadata.publicationConfirmationId = 'unrelated-publication';
+    if (variant === 'commit') metadata.controlledCommitEvidenceId = 'unrelated-commit';
+    const prepare = () => f.service.prepare({ item: f.item, inputBinding: binding,
+      intent: { type: 'propose_code_action', operation: 'modify' }, roleId: 'developer' });
+    if (variant === 'disabled') assert.equal(await prepare(), undefined);
+    else await assert.rejects(prepare, { code: 'OWN_PR_CI_SOURCE_NOT_READY' });
+    assert.equal(f.codeJobApprovalCount, 1);
+  });
+}
 
 test('native CI and Review continuation requires the exact live repair receipt', async t => {
   for (const kind of ['review', 'ci']) await t.test(kind, async () => {

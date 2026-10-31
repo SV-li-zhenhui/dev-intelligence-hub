@@ -14,7 +14,7 @@ import { isOwnerRequestedCiRepairEvent } from "./ci-repair-context-reader.js";
 import { AutomaticOwnPrVerificationRecovery } from './automatic-own-pr-verification-recovery.js';
 import { approveOwnPrAction, repairCommitMatchesJob, planOwnPrPushRetry, retryOwnPrPush, validateOwnPrPushRetry } from "./automatic-own-pr-repair-authorization.js";
 import { normalizeOwnerWorkRequest } from "../domain/owner-work-request.js";
-import { internalRepairReviewRequestId, normalizeInternalReviewMetadata } from "../domain/internal-repair-review.js";
+import { internalRepairReviewRequestId, normalizeInternalReviewMetadata, isInternalCiRepairReviewEvent } from "../domain/internal-repair-review.js";
 import { isOwnerPublicationId, normalizeObservedOwnerPublication } from "../domain/observed-owner-publication.js";
 import { createOriginalRepairFeedbackSnapshot, createOriginalCiRepairFeedbackSnapshot, normalizeOriginalRepairFeedbackSnapshot, normalizeOriginalRepairFeedbackArchiveReference,
   originalRepairFeedbackBinding, originalRepairFeedbackForRow } from "../domain/original-repair-feedback.js";
@@ -246,6 +246,7 @@ export class AutomaticOwnPrRepair {
     if (!samePullRequestExecutionBinding(context.inputBinding, binding)) return null;
     const root = await this.ledger.readItemForReconciliation({ itemId: binding.rootItemId });
     const event = currentWorkItemEvent(root);
+    const internalCiReview = await this.#internalCiReviewOrigin(binding, config, context, root);
     const ownerCiRequest = isOwnerRequestedCiRepairEvent(event) && root?.kind === 'source_root' &&
       root.itemId === binding.rootItemId && root.source?.kind === 'pull_request' &&
       root.source.scope.kind === 'owner_requested' && root.source.scope.active === true &&
@@ -255,9 +256,9 @@ export class AutomaticOwnPrRepair {
       event.eventId === binding.eventId && event.contentDigest === binding.eventDigest &&
       sameLogin(binding.gitTarget?.sourceAccountId, config.githubActions.actorAccountId);
     if (event?.eventType === 'pull_request.owner_requested' && !ownerCiRequest) return null;
-    if (!ownerCiRequest && (event?.payload?.relation !== "authored" || !sameLogin(context.author, config.githubActions.actorAccountId))) return null;
+    if (!ownerCiRequest && !internalCiReview && (event?.payload?.relation !== "authored" || !sameLogin(context.author, config.githubActions.actorAccountId))) return null;
     if (ownerCiRequest && context.author !== null && !sameLogin(context.author, config.githubActions.actorAccountId)) return null;
-    if (event.payload.nextAction === 'fix_ci' && this.ciRepairContextReader !== null) {
+    if ((event.payload.nextAction === 'fix_ci' || internalCiReview) && this.ciRepairContextReader !== null) {
       const current = await this.ciRepairContextReader.read({ inputBinding: binding, event });
       if (current === null) return null;
       const ciEvidence = normalizeCiRepairEvidence(current.ciEvidence);
@@ -281,6 +282,30 @@ export class AutomaticOwnPrRepair {
     return { config, facts, feedbackDigest: facts.reviewFeedbackDigest, sourceKind: 'review_repair' };
   }
 
+  async #internalCiReviewOrigin(binding, config, context, root) {
+    const event = currentWorkItemEvent(root);
+    if (!isInternalCiRepairReviewEvent(event) || root?.kind !== 'source_root' || root.itemId !== binding.rootItemId ||
+        root.currentTarget?.type !== 'role' || root.currentTarget.id !== 'developer' || root.source?.kind !== 'pull_request' ||
+        root.source.scope.kind !== 'internal_review' || root.source.scope.active !== true ||
+        root.source.pendingRevision != null || root.sourceQuarantine != null ||
+        !['queued', 'working', 'dispatch_pending', 'retry_wait', 'waiting_condition', 'waiting_external', 'completed'].includes(root.status) ||
+        root.source.identity.provider !== event.source.provider || root.source.identity.scopeId !== event.source.scopeId ||
+        event.eventId !== binding.eventId || event.contentDigest !== binding.eventDigest ||
+        !sameLogin(binding.gitTarget?.sourceAccountId, config.githubActions.actorAccountId) ||
+        (context.author !== null && !sameLogin(context.author, config.githubActions.actorAccountId))) return false;
+    const metadata = event.payload.internalReview;
+    const published = this.#state.published.find(row => row.repository === binding.repository && row.number === binding.pullRequestNumber &&
+      row.commitOid === binding.headRefOid && row.confirmationId === metadata.publicationConfirmationId);
+    if (!published?.feedbackSnapshotId || sourceKindFor(published) !== 'ci_repair') return false;
+    try {
+      await this.readOriginalFeedbackBinding({ inputBinding: binding, internalReview: metadata });
+      return true;
+    } catch (error) {
+      if (['OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE', 'OWN_PR_REPAIR_ORIGINAL_FEEDBACK_INVALID'].includes(error?.code)) return false;
+      throw error;
+    }
+  }
+
   async #verificationCurrent(binding) {
     const current = await this.#current(binding);
     if (!current || !sameLogin(binding.gitTarget.sourceAccountId, current.config.githubActions.actorAccountId)) return null;
@@ -295,11 +320,11 @@ export class AutomaticOwnPrRepair {
     const conflictSource = await this.conflictRepair?.prepare?.({ item, intent, inputBinding, roleId });
     if (conflictSource !== undefined) return conflictSource;
     if (roleId !== "developer" || intent.type !== "propose_code_action" || intent.operation !== "modify" ||
-        (event?.payload?.relation !== "authored" && !isOwnerRequestedCiRepairEvent(event)) ||
-        !['address_review', 'fix_ci'].includes(event?.payload?.nextAction)) return undefined;
+        (event?.payload?.relation !== "authored" && !isOwnerRequestedCiRepairEvent(event) && !isInternalCiRepairReviewEvent(event)) ||
+        (!['address_review', 'fix_ci'].includes(event?.payload?.nextAction) && !isInternalCiRepairReviewEvent(event))) return undefined;
     const current = await this.#current(inputBinding);
     if (!current) {
-      if (event?.payload?.nextAction === 'fix_ci' &&
+      if ((event?.payload?.nextAction === 'fix_ci' || isInternalCiRepairReviewEvent(event)) &&
           (this.ciRepairContextReader !== null || isOwnerRequestedCiRepairEvent(event)) &&
           (await this.#configuration())?.githubActions?.automaticOwnPrRepair === true) {
         throw repairError('OWN_PR_CI_SOURCE_NOT_READY', 'CI 修复来源需要重新读取当前检查');
@@ -329,8 +354,20 @@ export class AutomaticOwnPrRepair {
     }
     if (item.kind !== "local.code-job-create" || item.status !== "pending" || item.requestedBy.roleId !== "developer") return item;
     const grant = item.display?.payload?.action?.grant;
-    if (!grant?.inputBinding || !["inspect", "modify", "verify"].includes(grant.operation) ||
-        (grant.operation === "modify" && !isHeadRepairExecutionSource(grant.executionSource))) return item;
+    if (!grant?.inputBinding || !["inspect", "modify", "verify"].includes(grant.operation)) return item;
+    if (grant.operation === "modify" && !isHeadRepairExecutionSource(grant.executionSource)) {
+      if (Object.hasOwn(grant, 'executionSource')) return item;
+      const root = await this.ledger.readItemForReconciliation({ itemId: grant.inputBinding.rootItemId });
+      if (!isInternalCiRepairReviewEvent(currentWorkItemEvent(root))) return item;
+      const config = await this.#configuration();
+      if (config?.githubActions?.enabled !== true || config.githubActions.automaticOwnPrRepair !== true ||
+          !config.trackedRepositories.includes(grant.inputBinding.repository)) return item;
+      const context = await this.ledger.readPullRequestExecutionContext(grant.inputBinding);
+      // Retire only the unstarted legacy grant. A fresh decision must seal new
+      // current-Head CI provenance before any followup write can be approved.
+      return samePullRequestExecutionBinding(context.inputBinding, grant.inputBinding) &&
+        await this.#internalCiReviewOrigin(grant.inputBinding, config, context, root) ? this.#invalidatePending(item) : item;
+    }
     let current = await this.#current(grant.inputBinding);
     if (!current) return grant.executionSource?.kind === 'ci_repair' ? this.#invalidatePending(item) : item;
     if (grant.operation === 'modify' && (grant.executionSource.kind !== current.sourceKind ||

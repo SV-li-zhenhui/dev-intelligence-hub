@@ -6,11 +6,18 @@ import { normalizeWorkflowEvent } from '../src/domain/workflow-events.js';
 import { createPullRequestExecutionBinding } from '../src/domain/pull-request-execution-binding.js';
 import { JenkinsCiDiagnostics } from '../src/services/jenkins-ci-diagnostics.js';
 import { normalizeCiRepairEvidence } from '../src/domain/ci-repair-evidence.js';
+import { createOwnerPullRequestEvent } from '../src/domain/owner-work-request.js';
 
-function fixture({ ownerRequested = false } = {}) {
+function fixture({ ownerRequested = false, internalReview = null } = {}) {
   const target = { schemaVersion: 1, provider: 'github', sourceAccountId: 'me', baseRepository: 'acme/repo',
     baseRefName: 'main', baseRefOid: 'a'.repeat(40), headRepository: 'acme/repo', headRefName: 'fix/ci', headRefOid: 'b'.repeat(40) };
-  const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: ownerRequested ? 'pull_request.owner_requested' : 'pull_request.updated', occurredAt: '2026-10-23T10:00:00.000Z',
+  const event = internalReview ? createOwnerPullRequestEvent({ schemaVersion: 7,
+    requestId: '123e4567-e89b-42d3-a456-426614174000', workType: 'pull_request', priority: 'high', title: 'Review repaired CI',
+    description: 'Continue the published repair', acceptanceCriteria: ['Retain publication provenance'],
+    pullRequest: { repository: 'acme/repo', number: 42 }, internalReview: { kind: internalReview,
+      headRefOid: target.headRefOid, feedbackDigest: 'c'.repeat(64), publicationConfirmationId: 'confirmed-push', controlledCommitEvidenceId: 'verified-commit' } },
+    { repository: 'acme/repo', number: 42, title: 'Repair', state: 'open', gitTarget: target }, '2026-10-23T10:00:00.000Z')
+    : normalizeWorkflowEvent({ schemaVersion: 1, eventType: ownerRequested ? 'pull_request.owner_requested' : 'pull_request.updated', occurredAt: '2026-10-23T10:00:00.000Z',
     source: ownerRequested ? { provider: 'local-owner', scopeId: 'owner-request:123e4567-e89b-42d3-a456-426614174000' }
       : { provider: 'github', scopeId: 'github-dashboard' }, subject: { id: 'acme/repo#42', repository: 'acme/repo', number: 42 },
     payload: { ...(ownerRequested ? { workType: 'general', suggestedCapability: 'development', expectedHeadRefOid: target.headRefOid } : { relation: 'authored' }), nextAction: 'fix_ci', headRefOid: target.headRefOid, gitTargetAvailable: true, gitTarget: target } });
@@ -74,6 +81,20 @@ test('wrong author, changed Head/Base, merge conflict, success or incomplete che
     const f = fixture({ ownerRequested }); mutate(f); assert.equal(await f.reader().read(f.input), null);
   }
   }
+});
+
+test('host-issued CI review feedback captures only fresh failing checks on its exact published target', async () => {
+  const f = fixture({ internalReview: 'own_pr_ci_repair' });
+  assert.equal((await f.reader().read(f.input))?.ciEvidence.headRefOid, f.input.inputBinding.headRefOid);
+  const review = fixture({ internalReview: 'own_pr_repair' });
+  assert.equal(await review.reader().read(review.input), null);
+  for (const field of ['author', 'headRefOid', 'baseRefOid']) {
+    const changed = fixture({ internalReview: 'own_pr_ci_repair' });
+    changed.live[field] = field === 'author' ? 'other' : 'd'.repeat(40);
+    assert.equal(await changed.reader().read(changed.input), null);
+  }
+  const success = fixture({ internalReview: 'own_pr_ci_repair' }); success.factsInput.checks[0].conclusion = 'SUCCESS';
+  assert.equal(await success.reader().read(success.input), null);
 });
 
 test('target changes during diagnostic reading and adapter failures cannot become CI provenance', async () => {

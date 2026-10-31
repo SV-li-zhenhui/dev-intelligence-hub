@@ -144,8 +144,9 @@ function roleReadiness(overrides = {}) {
 }
 
 for (const kind of ["own_pr_repair", "own_pr_ci_repair"])
+for (const roleId of ["pr-engineer", "developer"])
 for (const variant of ["changed-base", "same-target", "changed-head", "changed-ref", "changed-account", "paused", "concurrent-pause", "unavailable"]) {
-  test(`internal repair review follows a new Base while retaining its published Head (${kind}, ${variant})`, async t => {
+  test(`internal repair review follows a new Base while retaining its published Head (${kind}, ${roleId}, ${variant})`, async t => {
     const root = await mkdtemp(path.join(tmpdir(), "internal-review-refresh-"));
     t.after(() => rm(root, { recursive: true, force: true }));
     const store = new StateStore(path.join(root, "state")), clock = clockFixture();
@@ -167,6 +168,8 @@ for (const variant of ["changed-base", "same-target", "changed-head", "changed-r
       feedbackDigest: "c".repeat(64), publicationConfirmationId: "confirmed-publication", controlledCommitEvidenceId: "controlled-commit" } }));
     const original = await owner.get(submitted.requestId);
     let item = await ledger.readItemForReconciliation({ itemId: submitted.workItemId });
+    if (roleId === "developer") item = await ledger.handoff({ itemId: item.itemId, expectedRevision: item.revision,
+      leaseId: null, actorId: "employee-pr-engineer", target: { type: "role", id: "developer" }, reason: "verified_defect" });
     item = await ledger.claim({ itemId: item.itemId, expectedRevision: item.revision,
       workerId: "employee-pr-engineer", leaseDurationMs: 30_000 });
     await ledger.scheduleRetry({ itemId: item.itemId, expectedRevision: item.revision, leaseId: item.leaseId,
@@ -189,6 +192,7 @@ for (const variant of ["changed-base", "same-target", "changed-head", "changed-r
     assert.equal((await owner.refreshBlockedPullRequestSources()).refreshed, variant === "changed-base" ? 1 : 0);
     const current = await ledger.readItemForReconciliation({ itemId: item.itemId });
     assert.equal(current.source.current.headRefOid, original.request.internalReview.headRefOid);
+    assert.equal(current.currentTarget.id, roleId);
     assert.deepEqual(current.source.current.event.payload.internalReview, original.request.internalReview);
     assert.equal(current.source.current.event.payload.gitTarget.baseRefOid, variant === "changed-base" ? base : "b".repeat(40));
     assert.equal(current.status, ["paused", "concurrent-pause"].includes(variant) ? "paused" : variant === "changed-base" ? "queued" : "retry_wait");

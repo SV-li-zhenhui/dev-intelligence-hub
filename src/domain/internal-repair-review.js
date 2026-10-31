@@ -37,3 +37,7 @@ export function isInternalRepairReviewEvent(event) {
   try { return normalizeInternalReviewMetadata(event.payload.internalReview).headRefOid === event.payload.headRefOid; }
   catch { return false; }
 }
+
+export function isInternalCiRepairReviewEvent(event) {
+  return isInternalRepairReviewEvent(event) && event.payload.internalReview.kind === "own_pr_ci_repair";
+}

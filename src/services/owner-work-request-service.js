@@ -39,7 +39,7 @@ function isInternalRepairReviewRequest(request) {
 
 function isRefreshableInternalReviewRoot(item) {
   return item?.kind === "source_root" && ["queued", "retry_wait"].includes(item.status) &&
-    item.currentTarget?.type === "role" && item.currentTarget.id === "pr-engineer" &&
+    item.currentTarget?.type === "role" && ["pr-engineer", "developer"].includes(item.currentTarget.id) &&
     item.graph.parentItemId === null && item.graph.deliveries.length === 0 &&
     item.source?.scope.kind === "internal_review" && item.source.scope.active === true;
 }
@@ -373,7 +373,7 @@ export class OwnerWorkRequestService {
             const binding = currentWorkItemExecutionBinding(item);
             if (binding?.schemaVersion !== 2) continue;
             await this.ledger.verifyPullRequestExecutionBinding(binding);
-            if (!repair && (await this.ledger.listOutbox({ itemId: item.itemId, limit: 1 })).items.length !== 0) continue;
+            if (!continuation && (await this.ledger.listOutbox({ itemId: item.itemId, limit: 1 })).items.length !== 0) continue;
             remoteAttempts++;
             if (!continuation && !await this.#hasCurrentReviewAssignment(binding, null)) continue;
             let event = await this.#createPullRequestEvent(record.request, this.#now(), signal, continuation ? binding : null);
