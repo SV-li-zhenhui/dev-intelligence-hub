@@ -120,13 +120,16 @@ export function createCompletedReviewConfirmationSettlement(item, outboxById, sn
         digest(Object.fromEntries(Object.keys(plan).map((key) => [key, confirmation[key]]))));
       if (!expected || confirmation.kind !== "github.work-proposal-review") return null;
       if (confirmation.status === "completed" && confirmation.receipt?.id) completed.push(confirmation);
-      else if (!(confirmation.status === "stale" && confirmation.execution === null && confirmation.failure === null)) return null;
+      // A definitive stale executor result also settles the old authority.
+      // Unknown/absent executions remain fenced; this proof cannot replay them.
+      else if (!(confirmation.status === "stale" && confirmation.failure === null &&
+          (confirmation.execution === null || confirmation.execution.outcome === "stale"))) return null;
     }
     if (completed.length !== 1) {
       const ids = [...new Set(plans.map(plan => plan.id))];
       const reference = item.decisionContext.value.downstreamRef;
-      // Both pre-enqueue rejection and unexecuted revocation require every
-      // historical identity. A retained reference must identify an actual row.
+      // Settled unpublished confirmations require every historical identity.
+      // A retained reference must identify an actual row.
       if (completed.length !== 0 || (reference !== null &&
           !snapshots.some(snapshot => snapshot?.item?.id === reference)) ||
           snapshots.length !== ids.length || snapshots.some((snapshot, index) =>

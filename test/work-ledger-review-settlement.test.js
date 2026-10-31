@@ -26,7 +26,7 @@ class MemoryStore {
 const lease = () => ({ run: (operation) => operation() });
 
 function assignment(sequence, scope = "initial", head = HEAD, {
-  eventType = "pull_request.updated", provider = "github",
+  eventType = "pull_request.updated", provider = "github", base = "b".repeat(40),
 } = {}) {
   const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType,
     occurredAt: `2026-10-15T01:0${sequence}:00.000Z`, source: { provider, scopeId: scope },
@@ -34,7 +34,7 @@ function assignment(sequence, scope = "initial", head = HEAD, {
     payload: { headRefOid: head, title: "Repair review", state: "open", gitTargetAvailable: true,
       ...(head === HEAD || eventType !== "pull_request.updated" ? {} : { changedFields: ["headRefOid"], previousHeadRefOid: HEAD }),
       gitTarget: { schemaVersion: 1, provider: "github", sourceAccountId: "review-account",
-        baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "b".repeat(40),
+        baseRepository: "acme/repo", baseRefName: "main", baseRefOid: base,
         headRepository: "contributor/repo", headRefName: "fix/review", headRefOid: head } } });
   return { sequence, event, assignment: { assignmentId: `assignment-${sequence}`, eventId: event.eventId,
     target: { type: "role", id: "pr-engineer" }, reason: "review", createdAt: event.occurredAt } };
@@ -51,7 +51,8 @@ function scopeLifecycleAssignment(sequence, event) {
 async function fixture({ outcome = "applied", transformPlan = (plan) => plan, downstream = false,
   followupScope = "followup", followupHead = HEAD, leaveScope = false, leaveScopeAfterResult = false,
   ignoredReentry = false, ownerFollowup = false, neverEnqueued = false, revokedUnexecuted = false,
-  leaveScopeAfterFollowup = false, legacyStaleResult = false } = {}) {
+  leaveScopeAfterFollowup = false, legacyStaleResult = false,
+  followupBase = "b".repeat(40), reconcileOutcome = null } = {}) {
   const store = new MemoryStore();
   let currentTime = NOW;
   const records = [assignment(1)];
@@ -74,10 +75,14 @@ async function fixture({ outcome = "applied", transformPlan = (plan) => plan, do
   const makeQueue = () => new ConfirmationQueue({ store, exclusiveLease: lease(), clock: () => new Date(NOW),
     executor: { async execute() { executions++;
       if (outcome === "absent") throw new ConfirmationExecutionError("TEST_REVIEW_ABSENT", "absent");
+      if (outcome === "stale") return { status: "stale" };
       return outcome === "applied" ? { status: "applied", receipt: { id: "review-42",
         url: "https://github.com/acme/repo/pull/42#pullrequestreview-42", createdAt: NOW } }
         : { status: "unknown", code: "TEST_UNKNOWN" };
-    }, async reconcile() { assert.fail("settlement must never replay external Review"); } } });
+    }, async reconcile() {
+      assert.equal(reconcileOutcome, "stale", "only the recovery fixture reconciles an unknown publication");
+      return { status: "stale" };
+    } } });
   service = makeService(); await service.recover(); await service.intake();
   const root = (await service.listItems()).items[0];
   const claimed = await service.claim({ itemId: root.itemId, expectedRevision: root.revision,
@@ -112,10 +117,11 @@ async function fixture({ outcome = "applied", transformPlan = (plan) => plan, do
     await service.intake();
   };
   if (leaveScope) await leaveAutomaticScope();
+  const confirmationStatus = neverEnqueued ? null : (await queue.get(plan.id)).status;
   const result = createWorkProposalResult({ proposal, sequence: 1, at: NOW, downstreamRef: downstream ? plan.id : null,
     transition: { status: "stale", summary: legacyStaleResult ? "GitHub Review 提案已失效" : "Authority left scope before receipt recovery", evidence: legacyStaleResult
       ? [`confirmation:${plan.id}`] : downstream
-      ? [`confirmation:${plan.id}`, "authorization_changed", `old_confirmation_status:${revokedUnexecuted ? "stale" : "completed"}`]
+      ? [`confirmation:${plan.id}`, "authorization_changed", `old_confirmation_status:${confirmationStatus}`]
       : ["authorization_changed", `proposal:${proposal.proposalId}`] } });
   await service.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
   const staleHistory = (await service.listOutbox()).items[0];
@@ -148,7 +154,8 @@ async function fixture({ outcome = "applied", transformPlan = (plan) => plan, do
   }
   if (followupScope !== null) {
     records.push(assignment(records.length + 1, followupScope, followupHead, ownerFollowup
-      ? { eventType: "pull_request.owner_requested", provider: "local-owner" } : {})); await service.intake();
+      ? { eventType: "pull_request.owner_requested", provider: "local-owner", base: followupBase }
+      : { base: followupBase })); await service.intake();
   }
   if (leaveScopeAfterFollowup) await leaveAutomaticScope();
   return { store, records, plan, proposal, reads, staleHistory,
@@ -229,7 +236,7 @@ for (const legacyStaleResult of [false, true]) {
   });
 }
 
-for (const outcome of ["applied", "unknown", "absent"]) {
+for (const outcome of ["applied", "unknown", "absent", "stale"]) {
   test(`same-Head Review recovery cannot repeat an execution (${outcome})`, async () => {
     const f = await fixture({ outcome, downstream: true, followupScope: null });
     const item = await f.service.readItemForReconciliation({ itemId: f.proposal.requestedBy.workItemId });
@@ -445,6 +452,33 @@ test("completed Review settlement activates a pending revision on the same root"
   assert.equal(current.source.activeRevision, 2); assert.equal(current.source.pendingRevision, null);
   assert.equal(current.status, "queued"); assert.equal(f.executions, 1);
 });
+
+for (const recovered of [false, true]) {
+  test(`a definitively stale Review releases a newer Base without replaying publication (recovered=${recovered})`, async () => {
+    const nextBase = "c".repeat(40);
+    const f = await fixture({ outcome: recovered ? "unknown" : "stale", downstream: true,
+      followupScope: "initial", followupBase: nextBase, reconcileOutcome: recovered ? "stale" : null });
+    if (recovered) {
+      const blocked = await f.service.reconcilePullRequestSource(await f.command());
+      assert.equal(blocked.applied, false, "unknown publication must remain fenced");
+    }
+    await f.restart();
+    const confirmation = await f.queue.readSettlement({ confirmationId: f.plan.id });
+    assert.equal(confirmation.item.status, "stale");
+    assert.equal(confirmation.item.execution.outcome, "stale");
+    const command = await f.command();
+    const result = await f.service.reconcilePullRequestSource(command);
+    assert.equal(result.applied, true, JSON.stringify(result));
+    const current = await f.service.readItemForReconciliation({ itemId: command.itemId });
+    assert.equal(current.status, "queued");
+    assert.equal(current.source.pendingRevision, null);
+    assert.equal(current.source.current.event.payload.gitTarget.baseRefOid, nextBase);
+    assert.equal(current.source.current.headRefOid, HEAD);
+    assert.deepEqual((await f.service.listOutbox()).items[0], f.staleHistory);
+    assert.deepEqual(await f.queue.readSettlement({ confirmationId: f.plan.id }), confirmation);
+    assert.equal(f.executions, 1, "source settlement never republishes the old Review");
+  });
+}
 
 test("historical Review actor casing preserves the same GitHub identity", async () => {
   const f = await fixture({ transformPlan(plan) {
