@@ -47,6 +47,28 @@ test('thread policy disables each inherited MCP without copying private configur
   assert.equal(JSON.stringify(result).includes('unsafe.toml'),false);
 });
 
+test('resuming a code-job thread for read-only review restores only the host-enabled reviewer capability', () => {
+  const reviewer = { features: { multi_agent: true }, agents: { enabled: true, default: {} } };
+  const code = threadConfiguration(reviewer, { channel: 'code-job', namespace: 'dih_code_job_0123456789abcdef',
+    execution: { url: 'http://127.0.0.1:1234/execution' }, agentConfigPath: 'D:/private/child.toml' });
+  const review = threadConfiguration(reviewer, { namespace: 'dih_pr_review_0123456789abcdef',
+    reader: { url: 'http://127.0.0.1:1234/read' }, agentConfigPath: 'D:/private/reviewer.toml' });
+  const resumed = { features: { multi_agent: false, ...review.features }, agents: { ...code.agents, ...review.agents } };
+  assert.equal(resumed.features.multi_agent, true);
+  assert.equal(resumed.agents.enabled, true);
+  assert.equal(resumed.agents.default.config_file, 'D:/private/reviewer.toml');
+  assert.equal(review.mcp_servers.dih_pr_review_0123456789abcdef.enabled_tools.includes('perform_action'), false);
+  for (const host of [{}, { features: { multi_agent: false }, agents: { enabled: false } },
+    { features: { multi_agent: true }, agents: { enabled: false } },
+    { features: { multi_agent: false }, agents: { enabled: true } }]) {
+    const advisory = threadConfiguration(host, {});
+    assert.equal(advisory.features.multi_agent, false);
+    assert.equal(advisory.agents.enabled, false);
+  }
+  assert.equal(code.features.multi_agent, false);
+  assert.equal(code.agents.enabled, false);
+});
+
 test('thread policy refuses alias collisions and malformed inventories',()=>{
   const options={namespace:'dih_pr_review_0123456789abcdef',reader:{url:'http://127.0.0.1:1234/review/token'},agentConfigPath:'D:/private/role.toml'};
   assert.throws(()=>threadConfiguration({mcp_servers:{[options.namespace]:{}}},options),{code:'STRUCTURED_PROVIDER_UNAVAILABLE'});

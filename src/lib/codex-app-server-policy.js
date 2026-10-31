@@ -85,5 +85,7 @@ export function threadConfiguration(config,{reader,execution,channel='review',na
     tools:Object.fromEntries(tools.map(tool=>[tool,{approval_mode:'approve',output_token_limit:65536}]))};
   const agents=Object.fromEntries(inventory(config.agents).filter(([,value])=>value && typeof value==='object' && !Array.isArray(value))
     .map(([name])=>[name,{config_file:agentConfigPath,description:'Trusted read-only independent reviewer; follow the host task and current permissions.'}]));
-  return {service_tier:'default',mcp_servers,agents:channel === 'code-job' ? { ...agents, enabled: false } : agents};
+  // Thread resumes retain prior overrides, including a code job's disabled agents.
+  const reviewAgents = channel === 'review' && config.features?.multi_agent === true && config.agents?.enabled === true;
+  return {service_tier:'default',features:{multi_agent:reviewAgents},mcp_servers,agents:{...agents,enabled:reviewAgents}};
 }

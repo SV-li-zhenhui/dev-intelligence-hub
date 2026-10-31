@@ -106,7 +106,7 @@ test('startup completion after cancellation cannot initialize or start a model b
   });
 });
 
-function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null,initializationFailure=false,turnStartFailure=null,codeJob=false,toolInventory=null,onInterrupt=null,contained=false}={}) {
+function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null,initializationFailure=false,turnStartFailure=null,codeJob=false,reviewAgents=false,toolInventory=null,onInterrupt=null,contained=false}={}) {
   let options; const calls=[]; let finish,interruptId,signalStopping;
   const stopping=new Promise(resolve=>{signalStopping=resolve;});
   const done = new Promise((r)=>{finish=r;});
@@ -120,11 +120,14 @@ function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=fals
       features:{...Object.fromEntries(['shell_tool','apps','browser_use','computer_use','image_generation','hooks','plugins','remote_plugin','plugin_sharing','skill_search','skill_mcp_dependency_install','goals','memories','workspace_dependencies','multi_agent_v2','code_mode','multi_agent'].map(name=>[name,false])),skip_host_skill_discovery:true,code_mode_host:true},
       agents:{enabled:false},web_search:'disabled',approval_policy:'never',sandbox_mode:'read-only',model_provider:'openai',notify:[],mcp_servers:{old:{url:'private'}},
     }};
+    if(request.method==='config/read' && reviewAgents) {
+      result.config.features.multi_agent=true; result.config.agents.enabled=true;
+    }
     if(request.method.startsWith('thread/'))result={thread:{id:threadId}};
-    if(request.method.startsWith('thread/') && codeJob)Object.assign(result,{approvalPolicy:'never',sandbox:{type:'readOnly',networkAccess:false}});
+    if(request.method.startsWith('thread/') && (codeJob || reviewAgents))Object.assign(result,{approvalPolicy:'never',sandbox:{type:'readOnly',networkAccess:false}});
     if(request.method==='mcpServerStatus/list') {
-      const namespace=Object.keys(calls.find(call=>call.method.startsWith('thread/')).params.config.mcp_servers).find(name=>name.startsWith('dih_code_job_'));
-        result={data:[{name:namespace,tools:Object.fromEntries((toolInventory??['perform_action','read_source','edit_source','get_state','read_conflict_source']).map(name=>[name,{}]))}],nextCursor:null};
+      const namespace=Object.keys(calls.find(call=>call.method.startsWith('thread/')).params.config.mcp_servers).find(name=>name.startsWith(codeJob?'dih_code_job_':'dih_pr_review_'));
+        result={data:[{name:namespace,tools:Object.fromEntries((toolInventory??(codeJob?['perform_action','read_source','edit_source','get_state','read_conflict_source']:['read_document','read_source','list_directory'])).map(name=>[name,{}]))}],nextCursor:null};
     }
     if(request.method==='turn/start')result={turn:{id:'turn-1'}};
     if(request.method==='turn/start' && turnStartFailure){send({id:request.id,error:turnStartFailure});return;}
@@ -160,6 +163,17 @@ async function invocation(runner,execute=(run)=>run(),appServerOverrides={}) {
     appServer:{input:'safe task',model:'test-model',schema:{type:'object'},previous:null,...appServerOverrides}}),directory);}
   finally{if (codeExecutionWatchdog) closeCodeExecutionWatchdog(codeExecutionWatchdog); await rm(directory,{recursive:true,force:true});}
 }
+
+test('native review resume explicitly restores host reviewer flags before starting its turn', async () => {
+  const f=fixture({reviewAgents:true});
+  await invocation(f.runner,run=>run(),{previous:threadId,isolation:{reader:{url:'http://127.0.0.1:1234/read'},agentConfigPath:'private-reviewer.toml'}});
+  const resumed=f.calls.find(call=>call.method==='thread/resume');
+  assert.equal(resumed.params.threadId,threadId);
+  assert.equal(resumed.params.config.features.multi_agent,true);
+  assert.equal(resumed.params.config.agents.enabled,true);
+  assert.equal(resumed.params.config.service_tier,'default');
+  assert.ok(f.calls.findIndex(call=>call.method==='mcpServerStatus/list')<f.calls.findIndex(call=>call.method==='turn/start'));
+});
 
 for (const contained of [false, true]) test(`useful current-turn native code progress remains active beyond ten hours with contained supervision ${contained}`, async t => {
   const f = fixture({ hold: true, codeJob: true, contained });
