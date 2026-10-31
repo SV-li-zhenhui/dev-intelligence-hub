@@ -106,7 +106,7 @@ test('startup completion after cancellation cannot initialize or start a model b
   });
 });
 
-function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null,initializationFailure=false,turnStartFailure=null,codeJob=false,reviewAgents=false,toolInventory=null,onInterrupt=null,contained=false}={}) {
+function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null,initializationFailure=false,turnStartFailure=null,resumeFailure=null,codeJob=false,reviewAgents=false,toolInventory=null,onInterrupt=null,contained=false}={}) {
   let options; const calls=[]; let finish,interruptId,signalStopping;
   const stopping=new Promise(resolve=>{signalStopping=resolve;});
   const done = new Promise((r)=>{finish=r;});
@@ -116,6 +116,7 @@ function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=fals
     const request=JSON.parse(line); if(!request.id)return;
     calls.push(request); let result={};
     if(request.method==='initialize' && initializationFailure){send({id:request.id,error:{code:-32600,message:'fixture startup refused'}});return;}
+    if(request.method==='thread/resume' && resumeFailure){send({id:request.id,error:resumeFailure});return;}
     if(request.method==='config/read') result={config:{
       features:{...Object.fromEntries(['shell_tool','apps','browser_use','computer_use','image_generation','hooks','plugins','remote_plugin','plugin_sharing','skill_search','skill_mcp_dependency_install','goals','memories','workspace_dependencies','multi_agent_v2','code_mode','multi_agent'].map(name=>[name,false])),skip_host_skill_discovery:true,code_mode_host:true},
       agents:{enabled:false},web_search:'disabled',approval_policy:'never',sandbox_mode:'read-only',model_provider:'openai',notify:[],mcp_servers:{old:{url:'private'}},
@@ -173,6 +174,16 @@ test('native review resume explicitly restores host reviewer flags before starti
   assert.equal(resumed.params.config.agents.enabled,true);
   assert.equal(resumed.params.config.service_tier,'default');
   assert.ok(f.calls.findIndex(call=>call.method==='mcpServerStatus/list')<f.calls.findIndex(call=>call.method==='turn/start'));
+});
+
+for(const [method,rpcCode] of [['turn/start',-32600],['thread/resume','PRIVATE_CODE']]) test(`native RPC failure reports its host stage without exposing server content (${method})`, async () => {
+  const events=[];
+  const serverError={code:rpcCode,message:'PRIVATE_SERVER_MESSAGE',data:{token:'PRIVATE_TOKEN'}};
+  const f=fixture(method==='turn/start'?{turnStartFailure:serverError}:{resumeFailure:serverError});
+  await assert.rejects(invocation(f.runner,run=>withTaskExecution({reportEvent:event=>events.push(event)},run),{previous:threadId}),
+    {code:'STRUCTURED_PROVIDER_PROCESS_FAILED'});
+  assert.deepEqual(events,[{type:'status',text:`Native RPC failed: ${method} (code ${typeof rpcCode==='number'?rpcCode:'unknown'})`}]);
+  assert.equal(JSON.stringify(events).includes('PRIVATE_'),false);
 });
 
 for (const contained of [false, true]) test(`useful current-turn native code progress remains active beyond ten hours with contained supervision ${contained}`, async t => {

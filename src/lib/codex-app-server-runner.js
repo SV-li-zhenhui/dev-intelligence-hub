@@ -75,7 +75,7 @@ export class CodexAppServerRunner {
       if(process.exited) return Promise.reject(failure());
       const id=++sequence; const waiting=deferred();
       const timer=setTimeout(()=>{pending.delete(id);waiting.reject(failure('STRUCTURED_PROVIDER_TIMEOUT'));},Math.min(timeoutMs,30_000));
-      pending.set(id,{...waiting,timer});
+      pending.set(id,{...waiting,timer,method});
       try{process.write(`${JSON.stringify({id,method,params})}\n`);}catch(cause){clearTimeout(timer);pending.delete(id);waiting.reject(failure());}
       return waiting.promise;
     };
@@ -99,7 +99,12 @@ export class CodexAppServerRunner {
         if(message.id!==undefined){
           const waiting=pending.get(message.id);if(!waiting)return;
           clearTimeout(waiting.timer);pending.delete(message.id);
-          if(message.error)waiting.reject(providerFailure(message.error, message.error.data ?? message.error));else waiting.resolve(message.result);
+          if(message.error) {
+            // Server messages/data may contain private paths or credentials.
+            const code=Number.isSafeInteger(message.error.code)?message.error.code:'unknown';
+            context?.reportEvent?.({type:'status',text:`Native RPC failed: ${waiting.method} (code ${code})`});
+            waiting.reject(providerFailure(message.error, message.error.data ?? message.error));
+          } else waiting.resolve(message.result);
           return;
         }
         const params=message.params??{};
