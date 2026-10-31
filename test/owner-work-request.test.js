@@ -31,6 +31,7 @@ import { AutomaticReviewScopeExitReader } from "../src/services/automatic-review
 import { emptyWorkGraphMemoryProjection, reconcileMigratedWorkGraphMemoryAuthority } from "../src/services/work-ledger-graph-memory.js";
 import { normalizeWorkLedgerLimits } from "../src/services/work-ledger-state.js";
 import { ownerWorkRequestForItem } from "../public/manual-work-assignment.js";
+import { normalizeBoundWorkProposal, workProposalDigest, createWorkProposalResult } from "../src/domain/work-proposal-contract.js";
 
 const REQUEST_ID = "123e4567-e89b-42d3-a456-426614174000";
 
@@ -143,9 +144,36 @@ function roleReadiness(overrides = {}) {
   };
 }
 
+async function expireUnstartedCodeProposal(ledger, item, clock, possibleJob = false) {
+  const intent = { schemaVersion: 1, type: "propose_code_action", operation: "modify", objective: "Fix the verified regression",
+    acceptanceCriteria: ["Preserve current source authority"], summary: "Continue repair", reason: "Verified internal feedback", evidence: [] };
+  const staged = await ledger.stageIntent({ itemId: item.itemId, expectedRevision: item.revision, leaseId: item.leaseId,
+    actorId: "employee-developer", roleId: "developer", intent });
+  const content = { policyVersion: 1, kind: "code_action_proposal", requestedBy: { roleId: "developer", workItemId: item.itemId },
+    source: { assignmentId: item.assignmentId, eventId: item.event.eventId },
+    binding: { eventId: item.event.eventId, subject: item.event.subject, repository: "acme/repo", workspaceId: "repair",
+      inputBinding: currentWorkItemExecutionBinding(item) },
+    payload: Object.fromEntries(["operation", "objective", "acceptanceCriteria", "summary", "reason", "evidence"].map(key => [key, intent[key]])) };
+  const proposal = normalizeBoundWorkProposal({ proposalId: `work-intent-${workProposalDigest(content)}`, ...content });
+  let outbox = await ledger.claimIntent({ intentId: staged.outbox.intentId, expectedRevision: staged.outbox.revision,
+    dispatcherId: "work-intent-dispatcher", leaseDurationMs: 30_000 });
+  outbox = await ledger.bindIntent({ intentId: outbox.intentId, expectedRevision: outbox.revision,
+    itemExpectedRevision: staged.item.revision, dispatcherId: outbox.dispatcherId, dispatchLeaseId: outbox.dispatchLeaseId,
+    boundIntent: { intentId: proposal.proposalId, ...content } });
+  await ledger.ackIntent({ intentId: outbox.intentId, expectedRevision: outbox.revision, itemExpectedRevision: staged.item.revision,
+    dispatchLeaseId: outbox.dispatchLeaseId, actorId: "work-intent-dispatcher", outcome: "delivered", nextStatus: "waiting_external",
+    details: { downstreamRef: proposal.proposalId, proposalDigest: proposal.contentDigest } });
+  const confirmationId = "confirmation-code-job-unstarted";
+  const result = createWorkProposalResult({ proposal, sequence: 1, at: clock().toISOString(), downstreamRef: confirmationId,
+    transition: { status: "stale", summary: "Confirmation expired", evidence: [`confirmation:${confirmationId}`,
+      ...(possibleJob ? ["code-job:possibly-running"] : [])] } });
+  await ledger.applyProposalBatch({ items: [result], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+}
+
 for (const kind of ["own_pr_repair", "own_pr_ci_repair"])
 for (const roleId of ["pr-engineer", "developer"])
-for (const variant of ["changed-base", "same-target", "changed-head", "changed-ref", "changed-account", "paused", "concurrent-pause", "unavailable"]) {
+for (const variant of ["changed-base", "same-target", "proposal-stale-changed-base", "proposal-stale-same-target", "unproven-proposal-stale", "possible-job-proposal-stale", "changed-head", "changed-ref", "changed-account", "paused", "concurrent-pause", "unavailable"]) {
+  if (variant.includes("proposal-stale") && roleId !== "developer") continue;
   test(`internal repair review follows a new Base while retaining its published Head (${kind}, ${roleId}, ${variant})`, async t => {
     const root = await mkdtemp(path.join(tmpdir(), "internal-review-refresh-"));
     t.after(() => rm(root, { recursive: true, force: true }));
@@ -171,10 +199,18 @@ for (const variant of ["changed-base", "same-target", "changed-head", "changed-r
     if (roleId === "developer") item = await ledger.handoff({ itemId: item.itemId, expectedRevision: item.revision,
       leaseId: null, actorId: "employee-pr-engineer", target: { type: "role", id: "developer" }, reason: "verified_defect" });
     item = await ledger.claim({ itemId: item.itemId, expectedRevision: item.revision,
-      workerId: "employee-pr-engineer", leaseDurationMs: 30_000 });
-    await ledger.scheduleRetry({ itemId: item.itemId, expectedRevision: item.revision, leaseId: item.leaseId,
-      actorId: "employee-pr-engineer", reason: "system_maintenance_auto_retry", details: { code: "ROLE_CONTEXT_PR_FACT_UNAVAILABLE" },
+      workerId: `employee-${roleId}`, leaseDurationMs: 30_000 });
+    if (variant.startsWith("proposal-stale") || variant === "possible-job-proposal-stale") {
+      await expireUnstartedCodeProposal(ledger, item, clock, variant === "possible-job-proposal-stale");
+    }
+    else await ledger.scheduleRetry({ itemId: item.itemId, expectedRevision: item.revision, leaseId: item.leaseId,
+      actorId: `employee-${roleId}`, reason: "system_maintenance_auto_retry", details: { code: "ROLE_CONTEXT_PR_FACT_UNAVAILABLE" },
       availableAt: new Date(clock().getTime() + 2_000).toISOString(), consumeAttempt: false });
+    if (variant === "unproven-proposal-stale") {
+      const current = await ledger.readItemForReconciliation({ itemId: item.itemId });
+      await ledger.transition({ itemId: item.itemId, expectedRevision: current.revision, leaseId: null,
+        actorId: "work-ledger-system", toStatus: "blocked", reason: "proposal_stale" });
+    }
     const pause = async () => {
       let current = await ledger.readItemForReconciliation({ itemId: item.itemId });
       if (current.status === "retry_wait") current = await ledger.transition({ itemId: current.itemId,
@@ -182,20 +218,22 @@ for (const variant of ["changed-base", "same-target", "changed-head", "changed-r
       await ledger.scopedGraphPlannerFactory.forRoot({ scopeRootTaskId: item.itemId }).pauseTask({ taskId: item.itemId,
         expectedTaskRevision: current.revision, expectedGraphRevision: (await ledger.getSummary()).revision, reason: "owner_paused" });
     };
-    if (variant !== "same-target") base = "d".repeat(40);
+    if (!variant.endsWith("same-target")) base = "d".repeat(40);
     if (variant === "changed-head") head = "e".repeat(40);
     if (variant === "changed-ref") ref = "other";
     if (variant === "changed-account") account = "other-user";
     if (variant === "paused") await pause();
     if (variant === "concurrent-pause") duringResolve = pause;
     if (variant === "unavailable") unavailable = true;
-    assert.equal((await owner.refreshBlockedPullRequestSources()).refreshed, variant === "changed-base" ? 1 : 0);
+    const shouldRefresh = ["changed-base", "proposal-stale-changed-base"].includes(variant);
+    assert.equal((await owner.refreshBlockedPullRequestSources()).refreshed, shouldRefresh ? 1 : 0);
     const current = await ledger.readItemForReconciliation({ itemId: item.itemId });
     assert.equal(current.source.current.headRefOid, original.request.internalReview.headRefOid);
     assert.equal(current.currentTarget.id, roleId);
     assert.deepEqual(current.source.current.event.payload.internalReview, original.request.internalReview);
-    assert.equal(current.source.current.event.payload.gitTarget.baseRefOid, variant === "changed-base" ? base : "b".repeat(40));
-    assert.equal(current.status, ["paused", "concurrent-pause"].includes(variant) ? "paused" : variant === "changed-base" ? "queued" : "retry_wait");
+    assert.equal(current.source.current.event.payload.gitTarget.baseRefOid, shouldRefresh ? base : "b".repeat(40));
+    assert.equal(current.status, ["paused", "concurrent-pause"].includes(variant) ? "paused" : shouldRefresh ? "queued" :
+      variant.includes("proposal-stale") ? "blocked" : "retry_wait");
     assert.deepEqual((await owner.get(submitted.requestId)).request, original.request);
     assert.deepEqual((await owner.get(submitted.requestId)).event, original.event);
   });

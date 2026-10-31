@@ -259,7 +259,7 @@ function pendingHeadChanged(source) {
   return active.headRevision !== pending.headRevision;
 }
 
-function isExpiredCodeConfirmation(decision) {
+export function isExpiredCodeConfirmation(decision) {
   const value = decision?.value;
   // Authorization changes can leave a running job quarantined. Only the
   // confirmation-only stale result proves that no code job was started.

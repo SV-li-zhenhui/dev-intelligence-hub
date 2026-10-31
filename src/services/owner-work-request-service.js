@@ -4,6 +4,7 @@ import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { normalizeWorkflowEvent } from "../domain/workflow-events.js";
 import { currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
 import { isAutomaticChildWait } from "./work-graph-wait-marker.js";
+import { isExpiredCodeConfirmation } from "./work-ledger-pr-cutover-commands.js";
 
 import {
   createOwnerIssueEvent,
@@ -37,8 +38,14 @@ function isInternalRepairReviewRequest(request) {
   return request.schemaVersion === 7 && request.workType === "pull_request";
 }
 
+function hasExpiredInternalCodeDecision(item) {
+  return item?.status === "blocked" && item.statusReason === "proposal_stale" &&
+    item.decisionContext?.source === "proposal" && isExpiredCodeConfirmation(item.decisionContext);
+}
+
 function isRefreshableInternalReviewRoot(item) {
-  return item?.kind === "source_root" && ["queued", "retry_wait"].includes(item.status) &&
+  return item?.kind === "source_root" && (["queued", "retry_wait"].includes(item.status) ||
+    hasExpiredInternalCodeDecision(item)) &&
     item.currentTarget?.type === "role" && ["pr-engineer", "developer"].includes(item.currentTarget.id) &&
     item.graph.parentItemId === null && item.graph.deliveries.length === 0 &&
     item.source?.scope.kind === "internal_review" && item.source.scope.active === true;
@@ -365,7 +372,8 @@ export class OwnerWorkRequestService {
             item?.kind === "source_root" && item.status === "blocked" && item.currentTarget?.id === "pr-engineer" &&
               item.statusReason === "decision_attempts_exhausted" && item.graph.deliveries.length === 0;
           if (!eligible ||
-              item.decisionContext !== null || item.activeIntentId !== null || item.leaseId !== null || item.ownerId !== null ||
+              (item.decisionContext !== null && !(internalReview && hasExpiredInternalCodeDecision(item))) ||
+              item.activeIntentId !== null || item.leaseId !== null || item.ownerId !== null ||
               item.sourceQuarantine !== null || item.source?.pendingRevision !== null ||
               item.source.current.event.source.provider !== record.event.source.provider ||
               item.source.current.event.source.scopeId !== record.event.source.scopeId) continue;
