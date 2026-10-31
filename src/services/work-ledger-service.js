@@ -1,4 +1,5 @@
 import { scheduler } from "node:timers/promises";
+import { isAutomaticChildWait } from "./work-graph-wait-marker.js";
 import { triageRetirementCandidate, planTriageRetirement } from './work-ledger-triage-retirement.js';
 import { isReviewTestingRetirementCandidate, reviewTestingRetirementCandidate, matchesAutomaticReviewTestingHandoff,
   planAutomaticReviewTestingRetirement } from './automatic-review-testing-retirement.js';
@@ -241,6 +242,10 @@ function canRequeueAdvancedPullRequestRoot(root, nextSource) {
   ) {
     return false;
   }
+  if (isAutomaticChildWait(root) && root.currentTarget?.id === "orchestrator" &&
+      root.source?.scope.kind === "owner_requested" && nextSource.scope.kind === "owner_requested" &&
+      (!sameHead || root.source.current.event.payload.gitTarget?.baseRefOid !==
+        nextSource.current.event.payload.gitTarget?.baseRefOid)) return true;
   return PR_SOURCE_REQUEUE_STATUSES.has(root.status) ||
     (root.kind === "source_root" &&
       root.source?.kind === "pull_request" &&

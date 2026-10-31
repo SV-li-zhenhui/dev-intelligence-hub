@@ -1060,7 +1060,7 @@ for (const variant of [
   });
 }
 
-for (const variant of ["base-changed", "head-changed", "queued-child", "working-child", "same-target", "paused", "concurrent-pause", "unavailable", "branch-changed", "account-changed"]) {
+for (const variant of ["base-changed", "head-changed", "queued-child", "working-child", "automatic-wait-base", "automatic-wait-head", "automatic-wait-same-target", "same-target", "paused", "concurrent-pause", "unavailable", "branch-changed", "account-changed"]) {
   test(`admitted orchestrated repair refreshes its existing source through ordinary intake (${variant})`, async t => {
     const directory = await mkdtemp(path.join(tmpdir(), "owner-repair-refresh-"));
     t.after(() => rm(directory, { recursive: true, force: true }));
@@ -1085,7 +1085,8 @@ for (const variant of ["base-changed", "head-changed", "queued-child", "working-
     const submitted = await owner.submit(request);
     const before = await ledger.readItemForReconciliation({ itemId: submitted.workItemId });
     let child;
-    if (["queued-child", "working-child"].includes(variant)) {
+    const automaticWait = variant.startsWith("automatic-wait");
+    if (["queued-child", "working-child"].includes(variant) || automaticWait) {
       await ledger.scopedGraphPlannerFactory.forRoot({ scopeRootTaskId: before.itemId }).createChild({
         parentTaskId: before.itemId, childKey: "continue-ci-repair", leaseId: null,
         work: { title: "Continue the existing repair", description: "Use the bound PR snapshot" },
@@ -1099,20 +1100,28 @@ for (const variant of ["base-changed", "head-changed", "queued-child", "working-
       if (variant === "working-child") child = await ledger.claim({ itemId: child.itemId,
         expectedRevision: child.revision, workerId: "employee-developer", leaseDurationMs: 30_000 });
     }
+    if (automaticWait) {
+      const parent = await ledger.readItemForReconciliation({ itemId: before.itemId });
+      await ledger.scopedGraphPlannerFactory.forRoot({ scopeRootTaskId: before.itemId }).pauseTask({
+        taskId: before.itemId, expectedTaskRevision: parent.revision,
+        expectedGraphRevision: (await ledger.getSummary()).revision,
+        reason: "Wait for the admitted repair child", waitForChildren: true,
+      });
+    }
     const pause = async () => {
       const item = await ledger.readItemForReconciliation({ itemId: before.itemId });
       await ledger.scopedGraphPlannerFactory.forRoot({ scopeRootTaskId: item.itemId }).pauseTask({
         taskId: item.itemId, expectedTaskRevision: item.revision,
         expectedGraphRevision: (await ledger.getSummary()).revision, reason: "owner_paused" });
     };
-    if (variant !== "same-target") target = { ...target, baseRefOid: "e".repeat(40) };
-    if (variant === "head-changed") target.headRefOid = "b".repeat(40);
+    if (!["same-target", "automatic-wait-same-target"].includes(variant)) target = { ...target, baseRefOid: "e".repeat(40) };
+    if (["head-changed", "automatic-wait-head"].includes(variant)) target.headRefOid = "b".repeat(40);
     if (variant === "branch-changed") target.headRefName = "different-branch";
     if (variant === "account-changed") target.sourceAccountId = "different-user";
     if (variant === "paused") await pause();
     if (variant === "concurrent-pause") duringResolve = pause;
     if (variant === "unavailable") unavailable = true;
-    const shouldRefresh = ["base-changed", "head-changed", "queued-child", "working-child"].includes(variant);
+    const shouldRefresh = ["base-changed", "head-changed", "queued-child", "working-child", "automatic-wait-base", "automatic-wait-head"].includes(variant);
     assert.equal((await owner.refreshBlockedPullRequestSources()).refreshed, shouldRefresh ? 1 : 0);
     const pending = (await ledger.listPendingPullRequestSources()).items.find(item => item.itemId === before.itemId);
     if (pending) await ledger.reconcilePullRequestSource({ itemId: pending.itemId,
@@ -1120,6 +1129,8 @@ for (const variant of ["base-changed", "head-changed", "queued-child", "working-
       expectedGraphRevision: (await ledger.getSummary()).revision });
     const after = await ledger.readItemForReconciliation({ itemId: before.itemId });
     assert.equal(after.itemId, before.itemId);
+    if (automaticWait) assert.equal(after.status, shouldRefresh ? "queued" : "paused",
+      "only a changed trusted Git target renews an automatic child wait");
     if (child) {
       const retained = await ledger.readItemForReconciliation({ itemId: child.itemId });
       assert.equal(retained.assignment.graphTask.sourceBinding.headRefOid, before.source.current.headRefOid);

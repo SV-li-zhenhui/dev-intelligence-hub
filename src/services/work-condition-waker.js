@@ -1,4 +1,4 @@
-import { AUTO_RESUME_ON_CHILD_DELIVERY } from "./work-graph-wait-marker.js";
+import { isAutomaticChildWait } from "./work-graph-wait-marker.js";
 import { normalizeRecordedDecisionFailure } from "./work-ledger-decision-failure.js";
 import { normalizeRecordedProposalFailure } from "./work-ledger-proposal-failure.js";
 import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
@@ -294,7 +294,7 @@ export class WorkConditionWaker {
       // The graph projection omits statusReason. Only a durable wait marker,
       // at the same revision, permits automatic resume after child progress.
       // A failure from before this wait has already been considered.
-      return item?.revision === task.revision && item.statusReason === AUTO_RESUME_ON_CHILD_DELIVERY &&
+      return item?.revision === task.revision && isAutomaticChildWait(item) &&
         (deliveryParents.has(task.taskId) || failedParents.get(task.taskId) > Date.parse(item.updatedAt));
     });
     if (!parent) return;

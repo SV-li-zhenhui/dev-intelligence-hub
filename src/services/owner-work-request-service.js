@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from "node:util";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { normalizeWorkflowEvent } from "../domain/workflow-events.js";
 import { currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
+import { isAutomaticChildWait } from "./work-graph-wait-marker.js";
 
 import {
   createOwnerIssueEvent,
@@ -33,7 +34,7 @@ function isOrchestratedRepairRequest(request) {
 }
 
 function isRefreshableRepairRoot(item) {
-  return item?.kind === "source_root" && ["queued", "retry_wait"].includes(item.status) &&
+  return item?.kind === "source_root" && (["queued", "retry_wait"].includes(item.status) || isAutomaticChildWait(item)) &&
     item.currentTarget?.type === "role" && item.currentTarget.id === "orchestrator" &&
     item.graph.parentItemId === null && item.source?.scope.kind === "owner_requested" &&
     item.source.scope.active === true;

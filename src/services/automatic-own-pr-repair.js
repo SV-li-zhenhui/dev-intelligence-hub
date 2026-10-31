@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { OperationQueue } from "../lib/operation-queue.js";
-import { AUTO_RESUME_ON_CHILD_DELIVERY } from "./work-graph-wait-marker.js";
+import { isAutomaticChildWait } from "./work-graph-wait-marker.js";
 import { createReviewRepairCodeExecutionSource, createCiRepairCodeExecutionSource, isHeadRepairExecutionSource } from "../domain/code-execution-source.js";
 import { normalizeCiRepairEvidence } from '../domain/ci-repair-evidence.js';
 import { codeJobIdForGrant } from "../domain/code-job-contract.js";
@@ -250,7 +250,7 @@ export class AutomaticOwnPrRepair {
       root.itemId === binding.rootItemId && root.source?.kind === 'pull_request' &&
       root.source.scope.kind === 'owner_requested' && root.source.scope.active === true &&
       (['queued', 'working', 'dispatch_pending', 'retry_wait', 'waiting_condition', 'waiting_external', 'completed'].includes(root.status) ||
-        (root.status === 'paused' && root.statusReason === AUTO_RESUME_ON_CHILD_DELIVERY)) && root.sourceQuarantine === null &&
+        isAutomaticChildWait(root)) && root.sourceQuarantine === null &&
       root.source.identity.provider === event.source.provider && root.source.identity.scopeId === event.source.scopeId &&
       event.eventId === binding.eventId && event.contentDigest === binding.eventDigest &&
       sameLogin(binding.gitTarget?.sourceAccountId, config.githubActions.actorAccountId);
