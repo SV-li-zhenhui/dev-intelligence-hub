@@ -12,6 +12,34 @@ const receipt = (id, overrides = {}) => ({runId:`run-${id}`,kind:'work-item',tas
   registeredAt:'2026-10-15T00:00:00.000Z',modelStartedAt:null,lastActivityAt:'2026-10-15T00:00:00.000Z',finishedAt:null,
   phase:'preparing',stopConfirmed:false,session:null,eventCount:0,outcomeCode:null,...overrides});
 
+test('a native RPC failure stage survives run completion and registry restart without event bodies', async () => {
+  const store=memoryStore(),runs=registry(store);let context;
+  await assert.rejects(runs.run(task,async()=>{
+    context=currentTaskExecution();
+    context.reportNativeFailure({kind:'rpc_error',method:'thread/resume',code:-32600});
+    context.reportNativeFailure({kind:'process_exit',method:null,code:1});
+    context.reportEvent({type:'status',text:'PRIVATE_SERVER_MESSAGE'});
+    throw Object.assign(new Error('private failure body'),{code:'STRUCTURED_PROVIDER_PROCESS_FAILED'});
+  }),{code:'STRUCTURED_PROVIDER_PROCESS_FAILED'});
+  context.reportNativeFailure({kind:'rpc_error',method:'turn/start',code:-32603});
+  const view=await registry(store).get(task.kind,task.taskId);
+  assert.deepEqual(view.receipt.nativeFailure,{kind:'rpc_error',method:'thread/resume',code:-32600});
+  assert.deepEqual(view.events,[]);
+  assert.equal(view.receipt.modelStartedAt,null);
+  assert.equal(JSON.stringify(store.values.get(TASK_RUN_RECEIPT_STATE_KEY)).includes('PRIVATE_'),false);
+});
+
+test('native RPC receipt metadata accepts only known methods and numeric codes while preserving old receipts', async () => {
+  const receipts=new TaskRunExecutionReceipts(memoryStore());
+  await receipts.record(receipt('legacy'));
+  await receipts.record(receipt('unknown-code',{nativeFailure:{kind:'rpc_error',method:'turn/start',code:null}}));
+  for(const nativeFailure of [
+    {kind:'rpc_error',method:'PRIVATE_METHOD',code:-32600}, {kind:'rpc_error',method:'turn/start',code:'PRIVATE_CODE'},
+    {kind:'rpc_error',method:'turn/start',code:1.5}, {kind:'rpc_error',method:'turn/start',code:-32600,message:'PRIVATE_MESSAGE'},
+  ]) assert.throws(()=>receipts.record(receipt('invalid',{nativeFailure})),{code:'TASK_RUN_RECEIPT_STATE_INVALID'});
+  assert.equal(Object.hasOwn((await receipts.list()).find(r=>r.runId==='run-legacy'),'nativeFailure'),false);
+});
+
 test('a stopped-owner commit holds registration until it settles and rejects a later run', async () => {
   const runs = registry(memoryStore());
   const root = { ...task, taskId: 'root', roleId: 'orchestrator' }, child = { ...task, taskId: 'child', roleId: 'developer' };

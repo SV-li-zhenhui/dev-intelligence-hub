@@ -106,7 +106,7 @@ test('startup completion after cancellation cannot initialize or start a model b
   });
 });
 
-function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null,initializationFailure=false,turnStartFailure=null,resumeFailure=null,codeJob=false,reviewAgents=false,toolInventory=null,onInterrupt=null,contained=false}={}) {
+function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null,initializationFailure=false,turnStartFailure=null,resumeFailure=null,exitDuringMethod=null,codeJob=false,reviewAgents=false,toolInventory=null,onInterrupt=null,contained=false}={}) {
   let options; const calls=[]; let finish,interruptId,signalStopping;
   const stopping=new Promise(resolve=>{signalStopping=resolve;});
   const done = new Promise((r)=>{finish=r;});
@@ -115,6 +115,7 @@ function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=fals
   const process={done,exited:false,start(value){options=value;},write(line){
     const request=JSON.parse(line); if(!request.id)return;
     calls.push(request); let result={};
+    if(request.method===exitDuringMethod){options.onExit({exitCode:19,signal:null});return;}
     if(request.method==='initialize' && initializationFailure){send({id:request.id,error:{code:-32600,message:'fixture startup refused'}});return;}
     if(request.method==='thread/resume' && resumeFailure){send({id:request.id,error:resumeFailure});return;}
     if(request.method==='config/read') result={config:{
@@ -177,13 +178,28 @@ test('native review resume explicitly restores host reviewer flags before starti
 });
 
 for(const [method,rpcCode] of [['turn/start',-32600],['thread/resume','PRIVATE_CODE']]) test(`native RPC failure reports its host stage without exposing server content (${method})`, async () => {
-  const events=[];
+  const events=[],failures=[];
   const serverError={code:rpcCode,message:'PRIVATE_SERVER_MESSAGE',data:{token:'PRIVATE_TOKEN'}};
   const f=fixture(method==='turn/start'?{turnStartFailure:serverError}:{resumeFailure:serverError});
-  await assert.rejects(invocation(f.runner,run=>withTaskExecution({reportEvent:event=>events.push(event)},run),{previous:threadId}),
+  await assert.rejects(invocation(f.runner,run=>withTaskExecution({reportEvent:event=>events.push(event),reportNativeFailure:value=>failures.push(value)},run),{previous:threadId}),
     {code:'STRUCTURED_PROVIDER_PROCESS_FAILED'});
   assert.deepEqual(events,[{type:'status',text:`Native RPC failed: ${method} (code ${typeof rpcCode==='number'?rpcCode:'unknown'})`}]);
+  assert.deepEqual(failures,[{kind:'rpc_error',method,code:typeof rpcCode==='number'?rpcCode:null}]);
   assert.equal(JSON.stringify(events).includes('PRIVATE_'),false);
+});
+
+test('an unexpected process exit retains the pending host method before teardown clears it', async () => {
+  const failures=[],f=fixture({exitDuringMethod:'thread/resume'});
+  await assert.rejects(invocation(f.runner,run=>withTaskExecution({reportNativeFailure:value=>failures.push(value)},run),{previous:threadId}),
+    {code:'STRUCTURED_PROVIDER_PROCESS_FAILED'});
+  assert.deepEqual(failures,[{kind:'process_exit',method:'thread/resume',code:19}]);
+});
+
+test('a failed diagnostic observer cannot strand the RPC or replace its original native failure', async () => {
+  const f=fixture({turnStartFailure:{code:-32600,message:'PRIVATE_SERVER_MESSAGE'}});
+  const broken=()=>{throw new Error('diagnostics unavailable');};
+  await assert.rejects(invocation(f.runner,run=>withTaskExecution({reportNativeFailure:broken,reportEvent:broken},run)),
+    error=>error.code==='STRUCTURED_PROVIDER_PROCESS_FAILED' && didAppServerReap(error));
 });
 
 for (const contained of [false, true]) test(`useful current-turn native code progress remains active beyond ten hours with contained supervision ${contained}`, async t => {

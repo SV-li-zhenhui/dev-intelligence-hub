@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual, types as utilTypes } from "node:util";
 import { OperationQueue } from "../lib/operation-queue.js";
 import { withTaskExecution } from '../lib/task-execution-context.js';
-import {TaskRunExecutionReceipts,executionReceiptView} from './task-run-execution-receipts.js';
+import {TaskRunExecutionReceipts,executionReceiptView,normalizeNativeFailure} from './task-run-execution-receipts.js';
 
 export const TASK_RUN_STATE_KEY = "task-run-settings";
 const MAX_RECORDS = 1_000;
@@ -369,6 +369,9 @@ export class TaskRunRegistry {
             this.#recordReceipt(run);
           } },
           reportEvent: (event) => { if (current()) { reportEvent(run, event, this.#now()); this.#recordReceipt(run); } },
+          reportNativeFailure: (value) => { if(current() && !run.nativeFailure) {
+            run.nativeFailure=normalizeNativeFailure(value);run.lastActivityAt=this.#now();this.#recordReceipt(run);
+          } },
           registerLiveControl: (control) => {
             if (!current()) return () => {};
             if (typeof control?.steer !== 'function' || typeof control?.interrupt !== 'function') throw invalidInput();
@@ -736,7 +739,8 @@ export class TaskRunRegistry {
       taskRevision:run.task.revision,leaseId:run.task.leaseId??null,registeredAt:run.startedAt,
       modelStartedAt:run.modelStartedAt,lastActivityAt:run.lastActivityAt??run.startedAt,
       finishedAt:run.finishedAt??null,phase:run.phase,stopConfirmed:run.stoppedConfirmed===true,
-      session:run.session ? {...run.session}:null,eventCount:run.eventSequence,outcomeCode:run.outcomeCode??null};
+      session:run.session ? {...run.session}:null,eventCount:run.eventSequence,outcomeCode:run.outcomeCode??null,
+      ...(run.nativeFailure?{nativeFailure:{...run.nativeFailure}}:{})};
     const recorded=this.#receipts.record(run.receipt);
     void recorded.catch(()=>{}); // Synchronous event callbacks report persistence failure at the next read/checkpoint.
     return recorded;

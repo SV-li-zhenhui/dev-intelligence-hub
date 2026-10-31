@@ -71,6 +71,15 @@ export class CodexAppServerRunner {
     let sequence=0,started=false,initialized=false,terminal=false,accepting=true,interrupted=false,detach,output,error,turnAttempted=false;
     const earlyEvents=[];const streamedItems=new Set();let earlyBytes=0;
     const activityItems = new Set(); let lastPlan = null;
+    const reportNativeFailure=(value,text)=>{
+      // Diagnostic observers must not replace a native failure or strand its waiter.
+      try { context?.reportNativeFailure?.(value); } catch {}
+      if(text)try { context?.reportEvent?.({type:'status',text}); } catch {}
+    };
+    const reportTransportFailure=(kind,code)=>{
+      if(accepting && !terminal)reportNativeFailure({kind,method:pending.values().next().value?.method??null,
+        code:Number.isSafeInteger(code)?code:null});
+    };
     const request=(method,params)=>{
       if(process.exited) return Promise.reject(failure());
       const id=++sequence; const waiting=deferred();
@@ -102,7 +111,8 @@ export class CodexAppServerRunner {
           if(message.error) {
             // Server messages/data may contain private paths or credentials.
             const code=Number.isSafeInteger(message.error.code)?message.error.code:'unknown';
-            context?.reportEvent?.({type:'status',text:`Native RPC failed: ${waiting.method} (code ${code})`});
+            reportNativeFailure({kind:'rpc_error',method:waiting.method,code:code==='unknown'?null:code},
+              `Native RPC failed: ${waiting.method} (code ${code})`);
             waiting.reject(providerFailure(message.error, message.error.data ?? message.error));
           } else waiting.resolve(message.result);
           return;
@@ -176,8 +186,8 @@ export class CodexAppServerRunner {
       started=true;
       await process.start({...(descriptor ? {command:descriptor.command,args:[...descriptor.prefixArgs,...args]} : {executable,args}),cwd,env,
         timeoutMs,signal,...(codeExecutionWatchdog ? { codeExecutionWatchdog } : {}),maxStdoutBytes:64*1024*1024,maxStderrBytes:1024*1024,
-        keepStdinOpen:true,onLine:receive,onError:fail,onLimit:()=>fail(failure('STRUCTURED_PROVIDER_OUTPUT_LIMIT')),
-        onExit:()=>{if(!terminal)fail(failure(initialized ? 'STRUCTURED_PROVIDER_PROCESS_FAILED' : 'STRUCTURED_PROVIDER_UNAVAILABLE'));}});
+        keepStdinOpen:true,onLine:receive,onError:cause=>{reportTransportFailure('process_error');fail(cause);},onLimit:()=>fail(failure('STRUCTURED_PROVIDER_OUTPUT_LIMIT')),
+        onExit:result=>{reportTransportFailure('process_exit',result?.exitCode);if(!terminal)fail(failure(initialized ? 'STRUCTURED_PROVIDER_PROCESS_FAILED' : 'STRUCTURED_PROVIDER_UNAVAILABLE'));}});
       if (!accepting) await completed.promise;
       await request('initialize',{clientInfo:{name:'dev_intelligence_hub',version:'0.1.0'},capabilities:{experimentalApi:true}});
       initialized=true;

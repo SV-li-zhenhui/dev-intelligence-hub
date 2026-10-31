@@ -8,10 +8,21 @@ const invalid = () => Object.assign(new Error('Execution receipt state is invali
 const empty = () => ({schemaVersion:1,records:[]});
 const validTime = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
 const capacityExceeded = () => Object.assign(new Error('Execution receipt capacity is full'),{code:'TASK_RUN_RECEIPT_CAPACITY_EXCEEDED',statusCode:507});
+const NATIVE_RPC_METHODS=new Set(['initialize','config/read','thread/start','thread/resume','mcpServerStatus/list','turn/start','turn/steer','turn/interrupt']);
+
+export function normalizeNativeFailure(value) {
+  if(!value || Object.getPrototypeOf(value)!==Object.prototype || Object.keys(value).length!==3 ||
+    !Object.hasOwn(value,'kind') || !['rpc_error','process_exit','process_error'].includes(value.kind) ||
+    !Object.hasOwn(value,'method') || !Object.hasOwn(value,'code') ||
+    !(NATIVE_RPC_METHODS.has(value.method) || value.kind!=='rpc_error' && value.method===null) ||
+    (value.code!==null && !Number.isSafeInteger(value.code))) throw invalid();
+  return {kind:value.kind,method:value.method,code:value.code};
+}
 
 function normalize(receipt) {
   const fields = ['runId','kind','taskId','roleId','taskRevision','leaseId','registeredAt','modelStartedAt','lastActivityAt','finishedAt','phase','stopConfirmed','session','eventCount','outcomeCode'];
-  if (!receipt || Object.getPrototypeOf(receipt)!==Object.prototype || Object.keys(receipt).length!==fields.length || fields.some(field=>!Object.hasOwn(receipt,field))) throw invalid();
+  if (!receipt || Object.getPrototypeOf(receipt)!==Object.prototype || Object.keys(receipt).length!==fields.length+(Object.hasOwn(receipt,'nativeFailure')?1:0) || fields.some(field=>!Object.hasOwn(receipt,field))) throw invalid();
+  if(Object.hasOwn(receipt,'nativeFailure'))normalizeNativeFailure(receipt.nativeFailure);
   if (!['work-item','code-job'].includes(receipt.kind) || !['runId','taskId','roleId'].every(field=>typeof receipt[field]==='string' && IDENTIFIER.test(receipt[field])) ||
     (receipt.leaseId!==null && (typeof receipt.leaseId!=='string' || !IDENTIFIER.test(receipt.leaseId))) || !PHASES.has(receipt.phase) || typeof receipt.stopConfirmed!=='boolean' ||
     !Number.isSafeInteger(receipt.taskRevision) || receipt.taskRevision<0 || !Number.isSafeInteger(receipt.eventCount) || receipt.eventCount<0 ||
