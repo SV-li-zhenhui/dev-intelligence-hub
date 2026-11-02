@@ -17,6 +17,12 @@ function abortError(signal) {
   if (signal?.aborted) throw signal.reason || Object.assign(new Error("DingTalk summary cancelled"), { name: "AbortError" });
 }
 
+function failureCode(error, fallback = "UNKNOWN_PROVIDER_FAILURE") {
+  return typeof error?.code === "string" && /^[A-Z0-9_]{1,80}$/.test(error.code)
+    ? error.code
+    : fallback;
+}
+
 export class RoutedDingTalkSummaryBrain {
   constructor({ router, primaryBrain, allowRemoteDingTalkSummary = false, fallback, timeoutMs = 90_000 } = {}) {
     if (!router || typeof router.generate !== "function") throw new TypeError("DingTalk primary brain router is required");
@@ -70,7 +76,18 @@ export class RoutedDingTalkSummaryBrain {
           abortError(signal);
           if (!timedOut && !(error instanceof InvalidDingTalkDigestError) && !FALLBACKABLE_CODES.has(error?.code)) throw error;
           useFallback = true;
-          return this.#fallbackBatch(batch, batchOptions);
+          const primaryFailureCode = timedOut
+            ? "STRUCTURED_PROVIDER_TIMEOUT"
+            : failureCode(error, error instanceof InvalidDingTalkDigestError ? "STRUCTURED_PROVIDER_RESPONSE_INVALID" : undefined);
+          try {
+            return await this.#fallbackBatch(batch, batchOptions);
+          } catch (fallbackError) {
+            const combined = new Error(fallbackError?.message || "DingTalk summary providers failed", { cause: fallbackError });
+            combined.code = "DINGTALK_SUMMARY_BOTH_PROVIDERS_FAILED";
+            combined.primaryFailureCode = primaryFailureCode;
+            combined.fallbackFailureCode = failureCode(fallbackError);
+            throw combined;
+          }
         } finally {
           clearTimeout(timer);
           signal?.removeEventListener("abort", relay);

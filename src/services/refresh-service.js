@@ -341,7 +341,12 @@ export class RefreshService {
       brainMeta.dingtalkSummarized = summaries.length;
       return applyDingTalkSummaries(prepared, summaries);
     } catch (error) {
-      brainMeta.dingtalkSummaryError = { message: error.message };
+      brainMeta.dingtalkSummaryError = {
+        message: error.message,
+        ...(typeof error.code === "string" ? { code: error.code } : {}),
+        ...(typeof error.primaryFailureCode === "string" ? { primaryFailureCode: error.primaryFailureCode } : {}),
+        ...(typeof error.fallbackFailureCode === "string" ? { fallbackFailureCode: error.fallbackFailureCode } : {}),
+      };
       brainMeta.errors.push("钉钉 AI 摘要暂时不可用，已显示消息摘录；系统将自动重试。");
       return applyDingTalkSummaries(prepared);
     }
