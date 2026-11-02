@@ -69,8 +69,10 @@ async function createValidationFixture(t) {
     "scripts/validate-system.mjs",
     "src/adapters/git-object-snapshotter.js",
     "src/domain/code-execution-policy.js",
+    "src/lib/git-blob-batch.js",
     "src/lib/line-buffer.js",
     "src/lib/managed-process.js",
+    "src/lib/preparation-cancellation.js",
     "src/lib/repository-source-state.js",
     "src/lib/runtime-source-identity.js",
   ]) {

@@ -265,7 +265,8 @@ test("supervised runner admits review traces above one MiB independently of fina
   const result = await testRunner().run(request(
     directory,
     "process.stdout.write(Buffer.alloc(2 * 1024 * 1024, 65));",
-    { maxStdoutBytes: 64 * 1024 * 1024 },
+    // This checks trace size, independently of Windows helper startup latency.
+    { maxStdoutBytes: 64 * 1024 * 1024, timeoutMs: 15_000 },
   ));
   assert.equal(result.exitCode, 0);
   assert.equal(result.stdoutBytes.length, 2 * 1024 * 1024);
