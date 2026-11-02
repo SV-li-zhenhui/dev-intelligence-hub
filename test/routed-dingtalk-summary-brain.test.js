@@ -83,6 +83,17 @@ test("DingTalk summaries fall back to Ollama once Luna transport fails", async (
   assert.equal(fallbackCalls, 1);
 });
 
+test("native CLI JSON text is parsed without requiring Ollama", async () => {
+  const brain = new RoutedDingTalkSummaryBrain({
+    router: routerFor(async () => JSON.stringify({ summaries: [SUMMARY] })),
+    primaryBrain: PRIMARY,
+    allowRemoteDingTalkSummary: true,
+    fallback: { async summarizeDingTalk() { assert.fail("valid CLI output must not need Ollama"); } },
+  });
+  const result = await brain.summarizeDingTalkWithReceipt(CONVERSATIONS);
+  assert.deepEqual(result, { summaries: [SUMMARY], fallbackUsed: false });
+});
+
 test("DingTalk content cannot be routed remotely without explicit authorization", async () => {
   let calls = 0;
   assert.throws(() => new RoutedDingTalkSummaryBrain({

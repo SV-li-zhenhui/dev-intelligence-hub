@@ -72,7 +72,7 @@ export class RoutedDingTalkSummaryBrain {
             signal: controller.signal,
           });
           abortError(signal);
-          return parseDingTalkDigest(response?.summaries ? response : response?.message?.content, groupIds);
+          return parseDingTalkDigest(typeof response === "string" || response?.summaries ? response : response?.message?.content, groupIds);
         } catch (error) {
           abortError(signal);
           if (!timedOut && !(error instanceof InvalidDingTalkDigestError) && !FALLBACKABLE_CODES.has(error?.code)) throw error;

@@ -23,6 +23,7 @@ import { startCodeExecutionTurn } from '../src/lib/code-execution-watchdog.js';
 import { ContainedStdioProcess } from '../src/lib/contained-stdio-process.js';
 import { preparePrEmployeeAnalysis } from '../src/adapters/ollama-pr-employee-reviewer.js';
 import { NATIVE_ADVISORY_INSTRUCTION } from '../src/lib/codex-app-server-policy.js';
+import { RoutedDingTalkSummaryBrain } from '../src/adapters/routed-dingtalk-summary-brain.js';
 
 const schema = { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false };
 const request = (overrides = {}) => ({ model: "gpt-6.1-sol", reasoningEffort: "high", messages: [{ role: "user", content: "PRIVATE_TASK_INPUT" }], schema, ...overrides });
@@ -691,6 +692,24 @@ test('standalone structured text skips inherited app-server tools using isolated
   assert.ok(call.args.includes('model_reasoning_effort="medium"'));
   assert.equal(call.env.CODEX_HOME, f.home);
   assert.deepEqual(await readdir(path.join(f.runtime, 'sessions')), []);
+  await provider.close();
+});
+
+test('DingTalk route consumes real native provider JSON text without a local fallback', async (t) => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = 'app-server';
+  const summary = { groupId: 'group-1', important: true, summary: '验证通过。', highlights: [], actionRequired: '' };
+  const provider = f.create(call => result(call, { summaries: [summary] }), {}, { appServerRunner: { async run() {
+    assert.fail('plain summaries must use isolated exec');
+  } } });
+  const brain = new RoutedDingTalkSummaryBrain({
+    router: new BrainRouter({ providers: [provider] }),
+    primaryBrain: { provider: provider.id, model: 'gpt-6-luna', reasoningEffort: 'medium', remoteData: { requirements: false, code: false, memory: false } },
+    allowRemoteDingTalkSummary: true,
+    fallback: { async summarizeDingTalk() { assert.fail('valid native output must not need Ollama'); } },
+  });
+  assert.deepEqual(await brain.summarizeDingTalkWithReceipt([{ groupId: 'group-1', messages: [{ content: '验证通过。' }] }]),
+    { summaries: [summary], fallbackUsed: false });
+  assert.equal(f.calls.length, 1);
   await provider.close();
 });
 
