@@ -469,6 +469,7 @@ class FakeRoleDirectory {
 
   async resolve(target) {
     this.calls.push(clone(target));
+    if (this.failure) throw this.failure;
     return this.entries.get(target.id) ?? null;
   }
 }
@@ -2062,6 +2063,54 @@ test("one failed target resolution is cached for the whole cycle", async () => {
     ["resolution_failed", "resolution_failed"],
   );
   assert.equal(ledger.calls.claim.length, 0);
+});
+
+test("unchanged work backs off after role resolution fails and retries when due", async () => {
+  const time = controlledClock();
+  const source = workItem(1);
+  const ledger = new FakeLedger({ source: [source], time });
+  const directory = new FakeRoleDirectory();
+  directory.failure = Object.assign(new Error("role state read timed out"), { code: "ROLE_RESOLUTION_TIMEOUT" });
+  const loop = createLoop({ ledger, directory, time });
+
+  const first = await loop.runCycle({ roleId: "pr-reviewer" });
+  assert.equal(first.outcomes[0].status, "resolution_failed");
+  const second = await loop.runCycle({ roleId: "pr-reviewer" });
+  assert.deepEqual(second.outcomes[0], {
+    itemId: source.itemId,
+    status: "resolution_deferred",
+    code: "ROLE_RESOLUTION_TIMEOUT",
+  });
+  assert.equal(directory.calls.length, 1);
+  assert.equal(ledger.calls.claim.length, 0);
+
+  time.advance(1_000);
+  directory.failure = null;
+  directory.entries.set("pr-reviewer", worker());
+  const retried = await loop.runCycle({ roleId: "pr-reviewer" });
+  assert.equal(directory.calls.length, 2);
+  assert.equal(retried.claimed, 1, JSON.stringify(retried.outcomes));
+  assert.equal(retried.staged, 1, JSON.stringify(retried.outcomes));
+});
+
+test("changed work bypasses a pending role resolution backoff", async () => {
+  const time = controlledClock();
+  const source = workItem(1);
+  const ledger = new FakeLedger({ source: [source], time });
+  const directory = new FakeRoleDirectory();
+  directory.failure = Object.assign(new Error("role state read timed out"), { code: "ROLE_RESOLUTION_TIMEOUT" });
+  const loop = createLoop({ ledger, directory, time });
+
+  await loop.runCycle({ roleId: "pr-reviewer" });
+  ledger.items[0].revision += 1;
+  ledger.items[0].inputDigest = "changed-input";
+  directory.failure = null;
+  directory.entries.set("pr-reviewer", worker());
+  const retried = await loop.runCycle({ roleId: "pr-reviewer" });
+
+  assert.equal(directory.calls.length, 2);
+  assert.equal(retried.claimed, 1, JSON.stringify(retried.outcomes));
+  assert.equal(retried.staged, 1, JSON.stringify(retried.outcomes));
 });
 
 test("a bounded decision timeout schedules a safe retry before the lease expires", async () => {

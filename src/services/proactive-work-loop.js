@@ -909,6 +909,7 @@ export class ProactiveWorkLoop {
     this.lastIssueRetirementKey = null;
     this.issueRetirementSweep = null;
     this.fencedClaimDeferrals = new Map();
+    this.roleResolutionDeferrals = new Map();
     this.rootContextDeferralSweeps = new Map();
     this.prPreparationSweeps = new Map();
     this.blockedRootSweeps = new Map();
@@ -991,6 +992,15 @@ export class ProactiveWorkLoop {
         this.fencedClaimDeferrals.delete(itemId);
       }
     }
+    const resolutionDeferrals = this.roleResolutionDeferrals;
+    for (const [key, deferral] of resolutionDeferrals) {
+      if (
+        deferral.scope === scope &&
+        itemRevisions.get(deferral.itemId) !== deferral.revision
+      ) {
+        resolutionDeferrals.delete(key);
+      }
+    }
     const graphBlocked = candidateWindow.graphBlocked;
     const activeQuestions = candidateWindow.activeQuestions;
     const resolutions = new Map();
@@ -1064,6 +1074,20 @@ export class ProactiveWorkLoop {
       ) {
         continue;
       }
+      const resolutionDeferralKey = `${scope}:${item.itemId}`;
+      const resolutionDeferral = resolutionDeferrals.get(resolutionDeferralKey);
+      if (
+        resolutionDeferral?.revision === item.revision &&
+        Date.parse(resolutionDeferral.retryAt) >
+          Date.parse(normalizeLoopClock(this.clock))
+      ) {
+        outcomes.push({
+          itemId: item.itemId,
+          status: "resolution_deferred",
+          code: resolutionDeferral.code,
+        });
+        continue;
+      }
       if (!isAvailable(item, normalizeLoopClock(this.clock))) continue;
       if (
         options.roleId !== null &&
@@ -1101,9 +1125,28 @@ export class ProactiveWorkLoop {
         continue;
       }
       if (resolution.status === "resolution_failed") {
-        outcomes.push({ itemId: item.itemId, status: "resolution_failed", code: stableFailureCode(resolution.error) });
+        const code = stableFailureCode(resolution.error);
+        const previous = resolutionDeferrals.get(resolutionDeferralKey);
+        const failures =
+          previous?.revision === item.revision ? previous.failures + 1 : 1;
+        const backoff = Math.min(
+          this.retryBaseMs * 2 ** Math.min(failures - 1, 20),
+          this.retryMaxMs,
+        );
+        resolutionDeferrals.set(resolutionDeferralKey, {
+          itemId: item.itemId,
+          revision: item.revision,
+          scope,
+          failures,
+          code,
+          retryAt: new Date(
+            Date.parse(normalizeLoopClock(this.clock)) + backoff,
+          ).toISOString(),
+        });
+        outcomes.push({ itemId: item.itemId, status: "resolution_failed", code });
         continue;
       }
+      resolutionDeferrals.delete(resolutionDeferralKey);
       if (options.roleId !== null && resolution.roleId !== options.roleId) {
         continue;
       }
