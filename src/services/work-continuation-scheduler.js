@@ -12,7 +12,8 @@ import {
 const WAITING = new Set(['waiting_external', 'waiting_condition', 'dispatch_pending', 'retry_wait', 'paused']);
 const TERMINAL = new Set(['completed', 'cancelled', 'superseded']);
 const DETERMINISTIC_DECISION_FAILURES = new Set(['ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION', 'STRUCTURED_BRAIN_RESPONSE_INVALID', 'STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED']);
-const UNCHANGED_INPUT_FAILURES = new Set([...DETERMINISTIC_DECISION_FAILURES, 'PR_FACTS_STALE']);
+const UNCHANGED_CONFIGURATION_FAILURES = new Set(['ROLE_TASK_BRAIN_NOT_CONFIGURED', 'BRAIN_PROVIDER_NOT_CONFIGURED', 'REMOTE_DATA_NOT_AUTHORIZED']);
+const UNCHANGED_INPUT_FAILURES = new Set([...DETERMINISTIC_DECISION_FAILURES, ...UNCHANGED_CONFIGURATION_FAILURES, 'PR_FACTS_STALE', 'WORK_CONTINUATION_UNCHANGED_DECISION']);
 const timeout = () => Object.assign(new Error('Work continuation execution exceeded its lease budget'), { code: 'WORK_CONTINUATION_TIMEOUT' });
 const recovery = (action, reason, dueAt = null) => ({ action, reason, dueAt });
 const graphProgress = value => typeof value?.graphProgressDigest === 'string' && /^[a-f0-9]{64}$/.test(value.graphProgressDigest)
@@ -265,7 +266,7 @@ export class WorkContinuationScheduler {
   }
 
   async #execute(claim, dispatch, signal) {
-    let result, observedRevision = null, errorCode = null, relatedProgressed = false;
+    let result, observedRevision = null, errorCode = null, relatedProgressed = false, unchangedGraph = false;
     try {
       signal.throwIfAborted();
       const role = await this.#ports.roleStateReader.read(claim.roleId);
@@ -286,12 +287,14 @@ export class WorkContinuationScheduler {
           if (latest !== null && observedRevision === item.revision && beforeProgress !== null) {
             const afterProgress = await this.#relatedProgress(claim.itemId);
             relatedProgressed = beforeProgress !== null && afterProgress !== null && beforeProgress !== afterProgress;
+            unchangedGraph = beforeProgress !== null && beforeProgress === afterProgress;
           }
           result = latest === null ? 'input_changed' : observedRevision !== item.revision || relatedProgressed ? 'role_woken' : 'no_progress';
           const outcome = dispatched?.continuationOutcome;
           if (result === 'no_progress' && hasExactLedgerKeys(outcome, ['itemId', 'fingerprint', 'status', 'code']) &&
               outcome.itemId === claim.itemId && outcome.fingerprint === claim.fingerprint &&
-              outcome.status === 'decision_deferred' && outcome.code === 'PR_FACTS_STALE') errorCode = outcome.code;
+              ((outcome.status === 'decision_deferred' && outcome.code === 'PR_FACTS_STALE') ||
+                (outcome.status === 'degraded' && UNCHANGED_CONFIGURATION_FAILURES.has(outcome.code)))) errorCode = outcome.code;
           if (result === 'no_progress' && errorCode === null && this.#ports.taskRuns?.get) {
             try {
               const run = await this.#ports.taskRuns.get('work-item', claim.itemId), receipt = run?.receipt;
@@ -299,6 +302,14 @@ export class WorkContinuationScheduler {
                   receipt.roleId === claim.roleId && receipt.taskId === claim.itemId &&
                   Date.parse(receipt.registeredAt) >= Date.parse(claim.receipts.at(-1).startedAt) &&
                   receipt.phase === 'failed' && DETERMINISTIC_DECISION_FAILURES.has(receipt.outcomeCode)) errorCode = receipt.outcomeCode;
+              if (unchangedGraph && run?.active === false && receipt?.taskRevision === item.revision &&
+                  receipt.roleId === claim.roleId && receipt.taskId === claim.itemId &&
+                  Date.parse(receipt.registeredAt) >= Date.parse(claim.receipts.at(-1).startedAt) &&
+                  receipt.phase === 'completed' && receipt.stopConfirmed === true &&
+                  receipt.session?.transport === 'app-server' && receipt.session.status === 'completed' &&
+                  Date.parse(receipt.modelStartedAt) >= Date.parse(receipt.registeredAt) &&
+                  Date.parse(receipt.finishedAt) >= Date.parse(receipt.modelStartedAt) &&
+                  Date.parse(receipt.finishedAt) <= Date.parse(this.#now())) errorCode = 'WORK_CONTINUATION_UNCHANGED_DECISION';
             } catch { this.#status.lastError = 'progress_observation_failed'; }
           }
         }

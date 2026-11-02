@@ -314,6 +314,79 @@ test('unchanged deterministic decision failures stop model retries across restar
   });
 });
 
+test('configuration failures wait for effective changes instead of repeating every five minutes', async t => {
+  for (const code of ['ROLE_TASK_BRAIN_NOT_CONFIGURED', 'BRAIN_PROVIDER_NOT_CONFIGURED', 'REMOTE_DATA_NOT_AUTHORIZED'])
+    for (const change of ['task', 'related-child', 'configuration', 'runtime']) await t.test(`${code}: ${change}`, async () => {
+  const f = relatedProgressFixture(); let calls = 0;
+  let runtimeRevision = 'a'.repeat(64);
+  f.items[0].currentTarget.id = 'requirements-analyst';
+  let scheduler = new WorkContinuationScheduler(f.options);
+  const dispatch = async ({ continuationTarget }) => {
+    calls++;
+    return { skipped: null, continuationOutcome: { ...continuationTarget, status: 'degraded', code } };
+  };
+  const run = async () => { await scheduler.runCycle({ ...f, dispatch, runtimeRevision }); await f.drain(); };
+  for (let i = 0; i < 3; i++) { await run(); f.advance(90_000); }
+  scheduler = new WorkContinuationScheduler(f.options);
+  f.advance(3600_000); await run();
+  assert.equal(calls, 3);
+  assert.equal(f.state().records[0].recovery.action, 'await_condition');
+  assert.equal(f.state().records[0].nextAttemptAt, null);
+  if (change === 'task') f.items[0].revision++;
+  if (change === 'related-child') f.items[1].revision++;
+  if (change === 'configuration') f.config.workCoordination = { leaseDurationMs: 180_000 };
+  if (change === 'runtime') runtimeRevision = 'b'.repeat(64);
+  await run(); assert.equal(calls, 4);
+  });
+});
+
+test('completed model decisions without graph progress wait across restart and wake on child changes', async () => {
+  const f = relatedProgressFixture(); let calls = 0, receipt;
+  f.options.taskRuns = { async order(items) { return items; }, async get() { return { active: false, receipt }; } };
+  let scheduler = new WorkContinuationScheduler(f.options);
+  const dispatch = async () => {
+    calls++;
+    receipt = { taskId: f.items[0].itemId, roleId: 'orchestrator', taskRevision: f.items[0].revision,
+      registeredAt: f.options.clock().toISOString(), modelStartedAt: f.options.clock().toISOString(),
+      finishedAt: f.options.clock().toISOString(), phase: 'completed', stopConfirmed: true,
+      session: { transport: 'app-server', status: 'completed' } };
+  };
+  const run = async () => { await scheduler.runCycle({ ...f, dispatch }); await f.drain(); };
+  for (let i = 0; i < 3; i++) { await run(); f.advance(90_000); }
+  scheduler = new WorkContinuationScheduler(f.options);
+  f.advance(3600_000); await run();
+  assert.equal(calls, 3);
+  assert.equal(f.state().records[0].recovery.action, 'await_condition');
+  f.items[1].revision++;
+  await run(); assert.equal(calls, 4);
+});
+
+test('missing or unconfirmed model/graph evidence keeps a continuation recoverable', async t => {
+  for (const variant of ['no-graph', 'active', 'unconfirmed', 'no-model', 'unfinished', 'old-run', 'future-finish']) await t.test(variant, async () => {
+    const f = variant === 'no-graph' ? fixture() : relatedProgressFixture(); let calls = 0, receipt;
+    f.items[0].currentTarget.id = 'orchestrator';
+    f.options.taskRuns = { async order(items) { return items; }, async get() { return { active: variant === 'active', receipt }; } };
+    const scheduler = new WorkContinuationScheduler(f.options);
+    const dispatch = async () => {
+      calls++;
+      const now = f.options.clock().toISOString();
+      receipt = { taskId: f.items[0].itemId, roleId: 'orchestrator', taskRevision: f.items[0].revision,
+        registeredAt: now, modelStartedAt: now, finishedAt: now, phase: 'completed', stopConfirmed: true,
+        session: { transport: 'app-server', status: 'completed' } };
+      if (variant === 'unconfirmed') receipt.stopConfirmed = false;
+      if (variant === 'no-model') receipt.modelStartedAt = null;
+      if (variant === 'unfinished') receipt.finishedAt = null;
+      if (variant === 'old-run') receipt.registeredAt = '2020-01-01T00:00:00.000Z';
+      if (variant === 'future-finish') receipt.finishedAt = '2099-01-01T00:00:00.000Z';
+    };
+    for (let i = 0; i < 4; i++) {
+      await scheduler.runCycle({ ...f, dispatch }); await f.drain(); f.advance(3600_000);
+    }
+    assert.equal(calls, 4);
+    assert.equal(f.state().records[0].recovery.action, 'retry');
+  });
+});
+
 test('unchanged preclaim stale facts wait across restart and rearm on effective changes', async t => {
   for (const change of ['task', 'related-child', 'configuration', 'runtime']) await t.test(change, async () => {
     const f = relatedProgressFixture(); let runtimeRevision = 'a'.repeat(64), calls = 0;
