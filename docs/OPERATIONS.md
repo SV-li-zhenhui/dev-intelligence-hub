@@ -246,6 +246,10 @@ returns a non-zero exit code for stopped, retained-uncertain, identity-mismatch,
 or otherwise unhealthy managed state. Treat retained control state as evidence
 to investigate; do not delete it merely to make `Start` succeed.
 
+On slow storage or with large persisted state, use `-TimeoutSeconds 1800` for
+`Start` or `Restart`. This extends the manager's observation window; the child's
+bounded unclaimed-process watchdog and authenticated claim checks still apply.
+
 On Windows, the launcher explicitly detaches from the command host's Job Object
 so closing the terminal or automation command does not terminate the service.
 If the host forbids job breakaway, startup fails before application code runs;
