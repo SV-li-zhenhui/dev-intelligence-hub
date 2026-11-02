@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { throwIfPreparationAborted, isPreparationAbort, withoutPreparationCancellation,
+  watchPreparationProcess, PreparationAbortedError } from "../lib/preparation-cancellation.js";
 import { execFile } from "node:child_process";
 import {
   lstat,
@@ -10,6 +12,7 @@ import {
   unlink,
 } from "node:fs/promises";
 import path from "node:path";
+import { MAX_BLOBS_PER_BATCH, parseGitBlobBatch } from "../lib/git-blob-batch.js";
 
 import {
   CodeExecutionPolicy,
@@ -18,7 +21,6 @@ import {
 
 const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const TREE_HEADER = /^(100644|100755|120000|160000) (blob|commit) ([a-f0-9]{40}|[a-f0-9]{64})$/;
-const BATCH_HEADER = /^([a-f0-9]{40}|[a-f0-9]{64}) blob ([1-9][0-9]*|0)$/;
 const CONTROL_CHARACTER = /[\p{Cc}\p{Cf}]/u;
 const WINDOWS_INVALID_CHARACTER = /[<>:"\\|?*]/u;
 const SAFE_ENV = Object.freeze({
@@ -517,76 +519,29 @@ function parseTree(value, { headOid, limits, shouldInclude }) {
   return entries;
 }
 
-function readLine(value, offset) {
-  const end = value.indexOf(0x0a, offset);
-  if (end === -1) {
-    throw snapshotError(
-      "GIT_SNAPSHOT_PROTOCOL_ERROR",
-      "Git blob 输出不完整",
-    );
-  }
-  return {
-    line: decodeSingleLine(
-      value.subarray(offset, end),
-      "GIT_SNAPSHOT_PROTOCOL_ERROR",
-      "Git blob 输出无效",
-    ),
-    nextOffset: end + 1,
-  };
-}
-
 function parseBlobs(value, oids, limits, objectFormat) {
-  const blobs = new Map();
-  let offset = 0;
-  let totalBytes = 0;
-  for (const expectedOid of oids) {
-    const header = readLine(value, offset);
-    offset = header.nextOffset;
-    const match = BATCH_HEADER.exec(header.line);
-    if (!match || match[1] !== expectedOid) {
-      throw snapshotError(
-        "GIT_SNAPSHOT_PROTOCOL_ERROR",
-        "Git blob 身份无法验证",
-      );
-    }
-    const size = Number(match[2]);
-    if (!Number.isSafeInteger(size) || size > limits.maxFileBytes) {
-      throw snapshotError("FILE_SIZE_LIMIT", "文件超过大小限制");
-    }
-    totalBytes += size;
-    if (totalBytes > limits.maxTotalBytes) {
-      throw snapshotError("TOTAL_SIZE_LIMIT", "工作区总大小超过限制");
-    }
-    const end = offset + size;
-    if (end >= value.length || value[end] !== 0x0a) {
-      throw snapshotError(
-        "GIT_SNAPSHOT_PROTOCOL_ERROR",
-        "Git blob 输出不完整",
-      );
-    }
-    const content = Buffer.from(value.subarray(offset, end));
-    if (gitBlobOid(objectFormat, content) !== expectedOid) {
-      throw snapshotError(
-        "GIT_SNAPSHOT_OBJECT_MISMATCH",
-        "Git blob 内容与对象身份不一致",
-      );
-    }
-    blobs.set(expectedOid, content);
-    offset = end + 1;
+  try {
+    return parseGitBlobBatch(value, oids, {
+      objectFormat, maxBlobBytes: limits.maxFileBytes, maxTotalBytes: limits.maxTotalBytes,
+    });
+  } catch (cause) {
+    const codes = {
+      PROTOCOL_ERROR: ["GIT_SNAPSHOT_PROTOCOL_ERROR", "Git blob 输出无效"],
+      BLOB_SIZE_LIMIT: ["FILE_SIZE_LIMIT", "文件超过大小限制"],
+      TOTAL_SIZE_LIMIT: ["TOTAL_SIZE_LIMIT", "工作区总大小超过限制"],
+      OBJECT_MISMATCH: ["GIT_SNAPSHOT_OBJECT_MISMATCH", "Git blob 内容与对象身份不一致"],
+    };
+    const [code, message] = codes[cause.code] ?? codes.PROTOCOL_ERROR;
+    throw snapshotError(code, message, cause);
   }
-  if (offset !== value.length) {
-    throw snapshotError(
-      "GIT_SNAPSHOT_PROTOCOL_ERROR",
-      "Git blob 输出包含额外数据",
-    );
-  }
-  return blobs;
 }
 
 class BinaryExecFileRunner {
   async run({ command, args, cwd, env, input, timeoutMs, maxOutputBytes }) {
+    throwIfPreparationAborted();
     return new Promise((resolve, reject) => {
       let child;
+      let releaseAbort = () => false;
       try {
         child = execFile(
           command,
@@ -602,6 +557,7 @@ class BinaryExecFileRunner {
             windowsHide: true,
           },
           (error, stdout, stderr) => {
+            if (releaseAbort() && error?.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") { reject(new PreparationAbortedError()); return; }
             if (
               error &&
               (error.killed || error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")
@@ -638,6 +594,7 @@ class BinaryExecFileRunner {
         );
         return;
       }
+      releaseAbort = watchPreparationProcess(child);
       child.stdin?.once("error", (error) => {
         if (error?.code !== "EPIPE") {
           child.kill("SIGKILL");
@@ -714,6 +671,7 @@ export class GitObjectSnapshotter {
   }
 
   async materialize(value) {
+    throwIfPreparationAborted();
     exactDataObject(value, [
       "sourceRoot",
       "targetRoot",
@@ -824,25 +782,31 @@ export class GitObjectSnapshotter {
         shouldInclude: (relativePath) => !policy.isExcluded(relativePath),
       });
       const oids = [...new Set(entries.map((entry) => entry.oid))];
-      const batchInput = Buffer.from(oids.map((oid) => `${oid}\n`).join(""));
-      const maxBlobOutput = Math.min(
-        Number.MAX_SAFE_INTEGER,
-        this.#limits.maxTotalBytes + oids.length * 160 + 1,
-      );
-      const blobOutput = oids.length === 0
-        ? Buffer.alloc(0)
-        : await this.#gitBytes(
-            ["cat-file", "--batch"],
-            sourceRoot,
-            batchInput,
-            maxBlobOutput,
-          );
-      const blobs = parseBlobs(
-        blobOutput,
-        oids,
-        this.#limits,
-        boundary.objectFormat,
-      );
+      const blobs = new Map();
+      let uniqueBlobBytes = 0;
+      // A whole repository can exceed one command's deadline. Keep each read
+      // bounded while validating the complete object set before writing files.
+      for (let offset = 0; offset < oids.length; offset += MAX_BLOBS_PER_BATCH) {
+        throwIfPreparationAborted();
+        const batchOids = oids.slice(offset, offset + MAX_BLOBS_PER_BATCH);
+        const remainingBytes = this.#limits.maxTotalBytes - uniqueBlobBytes;
+        const blobOutput = await this.#gitBytes(
+          ["cat-file", "--batch"],
+          sourceRoot,
+          Buffer.from(batchOids.map((oid) => `${oid}\n`).join("")),
+          Math.min(Number.MAX_SAFE_INTEGER, remainingBytes + batchOids.length * 160 + 1),
+        );
+        const batchBlobs = parseBlobs(
+          blobOutput,
+          batchOids,
+          { ...this.#limits, maxTotalBytes: remainingBytes },
+          boundary.objectFormat,
+        );
+        for (const [oid, content] of batchBlobs) {
+          blobs.set(oid, content);
+          uniqueBlobBytes += content.length;
+        }
+      }
       const totalBytes = entries.reduce((sum, entry) => {
         const content = blobs.get(entry.oid);
         if (!Buffer.isBuffer(content)) {
@@ -863,6 +827,7 @@ export class GitObjectSnapshotter {
       const createdDirectories = new Set();
       try {
         for (const entry of entries) {
+          throwIfPreparationAborted();
           const content = blobs.get(entry.oid);
           const target = path.resolve(
             targetRoot,
@@ -896,11 +861,11 @@ export class GitObjectSnapshotter {
         }
       } catch (cause) {
         try {
-          await this.#cleanupCreatedOutput(
+          await withoutPreparationCancellation(() => this.#cleanupCreatedOutput(
             targetRoot,
             createdFiles,
             createdDirectories,
-          );
+          ));
         } catch (cleanupCause) {
           throw snapshotError(
             "GIT_SNAPSHOT_CLEANUP_FAILED",
@@ -918,6 +883,7 @@ export class GitObjectSnapshotter {
         totalBytes,
       };
     } catch (cause) {
+      if (isPreparationAbort(cause)) throw cause;
       if (cause instanceof GitObjectSnapshotterError) throw cause;
       throw snapshotError(
         "GIT_SNAPSHOT_FAILED",
@@ -1427,6 +1393,7 @@ export class GitObjectSnapshotter {
   }
 
   async #gitOptionalText(args, cwd) {
+    throwIfPreparationAborted();
     const result = await this.#run({
       command: this.#gitCommand,
       args: [...SAFE_GIT_PREFIX, ...args],
@@ -1458,6 +1425,7 @@ export class GitObjectSnapshotter {
   }
 
   async #gitOptionalBytes(args, cwd, maxOutputBytes) {
+    throwIfPreparationAborted();
     return optionalOutput(
       await this.#run({
         command: this.#gitCommand,
@@ -1473,6 +1441,7 @@ export class GitObjectSnapshotter {
   }
 
   async #gitBytes(args, cwd, input, maxOutputBytes) {
+    throwIfPreparationAborted();
     return successfulOutput(
       await this.#run({
         command: this.#gitCommand,

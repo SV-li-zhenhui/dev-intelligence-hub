@@ -244,6 +244,93 @@ test("materializes only ordinary blobs from the exact commit without reading che
   }
 });
 
+function manyBlobs(count) {
+  const entries = [];
+  const blobs = new Map();
+  for (let index = 0; index < count; index += 1) {
+    const content = Buffer.from(`blob-${String(index).padStart(4, "0")}\n`);
+    const oid = blobOid(content);
+    entries.push({ path: `src/file-${String(index).padStart(4, "0")}.txt`, oid });
+    blobs.set(oid, content);
+  }
+  return { entries, blobs };
+}
+
+test("reads bounded blob batches with global deduplication and an intact large final blob", async (t) => {
+  const { sourceRoot, targetRoot } = await fixture(t);
+  const { entries, blobs } = manyBlobs(128);
+  const largeContent = Buffer.alloc(2_000_000, 0x61);
+  const largeOid = blobOid(largeContent);
+  entries.push({ path: "zz-large.bin", oid: largeOid });
+  entries.push({ path: "src/zz-duplicate.txt", oid: entries[0].oid });
+  blobs.set(largeOid, largeContent);
+  const runner = fakeRunner(sourceRoot, {
+    treeOutput: tree(entries),
+    blobs,
+    override(request) {
+      if (request.args.includes("--batch") && request.input.length > 128 * 41) {
+        throw new GitObjectSnapshotterError("GIT_SNAPSHOT_TIMEOUT", "bulk read timed out");
+      }
+    },
+  });
+
+  const result = await materialize(snapshotter(runner, { maxFileBytes: largeContent.length }), {
+    sourceRoot, targetRoot, headOid: HEAD, excludePaths: [],
+  });
+
+  const batches = runner.calls.filter((call) => call.args.includes("--batch"));
+  assert.deepEqual(batches.map((call) => call.input.length / 41), [128, 1]);
+  assert.equal(batches.every((call) => call.timeoutMs === 30_000), true);
+  assert.equal(result.fileCount, 130);
+  assert.equal(result.totalBytes, [...blobs.values()].reduce((sum, content) => sum + content.length, 0) + blobs.get(entries[0].oid).length);
+  assert.deepEqual(await readFile(path.join(targetRoot, "zz-large.bin")), largeContent);
+  assert.equal(result.baseline.get("zz-large.bin"), createHash("sha256").update(largeContent).digest("hex"));
+});
+
+test("keeps the unique blob byte budget across batches before writing any files", async (t) => {
+  const { sourceRoot, targetRoot } = await fixture(t);
+  const { entries, blobs } = manyBlobs(129);
+  const total = [...blobs.values()].reduce((sum, content) => sum + content.length, 0);
+  const runner = fakeRunner(sourceRoot, { treeOutput: tree(entries), blobs });
+
+  await assert.rejects(materialize(snapshotter(runner, { maxTotalBytes: total - 1 }), {
+    sourceRoot, targetRoot, headOid: HEAD, excludePaths: [],
+  }), { code: "TOTAL_SIZE_LIMIT" });
+
+  const batches = runner.calls.filter((call) => call.args.includes("--batch"));
+  assert.equal(batches.length, 2);
+  assert.equal(batches[1].maxOutputBytes < batches[0].maxOutputBytes, true);
+  assert.deepEqual(await readdir(targetRoot), []);
+});
+
+test("validates the later blob batch protocol and hashes before writing any files", async (t) => {
+  const { root, sourceRoot } = await fixture(t);
+  for (const failure of ["hash", "extra", "missing", "oid"]) {
+    const targetRoot = path.join(root, `later-batch-${failure}`);
+    await mkdir(targetRoot);
+    const { entries, blobs } = manyBlobs(129);
+    const finalOid = entries.at(-1).oid;
+    const content = blobs.get(finalOid);
+    const runner = fakeRunner(sourceRoot, {
+      treeOutput: tree(entries), blobs,
+      override(request) {
+        if (!request.args.includes("--batch") || request.input.toString("ascii") !== `${finalOid}\n`) return;
+        if (failure === "missing") return output(`${finalOid} missing\n`);
+        const body = failure === "hash" ? Buffer.alloc(content.length, 0x78) : content;
+        return output(Buffer.concat([
+          Buffer.from(`${failure === "oid" ? BLOB_A : finalOid} blob ${body.length}\n`),
+          body, Buffer.from(failure === "extra" ? "\nextra" : "\n"),
+        ]));
+      },
+    });
+
+    await assert.rejects(materialize(snapshotter(runner), {
+      sourceRoot, targetRoot, headOid: HEAD, excludePaths: [],
+    }), { code: failure === "hash" ? "GIT_SNAPSHOT_OBJECT_MISMATCH" : "GIT_SNAPSHOT_PROTOCOL_ERROR" });
+    assert.deepEqual(await readdir(targetRoot), []);
+  }
+});
+
 test("fails closed when commit identity, object format, repository root, or process receipt changes", async (t) => {
   const first = await fixture(t);
   const other = await fixture(t);

@@ -8,6 +8,7 @@ import {
   RoleDecisionEngine,
 } from "./role-decision-engine.js";
 import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
+import { githubEntitySessionKey } from '../lib/session-key.js';
 
 const SAFE_STATE_KEY = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
@@ -92,12 +93,24 @@ function safeRunSummary(value) {
   return value;
 }
 
+function verificationRecoverySummary(stages) {
+  const stage = stages && dataObject(stages.own_pr_material_recovery);
+  const result = stage?.ok === true && dataObject(stage.result);
+  const recovery = result && dataObject(result.verificationRecovery);
+  if (!recovery || ['scanned', 'requeued', 'failed'].some(key =>
+    !Number.isSafeInteger(recovery[key]) || recovery[key] < 0)) return '';
+  const code = typeof recovery.lastFailure === 'string' && /^[A-Z][A-Z0-9_]{0,127}$/.test(recovery.lastFailure)
+    ? `（${recovery.lastFailure}）` : '';
+  return `；验证准备恢复：扫描 ${recovery.scanned} 项，入队 ${recovery.requeued} 项，失败 ${recovery.failed} 项${code}`;
+}
+
 function runSummary(value) {
   const result = dataObject(value);
   const stages = result && dataObject(result.stages);
   const workStage = stages && dataObject(stages.work);
   const work = workStage?.ok === true && dataObject(workStage.result);
-  if (!work) return "本轮未执行岗位任务扫描";
+  const recovery = verificationRecoverySummary(stages);
+  if (!work) return `本轮未执行岗位任务扫描${recovery}`;
   const scanned = Number.isSafeInteger(work.scanned) && work.scanned >= 0
     ? work.scanned
     : 0;
@@ -130,9 +143,22 @@ function runSummary(value) {
       return `${status} ${aggregate.count}${codes ? `（${codes}）` : ""}`;
     })
     .join("、");
-  return `扫描 ${scanned} 项，尝试 ${attempts} 项${
+  const prefix = `扫描 ${scanned} 项，尝试 ${attempts} 项`;
+  const summary = `${prefix}${
     statuses ? `：${statuses}` : ""
-  }`;
+  }${recovery}`;
+  return recovery && Buffer.byteLength(summary, 'utf8') > 512 ? `${prefix}${recovery}` : summary;
+}
+
+function continuationWorkOutcome(value, target) {
+  const stages = dataObject(dataObject(value)?.stages);
+  const stage = dataObject(stages?.work);
+  const work = stage?.ok === true ? dataObject(stage.result) : null;
+  if (!Array.isArray(work?.outcomes)) return null;
+  const matches = work.outcomes.map(dataObject).filter(entry => entry?.itemId === target.itemId);
+  if (matches.length !== 1 || typeof matches[0].status !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(matches[0].status) ||
+      typeof matches[0].code !== 'string' || !/^[A-Z][A-Z0-9_]{0,127}$/.test(matches[0].code)) return null;
+  return { ...target, status: matches[0].status, code: matches[0].code };
 }
 
 function stableErrorCode(error) {
@@ -146,6 +172,38 @@ function stableErrorCode(error) {
     // Untrusted errors collapse to one local classification.
   }
   return "ROLE_RUN_FAILED";
+}
+
+function runFailureSummary(error) {
+  try {
+    const pending = [error];
+    const seen = new Set();
+    const details = [];
+    for (let index = 0; index < pending.length && index < 8; index += 1) {
+      const current = pending[index];
+      if (!current || !['object', 'function'].includes(typeof current) || seen.has(current)) continue;
+      seen.add(current);
+      const own = key => Object.getOwnPropertyDescriptor(current, key)?.value;
+      const stage = own('stage');
+      const codes = own('causeCodes');
+      if (typeof stage === 'string' && /^[a-z][a-z0-9_]{0,47}$/.test(stage) && Array.isArray(codes)) {
+        const safeCodes = [];
+        for (let i = 0; i < Math.min(Object.getOwnPropertyDescriptor(codes, 'length')?.value ?? 0, 2); i += 1) {
+          const code = Object.getOwnPropertyDescriptor(codes, String(i))?.value;
+          if (typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,127}$/.test(code)) safeCodes.push(code);
+        }
+        const detail = `${stage}${safeCodes.length ? ` [${safeCodes.join(' > ')}]` : ''}`;
+        if (Buffer.byteLength(details.concat(detail).join('; '), 'utf8') <= 460) details.push(detail);
+      }
+      const errors = own('errors');
+      if (Array.isArray(errors)) {
+        for (let i = 0; i < Math.min(Object.getOwnPropertyDescriptor(errors, 'length')?.value ?? 0, 8); i += 1) pending.push(Object.getOwnPropertyDescriptor(errors, String(i))?.value);
+      }
+    }
+    return `本轮岗位运行失败：${details.length ? details.join('; ') : stableErrorCode(error)}`;
+  } catch {
+    return `本轮岗位运行失败：${stableErrorCode(error)}`;
+  }
 }
 
 function decisionSignal(input) {
@@ -260,6 +318,8 @@ function requireDecisionEngine(value) {
     throw new TypeError("decisionEngine is invalid");
   }
   const availability = value.checkAvailability;
+  const admission=value.withAdmission;
+  if(admission!==undefined && typeof admission!=='function')throw new TypeError('decisionEngine admission is invalid');
   if (availability !== undefined && typeof availability !== "function") {
     throw new TypeError("decisionEngine is invalid");
   }
@@ -269,6 +329,7 @@ function requireDecisionEngine(value) {
     checkAvailability: availability
       ? availability.bind(value)
       : async () => {},
+    withAdmission: admission ? admission.bind(value) : (_request,operation) => operation(),
   });
 }
 
@@ -367,6 +428,7 @@ export class ConfiguredRoleEmployee {
   #taskDecisionEngine;
   #canProposeCodeAction;
   #workerPort;
+  #waitForModelCapacity;
 
   constructor({
     definition: definitionValue,
@@ -384,6 +446,7 @@ export class ConfiguredRoleEmployee {
     workerId,
     stateKey,
     initialPaused = false,
+    waitForModelCapacity = false,
     operationQueue = new OperationQueue(),
   } = {}) {
     if (typeof onRun !== "function") throw new TypeError("onRun is invalid");
@@ -391,6 +454,8 @@ export class ConfiguredRoleEmployee {
     if (typeof initialPaused !== "boolean") {
       throw new TypeError("initialPaused is invalid");
     }
+    if (typeof waitForModelCapacity !== "boolean") throw new TypeError("waitForModelCapacity is invalid");
+    this.#waitForModelCapacity = waitForModelCapacity;
     const definition = normalizeRoleDefinition(definitionValue);
     const permissions = normalizeRolePermissions(permissionsValue);
     const brain = normalizeBrainConfig(brainValue);
@@ -441,6 +506,7 @@ export class ConfiguredRoleEmployee {
         stateKey ?? configuredRoleLifecycleStateKey(definition.id),
       ),
       operationQueue,
+      responsiveControls: true,
       createState: () => ({
         schemaVersion: 2,
         revision: 0,
@@ -478,7 +544,8 @@ export class ConfiguredRoleEmployee {
         lastRun: state.lastRun ? { ...state.lastRun } : null,
         lastErrorCode: state.lastErrorCode,
       }),
-      run: async ({ state, trigger = "scheduled", signal = null }) => {
+      run: async ({ state, trigger = "scheduled", signal = null, continuationTarget = null, onContinuationOutcome = null }) => {
+        if (onContinuationOutcome !== null && typeof onContinuationOutcome !== 'function') throw new TypeError('Invalid continuation outcome observer');
         signal = normalizeAbortSignal(signal);
         throwIfDecisionAborted(signal);
         const normalizedTrigger = safeTrigger(trigger);
@@ -489,6 +556,7 @@ export class ConfiguredRoleEmployee {
             roleId: this.roleId,
             workerId: this.workerId,
             trigger: normalizedTrigger,
+            ...(continuationTarget === null ? {} : { continuationTarget }),
             ...(signal === null ? {} : { signal }),
           });
           throwIfDecisionAborted(signal);
@@ -504,11 +572,12 @@ export class ConfiguredRoleEmployee {
           lastRun: {
             trigger: normalizedTrigger,
             at: isoTimestamp(clock()),
-            summary: failure ? "本轮岗位运行失败" : runSummary(outcome),
+            summary: failure ? runFailureSummary(failure) : runSummary(outcome),
           },
           lastErrorCode: failure ? stableErrorCode(failure) : "",
         });
         if (failure) throw failure;
+        if (continuationTarget !== null && onContinuationOutcome !== null) onContinuationOutcome(continuationWorkOutcome(outcome, continuationTarget));
         return next;
       },
     });
@@ -518,6 +587,7 @@ export class ConfiguredRoleEmployee {
       workerId: this.workerId,
       view: this.workerView.bind(this),
       checkAvailability: this.checkAvailability.bind(this),
+      withDecisionAdmission: this.withDecisionAdmission.bind(this),
       decide: this.decide.bind(this),
     });
     Object.freeze(this);
@@ -544,15 +614,6 @@ export class ConfiguredRoleEmployee {
   }
 
   control(command, expectedRevision) {
-    if (this.#controller.running) {
-      return Promise.reject(
-        employeeError(
-          "ROLE_RUN_IN_PROGRESS",
-          "Configured role cannot be controlled while its run is in progress",
-          409,
-        ),
-      );
-    }
     return this.#controller.control(command, expectedRevision);
   }
 
@@ -625,6 +686,24 @@ export class ConfiguredRoleEmployee {
     throwIfDecisionAborted(signal);
     await this.#assertRoleUnchanged(before, signal);
     return decision;
+  }
+
+  async withDecisionAdmission(input, operation) {
+    const signal = decisionSignal(input);
+    const before = await this.#activeRole(signal);
+    const engine = this.#decisionEngineFor(input);
+    const item = input?.item;
+    const event = item ? currentWorkItemEvent(item) : null;
+    const kind = event?.eventType?.startsWith('pull_request.') ? 'pull_request' : event?.eventType?.startsWith('issue.') ? 'issue' : null;
+    const entityKey = kind && typeof event.subject?.repository === 'string' && Number.isSafeInteger(event.subject?.number) && event.subject.number > 0
+      ? githubEntitySessionKey({kind,repository:event.subject.repository,number:event.subject.number})
+      : `work-item:${item?.itemId ?? this.workerId}`;
+    return engine.withAdmission({entityKey,signal,
+      ...(this.#waitForModelCapacity ? {waitForCapacity:true} : {})}, async () => {
+      throwIfDecisionAborted(signal);
+      await this.#assertRoleUnchanged(before,signal);
+      return operation();
+    });
   }
 
   asRoleWorker() {

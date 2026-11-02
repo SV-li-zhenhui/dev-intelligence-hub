@@ -1,3 +1,4 @@
+import { types as utilTypes } from "node:util";
 import {
   CODE_JOB_ACTIONS_BY_OPERATION,
   CODE_JOB_LEGACY_BRAIN_BINDING_SCHEMA,
@@ -8,6 +9,7 @@ import {
 import { digestValue } from "../domain/code-executor-contract.js";
 import {
   codeExecutionSourceWritablePaths,
+  isHeadRepairExecutionSource,
   normalizeCodeExecutionSource,
   sameCodeExecutionSource,
 } from "../domain/code-execution-source.js";
@@ -42,9 +44,52 @@ const EXECUTOR_CAPABILITIES = new Set([
   "conflict_preparation_snapshot",
 ]);
 const PREPARED_CODE_JOB_GRANTS = new WeakSet();
+const INPUT_STORAGE_UNAVAILABLE = new Set([
+  "EACCES", "EPERM", "EBUSY", "EIO", "ENOSPC", "EMFILE", "ENFILE",
+]);
 
 function invalid(message = "代码任务授权配置无效") {
   return workProposalError("INVALID_CODE_JOB_AUTHORITY", message);
+}
+
+function verifierErrorCodes(error) {
+  try {
+    const codes = [], seen = new Set();
+    for (let current = error; current !== undefined;) {
+      if (!current || utilTypes.isProxy(current) || !(current instanceof Error) || seen.has(current) || codes.length >= 16) return null;
+      seen.add(current);
+      const code = Object.getOwnPropertyDescriptor(current, "code");
+      const cause = Object.getOwnPropertyDescriptor(current, "cause");
+      if ((code && !("value" in code)) || (cause && !("value" in cause)) ||
+          (!code && "code" in current) || (!cause && "cause" in current)) return null;
+      codes.push(code?.value ?? null);
+      current = cause?.value;
+    }
+    return codes;
+  } catch {
+    return null;
+  }
+}
+
+function verifierFailure(error, kind, message) {
+  const codes = verifierErrorCodes(error);
+  if (codes === null || codes.includes("PROCESS_STOP_FAILED")) return invalid(message);
+  let unavailable = false;
+  if (kind === "input") {
+    // These are errors from the configured trusted input port, never evidence
+    // that the current Head or assignment was revoked.
+    unavailable = codes[0] === "OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE" ||
+      (codes.length === 1 && (codes[0] === "WORK_LEDGER_NOT_READY" || INPUT_STORAGE_UNAVAILABLE.has(codes[0])));
+  } else {
+    // The broad preflight wrapper also contains security failures. Accept only
+    // the exact managed-process path whose timeout/abort confirms a safe stop.
+    unavailable = (codes[0] === "CONTROLLED_GIT_TIMEOUT" && codes.slice(1).every(code => code === null)) ||
+      (codes.length === 3 && codes[0] === "CONTROLLED_GIT_PREFLIGHT_FAILED" && codes[1] === "GIT_MIRROR_PREFLIGHT_FAILED" &&
+        ["PROCESS_TIMEOUT", "PROCESS_ABORTED"].includes(codes[2]));
+  }
+  return unavailable
+    ? workProposalError("CODE_JOB_AUTHORITY_VERIFICATION_UNAVAILABLE", "代码任务授权暂时无法核验，请稍后重试", 503, { cause: error })
+    : invalid(message);
 }
 
 function taskBrainNotConfigured(roleId) {
@@ -496,10 +541,17 @@ function publicRoleOperations(operationsByRole) {
 
 function writablePathsForGrant(operation, executionSource, workspace) {
   if (executionSource === null) {
-    return operation === "modify" ? workspace.writablePaths : [];
+    return operation === "modify"
+      ? [...workspace.writablePaths].sort((left, right) => left.localeCompare(right, "en"))
+      : [];
   }
   if (operation !== "modify") {
     throw invalid("Conflict preparation 只能授权 modify 代码任务");
+  }
+  if (isHeadRepairExecutionSource(executionSource) &&
+      digestValue(codeExecutionSourceWritablePaths(executionSource)) !==
+      digestValue([...workspace.writablePaths].sort((left, right) => left.localeCompare(right, "en")))) {
+    throw invalid("Review repair 写范围必须与当前工作区配置一致");
   }
   const configuredPolicy = new CodeExecutionPolicy({
     writablePaths: workspace.writablePaths,
@@ -682,7 +734,7 @@ export class CodeJobGrantFactory {
     const inputAuthorization = this.#verifyInputBinding(
       proposal.binding.inputBinding,
       workspace,
-      { requireGitHeadSnapshot: executionSource === null },
+      { requireGitHeadSnapshot: executionSource?.kind !== "conflict_preparation" },
     );
     return inputAuthorization instanceof Promise
       ? inputAuthorization.then(authorizeSource)
@@ -758,7 +810,7 @@ export class CodeJobGrantFactory {
     const inputAuthorization = this.#verifyInputBinding(
       grant.inputBinding,
       workspace,
-      { requireGitHeadSnapshot: executionSource === null },
+      { requireGitHeadSnapshot: executionSource?.kind !== "conflict_preparation" },
     );
     return inputAuthorization instanceof Promise
       ? inputAuthorization.then(verifySource)
@@ -795,12 +847,12 @@ export class CodeJobGrantFactory {
     let verified;
     try {
       verified = this.#verifyInputAuthority(structuredClone(inputBinding));
-    } catch {
-      throw invalid("PR 代码任务绑定的 Head 已失效");
+    } catch (error) {
+      throw verifierFailure(error, "input", "PR 代码任务绑定的 Head 已失效");
     }
     return verified instanceof Promise
-      ? verified.then(assertVerified, () => {
-          throw invalid("PR 代码任务绑定的 Head 已失效");
+      ? verified.then(assertVerified, (error) => {
+          throw verifierFailure(error, "input", "PR 代码任务绑定的 Head 已失效");
         })
       : assertVerified(verified);
   }
@@ -827,6 +879,12 @@ export class CodeJobGrantFactory {
     ) {
       throw invalid("Conflict preparation 与当前 PR Head 不匹配");
     }
+    if (isHeadRepairExecutionSource(normalized)) {
+      if (!workspace.capabilities.includes("git_head_snapshot")) {
+        throw invalid("Review repair 工作区缺少固定 Head 快照能力");
+      }
+      return normalized;
+    }
     if (!workspace.capabilities.includes("conflict_preparation_snapshot")) {
       throw invalid("代码工作区不具备 sealed conflict 快照能力");
     }
@@ -839,8 +897,8 @@ export class CodeJobGrantFactory {
       verification = this.#verifyConflictPreparation(
         structuredClone(normalized.preparationBinding),
       );
-    } catch {
-      throw invalid("Conflict preparation 已失效");
+    } catch (error) {
+      throw verifierFailure(error, "source", "Conflict preparation 已失效");
     }
     const assertVerified = (verified) => {
       if (
@@ -854,8 +912,8 @@ export class CodeJobGrantFactory {
       return normalized;
     };
     return verification instanceof Promise
-      ? verification.then(assertVerified, () => {
-          throw invalid("Conflict preparation 已失效");
+      ? verification.then(assertVerified, (error) => {
+          throw verifierFailure(error, "source", "Conflict preparation 已失效");
         })
       : assertVerified(verification);
   }

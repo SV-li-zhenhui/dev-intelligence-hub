@@ -3,6 +3,8 @@ import test from "node:test";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { getReadyWorkGraphTaskIds } from "../src/domain/work-graph-contract.js";
 import { WorkGraphStore } from "../src/services/work-graph-store.js";
+import { WorkConditionWaker } from "../src/services/work-condition-waker.js";
+import { AUTO_RESUME_ON_CHILD_DELIVERY } from "../src/services/work-graph-wait-marker.js";
 import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
 import { WORK_LEDGER_STATE_SCHEMA_VERSION } from "../src/services/work-ledger-state.js";
@@ -620,6 +622,66 @@ test("staging an escalation atomically reuses the standard ask-user outbox", asy
   );
 });
 
+test("a PR source root supports scoped escalation without duplicate publication", async () => {
+  const event = normalizeWorkflowEvent({
+    schemaVersion: 1, eventType: "pull_request.updated",
+    occurredAt: "2026-08-03T00:00:00.000Z",
+    source: { provider: "github", scopeId: "test-dashboard" },
+    subject: { id: "github:pr:acme/dashboard#42", repository: "acme/dashboard", number: 42 },
+    payload: { title: "PR 42", headRefOid: "a".repeat(40) },
+  });
+  const record = assignment(1);
+  record.assignment.target = { type: "role", id: "pr-engineer" };
+  record.event = event;
+  record.assignment.eventId = event.eventId;
+  const { service } = await fixture(0, { records: [record] });
+  const item = (await service.listItems()).items[0];
+  assert.equal(item.kind, "source_root");
+  const { planner } = graphPorts(service, "employee-orchestrator", item.itemId);
+  const command = escalationCommand(item, 1);
+  const staged = await planner.stageEscalation(command);
+  assert.equal(staged.item.status, "dispatch_pending");
+  const replay = await planner.stageEscalation(command);
+  assert.equal(replay.applied, false);
+  assert.equal(replay.outbox.intentId, staged.outbox.intentId);
+});
+
+test("automatic orchestration cannot overwrite a pending PR source cutover", async () => {
+  const prRecord = (sequence, scopeId) => {
+    const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.updated",
+      occurredAt: `2026-08-03T00:00:0${sequence}.000Z`, source: { provider: "github", scopeId },
+      subject: { id: "github:pr:acme/dashboard#42", repository: "acme/dashboard", number: 42 },
+      payload: { title: "PR 42", headRefOid: "a".repeat(40) } });
+    const record = assignment(sequence);
+    record.event = event;
+    record.assignment.eventId = event.eventId;
+    record.assignment.target = { type: "role", id: "pr-engineer" };
+    return record;
+  };
+  const { service, store, source } = await fixture(0, { records: [prRecord(1, "github-primary")] });
+  const old = (await service.listItems()).items[0];
+  const staged = await graphPorts(service, "employee-orchestrator", old.itemId).planner.stageEscalation(escalationCommand(old, 1));
+  const dispatch = await service.claimIntent({ intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision, dispatcherId: "attention-dispatcher", leaseDurationMs: 30_000 });
+  await service.ackIntent({ intentId: dispatch.intentId, expectedRevision: dispatch.revision,
+    dispatchLeaseId: dispatch.dispatchLeaseId, itemExpectedRevision: staged.item.revision,
+    outcome: "delivered", nextStatus: "waiting_user", actorId: "attention-dispatcher",
+    details: { questionRef: `attention-${"d".repeat(64)}` } });
+  source.records.push(prRecord(2, "github-secondary"));
+  await service.intake();
+  const pending = (await service.listItems()).items.find(item => item.itemId !== old.itemId);
+  assert.match(pending.statusReason, /^pr_source_cross_root_cutover_pending:/);
+  const revision = (await service.getGraphSnapshot()).graph.revision;
+  const { planner } = graphPorts(service, "employee-orchestrator", pending.itemId);
+  const writes = store.writes.length;
+  await assert.rejects(planner.pauseTask(scopedTaskCommand(pending, revision)),
+    error => error.code === "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING");
+  await assert.rejects(planner.stageEscalation(escalationCommand(pending, revision)),
+    error => error.code === "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING");
+  assert.equal(store.writes.length, writes);
+  assert.equal((await service.listItems()).items.find(item => item.itemId === pending.itemId).statusReason, pending.statusReason);
+});
+
 test("a failed sealed escalation clears its policy binding before restaging", async () => {
   const { service } = await fixture(1);
   const item = (await service.listItems()).items[0];
@@ -1013,6 +1075,106 @@ test("a parent becomes claimable after every direct child completes", async () =
   assert.equal(completedParent.status, "completed");
 });
 
+test("a parent explicitly waiting for child delivery resumes after a real child completion", async () => {
+  const { store, lease, source, service } = await fixture(1);
+  const parent = (await service.listItems()).items[0];
+  const { reader, planner } = graphPorts(service, "employee-orchestrator", null);
+  const created = await planner.createChild(createCommand({
+    parent,
+    graphRevision: 1,
+    contract: { revision: 1, acceptanceCriteria: [], expectedDeliverables: [] },
+  }));
+  const waiting = (await service.listItems()).items.find(({ itemId }) => itemId === parent.itemId);
+  const pauseRevision = (await reader.getSnapshot()).graph.revision;
+  const paused = await planner.pauseTask(scopedTaskCommand(waiting, pauseRevision, {
+    reason: "等待直属子任务交付",
+    waitForChildren: true,
+  }));
+  assert.equal(paused.status, "paused");
+
+  let child = (await service.listItems()).items.find(({ itemId }) => itemId === created.taskId);
+  child = await service.claim({
+    itemId: child.itemId,
+    expectedRevision: child.revision,
+    workerId: "employee-developer",
+    leaseDurationMs: 30_000,
+  });
+  await service.complete({
+    itemId: child.itemId,
+    expectedRevision: child.revision,
+    leaseId: child.leaseId,
+    actorId: "employee-developer",
+    result: { outcome: "child-complete" },
+  });
+  const recovered = new WorkLedgerService({
+    store,
+    assignmentSource: source,
+    exclusiveLease: lease,
+    clock: () => "2026-08-03T01:00:00.000Z",
+    idFactory: () => "recovered-lease",
+  });
+  await recovered.recover();
+  const recoveredGraph = graphPorts(recovered, "employee-orchestrator", null);
+  const waker = new WorkConditionWaker({
+    ledger: recovered,
+    graphReader: recoveredGraph.reader,
+    graphPlanner: recoveredGraph.planner,
+  });
+  await waker.runCycle();
+  const resumed = (await recovered.listItems()).items.find(({ itemId }) => itemId === parent.itemId);
+  assert.equal(resumed.status, "queued");
+});
+
+test("an intentionally paused parent stays paused after a real child completion until explicit resume", async () => {
+  const { service } = await fixture(1);
+  const parent = (await service.listItems()).items[0];
+  const { reader, planner } = graphPorts(service, "employee-orchestrator", null);
+  const created = await planner.createChild(createCommand({
+    parent,
+    graphRevision: 1,
+    contract: { revision: 1, acceptanceCriteria: [], expectedDeliverables: [] },
+  }));
+  const waiting = (await service.listItems()).items.find(({ itemId }) => itemId === parent.itemId);
+  const pauseRevision = (await reader.getSnapshot()).graph.revision;
+  await planner.pauseTask(scopedTaskCommand(waiting, pauseRevision, { reason: "主动暂停，等待人工恢复" }));
+  let child = (await service.listItems()).items.find(({ itemId }) => itemId === created.taskId);
+  child = await service.claim({
+    itemId: child.itemId,
+    expectedRevision: child.revision,
+    workerId: "employee-developer",
+    leaseDurationMs: 30_000,
+  });
+  await service.complete({
+    itemId: child.itemId,
+    expectedRevision: child.revision,
+    leaseId: child.leaseId,
+    actorId: "employee-developer",
+    result: { outcome: "child-complete" },
+  });
+  const waker = new WorkConditionWaker({ ledger: service, graphReader: reader, graphPlanner: planner });
+  await waker.runCycle();
+  let current = (await service.listItems()).items.find(({ itemId }) => itemId === parent.itemId);
+  assert.equal(current.status, "paused");
+  current = await planner.resumeTask(scopedTaskCommand(current, (await reader.getSnapshot()).graph.revision));
+  assert.equal(current.status, "queued");
+});
+
+test("child-wait pauses require a decomposed parent and reserve the durable marker", async () => {
+  const { service, store } = await fixture(1);
+  const parent = (await service.listItems()).items[0];
+  const { planner } = graphPorts(service, "employee-orchestrator", null);
+  const writes = store.writes.length;
+  await assert.rejects(
+    planner.pauseTask(scopedTaskCommand(parent, 1, { waitForChildren: true })),
+    (error) => error.code === "WORK_LEDGER_GRAPH_TASK_CONFLICT",
+  );
+  await assert.rejects(
+    planner.pauseTask(scopedTaskCommand(parent, 1, { reason: AUTO_RESUME_ON_CHILD_DELIVERY })),
+    (error) => error.code === "WORK_LEDGER_GRAPH_COMMAND_INVALID",
+  );
+  assert.equal(store.writes.length, writes);
+});
+
 test("combined parent and dependency cycles fail atomically", async () => {
   const { service, store } = await fixture(1);
   const parent = (await service.listItems()).items[0];
@@ -1116,6 +1278,45 @@ test("a created child recovers through the same ledger authority", async () => {
       .parentTaskId,
     parent.itemId,
   );
+});
+
+test("Review replacement persists cancellation and creation together and survives failed writes and restart", async () => {
+  const { service, store, lease, source } = await fixture(1);
+  let parent = (await service.listItems()).items[0];
+  const { planner } = graphPorts(service, "employee-orchestrator", parent.itemId);
+  const contract = { revision: 1, acceptanceCriteria: [{ criterionId: "reviewed", description: "Verified Review evidence" }],
+    expectedDeliverables: [{ deliverableId: "review", kind: "review-report", description: "Current Review", required: true }] };
+  const initial = createCommand({ parent, graphRevision: 1, childKey: "original-review", contract });
+  initial.target.id = "pr-engineer";
+  const created = await planner.createChild(initial);
+  let old = (await service.listItems()).items.find(item => item.itemId === created.taskId);
+  old = await service.transition({ itemId: old.itemId, expectedRevision: old.revision, leaseId: null,
+    actorId: "work-ledger-system", toStatus: "blocked", reason: "decision_attempts_exhausted", details: {} });
+  parent = (await service.listItems()).items.find(item => item.itemId === parent.itemId);
+  const revision = (await service.getGraphSnapshot()).graph.revision;
+  const command = createCommand({ parent, graphRevision: revision, childKey: "review-reuse-stable", contract });
+  command.target.id = "pr-engineer";
+  command.reviewReplacement = { taskId: old.itemId, expectedTaskRevision: old.revision, reason: "Host verified current candidate" };
+  const before = structuredClone(store.values.get(STATE_KEY)), writes = store.writes.length;
+  store.failNextWrite();
+  await assert.rejects(planner.createChild(command), error => error.code === "WORK_LEDGER_STATE_WRITE_FAILED" && error.cause?.message === "durable write failed");
+  assert.deepEqual(store.values.get(STATE_KEY), before);
+  assert.equal(store.writes.length, writes);
+  const result = await planner.createChild(command);
+  assert.equal(store.writes.length, writes + 1);
+  const durable = store.values.get(STATE_KEY);
+  assert.equal(durable.revision, revision + 1);
+  assert.equal(durable.items.find(item => item.itemId === old.itemId).status, "cancelled");
+  assert.equal(durable.items.find(item => item.itemId === result.taskId).status, "queued");
+  assert.deepEqual(durable.timeline.slice(-3).map(event => event.type), ["cancelled", "graph_child_created", "graph_parent_revised"]);
+  const restarted = new WorkLedgerService({ store, assignmentSource: source, exclusiveLease: lease,
+    clock: () => "2026-08-03T01:00:01.000Z", idFactory: () => "restart-lease" });
+  await restarted.recover();
+  const resumed = graphPorts(restarted, "employee-orchestrator", parent.itemId).planner;
+  const replay = await resumed.createChild(command);
+  assert.equal(replay.applied, false);
+  assert.equal(replay.taskId, result.taskId);
+  assert.equal(store.writes.length, writes + 1);
 });
 
 test("recovery rejects a forged graph assignment identity after generic bindings are resigned", async () => {

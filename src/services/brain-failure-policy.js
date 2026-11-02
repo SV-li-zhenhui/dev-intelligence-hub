@@ -4,18 +4,37 @@ const SHARED_OPERATOR_PAUSE_CODES = new Set([
   "BRAIN_PROVIDER_NOT_CONFIGURED",
   "REMOTE_DATA_NOT_AUTHORIZED",
 ]);
+const MAINTENANCE_REQUIRED_CODES = new Set([
+  "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
+  "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  "STRUCTURED_PROVIDER_REAP_FAILED",
+]);
 
-function attention(code, summary, remediation) {
-  return Object.freeze({ code, summary, remediation });
+export function requiresBrainMaintenance(code) {
+  return MAINTENANCE_REQUIRED_CODES.has(code);
+}
+
+function attention(code, summary, remediation, retryLabel = "已配置，重试") {
+  return Object.freeze({ code, summary, remediation, retryLabel });
 }
 
 const OWNER_ATTENTION_BY_CODE = new Map([
+  [
+    "STRUCTURED_PROVIDER_MODEL_CAPACITY",
+    attention(
+      "STRUCTURED_PROVIDER_MODEL_CAPACITY",
+      "所选模型暂时满载",
+      "系统将保留任务进度并稍后自动重试，无需确认或重新分配任务",
+      "自动重试中",
+    ),
+  ],
   [
     "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
     attention(
       "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
       "岗位 CLI 会话进度未能安全归档",
-      "保留隔离目录中的会话历史，不要删除；确认 CLI 已结束后检查会话存储并恢复该任务的原会话",
+      "这是系统会话保存或恢复故障，请先由维护人员修复；保留隔离目录中的会话历史，不要删除。修复前可选择“稍后再看”，重试只会重新排队，不会修复会话",
+      "修复后重试",
     ),
   ],
   [
@@ -87,6 +106,15 @@ const OWNER_ATTENTION_BY_CODE = new Map([
 export function brainFailureOwnerAttention(code) {
   if (typeof code !== "string") return null;
   return OWNER_ATTENTION_BY_CODE.get(code) ?? null;
+}
+
+export function automaticBrainRetryCode(intent) {
+  if (intent?.type !== "ask_user" || intent.choices?.length !== 1 ||
+      intent.choices[0].id !== "configured-retry") return null;
+  const code = /^真实任务不得回退到例行大脑；系统已安全停止（([A-Z_]+)）$/.exec(intent.reason)?.[1];
+  const failure = brainFailureOwnerAttention(code);
+  return failure && intent.summary.startsWith(`${failure.summary}（`) && intent.summary.endsWith("）")
+    ? code : null;
 }
 
 export function requiresBrainOperatorPause(code) {

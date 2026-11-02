@@ -21,8 +21,9 @@ const MAX_STATE_BYTES = 16 * 1024 * 1024;
 const EVENT_ID = /^attention-event-[a-f0-9]{64}$/;
 const RESULT_ID = /^attention-result-[a-f0-9]{64}$/;
 const OUTBOX_ID = /^attention-outbox-[a-f0-9]{64}$/;
-const ITEM_STATUSES = new Set(["pending", "answered", "rejected"]);
-const EVENT_TYPES = new Set(["created", "answered", "rejected"]);
+const ITEM_STATUSES = new Set(["pending", "answered", "rejected", "archived"]);
+const EVENT_TYPES = new Set(["created", "answered", "rejected", "archived"]);
+const RETIRED_WORK_STATUSES = new Set(["cancelled", "completed", "superseded"]);
 
 function stateError(message = "内部请示队列持久化状态损坏", cause) {
   return attentionError(
@@ -200,6 +201,28 @@ function requestFromItem(value) {
   });
 }
 
+function normalizeRetirement(value) {
+  assertAttentionExactKeys(value, ["status", "workItemRevision", "reason"], invalidState());
+  if (!RETIRED_WORK_STATUSES.has(value.status) &&
+      !(value.status === "retry_wait" && ["system_maintenance_auto_retry", "host_context_facts_recovered", "ci_materials_recovered"].includes(value.reason)) &&
+      !(value.status === "queued" && ["ci_materials_recovered", "host_context_facts_recovered"].includes(value.reason))) throw invalidState();
+  return {
+    status: value.status,
+    workItemRevision: safeStateInteger(value.workItemRevision, "archive.workItemRevision", 1),
+    reason: boundedAttentionText(value.reason, "archive.reason", {
+      maximumBytes: 512, error: invalidState(),
+    }),
+  };
+}
+
+function archiveDigest(item, retirement) {
+  return attentionDigest({
+    requestId: item.requestId,
+    requestContentDigest: item.contentDigest,
+    retirement,
+  });
+}
+
 export function createAttentionItem(request, revision, at) {
   const contentDigest = attentionDigest(request);
   const requestId = `attention-${contentDigest}`;
@@ -217,6 +240,7 @@ export function createAttentionItem(request, revision, at) {
     createdAt: at,
     updatedAt: at,
     result: null,
+    archive: null,
     timeline: [
       createTimelineEvent({
         type: "created",
@@ -229,7 +253,7 @@ export function createAttentionItem(request, revision, at) {
   };
 }
 
-function normalizeItem(value) {
+function normalizeItem(value, { legacy = false } = {}) {
   assertAttentionExactKeys(
     value,
     [
@@ -248,6 +272,7 @@ function normalizeItem(value) {
       "updatedAt",
       "result",
       "timeline",
+      ...(legacy ? [] : ["archive"]),
     ],
     invalidState(),
   );
@@ -270,6 +295,7 @@ function normalizeItem(value) {
     normalizeTimelineEvent,
   );
   const result = value.result === null ? null : normalizeResult(value.result);
+  const archive = legacy || value.archive === null ? null : normalizeRetirement(value.archive);
   const item = {
     requestId,
     contentDigest,
@@ -280,6 +306,7 @@ function normalizeItem(value) {
     createdAt: normalizeStateTimestamp(value.createdAt),
     updatedAt: normalizeStateTimestamp(value.updatedAt),
     result,
+    archive,
     timeline,
   };
   const created = timeline[0];
@@ -305,9 +332,16 @@ function normalizeItem(value) {
     throw invalidState("内部请示时间线版本必须严格递增");
   }
   if (item.status === "pending") {
-    if (timeline.length !== 1 || result !== null) throw invalidState();
+    if (timeline.length !== 1 || result !== null || archive !== null) throw invalidState();
+  } else if (item.status === "archived") {
+    if (
+      timeline.length !== 2 || result !== null || archive === null ||
+      terminal.type !== "archived" || terminal.requestId !== requestId ||
+      terminal.contentDigest !== archiveDigest(item, archive)
+    ) throw invalidState("内部请示归档与时间线不一致");
   } else if (
     timeline.length !== 2 ||
+    archive !== null ||
     result === null ||
     terminal.type !== item.status ||
     terminal.requestId !== requestId ||
@@ -406,7 +440,7 @@ function normalizeOutboxEntry(value) {
 
 export function defaultAttentionState() {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: 0,
     nextOutboxSequence: 1,
     items: [],
@@ -496,9 +530,9 @@ export function normalizeAttentionState(value) {
       ["schemaVersion", "revision", "nextOutboxSequence", "items", "outbox"],
       invalidState(),
     );
-    if (value.schemaVersion !== 1) throw invalidState();
+    if (![1, 2].includes(value.schemaVersion)) throw invalidState();
     const state = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       revision: safeStateInteger(value.revision, "revision"),
       nextOutboxSequence: safeStateInteger(
         value.nextOutboxSequence,
@@ -506,7 +540,7 @@ export function normalizeAttentionState(value) {
         1,
       ),
       items: attentionArrayValues(value.items, MAX_ITEMS, invalidState()).map(
-        normalizeItem,
+        (item) => normalizeItem(item, { legacy: value.schemaVersion === 1 }),
       ),
       outbox: attentionArrayValues(
         value.outbox,
@@ -550,6 +584,24 @@ export function resolveAttentionItem(item, answer, revision, at, sequence) {
   return {
     item: resolved,
     outbox: createAttentionOutboxEntry(resolved, sequence),
+  };
+}
+
+export function archiveAttentionItem(item, retirement, revision, at) {
+  const archive = normalizeRetirement(retirement);
+  return {
+    ...cloneAttentionValue(item),
+    status: "archived",
+    revision,
+    updatedAt: at,
+    archive,
+    timeline: [
+      ...cloneAttentionValue(item.timeline),
+      createTimelineEvent({
+        type: "archived", requestId: item.requestId, revision, at,
+        contentDigest: archiveDigest(item, archive),
+      }),
+    ],
   };
 }
 

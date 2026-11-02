@@ -58,6 +58,9 @@
           <button class="nav-item" data-view="system">
             <span>系统状态</span><kbd>S</kbd>
           </button>
+          <button class="nav-item" data-view="workbench">
+            <span>任务工作台</span>
+          </button>
         </nav>
 
         <div class="source-health" id="source-health">
@@ -87,6 +90,7 @@
         </header>
 
         <div id="status-banner" class="status-banner" role="status" aria-live="polite" hidden></div>
+        <section id="task-runs" class="task-runs" aria-labelledby="task-runs-title"></section>
         <section id="content" aria-live="polite">
           <div class="skeleton-header"></div>
           <div class="skeleton-row"></div>
@@ -98,6 +102,11 @@
     <dialog id="detail-dialog" aria-label="详情">
       <button class="dialog-close" aria-label="关闭详情">×</button>
       <div id="dialog-content"></div>
+    </dialog>
+
+    <dialog id="task-run-dialog" aria-label="当前运行任务详情">
+      <button type="button" class="dialog-close" data-task-run-close aria-label="关闭任务详情">×</button>
+      <div data-task-run-content></div>
     </dialog>
 
     <dialog id="confirmation-dialog" aria-label="待确认操作">

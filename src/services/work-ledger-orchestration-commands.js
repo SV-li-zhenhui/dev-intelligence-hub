@@ -9,7 +9,8 @@ import {
   assertWorkGraphTasksInScope,
   normalizeWorkGraphCommandAuthority,
 } from "./work-ledger-graph-command-support.js";
-import { planWorkGraphCancellation } from "./work-ledger-graph-commands.js";
+import { planWorkGraphCancellation, planWorkGraphChildCreation } from "./work-ledger-graph-commands.js";
+import { hasRequiredReviewDeliverable, requiredReviewDeliverables } from "../domain/pr-review-work-policy.js";
 import {
   createWorkIntentRecord,
   normalizeLedgerWorkIntent,
@@ -22,11 +23,13 @@ import {
 } from "./work-ledger-transitions.js";
 import {
   boundedLedgerString,
+  canonicalLedgerValue,
   hasExactLedgerKeys,
   normalizeLedgerTarget,
   workLedgerError,
 } from "./work-ledger-values.js";
-import { currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
+import { currentWorkItemExecutionBinding, pullRequestHeadAdmission } from "./work-ledger-pr-source.js";
+import { AUTO_RESUME_ON_CHILD_DELIVERY } from "./work-graph-wait-marker.js";
 
 const PAUSABLE_STATUSES = new Set(["queued", "blocked"]);
 const ESCALATABLE_STATUSES = new Set(["queued", "retry_wait", "blocked"]);
@@ -81,17 +84,24 @@ function coordinatorEnvelope(input, commandKeys, message) {
   };
 }
 
-function normalizeTaskCommand(input, message) {
+function normalizeTaskCommand(input, message, { allowChildWait = false } = {}) {
+  const commandKeys = [
+    "taskId",
+    "reason",
+    "expectedGraphRevision",
+    "expectedTaskRevision",
+  ];
+  const childWait = allowChildWait &&
+    hasExactLedgerKeys(input, ["authority", "command"]) &&
+    hasExactLedgerKeys(input.command, [...commandKeys, "waitForChildren"]);
   const { authority, command } = coordinatorEnvelope(
     input,
-    [
-      "taskId",
-      "reason",
-      "expectedGraphRevision",
-      "expectedTaskRevision",
-    ],
+    childWait ? [...commandKeys, "waitForChildren"] : commandKeys,
     message,
   );
+  if (childWait && command.waitForChildren !== true) {
+    throw invalidCommand("waitForChildren 无效");
+  }
   return {
     authority,
     command: {
@@ -102,6 +112,7 @@ function normalizeTaskCommand(input, message) {
         command.expectedTaskRevision,
         "expectedTaskRevision",
       ),
+      ...(childWait ? { waitForChildren: true } : {}),
     },
   };
 }
@@ -149,13 +160,19 @@ function requireScopedTask(state, authority, taskId) {
   return item;
 }
 
-function assertCoordinatableTask(item) {
-  if (!["assignment", "graph_task"].includes(item.kind)) {
+function assertCoordinatableTask(item, state) {
+  if (!["assignment", "graph_task", "source_root"].includes(item.kind)) {
     throw workLedgerError(
       "WORK_LEDGER_GRAPH_TASK_CONFLICT",
       "系统工作项不能由任务图编排器修改",
       409,
     );
+  }
+  if (item.kind === "source_root") {
+    const admission = pullRequestHeadAdmission(state, item);
+    if (!admission.current || admission.pending) {
+      throw workLedgerError("WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING", "PR 来源正在切换，不能覆盖其编排状态", 409);
+    }
   }
 }
 
@@ -194,7 +211,7 @@ export function planWorkGraphTaskReassignment({ state, input, clock }) {
   const { authority, command } = normalizeReassignCommand(input);
   const item = requireScopedTask(state, authority, command.taskId);
   assertCommandCas(state, item, command);
-  assertCoordinatableTask(item);
+  assertCoordinatableTask(item, state);
   assertNoActiveSideEffects(item);
   if (
     item.status !== "queued" ||
@@ -242,10 +259,11 @@ export function planWorkGraphTaskPause({ state, input, clock }) {
   const { authority, command } = normalizeTaskCommand(
     input,
     "暂停任务请求无效",
+    { allowChildWait: true },
   );
   const item = requireScopedTask(state, authority, command.taskId);
   assertCommandCas(state, item, command);
-  assertCoordinatableTask(item);
+  assertCoordinatableTask(item, state);
   assertNoActiveSideEffects(item);
   if (!PAUSABLE_STATUSES.has(item.status)) {
     throw workLedgerError(
@@ -254,11 +272,30 @@ export function planWorkGraphTaskPause({ state, input, clock }) {
       409,
     );
   }
+  if (
+    command.waitForChildren &&
+    (item.status !== "queued" ||
+      item.statusReason !== "waiting_for_children" ||
+      !state.items.some((candidate) =>
+        candidate.graph?.parentItemId === item.itemId &&
+        !["completed", "cancelled", "superseded"].includes(candidate.status)))
+  ) {
+    throw workLedgerError(
+      "WORK_LEDGER_GRAPH_TASK_CONFLICT",
+      "只有已拆分且仍有未完成直属子任务的父任务可以等待交付",
+      409,
+    );
+  }
+  if (!command.waitForChildren && command.reason === AUTO_RESUME_ON_CHILD_DELIVERY) {
+    throw invalidCommand("reason 是保留的子任务等待标记");
+  }
   const now = clock();
   const updated = moveWorkItem(item, {
     status: "paused",
     now,
-    reason: command.reason,
+    reason: command.waitForChildren
+      ? AUTO_RESUME_ON_CHILD_DELIVERY
+      : command.reason,
   });
   const items = replaceAndValidate(state, updated);
   return {
@@ -287,7 +324,7 @@ export function planWorkGraphTaskResume({ state, input, clock }) {
   );
   const item = requireScopedTask(state, authority, command.taskId);
   assertCommandCas(state, item, command);
-  assertCoordinatableTask(item);
+  assertCoordinatableTask(item, state);
   assertNoActiveSideEffects(item);
   if (item.status !== "paused") {
     throw workLedgerError(
@@ -328,7 +365,7 @@ export function planScopedWorkGraphCancellation({ state, input, clock }) {
     "取消任务请求无效",
   );
   const item = requireScopedTask(state, authority, command.taskId);
-  assertCoordinatableTask(item);
+  assertCoordinatableTask(item, state);
   return planWorkGraphCancellation({
     state,
     clock,
@@ -340,6 +377,48 @@ export function planScopedWorkGraphCancellation({ state, input, clock }) {
       reason: command.reason,
     },
   });
+}
+
+// The Review recovery hint grants no execution authority. Reuse the ordinary
+// cancellation and creation gates, then commit both graph changes together.
+export function planWorkGraphReviewReplacement({ state, input, clock }) {
+  const value = canonicalLedgerValue(input, { errorCode: "WORK_LEDGER_GRAPH_COMMAND_INVALID" });
+  if (!hasExactLedgerKeys(value, ["authority", "command"]) ||
+      !hasExactLedgerKeys(value.command.reviewReplacement, ["taskId", "expectedTaskRevision", "reason"])) throw invalidCommand("Review 替代请求无效");
+  const authority = normalizeWorkGraphCommandAuthority(value.authority);
+  const { reviewReplacement, ...command } = value.command;
+  const old = requireScopedTask(state, authority, reviewReplacement.taskId);
+  const parent = requireScopedTask(state, authority, command.parentTaskId);
+  if (old.kind !== "graph_task" || old.graph.parentItemId !== parent.itemId ||
+      authority.scopeRootTaskId !== parent.itemId || parent.currentTarget.type !== "role" || parent.currentTarget.id !== "orchestrator" ||
+      old.currentTarget.type !== "role" || old.currentTarget.id !== "pr-engineer" || old.activeIntentId !== null ||
+      old.graph.deliveries.length !== 0 || state.items.some(item => item.graph.parentItemId === old.itemId) ||
+      !hasRequiredReviewDeliverable(old.graph.acceptanceContracts.at(-1)) ||
+      !requiredReviewDeliverables(command.acceptanceContract).some(slot =>
+        requiredReviewDeliverables(old.graph.acceptanceContracts.at(-1)).some(oldSlot => oldSlot.deliverableId === slot.deliverableId)) ||
+      command.target.type !== "role" || command.target.id !== "pr-engineer") throw invalidCommand("Review 替代目标无效");
+  const reason = commandReason(reviewReplacement.reason);
+  assertNoActiveSideEffects(old);
+  const createInput = { authority, command };
+  if (old.status === "cancelled" && old.revision === reviewReplacement.expectedTaskRevision + 1 && old.statusReason === reason) {
+    const retained = planWorkGraphChildCreation({ state, input: createInput, clock });
+    if (retained.write === false) return retained;
+    throw invalidCommand("Review 替代任务缺失");
+  }
+  if (old.status !== "blocked") throw invalidCommand("Review 任务尚未结算");
+  const now = clock(), pinnedClock = () => now;
+  const cancelled = planScopedWorkGraphCancellation({ state, clock: pinnedClock, input: { authority, command: {
+    taskId: old.itemId, expectedTaskRevision: reviewReplacement.expectedTaskRevision,
+    expectedGraphRevision: command.expectedGraphRevision, reason,
+  } } });
+  // The ordinary planner validates its intermediate graph at the next revision;
+  // the combined mutation still commits exactly one durable ledger revision.
+  const created = planWorkGraphChildCreation({ state: { ...state, ...cancelled.patch, revision: state.revision + 1 },
+    input: { authority, command: { ...command, expectedGraphRevision: state.revision + 1 } }, clock: pinnedClock });
+  if (created.write === false) throw invalidCommand("Review 替代任务已存在但原任务未取消");
+  assertWorkGraphCommandTransition(state, created.patch.items);
+  return { ...created, result: { ...created.result, graphRevision: state.revision + 1 },
+    timelineEvents: [...cancelled.timelineEvents, ...created.timelineEvents] };
 }
 
 function normalizeEscalationCommand(input) {
@@ -436,7 +515,7 @@ export function planWorkGraphEscalation({ state, input, clock }) {
   }
 
   assertCommandCas(state, item, command);
-  assertCoordinatableTask(item);
+  assertCoordinatableTask(item, state);
   assertNoActiveSideEffects(item);
   if (!ESCALATABLE_STATUSES.has(item.status)) {
     throw workLedgerError(

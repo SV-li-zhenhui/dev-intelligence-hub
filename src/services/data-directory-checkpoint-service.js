@@ -8,24 +8,28 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import { types as utilTypes } from "node:util";
+import { isCanonicalBackupPath } from "../domain/backup-path.js";
 
 const MAX_FILES = 100_000;
 const MAX_DIRECTORIES = 100_000;
 const MAX_DEPTH = 128;
-const MAX_PATH_BYTES = 4_096;
 const MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 64 * 1024 * 1024 * 1024;
 const MAX_STORE_BYTES = 256 * 1024 * 1024;
 const READ_BUFFER_BYTES = 64 * 1024;
 const SAFE_STORE = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/u;
-const SAFE_SEGMENT =
-  /^(?!\.)(?!.*[. ]$)(?!.*[<>:"|?*])[^\u0000-\u001f\u007f\\/]+$/u;
 const EXCLUDED_ROOT_FILES = new Set(["mydashboard-server-process.json"]);
 const EXCLUDED_ROOT_DIRECTORIES = new Set([
   "playwright-browsers",
   "validation-profile-probe",
 ]);
 const OPTION_KEYS = new Set(["sourceDirectory", "gate"]);
+const MINIMUM_CRITICAL_FREE_BYTES = 10 * 1024 ** 3;
+
+export function dataVolumeCapacitySeverity(usedPercent, availableBytes) {
+  if (usedPercent >= 95 && availableBytes < MINIMUM_CRITICAL_FREE_BYTES) return "critical";
+  return usedPercent >= 80 ? "warning" : null;
+}
 
 export class DataDirectoryCheckpointError extends Error {
   constructor(code, message, options) {
@@ -117,11 +121,8 @@ function relativePath(parent, name) {
   return parent === "" ? name : `${parent}/${name}`;
 }
 
-function validateRelative(value) {
-  if (
-    Buffer.byteLength(value, "utf8") > MAX_PATH_BYTES ||
-    value.split("/").some((segment) => !SAFE_SEGMENT.test(segment))
-  ) {
+function validateRelative(value, directory) {
+  if (!isCanonicalBackupPath(value, { directory })) {
     throw failure("CHECKPOINT_PATH_INVALID", "数据目录包含不可备份路径");
   }
   return value;
@@ -278,7 +279,9 @@ async function inventory(directory) {
         }
         continue;
       }
-      const relative = validateRelative(relativePath(current.relative, entry.name));
+      const relative = validateRelative(
+        relativePath(current.relative, entry.name), entry.isDirectory(),
+      );
       const target = path.resolve(root, ...relative.split("/"));
       const targetInfo = await lstat(target);
       if (entry.isSymbolicLink() || targetInfo.isSymbolicLink()) {
@@ -442,9 +445,7 @@ export class DataDirectoryCheckpointService {
         throw new TypeError("statfs result is invalid");
       }
       const usedPercent = Math.round((1 - available / total) * 1_000) / 10;
-      const severity = usedPercent >= 95
-        ? "critical"
-        : usedPercent >= 80 ? "warning" : null;
+      const severity = dataVolumeCapacitySeverity(usedPercent, available);
       return Object.freeze({
         warnings: severity === null
           ? Object.freeze([])

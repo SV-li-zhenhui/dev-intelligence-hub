@@ -16,22 +16,36 @@ const RUNTIME_METHODS = Object.freeze([
   "getSummary",
   "getRoleWorkloads",
   "listItems",
+  "readItemProgress",
+  "readRepairDecisionBudget",
+  "readInternalReviewHandoff",
   "listClaimCandidates",
   "listPendingPullRequestSources",
   "listTimeline",
   "listOutbox",
   "readItemForReconciliation",
+  "readReviewAdoptionContext",
+  "readAutomaticRoleHandoffCandidates",
+  "canReconnectOwnPullRequest",
   "isAttentionRequestCurrent",
+  "areAttentionRequestsCurrent",
+  "readAttentionRequestRetirement",
   "isIntentDispatchCurrent",
   "verifyPullRequestExecutionBinding",
   "verifyPullRequestExecutionBindings",
   "readPullRequestExecutionContext",
+  "readAutomaticReviewAdmission",
+  "readCurrentAutomaticReviewWork",
   "intake",
   "retireInactiveIssues",
+  "retireAutomaticReviewTestingWork",
   "reconcilePullRequestSource",
   "reconcilePullRequestSourceBatch",
   "claim",
   "transition",
+  "recoverUnstartedReviewProposal",
+  "canRecoverUnstartedReviewProposal",
+  "controlModelRun",
   "scheduleRetry",
   "handoff",
   "complete",
@@ -41,6 +55,7 @@ const RUNTIME_METHODS = Object.freeze([
   "bindIntent",
   "ackIntent",
   "applyAttentionBatch",
+  "retrySystemMaintenanceQuestions",
   "applyProposalBatch",
   "wakeCondition",
 ]);
@@ -104,6 +119,10 @@ export async function createWorkLedgerRuntime({
   idFactory = randomUUID,
   limits,
   postCommitYield,
+  confirmationSettlementReader,
+  obsoleteCodeJobSettler,
+  hostContextRecoveryReader,
+  reviewTestingRetirementReader,
   createCandidateProcessor = createWorkerWorkLedgerCandidateProcessor,
   createGuard = (options) => new ProcessExclusiveGuard(options),
 } = {}) {
@@ -179,6 +198,10 @@ export async function createWorkLedgerRuntime({
       ...(clock ? { clock } : {}),
       ...(limits ? { limits } : {}),
       ...(postCommitYield === undefined ? {} : { postCommitYield }),
+      ...(confirmationSettlementReader === undefined ? {} : { confirmationSettlementReader }),
+      ...(obsoleteCodeJobSettler === undefined ? {} : { obsoleteCodeJobSettler }),
+      ...(hostContextRecoveryReader === undefined ? {} : { hostContextRecoveryReader }),
+      ...(reviewTestingRetirementReader === undefined ? {} : { reviewTestingRetirementReader }),
     });
     await service.recover();
     const graph = new WorkGraphStore({ ledger: service });
@@ -203,7 +226,7 @@ export async function createWorkLedgerRuntime({
     });
     const runtime = {
       graphReader: Object.freeze({
-        getSnapshot: () => admit(() => graphReader.getSnapshot()),
+        getSnapshot: (options) => admit(() => graphReader.getSnapshot(options)),
       }),
       graphBrowserReader: Object.freeze({
         getSnapshot: () =>

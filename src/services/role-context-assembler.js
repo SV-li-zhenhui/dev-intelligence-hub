@@ -1,4 +1,9 @@
+import { isInternalRepairReviewEvent } from "../domain/internal-repair-review.js";
+import { isOwnerRequestedCiRepairEvent } from "./ci-repair-context-reader.js";
 import { createHash } from "node:crypto";
+import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
+import { deliveryAcceptanceContractDigest, deliveryEvidenceKindsForProposal } from "../domain/delivery-evidence-contract.js";
+import { hasRequiredReviewDeliverable, isExternalRereview } from "../domain/pr-review-work-policy.js";
 
 import {
   normalizePullRequestGitTarget,
@@ -6,10 +11,17 @@ import {
 } from "../domain/git-tool-contract.js";
 import {
   createPullRequestExecutionBinding,
+  samePullRequestExecutionBinding,
 } from "../domain/pull-request-execution-binding.js";
+import { normalizeConflictPreparationBinding } from "../domain/conflict-preparation-binding.js";
+import { normalizeRepairFeedbackDescriptor } from "../domain/original-repair-feedback.js";
 import { normalizeWorkGraphSnapshot } from "../domain/work-graph-contract.js";
 import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
+import { WORK_LEDGER_STATUSES } from "./work-ledger-values.js";
 import { createRoleContextEvidenceCatalogAdapter } from "./role-context-evidence-catalog.js";
+import { normalizeRecordedDeliveryFailure } from "./work-ledger-delivery-failure.js";
+import { normalizeRecordedDecisionFailure } from './work-ledger-decision-failure.js';
+import { normalizeRecordedProposalFailure } from './work-ledger-proposal-failure.js';
 import {
   RoleContextAssemblerError,
   roleContextError,
@@ -305,6 +317,20 @@ function optionalMemoryQueryReader(value) {
   });
 }
 
+async function readFailedCodeJobContext(reader, item, signal) {
+  if (!reader || item.sourceBinding === null ||
+      item.decisionContext?.source !== "proposal" || item.decisionContext.outcome !== "failed" ||
+      item.decisionContext.value?.kind !== "code_action_proposal") return null;
+  const result = await reader.read({
+    itemId: item.taskId,
+    inputBinding: createPullRequestExecutionBinding({ sourceBinding: item.sourceBinding, event: item.event }),
+    decisionContext: item.decisionContext,
+    ...(signal === undefined ? {} : { signal }),
+  });
+  signal?.throwIfAborted();
+  return result === null ? null : canonicalValue(result);
+}
+
 function normalizeTarget(value, name) {
   const fields = exactData(value, ["type", "id"], name);
   const type = fields.get("type");
@@ -458,6 +484,32 @@ function publicContract(contract) {
   };
 }
 
+function normalizeDispatchFailure(value, task) {
+  const code = ownData(value, "dispatch failure").get("code");
+  if (code !== "delivery-evidence-incompatible") {
+    const failure = exactData(value, ["intentId", "code", "downstreamCreated"], "dispatch failure");
+    if (!["conflict-source-stale", "policy-binding-invalid"].includes(code) || failure.get("downstreamCreated") !== false) throw invalid("dispatch failure is invalid");
+    return { intentId: identifier(failure.get("intentId"), "dispatchFailure.intentId"), code, downstreamCreated: false };
+  }
+  const failure = exactData(value, ["intentId", "code", "downstreamCreated", "operation", "contractRevision",
+    "contractDigest", "compatibleEvidenceKinds", "expectedDeliverables"], "dispatch failure");
+  const operation = failure.get("operation"), contract = task?.acceptanceContracts.at(-1);
+  if (failure.get("downstreamCreated") !== false || !["verify", "modify"].includes(operation) || !contract ||
+      failure.get("contractRevision") !== contract.revision ||
+      digest(failure.get("contractDigest"), "dispatchFailure.contractDigest") !== deliveryAcceptanceContractDigest(contract)) throw invalid("dispatch failure contract is stale");
+  const kinds = denseArray(failure.get("compatibleEvidenceKinds"), "dispatch failure evidence kinds", 2).map(value => identifier(value, "evidence kind"));
+  const expected = denseArray(failure.get("expectedDeliverables"), "dispatch failure deliverables", 100).map(value => {
+    const entry = exactData(value, ["deliverableId", "kind"], "dispatch failure deliverable");
+    return { deliverableId: identifier(entry.get("deliverableId"), "deliverableId"), kind: identifier(entry.get("kind"), "kind") };
+  });
+  if (JSON.stringify(kinds) !== JSON.stringify(deliveryEvidenceKindsForProposal({ kind: "code_action_proposal", operation })) ||
+      JSON.stringify(expected) !== JSON.stringify(contract.expectedDeliverables.map(({ deliverableId, kind }) => ({ deliverableId, kind }))) ||
+      expected.some(({ kind }) => kinds.includes(kind))) throw invalid("dispatch failure action is compatible");
+  return { intentId: identifier(failure.get("intentId"), "dispatchFailure.intentId"), code, downstreamCreated: false,
+    operation, contractRevision: contract.revision, contractDigest: failure.get("contractDigest"),
+    compatibleEvidenceKinds: kinds, expectedDeliverables: expected };
+}
+
 function normalizeSnapshot(value) {
   const snapshot = exactData(
     value,
@@ -485,7 +537,30 @@ function normalizeSnapshot(value) {
       if (!fields.has(key)) throw invalid("task state is invalid");
     }
     const taskId = identifier(fields.get("taskId"), "taskState.taskId");
+    const ledgerStatus = fields.get("ledgerStatus") ?? null;
+    if (ledgerStatus !== null && !WORK_LEDGER_STATUSES.has(ledgerStatus)) {
+      throw invalid("taskState.ledgerStatus is invalid");
+    }
     const work = exactData(fields.get("work"), ["title", "description"], "task work");
+    let dispatchFailure = null;
+    let deliveryFailure = null;
+    let decisionFailure = null;
+    let proposalFailure = null;
+    if (ledgerStatus === "blocked" && fields.get("statusReason") === "intent_failed" && fields.get("dispatchFailure") != null) {
+      dispatchFailure = normalizeDispatchFailure(fields.get("dispatchFailure"), tasksById.get(taskId));
+    }
+    if (ledgerStatus === "blocked" && fields.get("statusReason") === "delivery_attempts_exhausted" && fields.get("deliveryFailure") != null) {
+      deliveryFailure = normalizeRecordedDeliveryFailure(fields.get("deliveryFailure"), fields.get("taskRevision"));
+      if (deliveryFailure === null) throw invalid("delivery failure binding is invalid");
+    }
+    if (ledgerStatus === 'blocked' && fields.get('statusReason') === 'decision_attempts_exhausted' && fields.get('decisionFailure') != null) {
+      decisionFailure = normalizeRecordedDecisionFailure(fields.get('decisionFailure'), fields.get('taskRevision'));
+      if (decisionFailure === null) throw invalid('decision failure binding is invalid');
+    }
+    if (ledgerStatus === 'blocked' && fields.get('statusReason') === 'proposal_failed' && fields.get('proposalFailure') != null) {
+      proposalFailure = normalizeRecordedProposalFailure(fields.get('proposalFailure'), fields.get('taskRevision'));
+      if (proposalFailure === null) throw invalid('proposal failure binding is invalid');
+    }
     if (statesById.has(taskId)) throw invalid("task state IDs are duplicated");
     statesById.set(taskId, {
       taskId,
@@ -493,6 +568,13 @@ function normalizeSnapshot(value) {
         fields.get("taskRevision"),
         "taskState.taskRevision",
       ),
+      ledgerStatus,
+      blockingCondition: ledgerStatus === "blocked" && fields.get("statusReason") === "proposal_stale"
+        ? "proposal-stale" : dispatchFailure?.code ?? deliveryFailure?.code ?? decisionFailure?.code ?? proposalFailure?.code ?? null,
+      dispatchFailure,
+      deliveryFailure,
+      decisionFailure,
+      proposalFailure,
       work: {
         title: nullableText(work.get("title"), "work.title", 256),
         description: nullableText(
@@ -867,6 +949,12 @@ function projectRootCoordination(roleId, currentTask, snapshot) {
       taskId: child.taskId,
       taskRevision: child.revision,
       status: child.status,
+      ledgerStatus: taskState.ledgerStatus,
+      blockingCondition: taskState.blockingCondition,
+      ...(taskState.dispatchFailure === null ? {} : { dispatchFailure: { ...taskState.dispatchFailure } }),
+      ...(taskState.deliveryFailure === null ? {} : { deliveryFailure: { ...taskState.deliveryFailure } }),
+      ...(taskState.decisionFailure === null ? {} : { decisionFailure: { ...taskState.decisionFailure } }),
+      ...(taskState.proposalFailure === null ? {} : { proposalFailure: { ...taskState.proposalFailure } }),
       responsibility: { ...child.responsibility },
       work: {
         title: taskState.work.title,
@@ -885,6 +973,8 @@ function projectRootCoordination(roleId, currentTask, snapshot) {
       deliverableCount: deliveries.slots.length,
       hasMoreDeliverables:
         deliveries.slots.length > visibleDeliverables.length,
+      hasAcceptedRequiredReview: deliveries.slots.some(({ kind, required, state }) =>
+        required && state === "accepted" && ["review-report", "github-review"].includes(kind)),
       deliverables: visibleDeliverables,
     };
   });
@@ -996,6 +1086,7 @@ async function readFacts(factSource, event, signal) {
 function normalizePullRequestContext(value) {
   const normalized = canonicalValue(value);
   const hasReviewMaterial = Object.hasOwn(normalized, "reviewMaterial");
+  const hasMaterialDigest = Object.hasOwn(normalized, "materialDigest");
   const fields = exactData(
     normalized,
     [
@@ -1010,6 +1101,7 @@ function normalizePullRequestContext(value) {
       "checks",
       "contextTruncated",
       ...(hasReviewMaterial ? ["reviewMaterial"] : []),
+      ...(hasMaterialDigest ? ["materialDigest"] : []),
     ],
     "pullRequest context",
   );
@@ -1074,6 +1166,7 @@ function normalizePullRequestContext(value) {
   }
   digest(fields.get("identityDigest"), "pullRequest.identityDigest");
   digest(fields.get("contentDigest"), "pullRequest.contentDigest");
+  if (hasMaterialDigest) digest(fields.get("materialDigest"), "pullRequest.materialDigest");
   const observedAt = fields.get("observedAt");
   if (
     typeof observedAt !== "string" ||
@@ -1213,6 +1306,14 @@ export class RoleContextAssembler {
   #pullRequestContextReader;
   #memoryQueryReader;
   #evidenceCatalogAdapter;
+  #failedCodeJobContextReader;
+  #internalReviewHandoffReader;
+  #originalRepairFeedbackReader;
+  #conflictInspectionReader;
+  #ciDiagnosticReader;
+  #settlementInputAuthorityVerifier;
+  #settlementEvidenceVerifier;
+  #publicationReuseReader;
 
   constructor({
     graphReader,
@@ -1220,13 +1321,42 @@ export class RoleContextAssembler {
     pullRequestContextReader,
     memoryQueryReader,
     evidenceCatalog,
+    failedCodeJobContextReader,
+    internalReviewHandoffReader,
+    originalRepairFeedbackReader,
+    conflictInspectionReader,
+    ciDiagnosticReader,
+    settlementInputAuthorityVerifier,
+    settlementEvidenceVerifier,
+    publicationReuseReader,
   } = {}) {
     this.#graphReader = requireGraphReader(graphReader);
+    this.#settlementInputAuthorityVerifier = settlementInputAuthorityVerifier == null ? null :
+      bindPortMethod(settlementInputAuthorityVerifier, "verify", "settlementInputAuthorityVerifier");
+    this.#settlementEvidenceVerifier = settlementEvidenceVerifier == null ? null :
+      bindPortMethod(settlementEvidenceVerifier, "verify", "settlementEvidenceVerifier");
+    this.#publicationReuseReader = publicationReuseReader == null ? null :
+      bindPortMethod(publicationReuseReader, "listCandidates", "publicationReuseReader");
     this.#factSource = optionalFactSource(factSource);
     this.#pullRequestContextReader = optionalPullRequestContextReader(
       pullRequestContextReader,
     );
     this.#memoryQueryReader = optionalMemoryQueryReader(memoryQueryReader);
+    this.#failedCodeJobContextReader = failedCodeJobContextReader == null ? null : Object.freeze({
+      read: bindPortMethod(failedCodeJobContextReader, "read", "failedCodeJobContextReader"),
+    });
+    this.#internalReviewHandoffReader = internalReviewHandoffReader == null ? null : Object.freeze({
+      read: bindPortMethod(internalReviewHandoffReader, "read", "internalReviewHandoffReader"),
+    });
+    this.#originalRepairFeedbackReader = originalRepairFeedbackReader == null ? null : Object.freeze({
+      readBinding: bindPortMethod(originalRepairFeedbackReader, "readBinding", "originalRepairFeedbackReader"),
+    });
+    this.#conflictInspectionReader = conflictInspectionReader == null ? null : Object.freeze({
+      read: bindPortMethod(conflictInspectionReader, "read", "conflictInspectionReader"),
+    });
+    this.#ciDiagnosticReader = ciDiagnosticReader == null ? null : Object.freeze({
+      read: bindPortMethod(ciDiagnosticReader, "read", "ciDiagnosticReader"),
+    });
     this.#evidenceCatalogAdapter =
       createRoleContextEvidenceCatalogAdapter(evidenceCatalog);
     Object.freeze(this);
@@ -1301,7 +1431,8 @@ export class RoleContextAssembler {
       currentTask,
       deliveryState,
     );
-    const [facts, authoritativeEvidence, pullRequest, memoryQuery] = await Promise.all([
+    const reviewPublicationSettlement = await this.#readReviewPublicationSettlement(roleId, item, currentTask, snapshot, signal);
+    const [facts, authoritativeEvidence, pullRequest, memoryQuery, failedExecution, internalReview] = await Promise.all([
       readFacts(this.#factSource, item.event, signal),
       this.#evidenceCatalogAdapter.read({
         roleId,
@@ -1309,11 +1440,72 @@ export class RoleContextAssembler {
         acceptanceContract: currentAcceptanceContract,
         signal,
       }),
-      readPullRequestContext(this.#pullRequestContextReader, item, signal),
+      reviewPublicationSettlement === null ? readPullRequestContext(this.#pullRequestContextReader, item, signal) : null,
       readMemoryQueryContext(this.#memoryQueryReader, roleId, item, signal),
+      readFailedCodeJobContext(this.#failedCodeJobContextReader, item, signal),
+      roleId === "pr-engineer" && this.#internalReviewHandoffReader !== null
+        ? this.#internalReviewHandoffReader.read({ itemId: item.taskId }) : null,
     ]);
     signal?.throwIfAborted();
+    if (internalReview !== null && internalReview.headRefOid !== item.event.payload?.headRefOid) {
+      throw contextError("ROLE_CONTEXT_STALE", "内部复审交接已不属于当前 Head", 409);
+    }
+    let conflictInspection = null;
+    if (roleId === "developer" && (item.event.payload?.nextAction === "resolve_conflict" ||
+        isInternalRepairReviewEvent(item.event) || isOwnerRequestedCiRepairEvent(item.event)) && this.#conflictInspectionReader) {
+      try {
+        conflictInspection = await this.#conflictInspectionReader.read({ itemId: item.taskId,
+          itemRevision: item.taskRevision, inputDigest: item.inputDigest });
+        signal?.throwIfAborted();
+        if (conflictInspection !== null) {
+          const expectedBinding = createPullRequestExecutionBinding({ sourceBinding: item.sourceBinding, event: item.event });
+          const preparation = normalizeConflictPreparationBinding(conflictInspection.preparationBinding);
+          if (!samePullRequestExecutionBinding(conflictInspection.inputBinding, expectedBinding) ||
+              !samePullRequestGitTarget(preparation.gitTarget, expectedBinding.gitTarget)) throw new TypeError("Conflict inspection binding changed");
+          conflictInspection = canonicalValue(conflictInspection);
+        }
+      } catch (cause) {
+        signal?.throwIfAborted();
+        throw contextError("ROLE_CONTEXT_CONFLICT_INSPECTION_UNAVAILABLE", "无法读取绑定的冲突检查材料", 503, { cause });
+      }
+    }
+    let originalRepairFeedback = null;
+    if (roleId === "pr-engineer" && item.eventType === "pull_request.internal_review_requested") {
+      if (this.#originalRepairFeedbackReader === null) throw contextError("OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE", "内部修复复审需要完整原始反馈快照", 503);
+      originalRepairFeedback = normalizeRepairFeedbackDescriptor(await this.#originalRepairFeedbackReader.readBinding({
+        inputBinding: createPullRequestExecutionBinding({ sourceBinding: item.sourceBinding, event: item.event }),
+        internalReview: item.event.payload.internalReview,
+      }));
+      if (originalRepairFeedback.reviewHeadRefOid !== item.event.payload.headRefOid ||
+          originalRepairFeedback.feedbackDigest !== item.event.payload.internalReview.feedbackDigest) throw contextError("ROLE_CONTEXT_STALE", "原始反馈与内部复审绑定不一致", 409);
+    }
     const isPullRequest = item.eventType.startsWith("pull_request.");
+    let reviewPublicationReuse = null;
+    if (roleId === "pr-engineer" && isPullRequest && item.eventType !== "pull_request.internal_review_requested" && internalReview === null &&
+        this.#publicationReuseReader !== null && hasRequiredReviewDeliverable(currentAcceptanceContract) && typeof pullRequest?.materialDigest === "string") {
+      reviewPublicationReuse = canonicalValue(await this.#publicationReuseReader({ taskId: currentTask.taskId, materialDigest: pullRequest.materialDigest },
+        signal === null ? {} : { signal }));
+      signal?.throwIfAborted();
+    }
+    let reviewPublicationRecovery = null;
+    if (coordination !== null && this.#publicationReuseReader !== null && typeof pullRequest?.materialDigest === "string" &&
+        isExternalRereview({ code: { sourceEvent: item.event } })) {
+      const child = coordination.coordination.directChildren.find(child => child.ledgerStatus === "blocked" &&
+        child.responsibility.type === "role" && child.responsibility.id === "pr-engineer" && child.decisionFailure &&
+        !child.hasMoreDeliverables && child.deliverables.every(slot => slot.state === "none") &&
+        hasRequiredReviewDeliverable({ expectedDeliverables: child.deliverables }));
+      if (child) {
+        const catalog = canonicalValue(await this.#publicationReuseReader({ taskId: child.taskId, materialDigest: pullRequest.materialDigest },
+          signal === null ? {} : { signal }));
+        signal?.throwIfAborted();
+        if (catalog.complete === true && catalog.candidates.length > 0) {
+          reviewPublicationRecovery = { childTaskId: child.taskId, childTaskRevision: child.taskRevision,
+            candidates: catalog.candidates.map(candidate => ({ ...candidate,
+              replacementChildKey: `review-reuse-${canonicalJsonDigest([currentTask.taskId, candidate.reviewUrl, candidate.deliverableId])}` })),
+            requiresTaskControlChecks: true };
+        }
+      }
+    }
 
     const binding = {
       roleId,
@@ -1385,11 +1577,18 @@ export class RoleContextAssembler {
       context.code = {
         ...(isPullRequest ? { sourceEvent: item.event } : {}),
         ...(pullRequest === null ? {} : { pullRequest }),
+        ...(reviewPublicationSettlement === null ? {} : { reviewPublicationSettlement }),
+        ...(reviewPublicationReuse === null ? {} : { reviewPublicationReuse }),
+        ...(reviewPublicationRecovery === null ? {} : { reviewPublicationRecovery }),
         acceptedDependencies: dependencies.code,
         facts: isPullRequest ? facts : [],
         ...(proposalDecisionContext === null
           ? {}
           : { decisionContext: proposalDecisionContext }),
+        ...(failedExecution === null ? {} : { failedExecution }),
+        ...(conflictInspection === null ? {} : { conflictInspection }),
+        ...(internalReview === null ? {} : { internalReview }),
+        ...(originalRepairFeedback === null ? {} : { originalRepairFeedback }),
         ...(currentTaskRejection?.dataClass === "code"
           ? { currentTaskRejection: currentTaskRejection.value }
           : {}),
@@ -1403,6 +1602,34 @@ export class RoleContextAssembler {
     }
     if (memoryQuery !== null) {
       context.memory = { agentQuery: memoryQuery };
+    }
+    if (isPullRequest && pullRequest !== null && context.code && this.#ciDiagnosticReader && item.sourceBinding !== null) {
+      const baselinePacket = { schemaVersion: 1, binding, context, acceptedInputs: dependencies.acceptedInputs, contextDigest: "0".repeat(64) };
+      const remaining = Math.min(12000, MAX_CONTEXT_BYTES - Buffer.byteLength(JSON.stringify(baselinePacket), "utf8") - 32);
+      if (remaining >= 256) {
+        let executionBinding;
+        try {
+          executionBinding = createPullRequestExecutionBinding({ sourceBinding: item.sourceBinding, event: item.event });
+          if (executionBinding.schemaVersion !== 2) throw invalid("CI diagnostic Git target is unavailable");
+          const value = await this.#ciDiagnosticReader.read({ repository: executionBinding.repository,
+            headRefOid: executionBinding.headRefOid, headRefName: executionBinding.gitTarget.headRefName,
+            checks: pullRequest.checks, maximumBytes: remaining }, signal === undefined ? {} : { signal });
+          signal?.throwIfAborted();
+          if (value !== null) {
+            const diagnostic = canonicalValue(value);
+            const { contentDigest, ...material } = diagnostic;
+            if (diagnostic.schemaVersion !== 1 || diagnostic.repository !== executionBinding.repository ||
+                diagnostic.headRefOid !== executionBinding.headRefOid || !Array.isArray(diagnostic.reports) || diagnostic.reports.length > 3 ||
+                canonicalJsonDigest(material) !== contentDigest || Buffer.byteLength(JSON.stringify(diagnostic), "utf8") > remaining) throw invalid("CI diagnostic binding is invalid");
+            context.code.ciDiagnostics = diagnostic;
+          }
+        } catch {
+          signal?.throwIfAborted();
+          context.code.ciDiagnostics = { schemaVersion: 1, repository: item.event.subject.repository,
+            headRefOid: item.sourceBinding.headRefOid, state: "unavailable", code: "CI_DIAGNOSTICS_UNAVAILABLE" };
+          if (Buffer.byteLength(JSON.stringify(context.code.ciDiagnostics)) > remaining) delete context.code.ciDiagnostics;
+        }
+      }
     }
     assertPacketSize(context);
 
@@ -1422,5 +1649,53 @@ export class RoleContextAssembler {
     assertPacketSize(packet);
     signal?.throwIfAborted();
     return deepFreeze(packet);
+  }
+
+  async #readReviewPublicationSettlement(roleId, item, currentTask, snapshot, signal) {
+    const event = item.event, payload = event.payload;
+    if (this.#settlementInputAuthorityVerifier === null || this.#settlementEvidenceVerifier === null ||
+        !isConfiguredRootOrchestrator(roleId, currentTask) || currentTask.acceptanceContracts.at(-1).expectedDeliverables.length !== 0 ||
+        !["queued", "working"].includes(snapshot.statesById.get(currentTask.taskId)?.ledgerStatus) ||
+        event.eventType !== "pull_request.owner_requested" || event.source?.provider !== "local-owner" ||
+        payload?.workType !== "general" || payload.nextAction !== "rereview" || payload.suggestedCapability !== "pr-review" ||
+        item.sourceBinding === null) return null;
+    const children = [...snapshot.tasksById.values()].filter(task => task.parentTaskId === currentTask.taskId && task.status !== "superseded");
+    if (children.length === 0) return null;
+    const entries = [];
+    for (const child of children) {
+      const state = snapshot.statesById.get(child.taskId);
+      if (child.responsibility.type !== "role" || child.responsibility.id !== "pr-engineer" || child.dependsOn.length !== 0 ||
+          state?.taskRevision !== child.revision || !["waiting_external", "completed"].includes(state.ledgerStatus)) return null;
+      const { currentContract, deliveries, latestByDeliverable } = currentDeliveryState(child);
+      if (!currentContract.expectedDeliverables.some(slot => slot.required) ||
+          currentContract.expectedDeliverables.some(slot => slot.kind !== "github-review")) return null;
+      const contractDigest = deliveryAcceptanceContractDigest(publicContract(currentContract));
+      for (const slot of currentContract.expectedDeliverables) {
+        const latest = latestByDeliverable.get(slot.deliverableId);
+        if (!["submitted", "accepted"].includes(latest?.status)) return null;
+        const submitted = latest.status === "submitted" ? latest : matchingSubmission(deliveries, latest,
+          "ROLE_CONTEXT_CHILD_DELIVERY_INVALID", "Published Review acceptance has no exact submission");
+        const records = submitted.evidence.filter(record => record.kind === "github-review");
+        if (records.length !== 1) return null;
+        entries.push({ taskId: child.taskId, taskRevision: child.revision, contractRevision: currentContract.revision,
+          contractDigest, deliverableId: slot.deliverableId,
+          submittedDeliveryRevision: submitted.revision, state: latest.status, completed: state.ledgerStatus === "completed",
+          evidence: records[0] });
+      }
+    }
+    const inputBinding = createPullRequestExecutionBinding({ sourceBinding: item.sourceBinding, event });
+    if (inputBinding.schemaVersion !== 2) return null;
+    const verifiedInput = await this.#settlementInputAuthorityVerifier(inputBinding);
+    signal?.throwIfAborted();
+    if (!samePullRequestExecutionBinding(verifiedInput, inputBinding)) throw invalid("Historical Review input authority changed");
+    for (const entry of entries) {
+      const verified = await this.#settlementEvidenceVerifier({ taskId: entry.taskId, roleId: "pr-engineer",
+        contractRevision: entry.contractRevision, contractDigest: entry.contractDigest, deliverableId: entry.deliverableId,
+        inputBinding, evidence: entry.evidence, ...(signal === undefined ? {} : { signal }) });
+      signal?.throwIfAborted();
+      if (verified !== true && !sameEvidence(verified, entry.evidence)) return null;
+    }
+    return { schemaVersion: 1, scope: "historical_publication_only", inputBinding,
+      allAccepted: entries.every(entry => entry.state === "accepted" && entry.completed), entries };
   }
 }

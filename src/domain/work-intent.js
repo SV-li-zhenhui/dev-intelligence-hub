@@ -484,7 +484,18 @@ function normalizeIntentVariant(value) {
         "body",
         "evidence",
       ]);
+      if (typeEntries.some(([key]) => key === "publicationReuse")) keys.push("publicationReuse");
       const entries = exactObject(value, keys);
+      let publicationReuse;
+      if (entries.has("publicationReuse")) {
+        const reuse = exactObject(entries.get("publicationReuse"), ["candidateId", "materialDigest", "coverageDigest"]);
+        const candidateId = text(reuse.get("candidateId"), "publicationReuse.candidateId", 128);
+        const materialDigest = text(reuse.get("materialDigest"), "publicationReuse.materialDigest", 64);
+        const coverageDigest = text(reuse.get("coverageDigest"), "publicationReuse.coverageDigest", 64);
+        if (!/^review-publication-candidate-[a-f0-9]{64}$/.test(candidateId) ||
+            !/^[a-f0-9]{64}$/.test(materialDigest) || !/^[a-f0-9]{64}$/.test(coverageDigest)) invalid("publicationReuse binding is invalid");
+        publicationReuse = { candidateId, materialDigest, coverageDigest };
+      }
       const verdict = entries.get("verdict");
       if (!REVIEW_VERDICTS.has(verdict)) invalid("verdict 无效");
       return {
@@ -493,6 +504,7 @@ function normalizeIntentVariant(value) {
         verdict,
         body: text(entries.get("body"), "body", 16 * 1024),
         evidence: normalizeEvidence(entries.get("evidence")),
+        ...(publicationReuse === undefined ? {} : { publicationReuse }),
       };
     }
     case "propose_github_pull_request_action": {

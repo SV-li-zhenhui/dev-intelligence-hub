@@ -5,10 +5,11 @@ import {
 import {
   normalizeConfigurationDocument,
 } from "../domain/configuration-contract.js";
-import { codeExecutionSourceWritablePaths } from "../domain/code-execution-source.js";
+import { codeExecutionSourceWritablePaths, isHeadRepairExecutionSource } from "../domain/code-execution-source.js";
 import { CodeExecutionPolicy } from "../domain/code-execution-policy.js";
 import { workProposalError } from "../domain/work-proposal-contract.js";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
+import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { createConfiguredCodeJobBrainDirectory } from "./code-job-brain-directory.js";
 import {
   createConfiguredConstructionCleanupOwner,
@@ -168,6 +169,18 @@ function globalExecutorAuthority(configuration) {
 
 function conflictPreparationAuthority(configuration, executionSource) {
   if (executionSource === null) return null;
+  if (isHeadRepairExecutionSource(executionSource)) {
+    const headRepository = executionSource.inputBinding.gitTarget.headRepository.toLowerCase();
+    const headMirror = Object.entries(configuration.codeExecutor.conflictPreparation?.headMirrorsByRepository ?? {})
+      .find(([repository]) => repository.toLowerCase() === headRepository)?.[1] ?? null;
+    return {
+      kind: executionSource.kind,
+      enabled: configuration.githubActions?.automaticOwnPrRepair === true,
+      gitCommand: configuration.codeExecutor.gitCommand ?? null,
+      headRepository,
+      headMirror,
+    };
+  }
   const conflict = configuration.codeExecutor.conflictPreparation;
   const gitTarget = executionSource.preparationBinding.gitTarget;
   const mirrorFor = (mirrors, repository) => {
@@ -251,13 +264,16 @@ function grantAuthorityDigest(authority, scope, brainBindingSchema) {
 
 export function codeJobAuthorityScopeCacheIdentity(scope) {
   const executionSource = scope.executionSource;
-  const gitTarget = executionSource?.preparationBinding?.gitTarget;
+  const gitTarget = isHeadRepairExecutionSource(executionSource)
+    ? executionSource.inputBinding.gitTarget
+    : executionSource?.preparationBinding?.gitTarget;
   return {
     ...scope,
     executionSource:
       executionSource === null || executionSource === undefined
         ? null
         : {
+            ...(isHeadRepairExecutionSource(executionSource) ? { kind: executionSource.kind } : {}),
             baseRepository: gitTarget.baseRepository.toLowerCase(),
             headRepository: gitTarget.headRepository.toLowerCase(),
           },
@@ -506,27 +522,31 @@ function requireTrackedRepository(configuration, repository) {
 
 function decisionAuthorization(value) {
   const keys = value && typeof value === "object" ? Reflect.ownKeys(value) : [];
+  const hasSignal = keys.includes("signal");
   if (
     !value ||
     Object.getPrototypeOf(value) !== Object.prototype ||
-    keys.length !== 2 ||
+    keys.length !== (hasSignal ? 3 : 2) ||
     !keys.includes("beforeGenerate") ||
     !keys.includes("brainDigest")
   ) {
     throw new TypeError("code brain authorization is invalid");
   }
   const brainDigest = Object.getOwnPropertyDescriptor(value, "brainDigest");
+  const signal = hasSignal ? Object.getOwnPropertyDescriptor(value, "signal") : null;
   if (
     !brainDigest?.enumerable ||
     !("value" in brainDigest) ||
     typeof brainDigest.value !== "string" ||
-    !/^[a-f0-9]{64}$/.test(brainDigest.value)
+    !/^[a-f0-9]{64}$/.test(brainDigest.value) ||
+    (hasSignal && (!signal?.enumerable || !("value" in signal)))
   ) {
     throw new TypeError("code brain authorization is invalid");
   }
   return {
     beforeGenerate: method(value, "beforeGenerate", "code brain authorization"),
     brainDigest: brainDigest.value,
+    ...(hasSignal ? { signal: normalizeAbortSignal(signal.value) } : {}),
   };
 }
 
@@ -621,7 +641,11 @@ function configurationAdmitsGrant(configuration, grant, executorAuthority) {
   if (grant.schemaVersion === 3) {
     if (
       grant.operation !== "modify" ||
-      !workspace.capabilities?.includes("conflict_preparation_snapshot")
+      !workspace.capabilities?.includes(isHeadRepairExecutionSource(grant.executionSource)
+        ? "git_head_snapshot" : "conflict_preparation_snapshot") ||
+      (isHeadRepairExecutionSource(grant.executionSource) &&
+        (configuration.githubActions?.automaticOwnPrRepair !== true ||
+          canonicalJsonDigest(expectedWritablePaths) !== canonicalJsonDigest([...workspace.writablePaths].sort((left, right) => left.localeCompare(right, "en")))))
     ) {
       return false;
     }
@@ -879,9 +903,50 @@ export class VersionedCodeJobAuthority {
     return null;
   }
 
+  async describe(roleId, brainDigest) {
+    this.#assertOpen();
+    decisionRoleId({ roleId });
+    if (brainDigest !== undefined &&
+        (typeof brainDigest !== "string" || !/^[a-f0-9]{64}$/.test(brainDigest))) {
+      throw new TypeError("code brain digest is invalid");
+    }
+    const current = await this.#current();
+    const context = brainDigest === undefined || current.brainDigests.get(roleId) === brainDigest
+      ? current : this.#brainCandidateContext(current, roleId, brainDigest);
+    if (!context || current.roleAuthorityDigest(roleId) === undefined ||
+        current.roleAuthorityDigest(roleId) !== context.roleAuthorityDigest(roleId)) {
+      throw invalid("岗位大脑封印已不受当前活动配置授权");
+    }
+    const describe = optionalMethod(this.#directory(context), "describe");
+    const result = describe ? await describe(roleId) : { supportsCodeReading: false };
+    this.#assertOpen();
+    const latest = await this.#current();
+    if (latest.roleAuthorityDigest(roleId) !== context.roleAuthorityDigest(roleId)) {
+      throw invalid("岗位大脑配置在能力读取时已变化");
+    }
+    return result;
+  }
+
+  async withEntityQuiescence({ roleId, brainDigest, entityKey, signal = null }, operation) {
+    this.#assertOpen();
+    await this.describe(roleId, brainDigest);
+    const current = await this.#current();
+    const context = current.brainDigests.get(roleId) === brainDigest
+      ? current : this.#brainCandidateContext(current, roleId, brainDigest);
+    if (!context) return { executed: false };
+    const directory = this.#directory(context);
+    const quiescence = optionalMethod(directory, 'withEntityQuiescence');
+    return quiescence ? quiescence({ roleId, entityKey, signal }, async () => {
+      this.#assertOpen();
+      const latest = await this.#current();
+      if (latest.roleAuthorityDigest(roleId) !== context.roleAuthorityDigest(roleId)) return null;
+      return operation();
+    }) : { executed: false };
+  }
+
   async decide(value, authorization) {
     this.#assertOpen();
-    const { beforeGenerate, brainDigest } = decisionAuthorization(authorization);
+    const { beforeGenerate, brainDigest, signal } = decisionAuthorization(authorization);
     const roleId = decisionRoleId(value);
     const current = await this.#current();
     let context = current.brainDigests.get(roleId) === brainDigest
@@ -908,6 +973,7 @@ export class VersionedCodeJobAuthority {
       },
       brainDigest,
       admitGenerate: this.#actionAdmission,
+      ...(signal === undefined ? {} : { signal }),
     });
     this.#assertOpen();
     return result;
@@ -965,7 +1031,7 @@ export class VersionedCodeJobAuthority {
         );
         if (
           !conflict.enabled ||
-          conflict.baseMirror === null ||
+          (!isHeadRepairExecutionSource(scope.executionSource) && conflict.baseMirror === null) ||
           conflict.headMirror === null
         ) {
           throw invalid("Conflict preparation 的仓库镜像授权未配置");

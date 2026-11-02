@@ -114,7 +114,7 @@ class FastSandbox {
     return {
       exitCode: 0,
       signal: null,
-      stdout: "1 trusted profile passed",
+      stdout: "TAP version 13\nok 1 - trusted profile\n1..1\n# tests 1\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0",
       stderr: "",
       durationMs: 1,
       imageId: `sha256:${"a".repeat(64)}`,

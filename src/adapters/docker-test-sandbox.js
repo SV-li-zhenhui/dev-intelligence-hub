@@ -41,6 +41,7 @@ const NODE_TEST_ARGS = Object.freeze([
   ...NODE_SHARED_READ_ARGS,
   ...NODE_SHARED_RUNTIME_ARGS,
   "--test",
+  "--test-reporter=tap",
 ]);
 const NODE_SCRIPT_ARGS = Object.freeze([
   ...NODE_SHARED_READ_ARGS,

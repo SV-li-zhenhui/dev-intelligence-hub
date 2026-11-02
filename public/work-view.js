@@ -632,7 +632,9 @@ function manifestProfileMarkup(profiles, manifest) {
         <span>尝试 ${escapeWorkHtml(profile?.attemptNumber ?? "未知")}</span>
       </div>
       <dl class="detail-grid">
-        <dt>固定镜像</dt><dd><code>${escapeWorkHtml(profile?.imageId || "未知")}</code></dd>
+        ${profile?.runtimeIdentity?.kind === "windows-process"
+          ? `<dt>Windows 进程</dt><dd>${escapeWorkHtml(profile.runtimeIdentity.pid)} · ${escapeWorkHtml(profile.verificationKind === "build" ? "构建" : "测试")}</dd><dt>程序摘要</dt><dd><code>${escapeWorkHtml(profile.runtimeIdentity.executableSha256)}</code></dd>`
+          : `<dt>固定镜像</dt><dd><code>${escapeWorkHtml(profile?.imageId || "未知")}</code></dd>`}
         <dt>配置摘要</dt><dd><code>${escapeWorkHtml(profile?.configDigest || "未知")}</code></dd>
         <dt>工作区修订</dt><dd><code>${escapeWorkHtml(profile?.workspaceRevision || "未知")}</code></dd>
         <dt>执行动作</dt><dd>${escapeWorkHtml(profile?.actionId || "未知")}</dd>
@@ -1028,7 +1030,7 @@ export function renderWorkView(state, { now = Date.now() } = {}) {
     </section>
     <div class="work-safeguards" role="note">
       <span class="status-pill ${safeguards.prEmployeePaused ? "status-paused" : "status-working"}">PR 新循环：${safeguards.prEmployeePaused ? "暂停 / 旧员工独占" : "已启用"}</span>
-      <span class="status-pill ${safeguards.externalActionsEnabled ? "status-waiting_user" : "status-disabled"}">GitHub 外部写：${safeguards.externalActionsEnabled ? "逐项确认" : "关闭"}</span>
+      <span class="status-pill ${safeguards.externalActionsEnabled ? "status-waiting_user" : "status-disabled"}">GitHub 外部写：${safeguards.automaticReviewEnabled ? "当前分配的 PR 自动 Review" : safeguards.externalActionsEnabled ? "逐项确认" : "关闭"}</span>
       <small>模型只生成结构化判断；代码执行和外部写入不能绕过受控执行器与确认队列。</small>
     </div>
     <details class="work-audit-graph">
