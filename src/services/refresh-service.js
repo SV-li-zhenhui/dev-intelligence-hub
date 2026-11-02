@@ -607,6 +607,12 @@ export class RefreshService {
     if (summaryRequest) summaryRequest.items = deduplicate([
       ...summaryRequest.items, ...previousItems.filter(item => staleDingTalkKinds.has(item.kind)),
     ]);
+    // A fact refresh can finish before the model. Keep that same request when
+    // both its authorization/configuration and complete input are unchanged.
+    if (summaryRequest && this.pendingDingTalkSummary?.fingerprint === fingerprint &&
+        canonicalJsonDigest(this.pendingDingTalkSummary.items) === canonicalJsonDigest(summaryRequest.items)) {
+      summaryRequest = this.pendingDingTalkSummary;
+    }
     signal?.throwIfAborted();
 
     const snapshot = {
@@ -757,6 +763,7 @@ export class RefreshService {
       notificationDiff,
       notification,
     });
+    if (summaryRequest) summaryRequest.refreshedAt = observationLowerBound;
     this.pendingDingTalkSummary = summaryRequest;
     return { dashboard, diff, notification };
   }

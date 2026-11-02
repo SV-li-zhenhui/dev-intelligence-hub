@@ -64,6 +64,25 @@ test("a deferred response cannot overwrite a newer message snapshot", async () =
   assert.equal(JSON.stringify(await f.store.read("snapshot")), before);
 });
 
+test("unchanged facts keep an in-flight summary across refresh timestamps without another model call", async () => {
+  const f = deferredSummaryFixture();
+  await f.service.refresh({ deferDingTalkSummary: true });
+  const summary = f.service.summarizePendingDingTalk();
+  await new Promise(resolve => setImmediate(resolve));
+  const latestTime = "2026-08-13T01:03:03.004Z";
+  f.service.clock = () => new Date(latestTime);
+  await f.service.refresh({ deferDingTalkSummary: true });
+  const duplicate = f.service.summarizePendingDingTalk();
+  f.finish();
+  assert.equal((await summary).state, "complete");
+  assert.equal((await duplicate).skipped, "no_pending_summary");
+  const snapshot = await f.store.read("snapshot");
+  assert.equal(snapshot.refreshedAt, latestTime);
+  assert.equal(snapshot.brain.dingtalkSummaryState, "complete");
+  assert.equal(snapshot.items.find(x => x.kind === "message").summaryStatus, "ai");
+  assert.equal(f.calls, 1);
+});
+
 test("deferred summaries preserve retained sources and concurrent PR metadata", async () => {
   const f = deferredSummaryFixture();
   await f.store.write("snapshot", { refreshedAt: REFRESH_STARTED_AT, items: [{
