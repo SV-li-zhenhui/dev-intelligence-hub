@@ -44,7 +44,7 @@ const ASSESSMENT_SCHEMA = {
 
 const ASSESSMENT_FIELDS = Object.freeze(Object.keys(ASSESSMENT_SCHEMA.properties));
 
-const DINGTALK_DIGEST_SCHEMA = {
+export const DINGTALK_DIGEST_SCHEMA = {
   type: "object",
   additionalProperties: false,
   required: ["summaries"],
@@ -82,7 +82,7 @@ const DINGTALK_DIGEST_FIELDS = Object.freeze(
 );
 
 class InvalidAssessmentError extends Error {}
-class InvalidDingTalkDigestError extends Error {}
+export class InvalidDingTalkDigestError extends Error {}
 
 function actionAdmissionRun(value) {
   if (!value || typeof value.run !== "function") {
@@ -256,7 +256,7 @@ function parseAssessment(content) {
   return assessment;
 }
 
-function dingTalkSystemPrompt(isRetry) {
+export function dingTalkSystemPrompt(isRetry = false) {
   const retryInstruction = isRetry
     ? "上一次响应不符合结构要求。请逐项检查，只返回 JSON 对象。"
     : "";
@@ -363,21 +363,67 @@ function validateDingTalkDigest(value, expectedGroupIds) {
   return issues;
 }
 
-function parseDingTalkDigest(content, groupIds) {
-  if (typeof content !== "string" || !content.trim()) {
-    throw new InvalidDingTalkDigestError("message.content must be a JSON string");
-  }
+export function createDingTalkDigestSchema(groupIds) {
+  const schema = structuredClone(DINGTALK_DIGEST_SCHEMA);
+  const summaries = schema.properties.summaries;
+  summaries.minItems = groupIds.length;
+  summaries.maxItems = groupIds.length;
+  summaries.items.properties.groupId.enum = [...groupIds];
+  return schema;
+}
+
+export function parseDingTalkDigest(content, groupIds) {
   let digest;
-  try {
-    digest = JSON.parse(content);
-  } catch (error) {
-    throw new InvalidDingTalkDigestError(
-      `response content is not valid JSON: ${error.message}`,
-    );
+  if (typeof content === "string") {
+    if (!content.trim()) throw new InvalidDingTalkDigestError("message.content must be a JSON string");
+    try {
+      digest = JSON.parse(content);
+    } catch (error) {
+      throw new InvalidDingTalkDigestError(`response content is not valid JSON: ${error.message}`);
+    }
+  } else {
+    digest = content;
   }
   const issues = validateDingTalkDigest(digest, new Set(groupIds));
   if (issues.length) throw new InvalidDingTalkDigestError(issues.join("; "));
   return digest.summaries;
+}
+
+export async function summarizeDingTalkConversations(
+  conversations,
+  { signal = null, numCtx = DEFAULT_CONTEXT_TOKENS, summarizeBatch } = {},
+) {
+  if (!Array.isArray(conversations) || conversations.length === 0) return [];
+  if (typeof summarizeBatch !== "function") throw new TypeError("DingTalk batch summarizer is required");
+  const budget = Math.max(2_048, (numCtx - 3_000) * 2);
+  const batchSize = Math.max(1, Math.floor((numCtx - 1_800) / 700));
+  const results = [];
+  let batch = [];
+  const flush = async () => {
+    if (!batch.length) return;
+    results.push(...await summarizeBatch(batch, { signal }));
+    batch = [];
+  };
+  for (const conversation of conversations) {
+    signal?.throwIfAborted();
+    if (Buffer.byteLength(JSON.stringify(conversation)) > budget) {
+      await flush();
+      const summaries = [];
+      for (const piece of digestConversationPieces(conversation, budget)) {
+        summaries.push(...await summarizeBatch([piece], { signal }));
+      }
+      const combined = { ...conversation, messages: summaries.map((part) => ({ author: "分段摘要", content: JSON.stringify(part), updatedAt: "" })) };
+      if (Buffer.byteLength(JSON.stringify(combined)) >= Buffer.byteLength(JSON.stringify(conversation))) {
+        throw new Error("DingTalk summary could not reduce oversized input");
+      }
+      results.push(...await summarizeDingTalkConversations([combined], { signal, numCtx, summarizeBatch }));
+    } else {
+      if (batch.length && (batch.length >= batchSize || Buffer.byteLength(JSON.stringify([...batch, conversation])) > budget)) await flush();
+      batch.push(conversation);
+    }
+  }
+  await flush();
+  return results;
 }
 
 export class OllamaBrain {
@@ -434,52 +480,18 @@ export class OllamaBrain {
   }
 
   async summarizeDingTalk(conversations, { signal = null } = {}) {
-    if (!Array.isArray(conversations) || conversations.length === 0) return [];
-    // Keep whole source text. Large mail threads are summarized in pieces,
-    // then their summaries are combined within the model's context budget.
-    const budget = Math.max(2_048, (this.numCtx - 3_000) * 2);
-    const batchSize = Math.max(1, Math.floor((this.numCtx - 1_800) / 700));
-    const results = [];
-    let batch = [];
-    const flush = async () => {
-      if (!batch.length) return;
-      results.push(...await this.summarizeDingTalkBatch(batch, { signal }));
-      batch = [];
-    };
-    for (const conversation of conversations) {
-      signal?.throwIfAborted();
-      if (Buffer.byteLength(JSON.stringify(conversation)) > budget) {
-        await flush();
-        const pieces = digestConversationPieces(conversation, budget);
-        const summaries = [];
-        for (const piece of pieces) {
-          summaries.push(...await this.summarizeDingTalkBatch([piece], { signal }));
-        }
-        const combined = { ...conversation, messages: summaries.map((part) => ({
-          author: "分段摘要", content: JSON.stringify(part), updatedAt: "",
-        })) };
-        if (Buffer.byteLength(JSON.stringify(combined)) >= Buffer.byteLength(JSON.stringify(conversation))) {
-          throw new Error("DingTalk summary could not reduce oversized input");
-        }
-        results.push(...await this.summarizeDingTalk([combined], { signal }));
-      } else {
-        if (batch.length && (batch.length >= batchSize ||
-            Buffer.byteLength(JSON.stringify([...batch, conversation])) > budget)) await flush();
-        batch.push(conversation);
-      }
-    }
-    await flush();
-    return results;
+    return summarizeDingTalkConversations(conversations, {
+      signal,
+      numCtx: this.numCtx,
+      summarizeBatch: (batch, options) => this.summarizeDingTalkBatch(batch, options),
+    });
   }
-
   async summarizeDingTalkBatch(conversations, { signal = null } = {}) {
     if (!Array.isArray(conversations) || conversations.length === 0) return [];
     const groupIds = conversations.map((conversation) => conversation.groupId);
-    const schema = structuredClone(DINGTALK_DIGEST_SCHEMA);
-    const summaries = schema.properties.summaries;
-    summaries.minItems = groupIds.length;
-    summaries.maxItems = groupIds.length;
-    summaries.items.properties.groupId.enum = groupIds;
+
+    const schema = createDingTalkDigestSchema(groupIds);
+
     let lastValidationError = "unknown validation error";
 
     for (let attempt = 0; attempt < 2; attempt += 1) {

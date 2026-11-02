@@ -280,8 +280,8 @@ export class RefreshService {
     const brainConfig = this.config.brain || {};
     const meta = {
       enabled: Boolean(brainConfig.enabled),
-      provider: brainConfig.provider || "",
-      model: brainConfig.model || "",
+      provider: brainConfig.primaryBrain?.provider || brainConfig.provider || "",
+      model: brainConfig.primaryBrain?.model || brainConfig.model || "",
       assessed: 0,
       errors: [],
     };
@@ -328,10 +328,16 @@ export class RefreshService {
 
     try {
       signal?.throwIfAborted();
-      const summaries = await this.brain.summarizeDingTalk(
-        dingTalkDigestFacts(prepared.groups),
-        { signal },
-      );
+      const facts = dingTalkDigestFacts(prepared.groups);
+      const receipt = typeof this.brain.summarizeDingTalkWithReceipt === "function"
+        ? await this.brain.summarizeDingTalkWithReceipt(facts, { signal })
+        : { summaries: await this.brain.summarizeDingTalk(facts, { signal }), fallbackUsed: false };
+      const summaries = receipt.summaries;
+      if (receipt.fallbackUsed) {
+        brainMeta.fallbackUsed = true;
+        brainMeta.fallbackProvider = this.config.brain?.provider || "ollama";
+        brainMeta.fallbackModel = this.config.brain?.model || "";
+      }
       brainMeta.dingtalkSummarized = summaries.length;
       return applyDingTalkSummaries(prepared, summaries);
     } catch (error) {

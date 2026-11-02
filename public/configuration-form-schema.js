@@ -371,6 +371,8 @@ const FIELD_RULES = deepFreeze([
   { pattern: ["**", "remoteData", "requirements"], control: "checkbox", kind: "boolean" },
   { pattern: ["**", "remoteData", "code"], control: "checkbox", kind: "boolean" },
   { pattern: ["**", "remoteData", "memory"], control: "checkbox", kind: "boolean" },
+  { pattern: ["**", "remoteData", "dingtalk"], control: "checkbox", kind: "boolean" },
+  { pattern: ["brain", "allowRemoteDingTalkSummary"], control: "checkbox", kind: "boolean", label: "允许 Luna 处理钉钉摘要" },
   { pattern: ["brainProviders", "*", "apiKeyEnv"], control: "env-reference", kind: "text", format: "environment", maximumBytes: 128 },
   {
     pattern: ["brainProviders", "*", "credentialMode"],
@@ -420,6 +422,7 @@ const FIELD_RULES = deepFreeze([
   { pattern: ["githubActions", "enabledActions", "#"], control: "select", kind: "text", options: ["comment", "review", "update_branch", "push", "merge"] },
   { pattern: ["workCoordination", "policy", "codeOperationsByRole", "*", "#"], control: "select", kind: "text", options: ["inspect", "modify", "verify"] },
   { pattern: ["brain", "provider"], control: "select", kind: "text", options: ["ollama"] },
+  { pattern: ["brain", "primaryBrain", "provider"], control: "select", kind: "text", format: "safe-id", maximumBytes: 128, optionsFrom: "brainProviders" },
   { pattern: ["employees", "prReviewer", "brain", "provider"], control: "select", kind: "text", options: ["ollama"] },
   ...[
     ["employees", "prReviewer", "primaryBrain", "provider"],
@@ -469,6 +472,7 @@ const FIELD_RULES = deepFreeze([
   { pattern: ["brainProviders", "*", "model"], kind: "text", maximumBytes: 256 },
   { pattern: ["brain", "baseUrl"], kind: "text", format: "endpoint", maximumBytes: 2_048 },
   { pattern: ["brain", "model"], kind: "text", maximumBytes: 256 },
+  { pattern: ["brain", "primaryBrain", "model"], kind: "text", maximumBytes: 256 },
   { pattern: ["employees", "prReviewer", "name"], kind: "text", maximumBytes: 256 },
   { pattern: ["employees", "prReviewer", "brain", "model"], kind: "text", maximumBytes: 256 },
   { pattern: ["employees", "prReviewer", "primaryBrain", "model"], kind: "text", maximumBytes: 256 },

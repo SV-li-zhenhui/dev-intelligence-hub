@@ -270,6 +270,8 @@ const LEGACY_BRAIN_FIELDS = [
   "numCtx",
   "contextTokens",
   "maxAssessmentsPerRefresh",
+  "primaryBrain",
+  "allowRemoteDingTalkSummary",
 ];
 const CLI_PROVIDER_KINDS = new Set(["codex-cli", "claude-cli"]);
 const CLI_PROVIDER_FORBIDDEN_FIELDS = [
@@ -280,24 +282,30 @@ const CLI_PROVIDER_FORBIDDEN_FIELDS = [
   "contextTokens",
 ];
 function assertLegacyBrain(value, path, { partial = false } = {}) {
+  const globalBrain = path === "configuration.brain";
   assertFields(
     value,
     path,
-    LEGACY_BRAIN_FIELDS,
+    globalBrain ? LEGACY_BRAIN_FIELDS : LEGACY_BRAIN_FIELDS.filter((name) => !["primaryBrain", "allowRemoteDingTalkSummary"].includes(name)),
     partial ? [] : ["enabled", "provider", "model", "baseUrl"],
   );
+  if (globalBrain) {
+    if (Object.hasOwn(value, "allowRemoteDingTalkSummary") && typeof value.allowRemoteDingTalkSummary !== "boolean") throw new TypeError(`${path}.allowRemoteDingTalkSummary must be boolean`);
+    if (value.primaryBrain) assertAssignedBrain(value.primaryBrain, `${path}.primaryBrain`, { allowDingTalk: true });
+  }
 }
 
-function assertAssignedBrain(value, path) {
+function assertAssignedBrain(value, path, { allowDingTalk = false } = {}) {
   assertFields(value, path, ["provider", "model", "reasoningEffort", "remoteData"], [
     "provider",
     "model",
     "remoteData",
   ]);
+  const remoteFields = allowDingTalk ? ["requirements", "code", "memory", "dingtalk"] : ["requirements", "code", "memory"];
   assertFields(
     value.remoteData,
     `${path}.remoteData`,
-    ["requirements", "code", "memory"],
+    remoteFields,
     ["requirements", "code", "memory"],
   );
 }

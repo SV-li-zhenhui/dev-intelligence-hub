@@ -8,6 +8,7 @@ import { isCodeExecutionContext } from "../lib/code-execution-context.js";
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
 const DATA_CLASSES = Object.freeze(["requirements", "code", "memory"]);
+const EXTENDED_DATA_CLASSES = Object.freeze([...DATA_CLASSES, "dingtalk"]);
 const REASONING_EFFORTS = new Set([
   "low",
   "medium",
@@ -83,12 +84,22 @@ function safeModel(value) {
 }
 
 function normalizeRemoteData(value) {
-  const normalized = exactData(value, DATA_CLASSES, "brain.remoteData");
-  if (DATA_CLASSES.some((name) => typeof normalized[name] !== "boolean")) {
+  const entries = dataEntries(value, "brain.remoteData");
+  const keys = new Set(entries.map(([key]) => key));
+  const isLegacyShape = DATA_CLASSES.length === keys.size && DATA_CLASSES.every((key) => keys.has(key));
+  const isExtendedShape = EXTENDED_DATA_CLASSES.length === keys.size && EXTENDED_DATA_CLASSES.every((key) => keys.has(key));
+  if (!isLegacyShape && !isExtendedShape) {
+    throw new TypeError("brain.remoteData is invalid");
+  }
+  const normalized = {
+    ...Object.fromEntries(entries),
+    dingtalk: isExtendedShape ? Object.fromEntries(entries).dingtalk : false,
+  };
+  if (EXTENDED_DATA_CLASSES.some((name) => typeof normalized[name] !== "boolean")) {
     throw new TypeError("brain.remoteData is invalid");
   }
   return Object.freeze(
-    Object.fromEntries(DATA_CLASSES.map((name) => [name, normalized[name]])),
+    Object.fromEntries(EXTENDED_DATA_CLASSES.map((name) => [name, normalized[name]])),
   );
 }
 
@@ -125,7 +136,7 @@ function normalizeDataClasses(value = []) {
     !Array.isArray(value) ||
     Object.getPrototypeOf(value) !== Array.prototype ||
     Reflect.ownKeys(value).length !== value.length + 1 ||
-    value.some((entry) => !DATA_CLASSES.includes(entry)) ||
+    value.some((entry) => !EXTENDED_DATA_CLASSES.includes(entry)) ||
     new Set(value).size !== value.length
   ) {
     throw new TypeError("dataClasses are invalid");
@@ -211,7 +222,7 @@ function authorizedSessionKey(entityKey, provider, brain, dataClasses) {
     brain.reasoningEffort ?? null,
     provider.remote,
     DATA_CLASSES.map((name) => brain.remoteData[name]),
-    DATA_CLASSES.filter((name) => dataClasses.includes(name)),
+    EXTENDED_DATA_CLASSES.filter((name) => dataClasses.includes(name)),
   ]);
   return `auth-v2:${createHash("sha256").update(scope, "utf8").digest("hex")}`;
 }
@@ -224,7 +235,12 @@ function frozenDescription(provider, brain) {
       ? { reasoningEffort: brain.reasoningEffort }
       : {}),
     remote: provider.remote,
-    remoteData: Object.freeze({ ...brain.remoteData }),
+    remoteData: Object.freeze({
+      requirements: brain.remoteData.requirements,
+      code: brain.remoteData.code,
+      memory: brain.remoteData.memory,
+      ...(brain.remoteData.dingtalk ? { dingtalk: true } : {}),
+    }),
     ...(provider.singleAttempt ? { singleAttempt: true } : {}),
     ...(provider.supportsReviewReading ? { supportsReviewReading: true } : {}),
     ...(provider.supportsCodeReading ? { supportsCodeReading: true } : {}),

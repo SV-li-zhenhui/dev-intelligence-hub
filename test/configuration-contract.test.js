@@ -25,6 +25,35 @@ function document() {
   return structuredClone(committedDocument);
 }
 
+test("global DingTalk digest brain requires only explicit DingTalk remote authority", () => {
+  const before = document();
+  const configured = document();
+  configured.brainProviders["digest-luna"] = { kind: "codex-cli", credentialMode: "codex-native-login", remote: true };
+  configured.brain.primaryBrain = {
+    provider: "digest-luna", model: "gpt-6-luna", reasoningEffort: "medium",
+    remoteData: { requirements: false, code: false, memory: false, dingtalk: true },
+  };
+  configured.brain.allowRemoteDingTalkSummary = true;
+  const normalized = normalizeConfigurationDocument(configured);
+  assert.deepEqual(normalized.brain.primaryBrain, configured.brain.primaryBrain);
+  assert.equal(normalized.brain.allowRemoteDingTalkSummary, true);
+  const form = configurationDocumentFromForm(createConfigurationFormState(normalized));
+  assert.equal(form.ok, true);
+  assert.deepEqual(form.configuration.brain.primaryBrain, configured.brain.primaryBrain);
+  const impact = configurationDocumentImpact(before, configured);
+  assert.ok(impact.authority_expansion.includes("brain.allowRemoteDingTalkSummary"));
+  assert.ok(impact.authority_expansion.includes("brain.primaryBrain"));
+  assert.ok(impact.restart_required.includes("brain.primaryBrain"));
+  for (const mutate of [
+    (value) => { value.brain.allowRemoteDingTalkSummary = false; },
+    (value) => { value.brain.primaryBrain.remoteData.code = true; },
+    (value) => { value.brain.primaryBrain.remoteData.dingtalk = false; },
+  ]) {
+    const invalid = structuredClone(configured); mutate(invalid);
+    assert.throws(() => normalizeConfigurationDocument(invalid));
+  }
+});
+
 test("PR promoter primary brain is optional, explicit, versioned and preserved by form round trips", () => {
   const old = document();
   const oldDigest = configurationDocumentDigest(old);

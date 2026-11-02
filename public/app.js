@@ -5011,7 +5011,7 @@ function updateChrome() {
       : []),
   ];
   const brainLabel = brain.enabled
-    ? `${brain.provider || "AI"} / ${brain.model || "未配置模型"}`
+    ? `${brain.provider || "AI"} / ${brain.model || "未配置模型"}${brain.fallbackUsed ? `（已回退 ${brain.fallbackProvider || "本地模型"} / ${brain.fallbackModel || ""}）` : ""}`
     : "确定性规则";
   lastUpdated.textContent = `更新于 ${relativeTime(dashboard.meta.refreshedAt)} · ${dashboard.meta.durationMs} ms`;
   sourceHealth.classList.toggle("error", errors.length > 0);

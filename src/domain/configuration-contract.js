@@ -75,6 +75,8 @@ const LEGACY_BRAIN_FIELDS = Object.freeze([
   "numCtx",
   "contextTokens",
   "maxAssessmentsPerRefresh",
+  "primaryBrain",
+  "allowRemoteDingTalkSummary",
 ]);
 const PROVIDER_FIELDS = Object.freeze([
   "kind",
@@ -472,7 +474,10 @@ function normalizeConflictPreparation(value) {
 
 function normalizeLegacyBrain(value, path, { partial = false } = {}) {
   const required = partial ? [] : ["enabled", "provider", "model", "baseUrl"];
-  const config = fields(value, path, LEGACY_BRAIN_FIELDS, required);
+  const allowedFields = path === "brain"
+    ? LEGACY_BRAIN_FIELDS
+    : LEGACY_BRAIN_FIELDS.filter((name) => !["primaryBrain", "allowRemoteDingTalkSummary"].includes(name));
+  const config = fields(value, path, allowedFields, required);
   const normalized = {
     ...optional(config, "enabled", (entry) => boolean(entry, `${path}.enabled`)),
     ...optional(config, "provider", (entry) => {
@@ -482,6 +487,10 @@ function normalizeLegacyBrain(value, path, { partial = false } = {}) {
     }),
     ...optional(config, "model", (entry) => text(entry, `${path}.model`, 256)),
     ...optional(config, "baseUrl", (entry) => endpoint(entry, `${path}.baseUrl`).value),
+    ...(path === "brain" ? {
+      ...optional(config, "primaryBrain", (entry) => normalizeAssignedBrain(entry, `${path}.primaryBrain`, { allowDingTalk: true })),
+      ...optional(config, "allowRemoteDingTalkSummary", (entry) => boolean(entry, `${path}.allowRemoteDingTalkSummary`)),
+    } : {}),
   };
   for (const name of [
     "timeoutMs",
@@ -499,14 +508,15 @@ function normalizeLegacyBrain(value, path, { partial = false } = {}) {
   return normalized;
 }
 
-function normalizeRemoteData(value, path) {
-  const config = fields(value, path, DATA_CLASSES, DATA_CLASSES);
+function normalizeRemoteData(value, path, { allowDingTalk = false } = {}) {
+  const classes = allowDingTalk ? [...DATA_CLASSES, "dingtalk"] : DATA_CLASSES;
+  const config = fields(value, path, classes, DATA_CLASSES);
   return Object.fromEntries(
-    DATA_CLASSES.map((name) => [name, boolean(config[name], `${path}.${name}`)]),
+    classes.filter((name) => Object.hasOwn(config, name)).map((name) => [name, boolean(config[name], `${path}.${name}`)]),
   );
 }
 
-function normalizeAssignedBrain(value, path) {
+function normalizeAssignedBrain(value, path, { allowDingTalk = false } = {}) {
   const config = fields(
     value,
     path,
@@ -523,7 +533,7 @@ function normalizeAssignedBrain(value, path) {
       }
       return effort;
     }),
-    remoteData: normalizeRemoteData(config.remoteData, `${path}.remoteData`),
+    remoteData: normalizeRemoteData(config.remoteData, `${path}.remoteData`, { allowDingTalk }),
   };
 }
 
@@ -1553,6 +1563,7 @@ function assertProviderReferences(document) {
   if (nativeCapacities.size > 1) throw invalid("brainProviders", "共享原生 Codex 登录的并发容量必须一致");
   const references = [
     ["brain.provider", document.brain.provider],
+    ...(document.brain.primaryBrain ? [["brain.primaryBrain.provider", document.brain.primaryBrain.provider]] : []),
     ...(document.employees.prReviewer.primaryBrain ? [["employees.prReviewer.primaryBrain.provider", document.employees.prReviewer.primaryBrain.provider]] : []),
     ...Object.entries(document.employees.roles).flatMap(([id, role]) => [
       [
@@ -1577,6 +1588,7 @@ function assertProviderReferences(document) {
     if (!providers.has(provider)) throw invalid(path, "引用了未知 Provider");
   }
   const assignedBrains = [
+    ...(document.brain.primaryBrain ? [["brain.primaryBrain", document.brain.primaryBrain]] : []),
     ...(document.employees.prReviewer.primaryBrain ? [["employees.prReviewer.primaryBrain", document.employees.prReviewer.primaryBrain]] : []),
     ...Object.entries(document.employees.roles).flatMap(([id, role]) => [
       [`employees.roles.${id}.brain`, role.brain],
@@ -1605,6 +1617,19 @@ function assertProviderReferences(document) {
       (document.brainProviders[primary.provider].remote &&
         (primary.remoteData.code !== true || primary.remoteData.requirements !== true)))) {
     throw invalid("employees.prReviewer.primaryBrain", "远程 PR 推进主模型需要显式授权需求和代码上下文");
+  }
+  const digestBrain = document.brain.primaryBrain;
+  if (document.brain.allowRemoteDingTalkSummary === true) {
+    if (!digestBrain || document.brainProviders[digestBrain.provider].remote !== true || digestBrain.remoteData.dingtalk !== true) {
+      throw invalid("brain.allowRemoteDingTalkSummary", "Luna 钉钉摘要必须显式授权钉钉数据范围");
+    }
+    if (digestBrain.remoteData.requirements || digestBrain.remoteData.code || digestBrain.remoteData.memory) {
+      throw invalid("brain.primaryBrain.remoteData", "钉钉摘要主模型只能访问钉钉数据");
+    }
+  } else if (digestBrain?.remoteData.dingtalk === true) {
+    throw invalid("brain.primaryBrain.remoteData.dingtalk", "远程钉钉摘要需要显式授权");
+  } else if (digestBrain) {
+    throw invalid("brain.allowRemoteDingTalkSummary", "配置钉钉摘要主模型时必须显式授权钉钉数据范围");
   }
 }
 
@@ -1808,6 +1833,12 @@ function setDirection(before, after) {
 
 function authorityDirection(change) {
   const { path, before, after } = change;
+  if (path === "brain.allowRemoteDingTalkSummary" || path === "brain.primaryBrain.remoteData.dingtalk") {
+    return { tightening: before === true && after !== true, expansion: before !== true && after === true };
+  }
+  if (path === "brain.primaryBrain") {
+    return { tightening: before !== undefined && after === undefined, expansion: before === undefined && after !== undefined };
+  }
   if (path === "githubRead") {
     const effectiveEnabled = (value, present) =>
       present ? value?.enabled === true : true;

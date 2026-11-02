@@ -17,6 +17,7 @@ import {
   runBoundedValidationCommand,
 } from "../scripts/system-validation-command.mjs";
 import { OllamaBrain } from "../src/adapters/ollama-brain.js";
+import { RoutedDingTalkSummaryBrain } from "../src/adapters/routed-dingtalk-summary-brain.js";
 import { OllamaPrEmployeeReviewer } from "../src/adapters/ollama-pr-employee-reviewer.js";
 import {
   SupervisedCliBrainProvider,
@@ -1413,6 +1414,28 @@ test("brain provider factory keeps the role independent from its model", () => {
   assert.equal(brain.model, "qwen3.5:9b");
   assert.equal(brain.baseUrl, "http://localhost:11434");
   assert.equal(createBrain({ enabled: false }), null);
+});
+
+test("global brain routes DingTalk summaries to the configured primary and keeps Ollama fallback", () => {
+  const brain = createBrain({
+    enabled: true,
+    provider: "ollama",
+    model: "qwen3.5:9b",
+    baseUrl: "http://127.0.0.1:11434",
+    primaryBrain: {
+      provider: "codex-login-cli",
+      model: "gpt-6-luna",
+      reasoningEffort: "medium",
+      remoteData: { requirements: false, code: false, memory: false, dingtalk: true },
+    },
+    allowRemoteDingTalkSummary: true,
+  }, { router: { async generate() { throw new Error("not invoked during construction"); } } });
+
+  assert.ok(brain instanceof RoutedDingTalkSummaryBrain);
+  assert.equal(brain.provider, "codex-login-cli");
+  assert.equal(brain.model, "gpt-6-luna");
+  assert.equal(brain.fallback.provider, "ollama");
+  assert.equal(brain.fallback.model, "qwen3.5:9b");
 });
 
 test("unknown brain providers fail explicitly", () => {

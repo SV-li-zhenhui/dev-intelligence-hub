@@ -20,6 +20,7 @@ import { OwnPrRepairObjectSync } from "./adapters/own-pr-repair-object-sync.js";
 import { createGitHubPullRequestActionTransport } from "./adapters/github-pull-request-action-transport.js";
 import { createGhLoginCredentialSource } from "./adapters/gh-login-credential-source.js";
 import { OllamaBrain } from "./adapters/ollama-brain.js";
+import { RoutedDingTalkSummaryBrain } from "./adapters/routed-dingtalk-summary-brain.js";
 import { OllamaPrEmployeeReviewer } from "./adapters/ollama-pr-employee-reviewer.js";
 import { RoutedPrEmployeeReviewer } from "./adapters/routed-pr-employee-reviewer.js";
 import { TokenEnvCredentialSource } from "./adapters/token-env-credential-source.js";
@@ -811,12 +812,20 @@ async function verifyChangePackageApplicationAuthority({
 export function createBrain(config = {}, dependencies = {}) {
   if (!config.enabled) return null;
   if (config.provider === "ollama") {
-    return new OllamaBrain({
+    const fallback = new OllamaBrain({
       ...config,
       ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
       ...(dependencies.actionAdmissionGate === undefined
         ? {}
         : { actionAdmissionGate: dependencies.actionAdmissionGate }),
+    });
+    if (!config.primaryBrain) return fallback;
+    return new RoutedDingTalkSummaryBrain({
+      router: dependencies.router,
+      primaryBrain: config.primaryBrain,
+      allowRemoteDingTalkSummary: config.allowRemoteDingTalkSummary,
+      fallback,
+      timeoutMs: config.timeoutMs,
     });
   }
   throw new Error(`Unsupported brain provider: ${config.provider || "(empty)"}`);
@@ -899,6 +908,7 @@ export async function createApplication({
   agentMemoryQueryServiceFactory = (options) =>
     new AgentMemoryQueryService(options),
   memoryBrainRouterFactory = createConfiguredBrainRouter,
+  dingTalkBrainRouterFactory = createConfiguredBrainRouter,
   prEmployeeBrainRouterFactory = createConfiguredBrainRouter,
   memoryAnswerDependencies = {},
   codexLoginCredentialBrokerFactory =
@@ -1195,12 +1205,7 @@ export async function createApplication({
         : {}),
     });
     const dingtalk = new DingTalkAdapter({ ownerLogin: config.githubLogin });
-    const brain = createBrain(
-      config.brain,
-      ordinaryActionAdmissionGate === null
-        ? {}
-        : { actionAdmissionGate: ordinaryActionAdmissionGate },
-    );
+    let brain = null;
     codeExecutorRuntime = trackRuntime(
       await codeExecutorRuntimeFactory(config.codeExecutor, {
         ...codeExecutorDependencies,
@@ -1272,6 +1277,22 @@ export async function createApplication({
         "nativeCodexStatusProvider",
       ));
       brainProviderStatus = frozenPort(nativeStatus, ["readStatus"], "brainProviderStatus");
+    }
+    if (config.brain?.primaryBrain) {
+      const router = trackRuntime(dingTalkBrainRouterFactory({
+        constructionCleanupOwner: configuredConstructionCleanupOwner,
+        brainProviders: config.brainProviders || {},
+        dependencies: brainDependencies({}, dingTalkBrainRouterFactory === createConfiguredBrainRouter),
+      }));
+      brain = createBrain(config.brain, {
+        ...(ordinaryActionAdmissionGate === null ? {} : { actionAdmissionGate: ordinaryActionAdmissionGate }),
+        router,
+      });
+    } else {
+      brain = createBrain(
+        config.brain,
+        ordinaryActionAdmissionGate === null ? {} : { actionAdmissionGate: ordinaryActionAdmissionGate },
+      );
     }
     const controlledConflictPorts = conflictPreparationPorts(
       config.codeExecutor,
