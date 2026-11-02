@@ -7,6 +7,17 @@ function identity(task) {
   return `${task.kind}:${task.taskId}`;
 }
 
+function pinnedPreview(task) {
+  if (!task || !['work-item', 'code-job'].includes(task.kind) ||
+      typeof task.taskId !== 'string' || task.taskId.length > 256) return null;
+  const text = (value, limit) => typeof value === 'string' ? value.slice(0, limit) : '';
+  // Browser metadata is a navigation bookmark, never evidence of live state.
+  return { kind: task.kind, taskId: task.taskId, title: text(task.title, 512),
+    roleId: text(task.roleId, 128), subject: text(task.subject, 512),
+    startedAt: text(task.startedAt, 64), priority: Object.hasOwn(priorities, task.priority) ? task.priority : 'normal',
+    phase: 'unknown', active: false, readOnly: true, progress: '已置顶记录，打开后读取最新状态' };
+}
+
 function taskUrl(task) {
   return `/api/task-runs/${encodeURIComponent(task.kind)}/${encodeURIComponent(task.taskId)}`;
 }
@@ -25,8 +36,8 @@ function timeMarkup(value) {
   return value ? `<time datetime="${escapeHtml(value)}">${escapeHtml(value)}</time>` : "未知";
 }
 
-function taskRow(task) {
-  return `<li><button type="button" class="task-run-row" data-task-run-kind="${escapeHtml(task.kind)}" data-task-run-id="${escapeHtml(task.taskId)}">
+function taskRow(task, selected = null) {
+  return `<li><button type="button" class="task-run-row" ${selected && identity(task) === identity(selected) ? 'aria-current="true"' : ''} data-task-run-kind="${escapeHtml(task.kind)}" data-task-run-id="${escapeHtml(task.taskId)}">
     <span class="task-run-row-title"><strong>${escapeHtml(task.title || task.taskId)}</strong><span class="status-pill">${escapeHtml(phaseLabel(task))}</span></span>
     <span>${escapeHtml(task.roleId)} · ${escapeHtml(task.subject || "无关联对象")}</span>
     <span>${['waiting_model','preparing','starting_model'].includes(task.phase)?'登记于':'开始于'} ${timeMarkup(task.startedAt ?? task.queuedAt)} · 优先级：${escapeHtml(priorities[task.priority] || "未知")}</span>
@@ -34,7 +45,15 @@ function taskRow(task) {
   </button></li>`;
 }
 
-export function renderTaskRuns({ loaded = false, loading = false, enabled = false, items = [], held = [], background = [], recent = [], recentExpanded = false, error = "" } = {}) {
+export function renderTaskRuns({ loaded = false, loading = false, enabled = false, items = [], held = [], background = [], recent = [], recentExpanded = false, error = "", selected = null, pinned = [], remembered = [] } = {}) {
+  const all = [...remembered, ...recent, ...background, ...held, ...items];
+  const pinnedTasks = [...new Map(all.filter(task => pinned.includes(identity(task))).map(task => [identity(task), task])).values()];
+  const row = task => taskRow(task, selected);
+  const unpinned = task => !pinned.includes(identity(task));
+  items = items.filter(unpinned);
+  held = held.filter(unpinned);
+  background = background.filter(unpinned);
+  recent = recent.filter(unpinned);
   const queued=items.filter(task=>task.active===true && task.phase==='waiting_model');
   const preparing=items.filter(task=>task.active===true && ['preparing','starting_model'].includes(task.phase));
   const active = items.filter((task) => task.active === true && !['waiting_model','preparing','starting_model'].includes(task.phase));
@@ -44,21 +63,23 @@ export function renderTaskRuns({ loaded = false, loading = false, enabled = fals
   const visibleRecent = recentExpanded ? orderedRecent : orderedRecent.slice(0, 5);
   return `<div class="section-heading task-runs-heading"><h2 id="task-runs-title">当前运行任务</h2>
     <button type="button" class="secondary-button" data-task-runs-refresh ${loading ? "disabled" : ""}>${loading ? "读取中…" : "刷新任务"}</button></div>
-    <p class="task-runs-hint">点击正在运行的任务，查看 CLI 会话和微调要求；后台作业显示步骤间的进度。</p>
+    <p class="task-runs-hint">选择任务查看执行过程、追加要求。切换任务保留草稿，刷新不会切换当前任务。</p>
+    ${pinnedTasks.length ? `<div><h3>已置顶 · ${pinnedTasks.length}</h3><ul class="task-runs-list">${pinnedTasks.map(row).join("")}</ul></div>` : ""}
     ${error ? `<p class="task-runs-error" role="status">${escapeHtml(error)}${loaded ? "；当前显示上次读取结果。" : "；可点击刷新任务重试。"}</p>` : ""}
     ${loaded && !enabled ? '<p class="task-runs-empty">当前服务未启用运行任务控制。</p>' : ""}
     ${enabled || !loaded ? `<div class="task-runs-groups"><div><h3>正在运行 · ${active.length}</h3>
-      ${active.length ? `<ul class="task-runs-list">${active.map(taskRow).join("")}</ul>` : `<p class="task-runs-empty">${loaded ? "当前没有正在运行的模型任务。" : "正在读取运行任务…"}</p>`}</div>
-      ${queued.length?`<div><h3>等待模型 · ${queued.length}</h3><ul class="task-runs-list">${queued.map(taskRow).join('')}</ul></div>`:''}
-      ${preparing.length?`<div><h3>准备启动 · ${preparing.length}</h3><ul class="task-runs-list">${preparing.map(taskRow).join('')}</ul></div>`:''}
-      ${paused.length ? `<div class="task-runs-held"><h3>暂停与待确认 · ${paused.length}</h3><ul class="task-runs-list">${paused.map(taskRow).join("")}</ul></div>` : ""}
-      ${background.length ? `<div class="task-runs-background"><h3>后台作业 · ${background.length}</h3><p class="task-runs-hint">作业尚未结束，当前未在执行模型回合。点击查看已记录的进展。</p><ul class="task-runs-list">${background.map(taskRow).join("")}</ul></div>` : ""}
+      ${active.length ? `<ul class="task-runs-list">${active.map(row).join("")}</ul>` : `<p class="task-runs-empty">${loaded ? (pinnedTasks.length ? "当前没有其他正在运行的模型任务。" : "当前没有正在运行的模型任务。") : "正在读取运行任务…"}</p>`}</div>
+      ${queued.length?`<div><h3>等待模型 · ${queued.length}</h3><ul class="task-runs-list">${queued.map(row).join('')}</ul></div>`:''}
+      ${preparing.length?`<div><h3>准备启动 · ${preparing.length}</h3><ul class="task-runs-list">${preparing.map(row).join('')}</ul></div>`:''}
+      ${paused.length ? `<div class="task-runs-held"><h3>暂停与待确认 · ${paused.length}</h3><ul class="task-runs-list">${paused.map(row).join("")}</ul></div>` : ""}
+      ${background.length ? `<div class="task-runs-background"><h3>后台作业 · ${background.length}</h3><p class="task-runs-hint">作业尚未结束，当前未在执行模型回合。点击查看已记录的进展。</p><ul class="task-runs-list">${background.map(row).join("")}</ul></div>` : ""}
       ${recent.length ? `<div><div class="section-heading"><h3>最近执行 · ${recent.length}</h3>
         ${recent.length > 5 ? `<button type="button" class="secondary-button" data-task-runs-recent-toggle aria-expanded="${recentExpanded}" aria-controls="task-runs-recent-list">${recentExpanded ? "收起" : `展开全部（${recent.length} 条）`}</button>` : ""}</div>
-        <ul id="task-runs-recent-list" class="task-runs-list">${visibleRecent.map(taskRow).join("")}</ul></div>` : ""}</div>` : ""}`;
+        <ul id="task-runs-recent-list" class="task-runs-list">${visibleRecent.map(row).join("")}</ul></div>` : ""}</div>` : ""}`;
 }
 
 function deliveryMarkup(task) {
+  if (!task.readOnly && task.phase === 'paused' && task.mode === 'paused') return '任务已暂停；补充要求可保存到原任务，恢复执行后应用。';
   if(task.receipt && task.readOnly)return '执行凭据只保留开始、活动、终态和会话标识，无对话正文。状态未知时需要核对原生进程，不能据此推定已停止。';
   if (task.readOnly) return "后台作业详情只读；当前没有可微调的 CLI 回合。模型开始下一步骤后，可打开当前会话并补充要求。";
   if (task.instructionReceipt === "failed") return "实时引导未确认送达；补充要求已保存，将在安全检查点续接，请先核对已提交的要求。";
@@ -75,6 +96,7 @@ function allowedCommand(task, command) {
   if (command === "resume") return task.active !== true && task.phase === "paused" && task.mode === "paused" && !task.pendingCommand;
   if (command === "priority") return task.active === true || task.phase === "paused";
   if (command === "cancel") return !task.pendingCommand && (task.active === true || task.phase === "paused");
+  if (command === 'instruct' && task.active !== true) return task.phase === 'paused' && task.mode === 'paused' && !task.pendingCommand && !task.stopUnconfirmed;
   return task.active === true && !task.pendingCommand;
 }
 
@@ -181,11 +203,35 @@ export function createTaskRunsController({
   isVisible = () => globalThis.document?.visibilityState !== "hidden",
   setTimeoutImpl = globalThis.setTimeout,
   clearTimeoutImpl = globalThis.clearTimeout,
+  storage = null,
 } = {}) {
   const state = { loaded: false, loading: false, enabled: false, items: [], held: [], background: [], recent:[], recentExpanded: false, error: "",
     selected: null, detail: null, detailLoading: false, detailStale: false, detailError: "",
-    submitting: false, notice: "", draft: { instruction: "", priority: "normal" } };
+    submitting: false, notice: "", draft: { instruction: "", priority: "normal" }, pinned: [], remembered: [] };
   const drafts = new Map();
+  const storageKey = 'mydashboard.task-workbench.v1';
+  try {
+    const saved = JSON.parse(storage?.getItem(storageKey) || 'null');
+    if (saved?.version === 1) {
+      state.pinned = Array.isArray(saved.pinned) ? saved.pinned.filter(key => typeof key === 'string' && key.length <= 512).slice(0, 100) : [];
+      state.remembered = (Array.isArray(saved.bookmarks) ? saved.bookmarks.slice(0, 100) : [])
+        .map(pinnedPreview).filter(task => task && state.pinned.includes(identity(task)));
+      if (['work-item', 'code-job'].includes(saved.selected?.kind) && typeof saved.selected.taskId === 'string' && saved.selected.taskId.length <= 256) state.selected = saved.selected;
+      for (const entry of Array.isArray(saved.drafts) ? saved.drafts.slice(0, 100) : []) {
+        if (typeof entry.key === 'string' && typeof entry.instruction === 'string' && Object.hasOwn(priorities, entry.priority)) {
+          drafts.set(entry.key, { instruction: entry.instruction.slice(0, 4000), priority: entry.priority, priorityDirty: entry.priorityDirty === true });
+        }
+      }
+    }
+  } catch { /* Browser storage may be disabled or contain an older format. */ }
+  if (state.selected && !drafts.has(identity(state.selected))) drafts.set(identity(state.selected), { instruction: '', priority: 'normal', priorityDirty: false });
+  if (state.selected) state.draft = { ...drafts.get(identity(state.selected)) };
+  function persist() {
+    try { storage?.setItem(storageKey, JSON.stringify({ version: 1, selected: state.selected, pinned: state.pinned,
+      bookmarks: state.remembered.filter(task => state.pinned.includes(identity(task))).map(pinnedPreview).filter(Boolean),
+      drafts: [...drafts].slice(-100).map(([key, draft]) => ({ key, ...draft })) })); }
+    catch { /* Task controls continue to work when browser storage is unavailable. */ }
+  }
   let listRequest = null;
   let detailRequest = null;
   let detailSequence = 0;
@@ -197,11 +243,21 @@ export function createTaskRunsController({
   function getState() { return { ...state, draft: { ...state.draft } }; }
   function notify() { onChange(getState()); }
   function toggleRecent() { state.recentExpanded = !state.recentExpanded; notify(); }
+  function togglePin() {
+    if (!state.selected) return;
+    const key = identity(state.selected);
+    state.pinned = state.pinned.includes(key) ? state.pinned.filter(value => value !== key) : [...state.pinned.slice(-99), key];
+    if (state.detail) state.remembered = [...state.remembered.filter(task => identity(task) !== key), state.detail].slice(-100);
+    persist(); notify();
+  }
   function currentDraft() { return state.selected ? drafts.get(identity(state.selected)) : null; }
 
   function applyDetail(detail) {
     state.detail = detail;
     state.detailStale = false;
+    if (state.pinned.includes(identity(detail))) {
+      state.remembered = [...state.remembered.filter(task => identity(task) !== identity(detail)), detail].slice(-100);
+    }
     const draft = currentDraft();
     if (draft && !draft.priorityDirty) draft.priority = detail.priority;
     if (draft) state.draft = { instruction: draft.instruction, priority: draft.priority };
@@ -213,6 +269,7 @@ export function createTaskRunsController({
     if (typeof patch.instruction === "string") draft.instruction = patch.instruction;
     if (Object.hasOwn(priorities, patch.priority)) { draft.priority = patch.priority; draft.priorityDirty = true; }
     state.draft = { instruction: draft.instruction, priority: draft.priority };
+    persist();
     notify();
   }
 
@@ -268,6 +325,7 @@ export function createTaskRunsController({
     const draft = drafts.get(key);
     Object.assign(state, { detail: null, detailError: "", detailStale: false, notice: "",
       draft: { instruction: draft.instruction, priority: draft.priority } });
+    persist();
     notify();
     await refreshDetail();
   }
@@ -277,6 +335,7 @@ export function createTaskRunsController({
     detailSequence += 1;
     detailRequest = null;
     Object.assign(state, { selected: null, detail: null, detailLoading: false });
+    persist();
     notify();
   }
 
@@ -320,7 +379,8 @@ export function createTaskRunsController({
       updateList(detail);
       if (selection !== selectionSequence) return true;
       applyDetail(detail);
-      state.notice = command === "resume" ? "原任务已恢复，等待后续调度。" : command === "priority" ? "后续调度优先级已保存。" : phaseLabel(detail);
+      state.notice = command === "resume" ? "原任务已恢复，等待后续调度。" : command === "priority" ? "后续调度优先级已保存。" :
+        command === 'instruct' ? (detail.phase === 'paused' ? '补充要求已保存，恢复原任务后应用。' : deliveryMarkup(detail)) : phaseLabel(detail);
       return true;
     } catch (error) {
       if (selection !== selectionSequence) return false;
@@ -333,7 +393,7 @@ export function createTaskRunsController({
             error.status === 409 ? "任务状态已更新，草稿已保留，请核对后重新提交。" : "提交结果尚未确认，已读取最新状态；请核对已提交要求后再操作。";
       } else state.detailError = error.message;
       return false;
-    } finally { state.submitting = false; notify(); }
+    } finally { state.submitting = false; persist(); notify(); }
   }
 
   function clearTimer() { if (timer !== null) clearTimeoutImpl(timer); timer = null; }
@@ -351,17 +411,24 @@ export function createTaskRunsController({
   function stop() { running = false; clearTimer(); }
   async function visibilityChanged() { clearTimer(); if (isVisible()) await poll(); }
 
-  return { getState, setDraft, toggleRecent, refresh, refreshDetail, open, close, control, start, stop, visibilityChanged };
+  return { getState, setDraft, toggleRecent, togglePin, refresh, refreshDetail, open, close, control, start, stop, visibilityChanged };
 }
 
-export function createTaskRunsView({ container, dialog, documentImpl = document, ...options }) {
-  const detailContent = dialog.querySelector("[data-task-run-content]");
+export function createTaskRunsView({ container, dialog, embedded = false, documentImpl = document, ...options }) {
+  if (embedded) {
+    container.classList.add('task-workbench');
+    container.innerHTML = '<div class="task-workbench-shell"><aside data-task-workbench-list aria-label="任务列表"></aside><section data-task-workbench-detail aria-label="当前任务"><p class="task-workbench-empty">从左侧选择任务，查看执行过程并补充要求。</p><div data-task-run-content></div></section></div>';
+  }
+  const listContent = embedded ? container.querySelector('[data-task-workbench-list]') : container;
+  const detailContent = (embedded ? container : dialog).querySelector("[data-task-run-content]");
   let renderedSelection = "";
   let lastListMarkup = "";
   let lastSummaryMarkup = "";
   let lastSessionMarkup = "";
   let lastActionsMarkup = "";
-  const controller = createTaskRunsController({ ...options, onChange: render });
+  let browserStorage = null;
+  try { browserStorage = documentImpl.defaultView?.sessionStorage ?? null; } catch { /* Optional browser persistence. */ }
+  const controller = createTaskRunsController({ storage: browserStorage, ...options, onChange: render });
 
   function render(state) {
     const listMarkup = renderTaskRuns(state);
@@ -370,7 +437,7 @@ export function createTaskRunsView({ container, dialog, documentImpl = document,
       const taskButton = focused?.closest?.("[data-task-run-kind]");
       const refreshFocused = focused?.matches?.("[data-task-runs-refresh]");
       const recentFocused = focused?.matches?.("[data-task-runs-recent-toggle]");
-      container.innerHTML = listMarkup;
+      listContent.innerHTML = listMarkup;
       lastListMarkup = listMarkup;
       if (taskButton) {
         [...container.querySelectorAll("[data-task-run-kind]")].find((button) =>
@@ -380,15 +447,42 @@ export function createTaskRunsView({ container, dialog, documentImpl = document,
       else if (recentFocused) container.querySelector("[data-task-runs-recent-toggle]")?.focus({ preventScroll: true });
     }
     if (!state.selected) return;
+    if (embedded) container.querySelector('.task-workbench-empty').hidden = true;
     const selected = identity(state.selected);
     if (renderedSelection !== selected) {
       detailContent.innerHTML = renderTaskRunDetail(state);
+      if (embedded) {
+        const detail = detailContent.querySelector('.task-run-detail');
+        const summary = detail.querySelector('[data-task-run-summary]');
+        const priorityForm = detail.querySelector('[data-task-run-priority-form]');
+        const actions = detail.querySelector('[data-task-run-actions]');
+        const inspector = documentImpl.createElement('aside');
+        inspector.className = 'task-workbench-inspector';
+        inspector.setAttribute('aria-label', '任务详情与控制');
+        inspector.innerHTML = '<button type="button" class="secondary-button" data-task-run-pin></button>';
+        inspector.append(summary, priorityForm, actions);
+        const conversation = documentImpl.createElement('div');
+        conversation.className = 'task-workbench-conversation';
+        const heading = documentImpl.createElement('h2');
+        heading.setAttribute('data-task-workbench-title', '');
+        conversation.append(...detail.childNodes);
+        conversation.prepend(heading);
+        detail.append(conversation, inspector);
+      }
       renderedSelection = selected;
       lastSummaryMarkup = "";
       lastSessionMarkup = "";
       lastActionsMarkup = "";
     }
     const summaryMarkup = renderTaskRunSummary(state.detail);
+    const heading = detailContent.querySelector('[data-task-workbench-title]');
+    if (heading) heading.textContent = state.detail?.title || state.selected.taskId;
+    const pinButton = detailContent.querySelector('[data-task-run-pin]');
+    if (pinButton) {
+      const pinned = state.pinned.includes(selected);
+      pinButton.textContent = pinned ? '取消置顶' : '置顶任务';
+      pinButton.setAttribute('aria-pressed', String(pinned));
+    }
     if (summaryMarkup !== lastSummaryMarkup) {
       const summary = detailContent.querySelector("[data-task-run-summary]");
       const historyOpen = summary.querySelector("details")?.open;
@@ -436,7 +530,7 @@ export function createTaskRunsView({ container, dialog, documentImpl = document,
     if (!button) return;
     renderedSelection = "";
     void controller.open(button.dataset.taskRunKind, button.dataset.taskRunId);
-    if (!dialog.open) dialog.showModal();
+    if (!embedded && !dialog.open) dialog.showModal();
   });
   detailContent.addEventListener("input", (event) => {
     if (event.target.name === "instruction") controller.setDraft({ instruction: event.target.value });
@@ -449,12 +543,14 @@ export function createTaskRunsView({ container, dialog, documentImpl = document,
     void controller.control(event.target.matches("[data-task-run-instruction-form]") ? "instruct" : "priority");
   });
   detailContent.addEventListener("click", (event) => {
+    if (event.target.closest('[data-task-run-pin]')) { controller.togglePin(); return; }
     if (event.target.closest("[data-task-run-reload]")) { void controller.refreshDetail(); return; }
     const button = event.target.closest("button[type=button][data-task-run-command]");
     if (button) void controller.control(button.dataset.taskRunCommand);
   });
-  dialog.querySelector("[data-task-run-close]").addEventListener("click", () => dialog.close());
-  dialog.addEventListener("close", () => {
+  if (!embedded) {
+    dialog.querySelector("[data-task-run-close]").addEventListener("click", () => dialog.close());
+    dialog.addEventListener("close", () => {
     const selected = controller.getState().selected;
     renderedSelection = "";
     controller.close();
@@ -463,7 +559,8 @@ export function createTaskRunsView({ container, dialog, documentImpl = document,
     );
     (opener || container.querySelector("[data-task-runs-refresh]"))?.focus({ preventScroll: true });
   });
-  dialog.addEventListener("click", (event) => { if (event.target === dialog) dialog.close(); });
+    dialog.addEventListener("click", (event) => { if (event.target === dialog) dialog.close(); });
+  }
   const onVisibility = () => { void controller.visibilityChanged(); };
   documentImpl.addEventListener("visibilitychange", onVisibility);
   render(controller.getState());

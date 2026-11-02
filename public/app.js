@@ -93,6 +93,7 @@ const pageTitle = document.querySelector("#page-title");
 const taskRunsView = createTaskRunsView({
   container: document.querySelector("#task-runs"),
   dialog: document.querySelector("#task-run-dialog"),
+  embedded: true,
 });
 
 let dashboard = null;
@@ -255,6 +256,7 @@ function attentionNextUrl() {
 }
 
 const viewTitles = {
+  workbench: "任务工作台",
   overview: "今天需要你推动什么",
   prs: "Pull Requests",
   issues: "分配给我的 Issues",
@@ -1742,6 +1744,9 @@ function bindConfirmationHistoryView() {
 function render() {
   pageTitle.textContent = viewTitles[currentView];
   document.title = `${viewTitles[currentView]} · Development Intelligence Hub`;
+  document.querySelector('#task-runs').hidden = currentView !== 'workbench';
+  content.hidden = currentView === 'workbench';
+  if (currentView === 'workbench') return;
   if (!isConfigurationBackedView() && currentView !== "system" && !dashboard) {
     content.innerHTML = '<div class="empty">正在建立第一次数据快照。配置恢复不依赖该快照，可从“配置中心”继续。</div>';
     return;
@@ -5593,6 +5598,7 @@ function activateView(view, { focusHeading = true } = {}) {
     });
   }
   currentView = view;
+  try { sessionStorage.setItem('mydashboard.active-view', view); } catch { /* Navigation works without browser storage. */ }
   render();
   if (currentView === "employees") void loadMaintenanceAttention();
   if (focusHeading) pageTitle.focus({ preventScroll: true });
@@ -5689,6 +5695,9 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
+try {
+  if (sessionStorage.getItem('mydashboard.active-view') === 'workbench') activateView('workbench', {focusHeading: false});
+} catch { /* Browser storage is optional. */ }
 void taskRunsView.start();
 await load();
 setInterval(load, 60_000);

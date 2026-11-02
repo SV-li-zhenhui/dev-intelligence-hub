@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import http from "node:http";
 import test from "node:test";
 import { chromium } from "playwright";
@@ -24,6 +24,8 @@ const response = (value, status = 200) => ({
   ok: status >= 200 && status < 300, status,
   async json() { return structuredClone(value); },
 });
+
+const browserExecutable = process.env.MYDASHBOARD_VALIDATION_BROWSER || chromium.executablePath();
 
 test('model queue and recovered receipts have distinct counts and readable states', async () => {
   const queued=run({taskId:'queued-model',phase:'waiting_model'});
@@ -296,10 +298,102 @@ test("global task section and dedicated native dialog are wired independently of
   assert.match(html, /<dialog id="task-run-dialog"/);
   assert.match(app, /createTaskRunsView\(/);
   assert.match(app, /taskRunsView\.start\(\)/);
+  assert.match(app, /embedded: true/);
+  assert.match(html, /data-view="workbench"/);
+});
+
+test('workbench remembers selection, pins and independent drafts across reload without selecting another task', async () => {
+  let saved = null;
+  const storage = { getItem: () => saved, setItem: (_key, value) => { saved = value; } };
+  const first = run();
+  const second = run({taskId: 'work/two', title: 'Other task'});
+  const fetchImpl = async url => response(url === '/api/task-runs' ? { enabled: true, items: [second], held: [] } : url.includes('two') ? second : first);
+  const controller = createTaskRunsController({ storage, fetchImpl });
+  await controller.open(first.kind, first.taskId);
+  controller.setDraft({ instruction: 'Keep this private draft', priority: 'high' });
+  controller.togglePin();
+  const pinnedMarkup = renderTaskRuns({...controller.getState(), items: [first]});
+  assert.equal((pinnedMarkup.match(/data-task-run-id="work\/one"/g) || []).length, 1);
+  await controller.open(second.kind, second.taskId);
+  controller.setDraft({ instruction: 'Independent draft' });
+  await controller.open(first.kind, first.taskId);
+  await controller.refresh();
+  assert.equal(controller.getState().selected.taskId, first.taskId);
+  assert.equal(controller.getState().draft.instruction, 'Keep this private draft');
+  const restored = createTaskRunsController({ storage, fetchImpl });
+  await restored.refresh();
+  assert.equal(restored.getState().selected.taskId, first.taskId);
+  assert.equal(restored.getState().draft.priority, 'high');
+  assert.deepEqual(restored.getState().pinned, ['work-item:work/one']);
+  await restored.open(second.kind, second.taskId);
+  assert.equal(restored.getState().draft.instruction, 'Independent draft');
+  restored.togglePin();
+  assert.equal(JSON.parse(saved).version, 1);
+});
+
+test('unavailable or invalid browser storage does not disable task controls', async () => {
+  for (const storage of [{getItem: () => '{invalid'}, {getItem: () => null, setItem: () => {throw Error('quota');}}]) {
+    const controller = createTaskRunsController({ storage, fetchImpl: async () => response(run()) });
+    await controller.open('work-item', 'work/one');
+    controller.setDraft({ instruction: 'Continue safely' });
+    assert.equal(controller.getState().draft.instruction, 'Continue safely');
+    assert.equal(await controller.control('instruct'), true);
+  }
+});
+
+test('pinned task keeps its fresh terminal state when it leaves the active list', async () => {
+  let current = run();
+  const controller = createTaskRunsController({fetchImpl: async url => response(url === '/api/task-runs' ? {enabled:true,items:[],held:[]} : current)});
+  await controller.open(current.kind, current.taskId);
+  controller.togglePin();
+  current = run({active:false,phase:'completed'});
+  await controller.refreshDetail();
+  await controller.refresh();
+  const markup = renderTaskRuns(controller.getState());
+  assert.match(markup,/已置顶 · 1/);
+  assert.match(markup,/已完成/);
+  assert.doesNotMatch(markup,/status-pill">正在运行/);
+});
+
+test('pinned task outside recent history remains selectable after reload without cached authority', async () => {
+  let saved;
+  const storage = {getItem: () => saved, setItem: (_key, value) => {saved = value;}};
+  const first = run({active:false, phase:'completed', title:'Old pinned task'});
+  const second = run({taskId:'work/two'});
+  const fetchImpl = async url => response(url === '/api/task-runs' ? {enabled:true,items:[],held:[],recent:[]} : url.includes('two') ? second : first);
+  const controller = createTaskRunsController({storage,fetchImpl});
+  await controller.open(first.kind,first.taskId); controller.togglePin();
+  await controller.open(second.kind,second.taskId);
+  const restored = createTaskRunsController({storage,fetchImpl});
+  await restored.refresh();
+  assert.match(renderTaskRuns(restored.getState()),/Old pinned task/);
+  assert.equal(restored.getState().remembered[0].readOnly,true);
+  assert.equal(restored.getState().remembered[0].active,false);
+  await restored.open(first.kind,first.taskId);
+  assert.equal(restored.getState().detail.phase,'completed');
+});
+
+test('settled paused task saves instructions for resume while unconfirmed stop remains fenced', async () => {
+  let current = run({active: false, phase: 'paused', mode: 'paused'});
+  let posts = 0;
+  const controller = createTaskRunsController({fetchImpl: async (_url, options) => {
+    if (options.method === 'POST') { posts++; current = {...current, revision: current.revision + 1}; }
+    return response(current);
+  }});
+  await controller.open('work-item', 'work/one');
+  controller.setDraft({instruction: 'Retest after resume'});
+  assert.equal(await controller.control('instruct'), true);
+  assert.match(controller.getState().notice, /恢复原任务后应用/);
+  assert.match(renderTaskRunDetail(controller.getState()), /恢复执行后应用/);
+  current = {...current, stopUnconfirmed: true};
+  await controller.refreshDetail();
+  controller.setDraft({instruction: 'Do not send yet'});
+  assert.equal(await controller.control('instruct'), false);
+  assert.equal(posts, 1);
 });
 
 test("isolated browser task controls preserve input and support keyboard pause/resume", {
-  timeout: 30_000, skip: !existsSync(chromium.executablePath()) && "Playwright Chromium is not installed",
+  timeout: 30_000, skip: !existsSync(browserExecutable) && "Playwright Chromium is not installed",
 }, async () => {
   const assets = new Map(await Promise.all(["task-runs-view.js", "view-format.js", "styles.css"].map(async (file) =>
     [`/${file}`, await readFile(new URL(`../public/${file}`, import.meta.url), "utf8")],
@@ -333,7 +427,7 @@ test("isolated browser task controls preserve input and support keyboard pause/r
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   let browser;
   try {
-    browser = await chromium.launch({ headless: true });
+    browser = await chromium.launch({ headless: true, executablePath: browserExecutable });
     const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
     page.setDefaultTimeout(5_000);
     const errors = [];
@@ -423,4 +517,60 @@ test("isolated browser task controls preserve input and support keyboard pause/r
     if (browser) await browser.close();
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test('embedded workbench preserves selection, caret, pins and drafts through polling and page reload', {
+  timeout: 30_000, skip: !existsSync(browserExecutable) && 'Playwright Chromium is not installed',
+}, async () => {
+  const assets = new Map(await Promise.all(['task-runs-view.js', 'view-format.js', 'styles.css'].map(async file =>
+    [`/${file}`, await readFile(new URL(`../public/${file}`, import.meta.url), 'utf8')])));
+  const fixture = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/styles.css"></head><body>
+    <main class="main"><section id="task-runs" class="task-runs"></section></main>
+    <script type="module">
+      import {createTaskRunsView} from '/task-runs-view.js';
+      window.tasks = [${JSON.stringify(run({live: true, session: {transport:'app-server',threadId:'thread-one',status:'running'}, events:[{sequence:1,type:'message',at:'2026-11-02T00:00:00Z',text:'Reading source'}]}))}, ${JSON.stringify(run({taskId:'work/two',title:'Second task'}))}];
+      window.posts = [];
+      window.view = createTaskRunsView({container:document.querySelector('#task-runs'),embedded:true,async fetchImpl(url,options={}) {
+        const reply = value => ({ok:true,status:200,async json(){return structuredClone(value);}});
+        if(url==='/api/task-runs')return reply({enabled:true,items:tasks,held:[]});
+        const task=tasks.find(t=>url.includes(encodeURIComponent(t.taskId)));
+        if(options.method==='POST') {const body=JSON.parse(options.body);posts.push(body);task.revision++;task.instructionReceipt='submitted';}
+        return reply(task);
+      }});await view.start();window.ready=true;
+    </script></body></html>`;
+  const server = http.createServer((request, result) => {
+    result.setHeader('content-type',request.url.endsWith('.js')?'text/javascript':request.url.endsWith('.css')?'text/css':'text/html');
+    result.end(assets.get(request.url)||fixture);
+  });
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  let browser;
+  try {
+    browser=await chromium.launch({headless:true,executablePath:browserExecutable});
+    const page=await browser.newPage({viewport:{width:1440,height:1000}});
+    const errors=[];page.on('pageerror',error=>errors.push(error.message));
+    await page.goto(`http://127.0.0.1:${server.address().port}`);await page.waitForFunction(()=>window.ready);
+    await page.getByRole('button',{name:/Implement controls/}).click();
+    await page.getByLabel('补充要求',{exact:true}).fill('Keep draft one');
+    await page.evaluate(async()=>{document.querySelector('textarea').setSelectionRange(4,4);tasks[0].events.push({sequence:2,type:'tool',text:'Read next file'});await view.refreshDetail();await view.refresh();});
+    assert.equal(await page.getByLabel('补充要求',{exact:true}).inputValue(),'Keep draft one');
+    assert.deepEqual(await page.locator('textarea').evaluate(input=>({caret:input.selectionStart,focused:document.activeElement===input})),{caret:4,focused:true});
+    await page.getByRole('button',{name:'置顶任务',exact:true}).click();
+    await page.getByRole('button',{name:/Second task/}).click();
+    await page.getByLabel('补充要求',{exact:true}).fill('Draft two');
+    await page.getByRole('button',{name:/Implement controls/}).first().click();
+    assert.equal(await page.getByLabel('补充要求',{exact:true}).inputValue(),'Keep draft one');
+    await page.reload();await page.waitForFunction(()=>window.ready);
+    await page.getByRole('button',{name:'取消置顶',exact:true}).waitFor();
+    assert.equal(await page.getByLabel('补充要求',{exact:true}).inputValue(),'Keep draft one');
+    await page.getByRole('button',{name:'提交补充要求',exact:true}).click();
+    await page.waitForFunction(()=>!view.getState().submitting);
+    assert.match(await page.locator('[data-task-run-notice]').innerText(),/回执不代表模型已经采用/);
+    await mkdir(new URL('../validation-artifacts/', import.meta.url), {recursive:true});
+    for(const width of [1440,1024,390]) {
+      await page.setViewportSize({width,height:1000});
+      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`overflow at ${width}`);
+      if (width !== 1024) await page.screenshot({path:new URL(`../validation-artifacts/task-workbench-${width === 1440 ? 'desktop' : 'mobile'}.png`,import.meta.url).pathname.replace(/^\/([A-Za-z]:)/,'$1'),fullPage:true});
+    }
+    assert.deepEqual(errors,[]);
+  } finally {await browser?.close();await new Promise(resolve=>server.close(resolve));}
 });
