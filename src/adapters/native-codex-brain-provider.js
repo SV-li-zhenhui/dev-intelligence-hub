@@ -129,8 +129,10 @@ function argumentsFor(request, directory, threadId, reader, nativeSkill = false)
     "-c", 'model_provider="openai"',
     ...(request.reasoningEffort ? ["-c", `model_reasoning_effort="${request.reasoningEffort}"`] : []),
     "-c", 'service_tier="default"',
-    ...["apps", "browser_use", "computer_use", "image_generation", ...(!nativeSkill ? ["multi_agent"] : []), "hooks", "plugins", "remote_plugin", "plugin_sharing", "skill_search", "goals"].flatMap((name) => ["--disable", name]),
-    ...(nativeSkill ? ["--enable", "multi_agent", "-c", "skills.include_instructions=false", "-c", "skills.bundled.enabled=false"] : []),
+    ...["shell_tool", "apps", "browser_use", "computer_use", "image_generation", ...(!nativeSkill ? ["multi_agent"] : []), "hooks", "plugins", "remote_plugin", "plugin_sharing", "skill_search", "goals"].flatMap((name) => ["--disable", name]),
+    "-c", "features.skip_host_skill_discovery=true",
+    "-c", "skills.include_instructions=false", "-c", "skills.bundled.enabled=false",
+    ...(nativeSkill ? ["--enable", "multi_agent"] : []),
     ...(reader ? ["-c", `mcp_servers.pr_review.url=${JSON.stringify(reader.url)}`, "-c", "mcp_servers.pr_review.required=true",
       "-c", 'mcp_servers.pr_review.enabled_tools=["read_document","read_source","list_directory"]',
       ...["read_document", "read_source", "list_directory"].flatMap((tool) => ["-c", `mcp_servers.pr_review.tools.${tool}.approval_mode="approve"`, "-c", `mcp_servers.pr_review.tools.${tool}.output_token_limit=65536`])] : []),
@@ -508,7 +510,12 @@ export class NativeCodexBrainProvider {
         }
         await writeFile(path.join(directory, "output-schema.json"), JSON.stringify(ENVELOPE_SCHEMA), { flag: "wx", mode: 0o600 });
         await writeFile(path.join(directory, "task.json"), wireInput, { flag: "wx", mode: 0o600 });
-        const live = this.transport === 'app-server';
+        // Standalone text needs no live controls, native history or code tools.
+        // Exec can ignore home configuration; app-server still discovers built-in
+        // app inventories even with its model-facing app features disabled.
+        const standaloneText = !currentTaskExecution() && !request.sessionKey && !request.admissionEntityKey &&
+          !request.reviewTarget && !request.codeReadContext && !request.codeExecutionContext;
+        const live = this.transport === 'app-server' && !standaloneText;
         const instructionsFile = path.join(directory,'model-instructions.txt');
         const agentConfigPath = path.join(directory,'reviewer.toml');
         if(live) {

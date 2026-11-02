@@ -676,6 +676,24 @@ test("native code reader revokes full-read proof on invalid output, cleanup fail
   }
 });
 
+test('standalone structured text skips inherited app-server tools using isolated native exec', async (t) => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = 'app-server';
+  const provider = f.create(call => result(call), {}, { appServerRunner: { async run() {
+    assert.fail('standalone text must not discover inherited app-server tools');
+  } } });
+  assert.deepEqual(JSON.parse(await provider.generate(request({ model: 'gpt-6-luna', reasoningEffort: 'medium' }))), { ok: true });
+  const call = f.calls[0];
+  assert.equal(call.args[0], 'exec');
+  for (const flag of ['--ignore-user-config', '--ignore-rules', '--ephemeral']) assert.ok(call.args.includes(flag));
+  assert.ok(call.args.includes('shell_tool'));
+  assert.ok(call.args.includes('features.skip_host_skill_discovery=true'));
+  assert.equal(call.args[call.args.indexOf('--model') + 1], 'gpt-6-luna');
+  assert.ok(call.args.includes('model_reasoning_effort="medium"'));
+  assert.equal(call.env.CODEX_HOME, f.home);
+  assert.deepEqual(await readdir(path.join(f.runtime, 'sessions')), []);
+  await provider.close();
+});
+
 test('opt-in app-server retains native home and explicit capability isolation before starting a model',async(t)=>{
   const f=await fixture(t);const calls=[];
   f.environment.DIH_CODEX_NATIVE_TRANSPORT='app-server';
@@ -683,13 +701,27 @@ test('opt-in app-server retains native home and explicit capability isolation be
     calls.push(call);await writeFile(path.join(call.cwd,'last-message.json'),JSON.stringify({result:JSON.stringify({ok:true})}));
     return success(JSON.stringify({type:'thread.started',thread_id:'thread-42'}));
   }}});
-  assert.deepEqual(JSON.parse(await provider.generate(request())),{ok:true});
+  assert.deepEqual(JSON.parse(await provider.generate(request({ sessionKey: 'pr:42' }))),{ok:true});
   assert.equal(calls[0].args.includes('--strict-config'),false);
   for(const flag of ['--ignore-user-config','--ignore-rules'])assert.equal(calls[0].args.includes(flag),false);
   for(const feature of ['hooks','plugins','apps','multi_agent','shell_tool'])assert.ok(calls[0].args.includes(`features.${feature}=false`),feature);
-  assert.equal(calls[0].appServer.isolation.ephemeral,true);
+  assert.equal(calls[0].appServer.isolation.ephemeral,false);
   assert.ok(calls[0].appServer.isolation.agentConfigPath.endsWith('reviewer.toml'));
   assert.equal(calls[0].env.CODEX_HOME,f.home);await provider.close();
+});
+
+test('registered tasks retain live transport even without a saved session or code tools', async (t) => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = 'app-server';
+  let liveCalls = 0;
+  const provider = f.create(() => assert.fail('registered tasks need their live controls'), {}, { appServerRunner: { async run(call) {
+    liveCalls++;
+    assert.equal(call.appServer.isolation.ephemeral, true);
+    await writeFile(path.join(call.cwd, 'last-message.json'), JSON.stringify({ result: JSON.stringify({ ok: true }) }));
+    return success();
+  } } });
+  assert.deepEqual(JSON.parse(await withTaskExecution({ reportModelState() {} }, () => provider.generate(request()))), { ok: true });
+  assert.equal(liveCalls, 1);
+  await provider.close();
 });
 
 test('unavailable production live transport leaves no unknown native session or active marker',async(t)=>{
@@ -804,7 +836,7 @@ test("native process uses read-only native login with scrubbed environment and s
   assert.ok(call.args.includes('model_reasoning_effort="high"'));
   assert.ok(call.args.includes('service_tier="default"'));
   assert.ok(call.args.includes("project_doc_max_bytes=0"));
-  assert.ok(!call.args.includes("shell_tool"));
+  assert.ok(call.args.includes("shell_tool"));
   await assert.rejects(provider.generate(request({ model: "--dangerous-argument" })), TypeError);
   assert.equal(f.calls.length, 1);
 });
