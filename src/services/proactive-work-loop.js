@@ -560,7 +560,8 @@ function isUnclaimedRootContextDeferral(result) {
   return (
     !result.claimAttempted &&
     result.outcome.status === "decision_deferred" &&
-    ["PR_FACTS_STALE", "ROLE_CONTEXT_TIMEOUT"].includes(result.outcome.code)
+    (result.outcome.code === "PR_FACTS_STALE" ||
+      ROOT_DECISION_DEFERRED_ERROR_CODES.has(result.outcome.code))
   );
 }
 
@@ -973,8 +974,8 @@ export class ProactiveWorkLoop {
     );
     const rootContextDeferralSweep = this.rootContextDeferralSweeps.get(scope) ?? new Map();
     this.rootContextDeferralSweeps.set(scope, rootContextDeferralSweep);
-    for (const [itemId, revision] of rootContextDeferralSweep) {
-      if (itemRevisions.get(itemId) !== revision) rootContextDeferralSweep.delete(itemId);
+    for (const [itemId, deferral] of rootContextDeferralSweep) {
+      if (itemRevisions.get(itemId) !== deferral.revision) rootContextDeferralSweep.delete(itemId);
     }
     const preparationSweep = this.prPreparationSweeps.get(scope) ?? new Map();
     this.prPreparationSweeps.set(scope, preparationSweep);
@@ -1063,7 +1064,15 @@ export class ProactiveWorkLoop {
       }
       // Sweep cursors preserve fairness during discovery. A scheduled retry of
       // this exact input must recheck transient preparation/context failures.
-      if (options.continuationTarget === null && rootContextDeferralSweep.get(item.itemId) === item.revision) continue;
+      const rootDeferral = rootContextDeferralSweep.get(item.itemId);
+      if (
+        options.continuationTarget === null &&
+        rootDeferral?.revision === item.revision &&
+        Date.parse(rootDeferral.retryAt) > Date.parse(normalizeLoopClock(this.clock))
+      ) {
+        outcomes.push({ itemId: item.itemId, status: "decision_deferred", code: rootDeferral.code });
+        continue;
+      }
       if (options.continuationTarget === null && preparationSweep.get(item.itemId) === item.revision) continue;
       if (blockedRootSweep.has(item.itemId) && options.continuationTarget === null) continue;
       const fencedDeferral = this.fencedClaimDeferrals.get(item.itemId);
@@ -1262,7 +1271,22 @@ export class ProactiveWorkLoop {
               blockedRootSweep.delete(item.itemId);
             }
             const rootContextDeferred = isUnclaimedRootContextDeferral(processed);
-            if (rootContextDeferred) rootContextDeferralSweep.set(item.itemId, item.revision);
+            if (rootContextDeferred) {
+              const previous = rootContextDeferralSweep.get(item.itemId);
+              const failures = previous?.revision === item.revision ? previous.failures + 1 : 1;
+              const backoff = Math.min(
+                this.retryBaseMs * 2 ** Math.min(failures - 1, 20),
+                this.retryMaxMs,
+              );
+              rootContextDeferralSweep.set(item.itemId, {
+                revision: item.revision,
+                failures,
+                code: processed.outcome.code,
+                retryAt: new Date(Date.parse(normalizeLoopClock(this.clock)) + backoff).toISOString(),
+              });
+            } else {
+              rootContextDeferralSweep.delete(item.itemId);
+            }
             if (configuredResultConsumesWorkBudget(processed)) {
               workAttempts += 1;
             } else if (!rootContextDeferred) {
@@ -1345,7 +1369,6 @@ export class ProactiveWorkLoop {
     // Continue a bounded root-context sweep across cycles without moving new or
     // urgent candidates behind old work. A changed revision is never skipped.
     if (completedCandidateSweep && options.continuationTarget === null) {
-      this.rootContextDeferralSweeps.delete(scope);
       this.prPreparationSweeps.delete(scope);
       this.blockedRootSweeps.delete(scope);
     }

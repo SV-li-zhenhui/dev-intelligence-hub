@@ -3933,6 +3933,51 @@ test("structured failures preserve specialist retries and root preclaim deferral
   }
 });
 
+test("an unchanged root session recovery failure backs off without consuming work", async () => {
+  const time = controlledClock();
+  const root = workItem(889, { type: "role", id: "orchestrator" });
+  const ledger = new FakeLedger({ source: [root], time });
+  let decisions = 0;
+  const loop = createLoop({
+    ledger,
+    directory: new FakeRoleDirectory({
+      orchestrator: worker({
+        roleId: "orchestrator",
+        workerId: "employee-orchestrator",
+        async decide() {
+          decisions += 1;
+          throw structuredBrainFailure("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+        },
+      }),
+    }),
+    time,
+    roleContextAssembler: {
+      async assemble({ roleId, item }) {
+        return contextPacket(item, roleId);
+      },
+    },
+    orchestratorService: { async execute() {} },
+  });
+
+  const first = await loop.runCycle({ roleId: "orchestrator" });
+  assert.equal(first.outcomes[0].status, "decision_deferred");
+  assert.equal(first.workAttempts, 0);
+  const repeated = await loop.runCycle({ roleId: "orchestrator" });
+  assert.equal(repeated.outcomes[0].status, "decision_deferred");
+  assert.equal(repeated.outcomes[0].code, "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+  assert.equal(repeated.workAttempts, 0);
+  assert.equal(decisions, 1);
+
+  time.advance(1_000);
+  await loop.runCycle({ roleId: "orchestrator" });
+  assert.equal(decisions, 2);
+  assert.equal(ledger.items[0].status, "queued");
+  assert.equal(ledger.items[0].revision, root.revision);
+  assert.equal(ledger.items[0].attempt, 0);
+  assert.equal(ledger.calls.claim.length, 0);
+  assert.equal(ledger.calls.scheduleRetry.length, 0);
+});
+
 test("cycle-signal cancellation wins over configured-root owner attention", async () => {
   const time = controlledClock();
   const root = workItem(86, { type: "role", id: "orchestrator" });
