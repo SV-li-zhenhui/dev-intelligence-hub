@@ -1214,7 +1214,12 @@ async function waitForJob(application, predicate, runHousekeeping, limit = 20) {
     await runHousekeeping();
     const jobs = await application.codeJobReader.listNewest({ limit: 20 });
     const match = jobs.items.find(predicate);
-    if (match) return application.codeJobReader.getDetail({ jobId: match.jobId });
+    if (match) {
+      // Proposal polling precedes code execution in housekeeping. A job that
+      // just finished needs the next poll before its role can submit delivery.
+      await runHousekeeping();
+      return application.codeJobReader.getDetail({ jobId: match.jobId });
+    }
   }
   throw new Error("timed out waiting for the mirrored Code Job");
 }
@@ -1356,12 +1361,14 @@ test(
     application = await startApplication();
     t.after(async () => application?.close());
 
+    const roleCycles = [];
     const runRole = async (roleId) => {
       const result = await application.workCoordination.runCycle({
         trigger: `u9:${roleId}`,
         includeWork: true,
         roleId,
       });
+      roleCycles.push({ roleId, work: result.stages.work });
       advance();
       return result;
     };
@@ -1469,6 +1476,7 @@ test(
     await runRole("tester");
     await runHousekeeping();
     next = await application.confirmationQueue.next();
+    assert.ok(next.item, `missing verification confirmation: ${JSON.stringify(roleCycles.slice(-4))}`);
     assert.equal(next.item.kind, "local.code-job-create");
     const createdVerification = await application.confirmationQueue.approve(
       next.item.id,

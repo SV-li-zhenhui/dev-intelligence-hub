@@ -182,7 +182,7 @@ test("workforce preserves an optional high-capability task brain separately", as
     provider: "task-brain",
     model: "high-capability-model",
     remote: true,
-    remoteData: { requirements: true, code: true, memory: false },
+    remoteData: { requirements: true, code: true, memory: false, dingtalk: false },
   });
   assert.equal(
     Object.hasOwn(await workforce.employees[1].roleView(), "taskBrain"),
