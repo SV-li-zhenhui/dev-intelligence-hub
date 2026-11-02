@@ -1559,10 +1559,12 @@ test(
 
         const brainStatus = await pollJson(
           `http://127.0.0.1:${port}/api/brain-providers/status`,
-          60_000,
+          // Allow one bounded status operation (180 s) and its cleanup (30 s).
+          // Aborting/retrying at 30 s can repeatedly cancel credential staging.
+          210_000,
           () => true,
           () => "",
-          30_000,
+          210_000,
         );
         assert.equal(brainStatus.body.schemaVersion, 1);
         assert.equal(
