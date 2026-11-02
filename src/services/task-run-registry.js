@@ -570,7 +570,9 @@ export class TaskRunRegistry {
     if (command === "instruct" && run?.instructionsClosed) {
       throw registryError("TASK_RUN_INSTRUCTIONS_CLOSED", "任务正在完成，无法接收追加要求");
     }
-    if ((["instruct", "pause"].includes(command) && !run) ||
+    const acceptsPausedInstruction = command === 'instruct' && !run && current.mode === 'paused' &&
+      current.pendingCommand === null && current.stopUnconfirmed !== true && !current.terminalStatus;
+    if ((["instruct", "pause"].includes(command) && !run && !acceptsPausedInstruction) ||
         (command === "cancel" && !run && current.mode === "active")) {
       throw registryError("TASK_RUN_NOT_ACTIVE", "任务当前没有正在运行的模型回合");
     }

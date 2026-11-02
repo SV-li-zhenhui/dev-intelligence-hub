@@ -6,6 +6,124 @@ import { OwnPrRepairProgressReader } from "../src/services/own-pr-repair-progres
 
 const REFRESH_STARTED_AT = "2026-08-13T01:02:03.004Z";
 
+function isolatedRefresh({ collect, summarizeDingTalk, auxiliaryTimeoutMs = 15 }) {
+  const store = new MemoryStore();
+  const service = new RefreshService({
+    github: { async searchRelevantPullRequests() { return [pullRequest()]; },
+      async searchIssues() { return []; }, async versions() { return []; } },
+    dingtalk: { collect }, brain: { summarizeDingTalk }, store, notifier: {},
+    auxiliaryTimeoutMs, clock: () => new Date(REFRESH_STARTED_AT),
+    config: { trackedRepositories: [], dingtalk: { enabled: true },
+      brain: { enabled: true }, prResponsibility: { historicalAfterDays: 60 } },
+  });
+  return { store, service };
+}
+
+test("a stuck message source cannot hold fresh GitHub facts or replace them after its deadline", async () => {
+  let finishCollection;
+  let collectionSignal;
+  const pending = new Promise(resolve => { finishCollection = resolve; });
+  const { store, service } = isolatedRefresh({ collect: (_since, { signal }) => {
+    collectionSignal = signal;
+    return pending;
+  } });
+  const startedAt = performance.now();
+  const refresh = service.refresh();
+  const timer = setTimeout(() => finishCollection({ items: [], errors: [] }), 1000);
+  try {
+    await refresh;
+    assert.ok(performance.now() - startedAt < 750, "a pending independent source must not hold refresh");
+    assert.equal(collectionSignal.aborted, true, "the independent source is cancelled at its budget");
+    const snapshot = await store.read("snapshot");
+    assert.equal(snapshot.sourceStatus.githubPullRequests.complete, true);
+    assert.equal(snapshot.sourceStatus.dingtalk.stale, true);
+    assert.equal(snapshot.items.find(item => item.kind === "pull_request").headRefOid, "head-1");
+    const recorded = JSON.stringify(snapshot);
+    finishCollection({ items: [{ id: "late", kind: "todo", title: "late result" }], errors: [] });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(JSON.stringify(await store.read("snapshot")), recorded);
+  } finally { clearTimeout(timer); finishCollection({ items: [], errors: [] }); }
+});
+
+test("a stuck AI digest falls back to collected messages within the shared auxiliary budget", async () => {
+  let finishSummary;
+  let summarySignal;
+  const pending = new Promise(resolve => { finishSummary = resolve; });
+  const { store, service } = isolatedRefresh({
+    collect: async () => ({ errors: [], items: [{ id: "message:release", kind: "message", context: "研发群",
+      title: "版本已发布", author: "测试", updatedAt: REFRESH_STARTED_AT }] }),
+    summarizeDingTalk: (_groups, { signal }) => { summarySignal = signal; return pending; },
+  });
+  const startedAt = performance.now();
+  const timer = setTimeout(() => finishSummary([]), 1000);
+  try {
+    await service.refresh();
+    assert.ok(performance.now() - startedAt < 750, "a pending optional summary must not hold refresh");
+    assert.equal(summarySignal.aborted, true);
+    const snapshot = await store.read("snapshot");
+    assert.equal(snapshot.sourceStatus.githubPullRequests.complete, true);
+    assert.equal(snapshot.sourceStatus.dingtalk.ok, true);
+    assert.equal(snapshot.brain.dingtalkSummaryError.code, "REFRESH_AUXILIARY_TIMEOUT");
+    assert.match(snapshot.items.find(item => item.summaryStatus === "fallback").title, /版本已发布/);
+    const recorded = JSON.stringify(snapshot);
+    finishSummary([{ groupId: "late", summary: "late model response" }]);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(JSON.stringify(await store.read("snapshot")), recorded);
+  } finally { clearTimeout(timer); finishSummary([]); }
+});
+
+test("refresh cancellation aborts a pending auxiliary read and never publishes its fallback", async () => {
+  let entered;
+  let finishCollection;
+  let collectionSignal;
+  const started = new Promise(resolve => { entered = resolve; });
+  const { store, service } = isolatedRefresh({ collect: (_since, { signal }) => {
+    collectionSignal = signal; entered(); return new Promise(resolve => { finishCollection = resolve; });
+  }, auxiliaryTimeoutMs: 1000 });
+  const controller = new AbortController();
+  const refresh = service.refresh({ signal: controller.signal });
+  await started;
+  const reason = new Error("owner cancelled refresh");
+  const cancelledAt = performance.now();
+  controller.abort(reason);
+  const timer = setTimeout(() => finishCollection({ items: [], errors: [] }), 1000);
+  try {
+    await assert.rejects(refresh, error => error === reason);
+    assert.ok(performance.now() - cancelledAt < 750, "cancellation must not wait for the adapter");
+    assert.equal(collectionSignal.aborted, true);
+    assert.equal(await store.read("snapshot"), null);
+  } finally { clearTimeout(timer); finishCollection({ items: [], errors: [] }); }
+});
+
+test("a late PR assessment cannot change authoritative facts after its read budget expires", async () => {
+  const store = new MemoryStore();
+  let finishAssessment;
+  let assessedInput;
+  const pending = new Promise(resolve => { finishAssessment = resolve; });
+  const service = new RefreshService({
+    github: { async searchRelevantPullRequests() { return [pullRequest({ reviewFactsAvailable: false })]; },
+      async searchIssues() { return []; }, async versions() { return []; } },
+    dingtalk: {}, store, notifier: {}, auxiliaryTimeoutMs: 15,
+    brain: { assessPullRequest(item) { assessedInput = item; return pending; } },
+    clock: () => new Date(REFRESH_STARTED_AT),
+    config: { trackedRepositories: [], dingtalk: { enabled: false }, brain: { enabled: true },
+      prResponsibility: { historicalAfterDays: 60 } },
+  });
+  const timer = setTimeout(() => finishAssessment({ classification: "action_now" }), 1000);
+  try {
+    await service.refresh();
+    const snapshot = await store.read("snapshot");
+    assert.equal(snapshot.brain.assessed, 0);
+    assert.equal(snapshot.sourceStatus.githubPullRequests.complete, true);
+    assert.equal(snapshot.items[0].actionState, "uncertain");
+    assessedInput.headRefOid = "late-mutation";
+    finishAssessment({ classification: "action_now" });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(snapshot.items[0].headRefOid, "head-1");
+    assert.equal(snapshot.items[0].brainAssessment, undefined);
+  } finally { clearTimeout(timer); finishAssessment({}); }
+});
+
 class MemoryStore {
   constructor(entries = {}) {
     this.values = new Map(Object.entries(entries));

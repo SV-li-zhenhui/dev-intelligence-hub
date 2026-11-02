@@ -4,6 +4,15 @@ const SHARED_OPERATOR_PAUSE_CODES = new Set([
   "BRAIN_PROVIDER_NOT_CONFIGURED",
   "REMOTE_DATA_NOT_AUTHORIZED",
 ]);
+const MAINTENANCE_REQUIRED_CODES = new Set([
+  "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
+  "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  "STRUCTURED_PROVIDER_REAP_FAILED",
+]);
+
+export function requiresBrainMaintenance(code) {
+  return MAINTENANCE_REQUIRED_CODES.has(code);
+}
 
 function attention(code, summary, remediation, retryLabel = "已配置，重试") {
   return Object.freeze({ code, summary, remediation, retryLabel });

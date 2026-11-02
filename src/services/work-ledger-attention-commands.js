@@ -22,7 +22,7 @@ import {
 import { createWorkDecisionContext } from "./work-ledger-state.js";
 import { moveWorkItem } from "./work-ledger-transitions.js";
 import { isSettledIssueReason } from "./work-ledger-issue-lifecycle.js";
-import { automaticBrainRetryCode } from "./brain-failure-policy.js";
+import { automaticBrainRetryCode, requiresBrainMaintenance } from "./brain-failure-policy.js";
 import { hostContextRetirement } from "./work-ledger-host-context-recovery.js";
 import { automaticTriageRetirement } from './work-ledger-triage-retirement.js';
 import { ciMaterialRetirement } from "./work-ledger-ci-material-recovery.js";
@@ -79,7 +79,7 @@ export function planSystemMaintenanceRetry({ state, input, clock }) {
         item.ownerId !== null || item.leaseId !== null || item.leaseUntil !== null) continue;
     const outbox = outboxById.get(item.activeIntentId);
     const code = automaticBrainRetryCode(outbox?.intent);
-    if (code === null || outbox.itemId !== item.itemId || outbox.status !== "delivered" ||
+    if (code === null || requiresBrainMaintenance(code) || outbox.itemId !== item.itemId || outbox.status !== "delivered" ||
         outbox.outcome?.status !== "delivered" || outbox.outcome.details?.resultAttestation ||
         typeof outbox.outcome.details?.questionRef !== "string") continue;
     const inputBinding = attentionResultInputBinding(state, item, outbox);
@@ -615,6 +615,13 @@ export function planAttentionBatchApplication({ state, input, clock }) {
       activeIntentId: null,
       decisionContext,
     });
+    const maintenanceCode = automaticBrainRetryCode(outbox.intent);
+    if (itemResult.status === "queued" && requiresBrainMaintenance(maintenanceCode) &&
+        entry.result.answer.type === "choice" && entry.result.answer.choiceId === "configured-retry") {
+      // The owner repaired infrastructure; this was not a business decision failure.
+      // Never erase attempts made before the current Head's sealed budget offset.
+      itemResult.attempt = Math.max(item.source?.decisionBudget?.attemptOffset ?? 0, item.attempt - 1);
+    }
     items = replaceWorkLedgerRecord(items, "itemId", itemResult);
     appliedItemIds.push(item.itemId);
     timelineEvents.push({

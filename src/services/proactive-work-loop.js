@@ -7,7 +7,7 @@ import { automaticReviewWorkEligibility } from "../domain/automatic-review-polic
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { TargetedCycleQueue } from "../lib/targeted-cycle-queue.js";
 import { normalizeContinuationTarget, matchesContinuationTarget } from "./work-continuation-state.js";
-import { brainFailureOwnerAttention } from "./brain-failure-policy.js";
+import { brainFailureOwnerAttention, requiresBrainMaintenance } from "./brain-failure-policy.js";
 import { OrchestratorServiceError } from "./orchestrator-service.js";
 import { RoleContextAssemblerError } from "./role-context-error.js";
 import { PrEngineerServiceError } from "./pr-engineer-service.js";
@@ -49,7 +49,6 @@ const ROOT_DECISION_DEFERRED_ERROR_CODES = new Set([
   "STRUCTURED_BRAIN_RESPONSE_INVALID",
   "STRUCTURED_PROVIDER_RESPONSE_INVALID",
   "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION",
-  "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
 ]);
 const CONTEXT_CONTENTION_ERROR_CODES = new Set([
   "ROLE_CONTEXT_STALE",
@@ -566,6 +565,7 @@ function isUnclaimedRootContextDeferral(result) {
 }
 
 function configuredResultConsumesWorkBudget(result) {
+  if (result.outcome.status === "maintenance_required") return false;
   if (isUnclaimedRootContextDeferral(result)) return false;
   if (result.decisionSkipped === true && result.outcome.status === "graph_blocked") return false;
   return result.claimed ||
@@ -1338,7 +1338,7 @@ export class ProactiveWorkLoop {
           // A host context failure has not made a decision. Keep its durable
           // retry and bounded availability/claim scan, but leave work capacity
           // for another eligible item in this cycle.
-          if (outcome.status === "retry_scheduled" && outcome.decisionSkipped === true) workAttempts -= 1;
+          if (outcome.decisionSkipped === true && ["retry_scheduled", "maintenance_required"].includes(outcome.status)) workAttempts -= 1;
           outcomes.push({ itemId: item.itemId, ...outcome });
           if (
             resolution.orchestrator &&
@@ -1838,7 +1838,7 @@ export class ProactiveWorkLoop {
         claimed: true,
         outcome: await this.#recordFailure(
           claim.item,
-          worker.workerId,
+          worker,
           error,
           options,
         ),
@@ -1984,7 +1984,7 @@ export class ProactiveWorkLoop {
       }
       return this.#recordFailure(
         item,
-        worker.workerId,
+        worker,
         error,
         options,
         failureReasons,
@@ -2050,7 +2050,7 @@ export class ProactiveWorkLoop {
       decision = await this.#decide(item, worker, options);
     } catch (error) {
       throwIfLoopAborted(options.signal);
-      return this.#recordFailure(item, worker.workerId, error, options);
+      return this.#recordFailure(item, worker, error, options);
     }
 
     throwIfLoopAborted(options.signal);
@@ -2099,7 +2099,7 @@ export class ProactiveWorkLoop {
       ) {
         return this.#recordFailure(
           item,
-          worker.workerId,
+          worker,
           error,
           options,
           failureReasons,
@@ -2436,17 +2436,58 @@ export class ProactiveWorkLoop {
     }
   }
 
+  async #infrastructureRetryDelay(item, code, signal) {
+    let failures = 0;
+    if (this.listTimeline !== null) {
+      try {
+        const page = await withinAbortable(
+          () => this.listTimeline({ itemId: item.itemId, order: "newest", limit: PAGE_SIZE }),
+          this.resolveTimeoutMs, "ROLE_RETRY_HISTORY_TIMEOUT", signal,
+        );
+        // Claims sit between retries. Any other event starts a new failure streak.
+        // A bounded tail suffices because the delay reaches its configured cap.
+        for (const entry of page.items) {
+          if (entry.type === "claimed") continue;
+          if (entry.type !== "retry_scheduled" || entry.details.reason !== "system_maintenance_auto_retry" ||
+              entry.details.code !== code) break;
+          failures += 1;
+        }
+      } catch {
+        throwIfLoopAborted(signal);
+      }
+    }
+    return Math.min(Math.max(this.retryMaxMs, 60_000),
+      Math.max(this.retryBaseMs, 60_000) * 2 ** Math.min(failures, 20));
+  }
+
   async #recordFailure(
     item,
-    actorId,
+    worker,
     error,
     options,
     reasons = DECISION_FAILURE_REASONS,
     beforeDecision = false,
   ) {
     throwIfLoopAborted(options.signal);
+    const actorId = worker.workerId;
     if (error instanceof TaskRunControlError) return {status:error.code === 'TASK_RUN_CANCELLED' ? 'cancelled' : error.code === 'TASK_RUN_CONTROL_PENDING' ? 'control_pending' : 'paused',workerId:actorId,code:error.code};
     const code = stableFailureCode(error);
+    if (requiresBrainMaintenance(code)) {
+      const failure = brainFailureOwnerAttention(code);
+      const outcome = await this.#stageDecision(item, worker, options, {
+        intent: {
+          schemaVersion: 1, type: "ask_user",
+          summary: `${failure.summary}（${worker.roleId}）`,
+          reason: `真实任务不得回退到例行大脑；系统已安全停止（${code}）`,
+          question: failure.remediation,
+          choices: [{ id: "configured-retry", label: failure.retryLabel,
+            description: "修复环境后重新排队；保留原任务权限与输入绑定。" }],
+        },
+      });
+      return ["staged", "stage_recovered"].includes(outcome.status)
+        ? { status: "maintenance_required", workerId: actorId, code, decisionSkipped: true }
+        : outcome;
+    }
     const contention = isContextContention(error);
     const contextTimeout = beforeDecision && code === "ROLE_CONTEXT_TIMEOUT";
     const unavailablePrFacts = beforeDecision && error instanceof RoleContextAssemblerError &&
@@ -2479,10 +2520,9 @@ export class ProactiveWorkLoop {
         return { status: "blocked", workerId: actorId, code };
       }
       const exponent = contention ? 0 : Math.min(Math.max(attempt - 1, 0), 30);
-      const normalDelay = Math.min(
-        this.retryMaxMs,
-        infrastructure ? Math.max(this.retryBaseMs, 60_000) : this.retryBaseMs * 2 ** exponent,
-      );
+      const normalDelay = infrastructure
+        ? await this.#infrastructureRetryDelay(item, code, options.signal)
+        : Math.min(this.retryMaxMs, this.retryBaseMs * 2 ** exponent);
       const delay = contextTimeout ? Math.max(60_000, normalDelay) : normalDelay;
       await this.ledger.scheduleRetry({
         ...input,

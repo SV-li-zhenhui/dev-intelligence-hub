@@ -15731,15 +15731,58 @@ async function prepareAttentionResult(
   ).outbox;
 }
 
-function systemMaintenanceIntent(roleId) {
+function systemMaintenanceIntent(roleId, code = "STRUCTURED_PROVIDER_MODEL_CAPACITY") {
+  const summaries = {
+    STRUCTURED_PROVIDER_MODEL_CAPACITY: "所选模型暂时满载",
+    STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED: "岗位 CLI 会话进度未能安全归档",
+    STRUCTURED_PROVIDER_CLEANUP_FAILED: "岗位任务大脑的隔离运行环境未能安全清理",
+    STRUCTURED_PROVIDER_REAP_FAILED: "岗位任务大脑的受监督 CLI 进程未能安全结束",
+  };
   return {
     schemaVersion: 1, type: "ask_user",
-    summary: `岗位 CLI 会话进度未能安全归档（${roleId}）`,
-    reason: "真实任务不得回退到例行大脑；系统已安全停止（STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED）",
+    summary: `${summaries[code]}（${roleId}）`,
+    reason: `真实任务不得回退到例行大脑；系统已安全停止（${code}）`,
     question: "保留会话历史，修复后重试",
     choices: [{ id: "configured-retry", label: "修复后重试", description: "重新排队" }],
   };
 }
+
+test("session and process maintenance questions wait for explicit repair retry across restart", async () => {
+  for (const code of ["STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED", "STRUCTURED_PROVIDER_CLEANUP_FAILED", "STRUCTURED_PROVIDER_REAP_FAILED"]) {
+    const fixture = await createFixture({ records: [assignment(1)] });
+    const answer = await prepareAttentionResult(fixture, { type: "choice", choiceId: "configured-retry" }, {
+      intent: systemMaintenanceIntent("pr-reviewer", code),
+    });
+    const waiting = (await fixture.service.listItems()).items[0];
+    const input = { limit: 10, requestKeys: [waiting.activeIntentId] };
+    assert.equal((await fixture.service.retrySystemMaintenanceQuestions(input)).retried, 0);
+    assert.equal((await fixture.service.listItems()).items[0].status, "waiting_user");
+    const restarted = await createFixture({ store: fixture.store, source: fixture.source, time: fixture.time });
+    assert.equal((await restarted.service.retrySystemMaintenanceQuestions(input)).retried, 0);
+    await restarted.service.applyAttentionBatch({ items: [answer], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+    const resumed = (await restarted.service.listItems()).items[0];
+    assert.equal(resumed.status, "queued");
+    assert.equal(resumed.inputDigest, waiting.inputDigest);
+    assert.equal(resumed.activeIntentId, null);
+    assert.equal(resumed.attempt, waiting.attempt - 1);
+  }
+});
+
+test("an explicit session repair retry preserves the PR source and Head budget", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  const answer = await prepareAttentionResult(fixture, { type: "choice", choiceId: "configured-retry" }, {
+    workerId: "employee-pr-engineer", roleId: "pr-engineer",
+    intent: systemMaintenanceIntent("pr-engineer", "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED"),
+  });
+  const waiting = (await fixture.service.listItems()).items[0];
+  await fixture.service.applyAttentionBatch({ items: [answer], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+  const resumed = (await fixture.service.listItems()).items[0];
+  assert.equal(resumed.status, "queued");
+  assert.equal(resumed.attempt, waiting.attempt - 1);
+  assert.deepEqual(resumed.source, waiting.source);
+  const restarted = await createFixture({ store: fixture.store, source: fixture.source, time: fixture.time });
+  assert.equal((await restarted.service.listItems()).items[0].attempt, resumed.attempt);
+});
 
 test("system maintenance questions retry without an owner answer and discard a raced result", async () => {
   const fixture = await createFixture({ records: [assignment(1)] });

@@ -419,6 +419,29 @@ test("a paused task can be cancelled without creating a model run", async () => 
   assert.deepEqual((await registry.list()).items, []);
 });
 
+test("requirements saved while paused survive restart and apply on the next run", async () => {
+  const { registry, store } = fixture();
+  const running = await start(registry);
+  const stopped = assert.rejects(running.result, hasError('TASK_RUN_PAUSED', 409));
+  await registry.control('work-item', 'work-1', control(running.view, 'pause'));
+  running.gate.resolve('obsolete');
+  await stopped;
+  const held = await registry.get('work-item', 'work-1');
+  const saved = await registry.control('work-item', 'work-1', control(held, 'instruct', { instruction: 'Test the recovery path before publishing' }));
+  assert.equal(saved.active, false);
+  assert.equal(saved.mode, 'paused');
+  assert.equal(saved.instructionReceipt, 'checkpoint');
+  const recovered = fixture({ store }).registry;
+  const restored = await recovered.get('work-item', 'work-1');
+  assert.equal(restored.instructions[0].text, 'Test the recovery path before publishing');
+  await recovered.control('work-item', 'work-1', control(restored, 'resume'));
+  let seen;
+  await recovered.run(task(), async ({ instructions }) => { seen = instructions; return 'done'; });
+  assert.deepEqual(seen, ['Test the recovery path before publishing']);
+  const terminal = await recovered.get('work-item', 'work-1');
+  await assert.rejects(recovered.control('work-item', 'work-1', control(terminal, 'instruct', { instruction: 'too late' })), hasError('TASK_RUN_NOT_ACTIVE', 409));
+});
+
 test("same revision controls serialize and reject the loser without losing the winner", async () => {
   const { registry } = fixture();
   const running = await start(registry);

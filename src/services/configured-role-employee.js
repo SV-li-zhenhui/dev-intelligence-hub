@@ -506,6 +506,7 @@ export class ConfiguredRoleEmployee {
         stateKey ?? configuredRoleLifecycleStateKey(definition.id),
       ),
       operationQueue,
+      responsiveControls: true,
       createState: () => ({
         schemaVersion: 2,
         revision: 0,
@@ -613,15 +614,6 @@ export class ConfiguredRoleEmployee {
   }
 
   control(command, expectedRevision) {
-    if (this.#controller.running) {
-      return Promise.reject(
-        employeeError(
-          "ROLE_RUN_IN_PROGRESS",
-          "Configured role cannot be controlled while its run is in progress",
-          409,
-        ),
-      );
-    }
     return this.#controller.control(command, expectedRevision);
   }
 

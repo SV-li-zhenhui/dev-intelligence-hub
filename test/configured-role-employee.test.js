@@ -547,7 +547,8 @@ test("RoleDecisionEngine checks its configured provider without generating a dec
 
   assert.equal(generateCalls, 0);
   assert.equal(availabilityCalls.length, 1);
-  assert.deepEqual(availabilityCalls[0].config, configuredBrain);
+  assert.deepEqual(availabilityCalls[0].config, { ...configuredBrain,
+    remoteData: { ...configuredBrain.remoteData, dingtalk: false } });
   assert.strictEqual(availabilityCalls[0].options.signal, controller.signal);
 });
 
@@ -1307,7 +1308,7 @@ test("task brain is safely projected while non-task activity keeps routine routi
     provider: "remote-task-brain",
     model: "high-capability-model",
     remote: true,
-    remoteData: { requirements: true, code: true, memory: false },
+    remoteData: { requirements: true, code: true, memory: false, dingtalk: false },
   });
 
   const decision = await employee.decide({ item: { itemId: "work-1" } });
@@ -1761,7 +1762,7 @@ test("pausing a role invalidates a task-brain decision already in flight", async
   await assert.rejects(deciding, (error) => error.code === "ROLE_PAUSED");
 });
 
-test("onRun self-control fails explicitly instead of deadlocking the role queue", async () => {
+test("onRun can persist a pause without waiting for its own role queue", async () => {
   const store = new MemoryStore();
   let employee;
   employee = new ConfiguredRoleEmployee({
@@ -1776,12 +1777,10 @@ test("onRun self-control fails explicitly instead of deadlocking the role queue"
     },
   });
 
-  await assert.rejects(
-    employee.run({ trigger: "manual" }),
-    (error) => error.code === "ROLE_RUN_IN_PROGRESS",
-  );
+  await employee.run({ trigger: "manual" });
   assert.equal(employee.running, null);
-  assert.equal((await employee.view()).lastErrorCode, "ROLE_RUN_IN_PROGRESS");
+  assert.equal((await employee.roleView()).paused, true);
+  assert.equal((await employee.view()).lastErrorCode, "");
 });
 
 test('coordination failures retain bounded stage and cause codes for automatic recovery diagnosis', async () => {

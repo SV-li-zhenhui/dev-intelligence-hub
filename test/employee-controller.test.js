@@ -236,6 +236,40 @@ test("a failed employee run releases the in-flight lock for the next run", async
   assert.equal(controller.running, null);
 });
 
+test("responsive role controls persist while its current cycle is waiting and survive stale cycle writes", async (t) => {
+  let release, markStarted;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { markStarted = resolve; });
+  t.after(() => release());
+  let calls = 0;
+  let controller;
+  controller = new EmployeeController({
+    definition: { id: 'developer' }, store: new MemoryStore(), stateKey: 'developer-state',
+    responsiveControls: true,
+    async run({ state }) {
+      calls += 1; markStarted(); await gate;
+      return controller.writeState({ ...state, lastRun: 'finished' });
+    },
+  });
+  const run = controller.run();
+  await started;
+  const result = await Promise.race([
+    controller.control('pause', 0),
+    new Promise((_, reject) => { const timer = setTimeout(() => reject(new Error('pause waited for the blocked cycle')), 250); timer.unref(); }),
+  ]);
+  assert.equal(result.role.paused, true);
+  await assert.rejects(controller.control('resume', 0), { statusCode: 409 });
+  release(); await run;
+  assert.equal((await controller.roleView()).paused, true);
+  assert.equal((await controller.readState()).lastRun, 'finished');
+  await controller.run();
+  assert.equal(calls, 1);
+  const paused = await controller.roleView();
+  await controller.control('resume', paused.revision);
+  await controller.run();
+  assert.equal(calls, 2);
+});
+
 test("role discovery does not build the employee work projection", async () => {
   const store = new MemoryStore();
   let workProjections = 0;

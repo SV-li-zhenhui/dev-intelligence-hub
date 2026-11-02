@@ -2218,6 +2218,55 @@ test("host PR fact preparation failures retry without spending a model decision"
   assert.equal(ledger.items[0].attempt, 1);
 });
 
+test("a fenced session parks only its task and leaves healthy work a decision slot across restart", async () => {
+  for (const roleId of ["developer", "orchestrator"]) {
+    const time = controlledClock();
+    const sources = [workItem(490, { type: "role", id: roleId }), workItem(491, { type: "role", id: roleId })];
+    const ledger = new FakeLedger({ source: sources, time });
+    const decisions = [];
+    const options = { ledger, time, directory: new FakeRoleDirectory({ [roleId]: worker({ roleId,
+      async decide({ item }) {
+        decisions.push(item.itemId);
+        if (item.itemId === sources[0].itemId) throw structuredBrainFailure("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+        return roleId === "orchestrator" ? orchestrationDecision(item) : completeDecision();
+      },
+    }) }), roleContextAssembler: { async assemble({ item, roleId }) { return contextPacket(item, roleId); } },
+    orchestratorService: { async execute() { return { applied: true }; } } };
+    const first = await createLoop(options).runCycle({ roleId, workLimit: 1 });
+    assert.equal(first.outcomes[0].status, "maintenance_required");
+    assert.deepEqual(decisions, sources.map(item => item.itemId));
+    assert.equal(ledger.items[0].status, "dispatch_pending");
+    assert.equal(ledger.calls.scheduleRetry.length, 0);
+    assert.equal(ledger.outbox[0].intent.type, "ask_user");
+    assert.equal(ledger.outbox[0].intent.choices[0].id, "configured-retry");
+    assert.match(ledger.outbox[0].intent.question, /会话历史.*不要删除/);
+    assert.equal(JSON.stringify(ledger.outbox[0]).includes("sk-owner-secret"), false);
+    time.advance(3_600_000);
+    await createLoop(options).runCycle({ roleId });
+    assert.equal(decisions.filter(id => id === sources[0].itemId).length, 1);
+  }
+});
+
+test("transient infrastructure backoff survives loop recreation without spending decision attempts", async () => {
+  const time = controlledClock();
+  const ledger = new FakeLedger({ source: [workItem(492)], time });
+  ledger.listTimeline = async () => ({ items: [...ledger.calls.scheduleRetry].reverse().map(call => ({
+    type: "retry_scheduled", details: { ...call.details, reason: call.reason },
+  })) });
+  const options = { ledger, time, retryMaxMs: 240_000,
+    directory: new FakeRoleDirectory({ "pr-reviewer": worker({ async decide() {
+      throw structuredBrainFailure("STRUCTURED_PROVIDER_MODEL_CAPACITY");
+    } }) }),
+  };
+  for (const expectedDelay of [60_000, 120_000, 240_000, 240_000]) {
+    const before = Date.parse(time.clock());
+    assert.equal((await createLoop(options).runCycle()).retried, 1);
+    assert.equal(Date.parse(ledger.items[0].availableAt) - before, expectedDelay);
+    assert.equal(ledger.items[0].attempt, 0);
+    time.advance(expectedDelay);
+  }
+});
+
 test("host fact preparation failure leaves the next healthy specialist a work slot", async () => {
   const time = controlledClock();
   const sources = [workItem(468, { type: "role", id: "developer" }), workItem(469, { type: "role", id: "developer" })];
@@ -3063,7 +3112,7 @@ test("specialist delivery exhaustion remains distinct from decision exhaustion",
   );
 });
 
-test("delivery infrastructure failures wait automatically without exhausting delivery attempts", async () => {
+test("delivery capacity failures wait automatically without exhausting delivery attempts", async () => {
   const time = controlledClock();
   const source = workItem(73, { type: "role", id: "developer" });
   const ledger = new FakeLedger({ source: [source], time });
@@ -3086,7 +3135,7 @@ test("delivery infrastructure failures wait automatically without exhausting del
     orchestratorService: {
       async execute() {
         throw Object.assign(new Error("delivery cleanup state is unknown"), {
-          code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+          code: "STRUCTURED_PROVIDER_MODEL_CAPACITY",
         });
       },
     },
@@ -3795,7 +3844,7 @@ test("a specialist closes a terminal PR task without consuming retry attempts", 
   });
 });
 
-test("infrastructure failures retain role retries and defer root session recovery without business exhaustion", async (t) => {
+test("infrastructure failures separate maintenance from transient retries", async (t) => {
   for (const roleId of ["developer", "orchestrator"]) {
     for (const { code, failurePoint } of [...STRUCTURED_BRAIN_ATTENTION_CASES,
       { code: 'STRUCTURED_PROVIDER_MODEL_CAPACITY', failurePoint: 'brain' }]) {
@@ -3814,23 +3863,26 @@ test("infrastructure failures retain role retries and defer root session recover
             return contextPacket(item, roleId);
           } }, orchestratorService: { async execute() { assert.fail("No execution after provider failure"); } },
         });
+        if (["STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED", "STRUCTURED_PROVIDER_CLEANUP_FAILED", "STRUCTURED_PROVIDER_REAP_FAILED"].includes(code)) {
+          const cycle = await loop.runCycle({ roleId });
+          assert.equal(cycle.outcomes[0].status, "maintenance_required");
+          assert.equal(cycle.retried, 0);
+          assert.equal(ledger.outbox.length, 1);
+          assert.match(ledger.outbox[0].intent.question, STRUCTURED_BRAIN_ATTENTION_CASES.find(entry => entry.code === code).remediation);
+          time.advance(60_000);
+          assert.equal((await loop.runCycle({ roleId })).claimed, 0);
+          assert.equal(ledger.calls.scheduleRetry.length, 0);
+          return;
+        }
         for (let turn = 0; turn < 5; turn += 1) {
           const cycle = await loop.runCycle({ roleId });
-          const deferred = roleId === 'orchestrator' && code === 'STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED';
-          assert.equal(cycle.retried, deferred ? 0 : 1);
+          assert.equal(cycle.retried, 1);
           assert.equal(cycle.outcomes[0].code, code);
-          assert.equal(ledger.items[0].status, deferred ? 'queued' : 'retry_wait');
+          assert.equal(ledger.items[0].status, 'retry_wait');
           assert.equal(ledger.items[0].attempt, 0);
-          if (deferred) {
-            assert.equal(cycle.outcomes[0].status, 'decision_deferred');
-            assert.equal(ledger.items[0].revision, source.revision);
-            assert.equal(ledger.calls.claim.length, 0);
-            assert.equal(ledger.calls.scheduleRetry.length, 0);
-          } else {
-            assert.equal(ledger.calls.scheduleRetry.at(-1).consumeAttempt, false);
-            assert.equal(Date.parse(ledger.items[0].availableAt) > Date.parse(time.clock()), true);
-            assert.equal((await loop.runCycle({ roleId })).claimed, 0);
-          }
+          assert.equal(ledger.calls.scheduleRetry.at(-1).consumeAttempt, false);
+          assert.equal(Date.parse(ledger.items[0].availableAt) > Date.parse(time.clock()), true);
+          assert.equal((await loop.runCycle({ roleId })).claimed, 0);
           time.advance(60_000);
         }
         assert.equal(ledger.outbox.length, 0);
@@ -3895,7 +3947,6 @@ test("structured failures preserve specialist retries and root preclaim deferral
     "STRUCTURED_BRAIN_RESPONSE_INVALID",
     "STRUCTURED_PROVIDER_RESPONSE_INVALID",
     "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION",
-    "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
   ]) {
     await t.test(`root defers ${code} without failing the employee`, async () => {
       const time = controlledClock();
@@ -3933,7 +3984,7 @@ test("structured failures preserve specialist retries and root preclaim deferral
   }
 });
 
-test("an unchanged root session recovery failure backs off without consuming work", async () => {
+test("an unchanged root malformed response backs off without consuming work", async () => {
   const time = controlledClock();
   const root = workItem(889, { type: "role", id: "orchestrator" });
   const ledger = new FakeLedger({ source: [root], time });
@@ -3946,7 +3997,7 @@ test("an unchanged root session recovery failure backs off without consuming wor
         workerId: "employee-orchestrator",
         async decide() {
           decisions += 1;
-          throw structuredBrainFailure("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+          throw structuredBrainFailure("STRUCTURED_PROVIDER_RESPONSE_INVALID");
         },
       }),
     }),
@@ -3964,7 +4015,7 @@ test("an unchanged root session recovery failure backs off without consuming wor
   assert.equal(first.workAttempts, 0);
   const repeated = await loop.runCycle({ roleId: "orchestrator" });
   assert.equal(repeated.outcomes[0].status, "decision_deferred");
-  assert.equal(repeated.outcomes[0].code, "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+  assert.equal(repeated.outcomes[0].code, "STRUCTURED_PROVIDER_RESPONSE_INVALID");
   assert.equal(repeated.workAttempts, 0);
   assert.equal(decisions, 1);
 
