@@ -5,7 +5,7 @@ import { PassThrough } from 'node:stream';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { CodexAppServerRunner,didAppServerNotStart,didAppServerNotStartModel,didAppServerReap } from '../src/lib/codex-app-server-runner.js';
+import { CodexAppServerRunner,didAppServerNotStart,didAppServerNotStartModel,didAppServerReap,readAppServerFailureDiagnostic } from '../src/lib/codex-app-server-runner.js';
 import { ManagedProcess } from '../src/lib/managed-process.js';
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { withTaskExecution } from '../src/lib/task-execution-context.js';
@@ -186,6 +186,15 @@ for(const [method,rpcCode] of [['turn/start',-32600],['thread/resume','PRIVATE_C
   assert.deepEqual(events,[{type:'status',text:`Native RPC failed: ${method} (code ${typeof rpcCode==='number'?rpcCode:'unknown'})`}]);
   assert.deepEqual(failures,[{kind:'rpc_error',method,code:typeof rpcCode==='number'?rpcCode:null}]);
   assert.equal(JSON.stringify(events).includes('PRIVATE_'),false);
+});
+
+test('RPC diagnostics remain available without a task registry and contain no server text', async () => {
+  const f = fixture({ turnStartFailure: { code: -32600, message: 'PRIVATE_MESSAGE', data: { token: 'PRIVATE_TOKEN' } } });
+  await assert.rejects(invocation(f.runner), error => {
+    assert.deepEqual(readAppServerFailureDiagnostic(error), { kind: 'rpc_error', method: 'turn/start', code: -32600 });
+    assert.equal(JSON.stringify(readAppServerFailureDiagnostic(error)).includes('PRIVATE'), false);
+    return error.code === 'STRUCTURED_PROVIDER_PROCESS_FAILED';
+  });
 });
 
 test('an unexpected process exit retains the pending host method before teardown clears it', async () => {

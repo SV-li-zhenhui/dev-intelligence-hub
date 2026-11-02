@@ -9,6 +9,7 @@ import { prioritize } from "../domain/prioritizer.js";
 import { diffSnapshots } from "../domain/snapshot-diff.js";
 import { runStructuredProviderRequest } from "../lib/structured-provider-request.js";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
+import { normalizeNativeFailure } from "./task-run-execution-receipts.js";
 import {
   resolveEffectivePullRequestUpdatedWindow,
 } from "../domain/pull-request-updated-window.js";
@@ -431,6 +432,10 @@ export class RefreshService {
         ...(typeof error.primaryFailureCode === "string" ? { primaryFailureCode: error.primaryFailureCode } : {}),
         ...(typeof error.fallbackFailureCode === "string" ? { fallbackFailureCode: error.fallbackFailureCode } : {}),
       };
+      try {
+        const diagnostic = Object.getOwnPropertyDescriptor(error, "primaryNativeFailure")?.value;
+        if (diagnostic) brainMeta.dingtalkSummaryError.primaryNativeFailure = normalizeNativeFailure(diagnostic);
+      } catch { /* Invalid diagnostics do not replace the original provider failure. */ }
       brainMeta.errors.push("钉钉 AI 摘要暂时不可用，已显示消息摘录；系统将自动重试。");
       return applyDingTalkSummaries(prepared);
     }

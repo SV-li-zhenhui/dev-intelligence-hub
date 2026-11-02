@@ -111,3 +111,18 @@ test("Luna cancellation does not trigger a local fallback", async () => {
   );
   assert.equal(fallbackCalls, 0);
 });
+
+test("both-provider failures retain only validated native stage diagnostics", async () => {
+  const nativeFailure = { kind: 'rpc_error', method: 'turn/start', code: -32600 };
+  const brain = new RoutedDingTalkSummaryBrain({
+    router: routerFor(async () => { throw Object.assign(new Error('PRIVATE_MESSAGE'), {
+      code: 'STRUCTURED_PROVIDER_PROCESS_FAILED', nativeFailure,
+    }); }), primaryBrain: PRIMARY, allowRemoteDingTalkSummary: true,
+    fallback: { async summarizeDingTalk() { throw new Error('fallback unavailable'); } },
+  });
+  await assert.rejects(brain.summarizeDingTalkWithReceipt(CONVERSATIONS), error => {
+    assert.deepEqual(error.primaryNativeFailure, nativeFailure);
+    assert.equal(JSON.stringify(error).includes('PRIVATE_MESSAGE'), false);
+    return error.code === 'DINGTALK_SUMMARY_BOTH_PROVIDERS_FAILED';
+  });
+});

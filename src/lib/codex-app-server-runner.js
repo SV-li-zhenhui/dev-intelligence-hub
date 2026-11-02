@@ -10,6 +10,8 @@ import { codeExecutionWatchdogSignal, startCodeExecutionTurn, reportCodeExecutio
 import { threadConfiguration, assertEffectiveAppServerPolicy, NATIVE_CHANNEL_INSTRUCTIONS, CODE_EXECUTION_CHANNEL_INSTRUCTIONS, CODE_EXECUTION_TOOLS } from './codex-app-server-policy.js';
 
 const FAILURE_OUTPUT = new WeakMap();
+const FAILURE_DIAGNOSTICS = new WeakMap();
+export const readAppServerFailureDiagnostic = error => FAILURE_DIAGNOSTICS.get(error) ?? null;
 const NOT_STARTED = new WeakSet();
 const NO_MODEL_TURN = new WeakSet();
 const REAPED_FAILURES = new WeakSet();
@@ -71,7 +73,9 @@ export class CodexAppServerRunner {
     let sequence=0,started=false,initialized=false,terminal=false,accepting=true,interrupted=false,detach,output,error,turnAttempted=false;
     const earlyEvents=[];const streamedItems=new Set();let earlyBytes=0;
     const activityItems = new Set(); let lastPlan = null;
+    let nativeFailure = null;
     const reportNativeFailure=(value,text)=>{
+      nativeFailure = Object.freeze({ ...value });
       // Diagnostic observers must not replace a native failure or strand its waiter.
       try { context?.reportNativeFailure?.(value); } catch {}
       if(text)try { context?.reportEvent?.({type:'status',text}); } catch {}
@@ -280,6 +284,7 @@ export class CodexAppServerRunner {
       if(interrupted && !error && !codeExecution)context?.confirmStopped();
     }
     if(error){
+      if (nativeFailure) FAILURE_DIAGNOSTICS.set(error, nativeFailure);
       if(started && process.exited && error.code!=='STRUCTURED_PROVIDER_REAP_FAILED')REAPED_FAILURES.add(error);
       if(threadId && (appServer.previous || turnAttempted))FAILURE_OUTPUT.set(error,{stdoutBytes:Buffer.from(JSON.stringify({type:'thread.started',thread_id:threadId})+'\n')});
       if(!started || process.notStarted)NOT_STARTED.add(error);

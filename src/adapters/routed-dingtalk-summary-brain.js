@@ -5,6 +5,7 @@ import {
   parseDingTalkDigest,
   summarizeDingTalkConversations,
 } from "./ollama-brain.js";
+import { normalizeNativeFailure } from "../services/task-run-execution-receipts.js";
 
 const FALLBACKABLE_CODES = new Set([
   "STRUCTURED_PROVIDER_UNAVAILABLE", "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE",
@@ -86,6 +87,10 @@ export class RoutedDingTalkSummaryBrain {
             combined.code = "DINGTALK_SUMMARY_BOTH_PROVIDERS_FAILED";
             combined.primaryFailureCode = primaryFailureCode;
             combined.fallbackFailureCode = failureCode(fallbackError);
+            try {
+              const diagnostic = Object.getOwnPropertyDescriptor(error, "nativeFailure")?.value;
+              if (diagnostic) combined.primaryNativeFailure = normalizeNativeFailure(diagnostic);
+            } catch { /* Keep provider-owned text and invalid diagnostics out of the public receipt. */ }
             throw combined;
           }
         } finally {

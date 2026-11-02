@@ -8,7 +8,7 @@ import { projectRoot } from "../lib/config.js";
 import { KnownCliLocator } from "../lib/known-cli-locator.js";
 import { PRODUCTION_PRIVATE_DIRECTORY_MANAGER } from "../lib/private-directory-manager.js";
 import { SupervisedProcessRunner, isProductionSupervisedProcessRunner, didSupervisedProcessNotStart, readReapedProcessFailureOutput } from "../lib/supervised-process-runner.js";
-import { CodexAppServerRunner, didAppServerNotStart, didAppServerNotStartModel, didAppServerReap, readAppServerFailureOutput } from '../lib/codex-app-server-runner.js';
+import { CodexAppServerRunner, didAppServerNotStart, didAppServerNotStartModel, didAppServerReap, readAppServerFailureOutput, readAppServerFailureDiagnostic } from '../lib/codex-app-server-runner.js';
 import { normalizeStructuredBrainRequest, readStructuredBrainGenerateInput } from "../lib/structured-brain-request.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { parseJsonWithUniqueKeys } from "../lib/strict-json.js";
@@ -395,7 +395,10 @@ export class NativeCodexBrainProvider {
         if (!token && operation.signal.aborted) context?.confirmStopped?.();
         if (model) this.#invalidateAvailability(error);
         if (error instanceof TypeError) throw error;
-        throw failure(error?.code);
+        const mapped = failure(error?.code);
+        const diagnostic = readAppServerFailureDiagnostic(error);
+        if (diagnostic) Object.defineProperty(mapped, 'nativeFailure', { value: diagnostic });
+        throw mapped;
       } finally {
         detach?.();
         detachWatchdog?.(); if (watchdog) closeCodeExecutionWatchdog(watchdog);
