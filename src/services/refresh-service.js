@@ -8,6 +8,7 @@ import {
 import { prioritize } from "../domain/prioritizer.js";
 import { diffSnapshots } from "../domain/snapshot-diff.js";
 import { runStructuredProviderRequest } from "../lib/structured-provider-request.js";
+import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 import {
   resolveEffectivePullRequestUpdatedWindow,
 } from "../domain/pull-request-updated-window.js";
@@ -185,6 +186,7 @@ export class RefreshService {
     clock = () => new Date(),
     auxiliaryTimeoutMs = AUXILIARY_TIMEOUT_MS,
     dingtalkTimeoutMs = DINGTALK_TIMEOUT_MS,
+    dingtalkSummaryTimeoutMs = 180_000,
   }) {
     this.github = github;
     this.brain = brain;
@@ -204,6 +206,12 @@ export class RefreshService {
       throw new TypeError("RefreshService dingtalkTimeoutMs must be between 1 and 30000");
     }
     this.dingtalkTimeoutMs = dingtalkTimeoutMs;
+    if (!Number.isSafeInteger(dingtalkSummaryTimeoutMs) || dingtalkSummaryTimeoutMs < 1 || dingtalkSummaryTimeoutMs > 600_000) {
+      throw new TypeError("RefreshService dingtalkSummaryTimeoutMs must be between 1 and 600000");
+    }
+    this.dingtalkSummaryTimeoutMs = dingtalkSummaryTimeoutMs;
+    this.pendingDingTalkSummary = null;
+    this.summaryOperations = Promise.resolve();
     this.running = null;
     this.operationQueue = operationQueue;
     this.repairProgressReader = repairProgressReader;
@@ -224,6 +232,41 @@ export class RefreshService {
     return this.#enqueue(() =>
       this.#confirmPullRequestResponsibility(id, actionState, headRefOid),
     );
+  }
+
+  summarizePendingDingTalk({ signal } = {}) {
+    const operation = this.summaryOperations.then(async () => {
+      signal?.throwIfAborted();
+      const request = this.pendingDingTalkSummary;
+      if (!request) return { skipped: "no_pending_summary" };
+      const meta = { enabled: true, errors: [] };
+      const items = await this.#summarizeDingTalk(request.items, meta, signal,
+        performance.now() + this.dingtalkSummaryTimeoutMs);
+      return this.#enqueue(async () => {
+        signal?.throwIfAborted();
+        const current = await this.store.read("snapshot");
+        if (this.pendingDingTalkSummary !== request || current?.refreshedAt !== request.refreshedAt ||
+            current.brain?.dingtalkSummaryFingerprint !== request.fingerprint) return { skipped: "snapshot_changed" };
+        const brain = { ...current.brain, ...meta,
+          errors: [...current.brain.errors, ...meta.errors],
+          dingtalkSummaryState: meta.dingtalkSummaryError ? "failed" : "complete" };
+        // Summary metadata must not replace PR assessment/provider metadata.
+        brain.enabled = current.brain.enabled;
+        const next = { ...current, brain,
+          items: [...current.items.filter(item => !Object.values(DINGTALK_KINDS_BY_SOURCE).flat().includes(item.kind)), ...items],
+          sources: { ...current.sources, dingtalk: items.length } };
+        const previous = await this.store.read("previous-snapshot");
+        const dashboard = buildDashboard(next, previous, dashboardOptions(this.config));
+        dashboard.dingtalkReport = projectDingTalkReportState(normalizeDingTalkReportState(await this.store.read(DINGTALK_REPORT_STATE_KEY)));
+        signal?.throwIfAborted();
+        await this.store.write("snapshot", next);
+        await this.store.write("dashboard", dashboard);
+        this.pendingDingTalkSummary = null;
+        return { summarized: brain.dingtalkSummarized, state: brain.dingtalkSummaryState };
+      });
+    });
+    this.summaryOperations = operation.catch(() => {});
+    return operation;
   }
 
   #enqueue(operation) {
@@ -393,7 +436,7 @@ export class RefreshService {
     }
   }
 
-  async #performRefresh({ notify = false, signal } = {}) {
+  async #performRefresh({ notify = false, signal, deferDingTalkSummary = false } = {}) {
     signal?.throwIfAborted();
     const startedAt = clockMilliseconds(this.clock);
     const observationLowerBound = new Date(startedAt).toISOString();
@@ -526,11 +569,38 @@ export class RefreshService {
       (dingtalkResult.failedSources || [])
         .flatMap((source) => DINGTALK_KINDS_BY_SOURCE[source] || []),
     );
-    const freshDingTalkItems = dingtalkResult.retained ? dingtalkResult.items :
-      await this.#summarizeDingTalk(dingtalkResult.items, assessedPullRequests.meta, signal, performance.now() + this.auxiliaryTimeoutMs);
+    const prepared = prepareDingTalkDigest(dingtalkResult.items);
+    const fingerprint = canonicalJsonDigest([dingTalkDigestFacts(prepared.groups), this.config.brain ?? null]);
+    let summaryRequest = null;
+    let freshDingTalkItems;
+    const reusable = !dingtalkResult.retained && previous?.brain?.dingtalkSummaryState === "complete" && previous.brain.dingtalkSummarized > 0 &&
+      previous.brain.dingtalkSummaryFingerprint === fingerprint;
+    if (reusable) {
+      const ids = new Set(prepared.groups.map(group => `dingtalk:digest:${group.groupId}`));
+      freshDingTalkItems = [...prepared.passthrough, ...previous.items.filter(item => ids.has(item.id))];
+      Object.assign(assessedPullRequests.meta, { dingtalkSummaryFingerprint: fingerprint, dingtalkSummaryState: "complete",
+        dingtalkGroups: prepared.groups.length, dingtalkSummarized: previous.brain.dingtalkSummarized });
+      for (const key of ["fallbackUsed", "fallbackProvider", "fallbackModel"]) {
+        if (Object.hasOwn(previous.brain, key)) assessedPullRequests.meta[key] = previous.brain[key];
+      }
+    } else if (deferDingTalkSummary && !dingtalkResult.retained && prepared.groups.length > 0 &&
+        assessedPullRequests.meta.enabled && typeof this.brain?.summarizeDingTalk === "function") {
+      freshDingTalkItems = applyDingTalkSummaries(prepared);
+      Object.assign(assessedPullRequests.meta, { dingtalkSummaryFingerprint: fingerprint, dingtalkSummaryState: "pending",
+        dingtalkGroups: prepared.groups.length, dingtalkSummarized: 0 });
+      summaryRequest = { refreshedAt: observationLowerBound, fingerprint, items: structuredClone(dingtalkResult.items) };
+    } else {
+      freshDingTalkItems = dingtalkResult.retained ? dingtalkResult.items :
+        await this.#summarizeDingTalk(dingtalkResult.items, assessedPullRequests.meta, signal, performance.now() + this.dingtalkSummaryTimeoutMs);
+      if (!dingtalkResult.retained) Object.assign(assessedPullRequests.meta, {
+        dingtalkSummaryFingerprint: fingerprint, dingtalkSummaryState: assessedPullRequests.meta.dingtalkSummaryError ? "failed" : "complete" });
+    }
     const summarizedDingTalkItems = deduplicate([
       ...freshDingTalkItems,
       ...previousItems.filter((item) => staleDingTalkKinds.has(item.kind)),
+    ]);
+    if (summaryRequest) summaryRequest.items = deduplicate([
+      ...summaryRequest.items, ...previousItems.filter(item => staleDingTalkKinds.has(item.kind)),
     ]);
     signal?.throwIfAborted();
 
@@ -682,6 +752,7 @@ export class RefreshService {
       notificationDiff,
       notification,
     });
+    this.pendingDingTalkSummary = summaryRequest;
     return { dashboard, diff, notification };
   }
 }

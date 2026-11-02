@@ -6,18 +6,112 @@ import { OwnPrRepairProgressReader } from "../src/services/own-pr-repair-progres
 
 const REFRESH_STARTED_AT = "2026-08-13T01:02:03.004Z";
 
-function isolatedRefresh({ collect, summarizeDingTalk, auxiliaryTimeoutMs = 15, dingtalkTimeoutMs = auxiliaryTimeoutMs }) {
+function isolatedRefresh({ collect, summarizeDingTalk, auxiliaryTimeoutMs = 15, dingtalkTimeoutMs = auxiliaryTimeoutMs, dingtalkSummaryTimeoutMs = auxiliaryTimeoutMs }) {
   const store = new MemoryStore();
   const service = new RefreshService({
     github: { async searchRelevantPullRequests() { return [pullRequest()]; },
       async searchIssues() { return []; }, async versions() { return []; } },
     dingtalk: { collect }, brain: { summarizeDingTalk }, store, notifier: {},
-    auxiliaryTimeoutMs, dingtalkTimeoutMs, clock: () => new Date(REFRESH_STARTED_AT),
+    auxiliaryTimeoutMs, dingtalkTimeoutMs, dingtalkSummaryTimeoutMs, clock: () => new Date(REFRESH_STARTED_AT),
     config: { trackedRepositories: [], dingtalk: { enabled: true },
       brain: { enabled: true }, prResponsibility: { historicalAfterDays: 60 } },
   });
   return { store, service };
 }
+
+function deferredSummaryFixture() {
+  let title = "版本发布，请确认风险";
+  let finish;
+  let summarySignal;
+  let calls = 0;
+  const fixture = isolatedRefresh({
+    dingtalkSummaryTimeoutMs: 1000,
+    collect: async () => ({ errors: [], items: [{ id: "message:release", kind: "message", context: "研发群",
+      title, updatedAt: REFRESH_STARTED_AT }] }),
+    summarizeDingTalk: (groups, { signal }) => {
+      calls++; summarySignal = signal;
+      return new Promise(resolve => { finish = () => resolve(groups.map(group => ({ groupId: group.groupId,
+        important: true, summary: "已核对的版本发布摘要", highlights: [], actionRequired: "确认风险" }))); });
+    },
+  });
+  return { ...fixture, change() { title = "新版本发布，请重新确认"; }, finish() { finish(); },
+    get calls() { return calls; }, get signal() { return summarySignal; } };
+}
+
+test("deferred summaries do not block facts, and unchanged messages reuse the completed summary", async () => {
+  const f = deferredSummaryFixture();
+  await f.service.refresh({ deferDingTalkSummary: true });
+  assert.equal(f.calls, 0);
+  assert.equal((await f.store.read("snapshot")).brain.dingtalkSummaryState, "pending");
+  const summary = f.service.summarizePendingDingTalk();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.calls, 1);
+  f.finish(); await summary;
+  assert.equal((await f.store.read("snapshot")).items.find(x => x.kind === "message").summaryStatus, "ai");
+  await f.service.refresh({ deferDingTalkSummary: true });
+  await f.service.summarizePendingDingTalk();
+  assert.equal(f.calls, 1, "unchanged messages must not trigger another model call");
+});
+
+test("a deferred response cannot overwrite a newer message snapshot", async () => {
+  const f = deferredSummaryFixture();
+  await f.service.refresh({ deferDingTalkSummary: true });
+  const summary = f.service.summarizePendingDingTalk();
+  await new Promise(resolve => setImmediate(resolve));
+  f.change(); await f.service.refresh({ deferDingTalkSummary: true });
+  const before = JSON.stringify(await f.store.read("snapshot"));
+  f.finish(); await summary;
+  assert.equal(JSON.stringify(await f.store.read("snapshot")), before);
+});
+
+test("deferred summaries preserve retained sources and concurrent PR metadata", async () => {
+  const f = deferredSummaryFixture();
+  await f.store.write("snapshot", { refreshedAt: REFRESH_STARTED_AT, items: [{
+    id: "mail:retained", kind: "mail", summaryStatus: "fallback", title: "旧邮箱摘要",
+  }] });
+  const collect = f.service.dingtalk.collect;
+  f.service.dingtalk.collect = async (...args) => ({ ...await collect(...args), errors: ["mail: unavailable"], failedSources: ["mail"] });
+  await f.service.refresh({ deferDingTalkSummary: true });
+  const summary = f.service.summarizePendingDingTalk();
+  await new Promise(resolve => setImmediate(resolve));
+  const current = await f.store.read("snapshot");
+  current.brain.assessed = 7;
+  current.items.find(x => x.kind === "pull_request").headRefOid = "current-head";
+  await f.store.write("snapshot", current);
+  f.finish(); await summary;
+  const next = await f.store.read("snapshot");
+  assert.equal(next.items.find(x => x.id === "mail:retained").title, "旧邮箱摘要");
+  assert.equal(next.items.find(x => x.kind === "pull_request").headRefOid, "current-head");
+  assert.equal(next.brain.assessed, 7);
+  assert.equal(next.sourceStatus.dingtalk.stale, true);
+});
+
+test("changed summary model invalidates the cache while duplicate workers share one result", async () => {
+  const f = deferredSummaryFixture();
+  await f.service.refresh({ deferDingTalkSummary: true });
+  const first = f.service.summarizePendingDingTalk();
+  const duplicate = f.service.summarizePendingDingTalk();
+  await new Promise(resolve => setImmediate(resolve));
+  f.finish(); await Promise.all([first, duplicate]);
+  assert.equal(f.calls, 1);
+  f.service.config.brain.model = "changed-model";
+  await f.service.refresh({ deferDingTalkSummary: true });
+  assert.equal((await f.store.read("snapshot")).brain.dingtalkSummaryState, "pending");
+});
+
+test("shutdown cancels deferred summarization without publishing a late result", async () => {
+  const f = deferredSummaryFixture();
+  await f.service.refresh({ deferDingTalkSummary: true });
+  const controller = new AbortController();
+  const summary = f.service.summarizePendingDingTalk({ signal: controller.signal });
+  await new Promise(resolve => setImmediate(resolve));
+  const before = JSON.stringify(await f.store.read("snapshot"));
+  const reason = new Error("shutdown"); controller.abort(reason);
+  await assert.rejects(summary, error => error === reason);
+  assert.equal(f.signal.aborted, true);
+  f.finish(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(JSON.stringify(await f.store.read("snapshot")), before);
+});
 
 test("DingTalk collection can outlive the AI budget and still publish fresh data", async () => {
   const { store, service } = isolatedRefresh({

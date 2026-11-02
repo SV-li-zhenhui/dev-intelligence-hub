@@ -4101,8 +4101,8 @@ function backgroundOperationOptions(input, signal) {
   return options;
 }
 
-function backgroundRefreshOptions(notify, signal) {
-  return backgroundOperationOptions({ notify }, signal);
+function backgroundRefreshOptions(notify, signal, deferDingTalkSummary = false) {
+  return backgroundOperationOptions({ notify, ...(deferDingTalkSummary ? { deferDingTalkSummary: true } : {}) }, signal);
 }
 
 async function drainBackgroundWork(operation, drainTimeoutMs) {
@@ -4816,11 +4816,18 @@ export function startApplicationBackgroundWork(
           () => runDrainParticipant(
             DRAIN_PARTICIPANTS.refresh,
             () => application.refreshService.refresh(
-              backgroundRefreshOptions(notify, signal),
+              backgroundRefreshOptions(notify, signal, typeof application.refreshService.summarizePendingDingTalk === "function"),
             ),
           ),
           signal,
-        ),
+        ).then(result => {
+          if (!stopped && typeof application.refreshService.summarizePendingDingTalk === "function") {
+            // Enrichment owns a tracked lifetime, but never holds fact admission.
+            runTracked(summarySignal => runDrainParticipant(DRAIN_PARTICIPANTS.refresh,
+              () => application.refreshService.summarizePendingDingTalk({ signal: summarySignal })));
+          }
+          return result;
+        }),
       runOptions,
     );
   }

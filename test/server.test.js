@@ -242,6 +242,29 @@ test('continuation watchdog still stops owned work after fact refresh fails', { 
   } finally { release.resolve(); await background.stop(); }
 });
 
+test('deferred DingTalk enrichment releases facts and remains owned by shutdown', { timeout: 5_000 }, async () => {
+  const started = deferred();
+  let summarySignal, deferredRefresh;
+  const background = startApplicationBackgroundWork({ config: { refreshMinutes: 7 },
+    refreshService: {
+      async refresh(options) { deferredRefresh = options.deferDingTalkSummary; },
+      async summarizePendingDingTalk({ signal }) {
+        summarySignal = signal; started.resolve();
+        await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+      },
+    },
+    employeeRegistry: { schedules: () => [], async runAll() {} },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError() {} });
+  try {
+    await background.initialRefresh;
+    await started.promise;
+    assert.equal(deferredRefresh, true);
+    assert.equal(summarySignal.aborted, false);
+    await background.stop();
+    assert.equal(summarySignal.aborted, true);
+  } finally { await background.stop(); }
+});
+
 test('shutdown removes unstarted queued manual work while still draining admitted work', { timeout: 5_000 }, async () => {
   const codeStarted = deferred(), releaseCode = deferred();
   let roleCalls = 0;
