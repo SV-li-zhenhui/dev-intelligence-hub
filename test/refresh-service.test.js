@@ -6,18 +6,47 @@ import { OwnPrRepairProgressReader } from "../src/services/own-pr-repair-progres
 
 const REFRESH_STARTED_AT = "2026-08-13T01:02:03.004Z";
 
-function isolatedRefresh({ collect, summarizeDingTalk, auxiliaryTimeoutMs = 15 }) {
+function isolatedRefresh({ collect, summarizeDingTalk, auxiliaryTimeoutMs = 15, dingtalkTimeoutMs = auxiliaryTimeoutMs }) {
   const store = new MemoryStore();
   const service = new RefreshService({
     github: { async searchRelevantPullRequests() { return [pullRequest()]; },
       async searchIssues() { return []; }, async versions() { return []; } },
     dingtalk: { collect }, brain: { summarizeDingTalk }, store, notifier: {},
-    auxiliaryTimeoutMs, clock: () => new Date(REFRESH_STARTED_AT),
+    auxiliaryTimeoutMs, dingtalkTimeoutMs, clock: () => new Date(REFRESH_STARTED_AT),
     config: { trackedRepositories: [], dingtalk: { enabled: true },
       brain: { enabled: true }, prResponsibility: { historicalAfterDays: 60 } },
   });
   return { store, service };
 }
+
+test("DingTalk collection can outlive the AI budget and still publish fresh data", async () => {
+  const { store, service } = isolatedRefresh({
+    auxiliaryTimeoutMs: 10, dingtalkTimeoutMs: 200,
+    collect: async () => {
+      await new Promise(resolve => setTimeout(resolve, 40));
+      return { errors: [], items: [{ id: "todo:fresh", kind: "todo", title: "fresh task" }] };
+    },
+  });
+  await service.refresh();
+  const snapshot = await store.read("snapshot");
+  assert.equal(snapshot.sourceStatus.dingtalk.ok, true);
+  assert.ok(snapshot.items.some(item => item.id === "todo:fresh"));
+});
+
+test("DingTalk starts while GitHub discovery is pending", async () => {
+  let collected;
+  const collectionStarted = new Promise(resolve => { collected = resolve; });
+  const { service } = isolatedRefresh({ collect: async () => {
+    collected(); return { items: [], errors: [] };
+  } });
+  service.github.searchRelevantPullRequests = async () => {
+    await collectionStarted; return [pullRequest()];
+  };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error("collection did not start alongside GitHub")), 500);
+  try { await service.refresh({ signal: controller.signal }); }
+  finally { clearTimeout(timer); }
+});
 
 test("a stuck message source cannot hold fresh GitHub facts or replace them after its deadline", async () => {
   let finishCollection;
@@ -45,7 +74,7 @@ test("a stuck message source cannot hold fresh GitHub facts or replace them afte
   } finally { clearTimeout(timer); finishCollection({ items: [], errors: [] }); }
 });
 
-test("a stuck AI digest falls back to collected messages within the shared auxiliary budget", async () => {
+test("a stuck AI digest falls back to collected messages within its bounded budget", async () => {
   let finishSummary;
   let summarySignal;
   const pending = new Promise(resolve => { finishSummary = resolve; });

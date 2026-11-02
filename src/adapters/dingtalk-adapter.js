@@ -1,5 +1,6 @@
 import { runCommand, runJson } from "../lib/command-runner.js";
 import { DingTalkMailAdapter } from "./dingtalk-mail-adapter.js";
+import { runStructuredProviderRequest } from "../lib/structured-provider-request.js";
 
 function isoWithOffset(date) {
   const offset = -date.getTimezoneOffset();
@@ -97,18 +98,32 @@ export class DingTalkAdapter {
     this.mail = new DingTalkMailAdapter({ run, ownerLogin });
   }
 
-  async collect(since, { signal = null, mailEnabled = false } = {}) {
+  async collect(since, { signal = null, mailEnabled = false, sourceTimeoutMs = null } = {}) {
+    if (sourceTimeoutMs !== null && (!Number.isSafeInteger(sourceTimeoutMs) || sourceTimeoutMs < 1 || sourceTimeoutMs > 30_000)) {
+      throw new TypeError("DingTalk sourceTimeoutMs must be between 1 and 30000");
+    }
+    signal?.throwIfAborted();
     const now = new Date();
     const start = new Date(now);
     start.setHours(0, 0, 0, 0);
-    const commandOptions = signal === null ? {} : { signal };
+    const read = operation => {
+      if (sourceTimeoutMs === null) return Promise.resolve().then(() => operation(signal === null ? {} : { signal }));
+      const controller = new AbortController();
+      return runStructuredProviderRequest({
+        controller, timeoutMs: sourceTimeoutMs, signal,
+        operation: () => operation({ signal: controller.signal }),
+        cancellationError: () => signal.reason,
+        timeoutError: () => Object.assign(new Error("数据源读取超时，本轮保留该来源已有数据"), { code: "DINGTALK_SOURCE_TIMEOUT" }),
+      });
+    };
     const [dailyMessages, unread, mentions, todos, mail] = await Promise.allSettled([
-      this.dailyMessages(start, now, commandOptions),
-      this.unreadConversations(commandOptions),
-      this.mentions(start, now, commandOptions),
-      this.todos(commandOptions),
-      mailEnabled ? this.mail.collect(now, commandOptions) : Promise.resolve([]),
+      read(options => this.dailyMessages(start, now, options)),
+      read(options => this.unreadConversations(options)),
+      read(options => this.mentions(start, now, options)),
+      read(options => this.todos(options)),
+      mailEnabled ? read(options => this.mail.collect(now, options)) : Promise.resolve([]),
     ]);
+    signal?.throwIfAborted();
     const errors = [];
     const failedSources = [];
     const value = (result, label) => {

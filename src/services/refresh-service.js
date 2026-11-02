@@ -25,6 +25,7 @@ import {
 
 const DINGTALK_REPORT_STATE_KEY = "dingtalk-report-state";
 const AUXILIARY_TIMEOUT_MS = 5_000;
+const DINGTALK_TIMEOUT_MS = 30_000;
 
 function auxiliaryTimeoutError() {
   return Object.assign(new Error("辅助数据读取超时，本轮保留已有数据"), {
@@ -183,6 +184,7 @@ export class RefreshService {
     repairProgressReader = null,
     clock = () => new Date(),
     auxiliaryTimeoutMs = AUXILIARY_TIMEOUT_MS,
+    dingtalkTimeoutMs = DINGTALK_TIMEOUT_MS,
   }) {
     this.github = github;
     this.brain = brain;
@@ -198,6 +200,10 @@ export class RefreshService {
       throw new TypeError("RefreshService auxiliaryTimeoutMs must be between 1 and 30000");
     }
     this.auxiliaryTimeoutMs = auxiliaryTimeoutMs;
+    if (!Number.isSafeInteger(dingtalkTimeoutMs) || dingtalkTimeoutMs < 1 || dingtalkTimeoutMs > 30_000) {
+      throw new TypeError("RefreshService dingtalkTimeoutMs must be between 1 and 30000");
+    }
+    this.dingtalkTimeoutMs = dingtalkTimeoutMs;
     this.running = null;
     this.operationQueue = operationQueue;
     this.repairProgressReader = repairProgressReader;
@@ -406,6 +412,21 @@ export class RefreshService {
     const errors = [];
     const since = previous?.refreshedAt;
 
+    // Collect independent sources while GitHub is loading. A slow mailbox gets
+    // its own bounded read, without spending the optional AI enrichment budget.
+    const dingtalkCollection = this.config.dingtalk.enabled
+      ? auxiliaryRead(stageSignal => this.dingtalk.collect(since, {
+          signal: stageSignal, mailEnabled: this.config.dingtalk.mailEnabled === true,
+          sourceTimeoutMs: Math.max(1, this.dingtalkTimeoutMs - Math.min(1000, Math.floor(this.dingtalkTimeoutMs / 5))),
+        }), performance.now() + this.dingtalkTimeoutMs, signal).catch((error) => ({
+          items: previousItems.filter((item) =>
+            ["announcement", "message", "mention", "todo", "conversation",
+              ...(this.config.dingtalk.mailEnabled ? ["mail"] : [])].includes(item.kind)),
+          errors: [`钉钉: ${error.message}`],
+          retained: true,
+        }))
+      : Promise.resolve({ items: [], errors: [] });
+
     const githubCalls = this.config.githubRead?.enabled === false
       ? [[], [], []].map((value) => ({ status: "fulfilled", value }))
       : await Promise.allSettled([
@@ -486,31 +507,13 @@ export class RefreshService {
         responsibilityConfirmedAt: override.confirmedAt || "",
       };
     });
-    // One shared budget covers optional enrichment, rather than one timeout per source or PR.
+    // PR assessments share one budget rather than one timeout per PR.
     const auxiliaryDeadline = performance.now() + this.auxiliaryTimeoutMs;
     const brainAssessment = this.#assessUncertainPullRequests(
       classifiedPullRequests,
       signal,
       auxiliaryDeadline,
     );
-    const dingtalkCollection = this.config.dingtalk.enabled
-      ? auxiliaryRead(stageSignal => this.dingtalk.collect(since, {
-          signal: stageSignal, mailEnabled: this.config.dingtalk.mailEnabled === true,
-        }), auxiliaryDeadline, signal).catch((error) => ({
-          items: previousItems.filter((item) =>
-            [
-              "announcement",
-              "message",
-              "mention",
-              "todo",
-              "conversation",
-              ...(this.config.dingtalk.mailEnabled ? ["mail"] : []),
-            ].includes(item.kind),
-          ),
-          errors: [`钉钉: ${error.message}`],
-          retained: true,
-        }))
-      : Promise.resolve({ items: [], errors: [] });
     const [assessedPullRequests, dingtalkResult] = await Promise.all([
       brainAssessment,
       dingtalkCollection,
@@ -524,7 +527,7 @@ export class RefreshService {
         .flatMap((source) => DINGTALK_KINDS_BY_SOURCE[source] || []),
     );
     const freshDingTalkItems = dingtalkResult.retained ? dingtalkResult.items :
-      await this.#summarizeDingTalk(dingtalkResult.items, assessedPullRequests.meta, signal, auxiliaryDeadline);
+      await this.#summarizeDingTalk(dingtalkResult.items, assessedPullRequests.meta, signal, performance.now() + this.auxiliaryTimeoutMs);
     const summarizedDingTalkItems = deduplicate([
       ...freshDingTalkItems,
       ...previousItems.filter((item) => staleDingTalkKinds.has(item.kind)),
