@@ -1,3 +1,4 @@
+import { createLanTaskBoard } from "./services/lan-task-board.js";
 import {
   createHash,
   createHmac,
@@ -2642,6 +2643,7 @@ export function createDashboardServer(
   shutdownDrainTimeoutMs = shutdownTimeoutMilliseconds(shutdownDrainTimeoutMs);
   const processController = createManagedProcessController(managedProcess);
   const expectedOrigin = `http://127.0.0.1:${application.config.port}`;
+  const lanTaskBoard = createLanTaskBoard(() => application.taskRuns?.list() ?? {});
   const employeeRegistry = resolveEmployeeRegistry(application);
   const operationalAdmission = resolveOperationalAdmission(application);
   const handleRequest = async (
@@ -3387,6 +3389,17 @@ export function createDashboardServer(
         sendJson(response, 200, result);
         return;
       }
+      if (url.pathname === "/api/lan-task-board" && ["GET", "POST"].includes(request.method)) {
+        requireNoQuery(url);
+        if (request.socket.remoteAddress !== "127.0.0.1") throw httpError(403, "仅本机可以管理局域网看板");
+        if (request.method === "POST") {
+          assertTrustedMutation(request, expectedOrigin, { json: true });
+          sendJson(response, 200, await lanTaskBoard.configure(await readJsonBody(request)));
+        } else {
+          sendJson(response, 200, lanTaskBoard.view());
+        }
+        return;
+      }
       if (request.method === 'GET' && url.pathname === '/api/task-runs') {
         requireNoQuery(url);
         sendJson(response,200,application.taskRuns ? await application.taskRuns.list() : {enabled:false,items:[],held:[]});
@@ -4009,6 +4022,7 @@ export function createDashboardServer(
     }
   };
   const server = http.createServer(handleRequest);
+  server.once("close", () => { void lanTaskBoard.close().catch(reportError); });
   const managedServer = attachServerLifecycle(
     server,
     application,

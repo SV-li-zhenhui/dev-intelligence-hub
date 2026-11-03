@@ -79,6 +79,7 @@
             <h1 id="page-title" tabindex="-1">今天需要你推动什么</h1>
           </div>
           <div class="topbar-actions">
+            <button class="secondary-button" id="lan-board-open" type="button">局域网查看</button>
             <span id="last-updated" class="last-updated">尚未刷新</span>
             <button class="refresh-button" id="refresh-button">
               <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -114,6 +115,21 @@
       <div id="confirmation-content"></div>
     </dialog>
 
+    <dialog id="lan-board-dialog" aria-labelledby="lan-board-title">
+      <div class="detail">
+        <h2 id="lan-board-title">局域网任务看板</h2>
+        <p>启用后，白名单中的设备可以查看任务名称、岗位和状态。服务重启后默认关闭。</p>
+        <form id="lan-board-form">
+          <label><input type="checkbox" name="enabled"> 允许局域网查看</label>
+          <p><label>本机监听 IPv4 <input name="host" placeholder="192.168.1.20"></label></p>
+          <p><label>同事设备的 IPv4，每行一个<br><textarea name="allow" rows="4" placeholder="192.168.1.35"></textarea></label></p>
+          <p><output id="lan-board-status" aria-live="polite"></output></p>
+          <button class="secondary-button" type="submit">应用设置</button>
+          <button class="secondary-button" id="lan-board-close" type="button">关闭窗口</button>
+        </form>
+      </div>
+    </dialog>
+    <script type="module" src="/lan-board-settings.js"></script>
     <script type="module" src="/app.js"></script>
   </body>
 </html>

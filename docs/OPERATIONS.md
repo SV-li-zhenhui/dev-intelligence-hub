@@ -5,6 +5,15 @@ data, backups, restore control state, and managed-process runtime on trusted
 local storage. Do not publish port 4173 through a proxy, port forward, or LAN
 listener.
 
+The optional LAN task board uses a separate listener on port 4174. From the
+local dashboard, open **局域网查看**, enter the host's private IPv4 address
+and the exact private IPv4 addresses of colleagues' devices, then apply the
+settings. Allow inbound TCP 4174 from those addresses if the Windows firewall
+blocks access. The board shares task titles, roles, states, and update times.
+It uses the TCP peer address for admission. Disabling the board closes its
+listener and active connections. The setting starts disabled after each
+service restart.
+
 ## Prerequisites
 
 - Node.js 22 or newer and `npm`.
