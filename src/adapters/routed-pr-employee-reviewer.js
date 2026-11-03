@@ -1,6 +1,7 @@
 import { normalizeBrainConfig } from "../services/brain-router.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { githubEntitySessionKey } from "../lib/session-key.js";
+import { normalizeNativeFailure } from "../services/task-run-execution-receipts.js";
 import { InvalidEmployeeResultError, preparePrEmployeeAnalysis, parsePrEmployeeResult } from "./ollama-pr-employee-reviewer.js";
 
 const FALLBACK_CODES = new Set([
@@ -54,6 +55,7 @@ export class RoutedPrEmployeeReviewer {
     if (signal?.aborted) abort();
     let timer;
     let fallbackReason;
+    let nativeFailure;
     try {
       const generate = () => {
         controller.signal.throwIfAborted();
@@ -81,14 +83,20 @@ export class RoutedPrEmployeeReviewer {
       else if (timedOut && ["STRUCTURED_PROVIDER_CANCELLED", "BRAIN_REQUEST_CANCELLED", "PR_EMPLOYEE_PRIMARY_TIMEOUT"].includes(error?.code)) {
         fallbackReason = "PR_EMPLOYEE_PRIMARY_TIMEOUT";
       } else throw error;
+      try {
+        nativeFailure = normalizeNativeFailure(Object.getOwnPropertyDescriptor(error, "nativeFailure")?.value);
+      } catch { /* Only retain validated protocol metadata. */ }
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
     }
     signal?.throwIfAborted();
     const brain = { provider: this.fallback.provider, model: this.fallback.model,
-      fallbackFrom: { provider: this.provider, model: this.model, reason: fallbackReason } };
+      fallbackFrom: { provider: this.provider, model: this.model, reason: fallbackReason,
+        ...(nativeFailure ? { nativeFailure } : {}) } };
     try {
+      await this.fallback.checkAvailability?.(options);
+      signal?.throwIfAborted();
       const analysis = await this.fallback.analyze(input, options);
       signal?.throwIfAborted();
       return { analysis, brain };
@@ -97,7 +105,7 @@ export class RoutedPrEmployeeReviewer {
       signal?.throwIfAborted();
       if (error !== null && (typeof error === "object" || typeof error === "function")) {
         const knownFailure = error instanceof InvalidEmployeeResultError || FALLBACK_CODES.has(error?.code) || transportFailure(error, brain.provider);
-        const modelFailure = knownFailure && (fallbackReason === "PR_EMPLOYEE_RESULT_INVALID" || MODEL_FAILURE_CODES.has(fallbackReason) ||
+        const modelFailure = error?.code !== "STRUCTURED_PROVIDER_UNAVAILABLE" && knownFailure && (fallbackReason === "PR_EMPLOYEE_RESULT_INVALID" || MODEL_FAILURE_CODES.has(fallbackReason) ||
           error instanceof InvalidEmployeeResultError || MODEL_FAILURE_CODES.has(error?.code));
         const infrastructureFailure = !modelFailure && (transportFailure(error, brain.provider) ||
           (FALLBACK_CODES.has(error?.code) && !MODEL_FAILURE_CODES.has(error.code)));

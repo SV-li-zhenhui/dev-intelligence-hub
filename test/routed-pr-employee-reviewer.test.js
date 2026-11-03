@@ -12,7 +12,8 @@ const result = { workType: "triage_plan", summary: "Transfer to PR engineer", co
 const fail = (code) => Object.assign(new Error(code), { code });
 function setup(generate, overrides = {}) {
   let fallbackCalls = 0;
-  const fallback = new OllamaPrEmployeeReviewer({ model: "qwen3.5:9b", fetch: async () => {
+  const fallback = new OllamaPrEmployeeReviewer({ model: "qwen3.5:9b", fetch: async (url) => {
+    if (url.endsWith("/api/tags")) return { ok: true, json: async () => ({ models: [{ name: "qwen3.5:9b" }] }) };
     fallbackCalls += 1;
     return { ok: true, json: async () => ({ message: { content: JSON.stringify(result) } }) };
   } });
@@ -173,6 +174,24 @@ test("backup failure remains a real failed analysis", async () => {
     modelFailure: false,
   });
   assert.equal(run.reviewer.getFailureReceipt(new Error("unrelated failure")), null);
+});
+
+test("an unavailable backup never receives PR data and retains the primary protocol failure", async () => {
+  const nativeFailure = { kind: "rpc_error", method: "turn/start", code: -32603 };
+  const fallback = new OllamaPrEmployeeReviewer({ fetch: async (url, options) => {
+    assert.match(url, /\/api\/tags$/);
+    assert.equal(options.body, undefined);
+    return { ok: true, json: async () => ({ models: [] }) };
+  } });
+  const run = setup(async () => { throw Object.assign(fail("STRUCTURED_PROVIDER_PROCESS_FAILED"), { nativeFailure }); }, { fallback });
+  await assert.rejects(run.reviewer.analyze(input), error => {
+    assert.equal(error.code, "STRUCTURED_PROVIDER_UNAVAILABLE");
+    const receipt = run.reviewer.getFailureReceipt(error);
+    assert.equal(receipt.infrastructureFailure, true);
+    assert.equal(receipt.modelFailure, false);
+    assert.deepEqual(receipt.brain.fallbackFrom.nativeFailure, nativeFailure);
+    return true;
+  });
 });
 
 test("failed fallback receipt cannot be forged by error properties or modified after retrieval", async () => {
