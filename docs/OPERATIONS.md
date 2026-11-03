@@ -14,8 +14,9 @@ endpoints for GitHub work, employees, workflow, work records, test inventory,
 and task state. DingTalk content, memory search, CLI transcripts, management
 configuration, and mutation endpoints are reserved for the local interface.
 It uses the TCP peer address for admission. Disabling the board closes its
-listener and active connections. The setting starts disabled after each
-service restart.
+listener and active connections. Applied settings are saved locally and restored
+after service restart. A changed host address or occupied port leaves the LAN
+listener closed with an actionable error; the saved addresses remain editable.
 
 ## Prerequisites
 

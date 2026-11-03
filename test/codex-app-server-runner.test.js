@@ -106,7 +106,7 @@ test('startup completion after cancellation cannot initialize or start a model b
   });
 });
 
-function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null,initializationFailure=false,turnStartFailure=null,resumeFailure=null,exitDuringMethod=null,codeJob=false,reviewAgents=false,toolInventory=null,onInterrupt=null,contained=false}={}) {
+function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=false,stopGate=null,steerTurnId=null,initializationFailure=false,turnStartFailure=null,resumeFailure=null,exitDuringMethod=null,codeJob=false,reviewAgents=false,toolInventory=null,onInterrupt=null,contained=false,largeInheritedInventory=false}={}) {
   let options; const calls=[]; let finish,interruptId,signalStopping;
   const stopping=new Promise(resolve=>{signalStopping=resolve;});
   const done = new Promise((r)=>{finish=r;});
@@ -124,6 +124,11 @@ function fixture({hold=false,failed=false,stopFailure=false,manualInterrupt=fals
     }};
     if(request.method==='config/read' && reviewAgents) {
       result.config.features.multi_agent=true; result.config.agents.enabled=true;
+    }
+    if(request.method==='config/read' && largeInheritedInventory) {
+      result.config.mcp_servers.old.tools=Object.fromEntries(Array.from({length:4000},(_,i)=>[`tool_${i}`,{
+        description:'Inherited tool metadata',inputSchema:{type:'object',properties:{query:{type:'string'}}},
+      }]));
     }
     if(request.method.startsWith('thread/'))result={thread:{id:threadId}};
     if(request.method.startsWith('thread/') && (codeJob || reviewAgents))Object.assign(result,{approvalPolicy:'never',sandbox:{type:'readOnly',networkAccess:false}});
@@ -165,6 +170,17 @@ async function invocation(runner,execute=(run)=>run(),appServerOverrides={}) {
     appServer:{input:'safe task',model:'test-model',schema:{type:'object'},previous:null,...appServerOverrides}}),directory);}
   finally{if (codeExecutionWatchdog) closeCodeExecutionWatchdog(codeExecutionWatchdog); await rm(directory,{recursive:true,force:true});}
 }
+
+test('large inherited MCP metadata does not prevent an isolated review from starting', async () => {
+  const f=fixture({reviewAgents:true,largeInheritedInventory:true});
+  await invocation(f.runner, async run=>{
+    const result=await run();
+    assert.equal(result.exitCode,0);
+    const thread=f.calls.find(call=>call.method.startsWith('thread/'));
+    assert.deepEqual(thread.params.config.mcp_servers.old,{enabled:false});
+    assert.ok(f.calls.some(call=>call.method==='turn/start'));
+  }, {isolation:{reader:{url:'http://127.0.0.1:1234/read'},agentConfigPath:'private-reviewer.toml'}});
+});
 
 test('native review resume explicitly restores host reviewer flags before starting its turn', async () => {
   const f=fixture({reviewAgents:true});

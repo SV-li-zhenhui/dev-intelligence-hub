@@ -209,36 +209,54 @@ function optionalPullRequestSourceReconciler(ledger) {
       conflicted: 0,
     };
     if (reconcileBatch !== null && pendingRoots.length > 0) {
-      const summary = await getSummary();
-      throwIfAborted(signal);
-      const batch = await reconcileBatch({
-        expectedGraphRevision: summary.revision,
-        items: pendingRoots.slice(0, limit).map((root) => ({
-          itemId: root.itemId,
-          expectedRevision: root.revision,
-          expectedPendingRevision:
-            root.source.pendingRevision ?? root.source.activeRevision,
-        })),
-      });
-      throwIfAborted(signal);
-      if (!batch || !Array.isArray(batch.outcomes)) {
-        throw new TypeError(
-          "ledger reconcilePullRequestSourceBatch returned an invalid result",
-        );
-      }
-      result.scanned = batch.outcomes.length;
-      for (const outcome of batch.outcomes) {
-        if (outcome?.status === "applied") result.applied += 1;
-        else if (outcome?.status === "blocked") result.blocked += 1;
-        else if (
-          outcome?.status === "conflicted" ||
-          outcome?.status === "unchanged"
-        ) {
-          result.conflicted += 1;
-        } else {
+      // A blocked first page must not hide later roots. Each batch stops after
+      // its first write; limit counts applied roots, as in the single-item path.
+      for (let offset = 0; offset < pendingRoots.length && result.applied < limit;) {
+        const summary = await getSummary();
+        throwIfAborted(signal);
+        const roots = pendingRoots.slice(offset, offset + limit);
+        let batch;
+        try {
+          batch = await reconcileBatch({
+            expectedGraphRevision: summary.revision,
+            items: roots.map((root) => ({
+              itemId: root.itemId,
+              expectedRevision: root.revision,
+              expectedPendingRevision:
+                root.source.pendingRevision ?? root.source.activeRevision,
+            })),
+          });
+        } catch (error) {
+          throwIfAborted(signal);
+          if (!SOURCE_RECONCILIATION_CONFLICTS.has(error?.code)) throw error;
+          // Another lane changed the ledger. Keep CAS intact and defer these
+          // roots to a fresh cycle instead of failing housekeeping or spinning.
+          result.scanned += roots.length;
+          result.conflicted += roots.length;
+          offset += roots.length;
+          continue;
+        }
+        throwIfAborted(signal);
+        if (!batch || !Array.isArray(batch.outcomes) || batch.outcomes.length < 1 || batch.outcomes.length > roots.length) {
           throw new TypeError(
             "ledger reconcilePullRequestSourceBatch returned an invalid result",
           );
+        }
+        result.scanned += batch.outcomes.length;
+        offset += batch.outcomes.length;
+        for (const outcome of batch.outcomes) {
+          if (outcome?.status === "applied") result.applied += 1;
+          else if (outcome?.status === "blocked") result.blocked += 1;
+          else if (
+            outcome?.status === "conflicted" ||
+            outcome?.status === "unchanged"
+          ) {
+            result.conflicted += 1;
+          } else {
+            throw new TypeError(
+              "ledger reconcilePullRequestSourceBatch returned an invalid result",
+            );
+          }
         }
       }
       return result;

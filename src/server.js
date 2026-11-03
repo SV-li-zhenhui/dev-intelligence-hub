@@ -2644,7 +2644,7 @@ export function createDashboardServer(
   shutdownDrainTimeoutMs = shutdownTimeoutMilliseconds(shutdownDrainTimeoutMs);
   const processController = createManagedProcessController(managedProcess);
   const expectedOrigin = `http://127.0.0.1:${application.config.port}`;
-  const lanTaskBoard = createLanTaskBoard((target, signal) => readLanDashboard(expectedOrigin, target, signal));
+  const lanTaskBoard = createLanTaskBoard((target, signal) => readLanDashboard(expectedOrigin, target, signal), { store: application.store });
   const employeeRegistry = resolveEmployeeRegistry(application);
   const operationalAdmission = resolveOperationalAdmission(application);
   const handleRequest = async (
@@ -3397,6 +3397,7 @@ export function createDashboardServer(
           assertTrustedMutation(request, expectedOrigin, { json: true });
           sendJson(response, 200, await lanTaskBoard.configure(await readJsonBody(request)));
         } else {
+          await lanTaskBoard.ready;
           sendJson(response, 200, lanTaskBoard.view());
         }
         return;

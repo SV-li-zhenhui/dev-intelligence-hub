@@ -556,6 +556,40 @@ test("housekeeping reconciles a bounded PR source batch against one ledger revis
   });
 });
 
+for (const conflict of [false, true]) test(`PR source batches reach later roots after ${conflict ? 'CAS conflict' : 'blocked first batch'}`, async () => {
+  const roots = [1, 2, 3].map(n => ({ itemId: `root-${n}`, revision: 2,
+    source: { activeRevision: 1, pendingRevision: 2 } }));
+  const batches = [];
+  const { service, calls } = fixture({ intakeLimit: 2, ledger: {
+    async intake() {},
+    async listPendingPullRequestSources() { return { items: roots, nextCursor: null }; },
+    async getSummary() { return { revision: 10 + batches.length }; },
+    async reconcilePullRequestSourceBatch(input) {
+      batches.push(input);
+      if (conflict && batches.length === 1) throw Object.assign(new Error('concurrent write'), {
+        code: 'WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT' });
+      return { outcomes: input.items.map(root => ({ itemId: root.itemId,
+        status: root.itemId === 'root-3' ? 'applied' : 'blocked' })) };
+    },
+  } });
+  const result = await service.runCycle({ includeWork: false });
+  assert.deepEqual(batches.map(batch => batch.items.map(item => item.itemId)), [['root-1', 'root-2'], ['root-3']]);
+  assert.equal(batches[1].expectedGraphRevision, 11);
+  assert.deepEqual(result.stages.pull_request_source_reconciliation.result,
+    { scanned: 3, pending: 3, applied: 1, blocked: conflict ? 0 : 2, conflicted: conflict ? 2 : 0 });
+  assert.ok(calls.some(([name]) => name === 'dispatch'));
+});
+
+test("PR source batch storage failures remain visible", async () => {
+  const { service } = fixture({ ledger: {
+    async intake() {},
+    async listPendingPullRequestSources() { return { items: [{ itemId: 'root', revision: 2, source: { activeRevision: 1, pendingRevision: 2 } }], nextCursor: null }; },
+    async getSummary() { return { revision: 10 }; },
+    async reconcilePullRequestSourceBatch() { throw Object.assign(new Error('disk unavailable'), { code: 'EIO' }); },
+  } });
+  await assert.rejects(service.runCycle({ includeWork: false }), error => error.cause?.code === 'EIO');
+});
+
 test("blocked pending PR sources on the first page cannot starve later pages", async () => {
   const roots = Array.from({ length: 101 }, (_, index) => ({
     itemId: `work-item-pr-root-${String(index + 1).padStart(3, "0")}`,

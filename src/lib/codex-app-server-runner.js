@@ -1,7 +1,7 @@
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { materializeVerifiedCliDescriptor } from './known-cli-locator.js';
-import { parseJsonWithUniqueKeys } from './strict-json.js';
+import { parseJsonWithUniqueKeys, parseProtocolJsonWithUniqueKeys } from './strict-json.js';
 import { currentTaskExecution } from './task-execution-context.js';
 import { isNativeCodexThreadId } from '../adapters/codex-native-session-store.js';
 import { ContainedStdioProcess } from './contained-stdio-process.js';
@@ -103,7 +103,9 @@ export class CodexAppServerRunner {
     const receive=({stream,line})=>{
       if(!accepting || stream!=='stdout' || !line.trim())return;
       try {
-        const message=parseJsonWithUniqueKeys(line);
+        let message;
+        try { message=parseProtocolJsonWithUniqueKeys(line); }
+        catch { throw failure('STRUCTURED_PROVIDER_RESPONSE_INVALID'); }
         if(!message || typeof message!=='object' || Array.isArray(message))throw failure('STRUCTURED_PROVIDER_RESPONSE_INVALID');
         if(message.method && message.id!==undefined){
           process.write(`${JSON.stringify({id:message.id,error:{code:-32601,message:'Interactive server requests are not authorized in this controlled channel'}})}\n`);
