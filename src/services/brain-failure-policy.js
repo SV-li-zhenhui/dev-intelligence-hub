@@ -19,6 +19,10 @@ function attention(code, summary, remediation, retryLabel = "已配置，重试"
 }
 
 const OWNER_ATTENTION_BY_CODE = new Map([
+  ...["STRUCTURED_PROVIDER_PROCESS_FAILED", "STRUCTURED_PROVIDER_PROCESS_EXITED"].map(code => [
+    code,
+    attention(code, "岗位 CLI 执行中断", "任务将等待后重试。请根据执行记录检查 CLI 的退出阶段。", "自动重试中"),
+  ]),
   [
     "STRUCTURED_PROVIDER_MODEL_CAPACITY",
     attention(

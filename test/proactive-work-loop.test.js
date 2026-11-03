@@ -3847,6 +3847,8 @@ test("a specialist closes a terminal PR task without consuming retry attempts", 
 test("infrastructure failures separate maintenance from transient retries", async (t) => {
   for (const roleId of ["developer", "orchestrator"]) {
     for (const { code, failurePoint } of [...STRUCTURED_BRAIN_ATTENTION_CASES,
+      { code: 'STRUCTURED_PROVIDER_PROCESS_FAILED', failurePoint: 'brain' },
+      { code: 'STRUCTURED_PROVIDER_PROCESS_EXITED', failurePoint: 'brain' },
       { code: 'STRUCTURED_PROVIDER_MODEL_CAPACITY', failurePoint: 'brain' }]) {
       await t.test(`${roleId}:${code}`, async () => {
         const time = controlledClock();
