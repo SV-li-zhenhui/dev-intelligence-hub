@@ -1,4 +1,5 @@
 import { createLanTaskBoard } from "./services/lan-task-board.js";
+import { readLanDashboard } from "./services/lan-dashboard-read.js";
 import {
   createHash,
   createHmac,
@@ -2643,7 +2644,7 @@ export function createDashboardServer(
   shutdownDrainTimeoutMs = shutdownTimeoutMilliseconds(shutdownDrainTimeoutMs);
   const processController = createManagedProcessController(managedProcess);
   const expectedOrigin = `http://127.0.0.1:${application.config.port}`;
-  const lanTaskBoard = createLanTaskBoard(() => application.taskRuns?.list() ?? {});
+  const lanTaskBoard = createLanTaskBoard((target, signal) => readLanDashboard(expectedOrigin, target, signal));
   const employeeRegistry = resolveEmployeeRegistry(application);
   const operationalAdmission = resolveOperationalAdmission(application);
   const handleRequest = async (

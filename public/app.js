@@ -75,6 +75,9 @@ const configurationActivationActions = Object.freeze({
   }),
 });
 
+const lanReadOnly = location.hostname !== "127.0.0.1";
+const localViews = new Set(["signals", "memory", "configuration"]);
+if (lanReadOnly) document.body.classList.add("lan-read-only");
 const content = document.querySelector("#content");
 const refreshButton = document.querySelector("#refresh-button");
 const lastUpdated = document.querySelector("#last-updated");
@@ -280,12 +283,14 @@ function isConfigurationBackedView(view = currentView) {
 }
 
 const workflowView = createWorkflowView({
+  requestIdFactory: lanReadOnly ? () => "lan-read-only" : undefined,
   onChange() {
     if (dashboard && currentView === "workflow") render();
   },
 });
 
 const workView = createWorkView({
+  requestIdFactory: lanReadOnly ? () => "lan-read-only" : undefined,
   onChange() {
     if (dashboard && currentView === "work") render();
   },
@@ -1747,6 +1752,10 @@ function render() {
   document.querySelector('#task-runs').hidden = currentView !== 'workbench';
   content.hidden = currentView === 'workbench';
   if (currentView === 'workbench') return;
+  if (lanReadOnly && localViews.has(currentView)) {
+    content.innerHTML = '<div class="empty">此页面的详细内容仅在本机工作台可见。</div>';
+    return;
+  }
   if (!isConfigurationBackedView() && currentView !== "system" && !dashboard) {
     content.innerHTML = '<div class="empty">正在建立第一次数据快照。配置恢复不依赖该快照，可从“配置中心”继续。</div>';
     return;
@@ -5465,6 +5474,23 @@ async function refreshAfterDeferral() {
 }
 
 async function load({ showConfirmation = true } = {}) {
+  if (lanReadOnly) {
+    const sequence = ++requestSequence;
+    try {
+      void loadEmployeeRoles();
+      const snapshot = await fetchDashboard();
+      if (snapshot) applyDashboard(snapshot, sequence);
+      else render();
+      if (currentView === "work") await workView.load();
+      if (currentView === "workflow") await workflowView.load();
+      if (currentView === "system") await loadSystemStatus();
+      if (currentView === "automation-tests") await loadConfiguration();
+    } catch {
+      statusBanner.hidden = false;
+      statusBanner.textContent = "局域网查看暂不可用，页面会自动重试。";
+    }
+    return;
+  }
   if (isConfigurationBackedView()) {
     try {
       await loadConfigurationBackedView({ showConfirmation });
@@ -5533,6 +5559,7 @@ async function load({ showConfirmation = true } = {}) {
 
 async function refresh() {
   void taskRunsView.refresh();
+  if (lanReadOnly) return load();
   refreshButton.disabled = true;
   refreshButton.classList.add("loading");
   if (isConfigurationBackedView()) {
@@ -5600,6 +5627,14 @@ function activateView(view, { focusHeading = true } = {}) {
   currentView = view;
   try { sessionStorage.setItem('mydashboard.active-view', view); } catch { /* Navigation works without browser storage. */ }
   render();
+  if (lanReadOnly) {
+    if (focusHeading) pageTitle.focus({ preventScroll: true });
+    if (view === "automation-tests") void loadConfiguration();
+    if (view === "work") void workView.load();
+    if (view === "workflow") void workflowView.load();
+    if (view === "system") void loadSystemStatus();
+    return;
+  }
   if (currentView === "employees") void loadMaintenanceAttention();
   if (focusHeading) pageTitle.focus({ preventScroll: true });
   if (currentView === "configuration") {
