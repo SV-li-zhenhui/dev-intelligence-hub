@@ -656,6 +656,28 @@ test('obsolete and terminal pending intents are retired without dispatch', async
   assert.equal(f.dispatched.length, 0);
 });
 
+test('blocked ledger work retires stale continuation without dispatch and resumes on a new revision', async () => {
+  for (const reason of ['decision_attempts_exhausted', 'pr_source_left_scope', 'pr_source_authority_fenced']) {
+    const f = fixture(); const scheduler = new WorkContinuationScheduler(f.options);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await scheduler.runCycle({ ...f, dispatch: async () => {} }); await f.drain(); f.advance(90_000);
+    }
+    const receipts = f.state().records[0].receipts;
+    Object.assign(f.items[0], { status: 'blocked', statusReason: reason, revision: 2 });
+    const candidates = f.ledger.listClaimCandidates;
+    f.ledger.listClaimCandidates = async () => f.items[0].status === 'blocked'
+      ? { items: [], facts: [], nextCursor: null } : candidates();
+    await scheduler.runCycle(f); await f.drain();
+    assert.equal(f.state().records[0].status, 'superseded', reason);
+    assert.deepEqual(f.state().records[0].receipts, receipts);
+    assert.equal(f.dispatched.length, 0);
+    Object.assign(f.items[0], { status: 'queued', statusReason: null, revision: 3 });
+    await scheduler.runCycle(f); await f.drain();
+    assert.equal(f.state().records[0].status, 'delivered');
+    assert.equal(f.dispatched.length, 1);
+  }
+});
+
 test('retired cross-root PR work leaves the stalled wake backlog and can reenter on a real new revision', async () => {
   const f = fixture(); const scheduler = new WorkContinuationScheduler(f.options);
   const stalled = { ...f, dispatch: async () => {} };

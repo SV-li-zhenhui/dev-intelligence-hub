@@ -208,8 +208,7 @@ export class WorkContinuationScheduler {
     const byId = new Map(progress.map(item => [item.itemId, item]));
     for (const record of cleanup) {
       const item = byId.get(record.itemId);
-      if (!item || item.currentTarget?.id !== record.roleId || TERMINAL.has(item.status) ||
-          (item.status === 'blocked' && item.statusReason === 'pr_source_cross_root_cutover_retired')) {
+      if (!item || item.currentTarget?.id !== record.roleId || TERMINAL.has(item.status) || item.status === 'blocked') {
         Object.assign(record, { status: 'superseded', reason: 'input_changed', updatedAt: now, nextAttemptAt: null,
           recovery: recovery('none', 'input_changed') });
       }
