@@ -2,49 +2,6 @@ import { createServer } from "node:http";
 import { isIPv4 } from "node:net";
 
 const PORT = 4174;
-const phases = {
-  preparing: "准备执行", starting_model: "启动模型", waiting_model: "等待模型",
-  running: "执行中", waiting_checkpoint: "等待检查点", waiting_step: "等待下一步骤",
-  paused: "已暂停", failed: "失败", completed: "已完成", cancelled: "已取消",
-  fenced: "等待维护", unknown: "状态待确认", idle: "等待调度",
-  control_failed: "停止待确认",
-};
-
-const page = `<!doctype html><html lang="zh-CN"><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>任务进度看板</title><link rel="stylesheet" href="/board.css">
-<main><h1>任务进度看板</h1><p id="status" role="status">正在读取任务…</p>
-<table><thead><tr><th>任务</th><th>岗位</th><th>状态</th><th>最近更新</th></tr></thead>
-<tbody id="tasks"></tbody></table></main><script src="/board.js" defer></script></html>`;
-const style = `body{font:16px system-ui;margin:0;color:#17201d;background:#f4f2ec}
-main{max-width:960px;margin:auto;padding:24px}table{width:100%;border-collapse:collapse;background:#fffdf8}
-th,td{text-align:left;padding:12px;border-bottom:1px solid #d9d7cf;overflow-wrap:anywhere}`;
-const script = `const status = document.getElementById("status");
-const tasks = document.getElementById("tasks");
-async function refresh() {
-  try {
-    const response = await fetch("/api/tasks", { cache: "no-store", signal: AbortSignal.timeout(8000) });
-    if (!response.ok) throw new Error();
-    const rows = await response.json();
-    tasks.replaceChildren(...rows.map(row => {
-      const tr = document.createElement("tr");
-      for (const value of [row.title, row.role, row.phase, row.updatedAt ? new Date(row.updatedAt).toLocaleString() : "—"]) {
-        const td = document.createElement("td");
-        td.textContent = value;
-        tr.append(td);
-      }
-      return tr;
-    }));
-    status.textContent = rows.length ? "每 5 秒刷新" : "当前没有可查看的任务";
-  } catch {
-    tasks.replaceChildren();
-    status.textContent = "看板已关闭、访问权限已变化或连接不可用";
-  } finally {
-    setTimeout(refresh, 5000);
-  }
-}
-void refresh();`;
-
 function privateIPv4(value) {
   if (typeof value !== "string" || !isIPv4(value)) return false;
   const [first, second] = value.split(".").map(Number);
@@ -72,17 +29,7 @@ function send(response, status, type, body) {
   response.end(body);
 }
 
-function project(list) {
-  return [...list.items ?? [], ...list.held ?? [], ...list.background ?? [], ...list.recent ?? []]
-    .slice(0, 100).map(task => ({
-      title: typeof task.title === "string" ? task.title.slice(0, 240) : "任务",
-      role: typeof task.roleId === "string" ? task.roleId.slice(0, 64) : "",
-      phase: Object.hasOwn(phases, task.phase) ? phases[task.phase] : "状态待确认",
-      updatedAt: Number.isFinite(Date.parse(task.lastActivityAt)) ? task.lastActivityAt : null,
-    }));
-}
-
-export function createLanTaskBoard(readTasks) {
+export function createLanTaskBoard(readPage) {
   let listener;
   let current = settings({ enabled: false });
   let queue = Promise.resolve();
@@ -117,15 +64,12 @@ export function createLanTaskBoard(readTasks) {
           current.allow.includes(request.socket.remoteAddress);
         if (!allowed()) return send(response, 403, "text/plain", "此设备无访问权限");
         if (request.method !== "GET") return send(response, 405, "text/plain", "只读看板");
-        if (request.url === "/") return send(response, 200, "text/html", page);
-        if (request.url === "/board.js") return send(response, 200, "text/javascript", script);
-        if (request.url === "/board.css") return send(response, 200, "text/css", style);
-        if (request.url !== "/api/tasks") return send(response, 404, "text/plain", "页面不存在");
         try {
-          const rows = project(await readTasks());
+          const result = await readPage(request.url, AbortSignal.timeout(10_000));
           if (response.destroyed) return;
           if (!allowed()) return send(response, 403, "text/plain", "此设备无访问权限");
-          send(response, 200, "application/json", JSON.stringify(rows));
+          if (!result) return send(response, 404, "text/plain", "此内容仅本机可见");
+          send(response, result.status, result.type, result.body);
         } catch {
           if (!response.destroyed) send(response, 503, "text/plain", "任务状态暂不可用");
         }

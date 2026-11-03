@@ -1,3 +1,25 @@
+.lan-read-only #lan-board-open,
+.lan-read-only [data-role-run],
+.lan-read-only [data-role-control],
+.lan-read-only [data-employee-run],
+.lan-read-only [data-employee-control],
+.lan-read-only [data-code-job-control],
+.lan-read-only [data-work-request-form],
+.lan-read-only .workflow-owner-request,
+.lan-read-only #workflow-dry-run-form,
+.lan-read-only .confirmation-actions,
+.lan-read-only [data-task-run-command],
+.lan-read-only [data-task-run-instruction-form],
+.lan-read-only [data-task-run-priority-form],
+.lan-read-only [data-automation-test-source] {
+  display: none;
+}
+
+.lan-read-only .topbar-actions::before {
+  content: "局域网只读";
+  color: var(--muted);
+}
+
 :root {
   --ink: #17201d;
   --muted: #555f5b;

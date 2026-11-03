@@ -2,6 +2,10 @@ import { escapeHtml } from "./view-format.js";
 
 const priorities = { normal: "普通", high: "高", urgent: "紧急" };
 const commands = new Set(["instruct", "priority", "pause", "resume", "cancel"]);
+const roleLabels = {
+  orchestrator: "主控", "requirements-analyst": "需求分析师", "pr-engineer": "PR 工程师",
+  "pr-reviewer": "PR 推进员工", developer: "开发工程师", tester: "测试工程师",
+};
 
 function identity(task) {
   return `${task.kind}:${task.taskId}`;
@@ -39,7 +43,7 @@ function timeMarkup(value) {
 function taskRow(task, selected = null) {
   return `<li><button type="button" class="task-run-row" ${selected && identity(task) === identity(selected) ? 'aria-current="true"' : ''} data-task-run-kind="${escapeHtml(task.kind)}" data-task-run-id="${escapeHtml(task.taskId)}">
     <span class="task-run-row-title"><strong>${escapeHtml(task.title || task.taskId)}</strong><span class="status-pill">${escapeHtml(phaseLabel(task))}</span></span>
-    <span>${escapeHtml(task.roleId)} · ${escapeHtml(task.subject || "无关联对象")}</span>
+    <span>${escapeHtml(roleLabels[task.roleId] || task.roleId)} · ${escapeHtml(task.subject || "无关联对象")}</span>
     <span>${['waiting_model','preparing','starting_model'].includes(task.phase)?'登记于':'开始于'} ${timeMarkup(task.startedAt ?? task.queuedAt)} · 优先级：${escapeHtml(priorities[task.priority] || "未知")}</span>
     ${task.progress ? `<span>${escapeHtml(task.progress)}</span>` : ""}
   </button></li>`;
@@ -106,7 +110,7 @@ export function renderTaskRunSummary(task) {
     <h2 id="task-run-detail-title">${escapeHtml(task.title || task.taskId)}</h2>
     <p class="task-run-phase"><strong>${escapeHtml(phaseLabel(task))}</strong></p>
     <dl class="task-run-metadata">
-      <div><dt>岗位</dt><dd>${escapeHtml(task.roleId)}</dd></div>
+      <div><dt>岗位</dt><dd>${escapeHtml(roleLabels[task.roleId] || task.roleId)}</dd></div>
       <div><dt>关联对象</dt><dd>${escapeHtml(task.subject || "无")}</dd></div>
       <div><dt>${['waiting_model','preparing','starting_model'].includes(task.phase)?'登记时间':'开始时间'}</dt><dd>${timeMarkup(task.receipt?.modelStartedAt ?? task.startedAt ?? task.queuedAt)}</dd></div>
       <div><dt>优先级</dt><dd>${escapeHtml(priorities[task.priority] || "未知")}</dd></div>
@@ -122,6 +126,7 @@ export function renderTaskRunSummary(task) {
 }
 
 function renderTaskRunSession(task) {
+  if (task?.lanView) return '<section class="task-run-session"><h3>执行状态</h3><p>会话和执行输出仅在本机可见。</p><div data-task-run-events></div></section>';
   const session = task?.session;
   const statuses = { starting: "正在连接", running: "当前回合进行中", completed: "本回合已完成", interrupted: "本回合已中断", failed: "本回合失败" };
   const types = { message: "模型输出", tool: "工具活动", plan: "计划更新", status: "状态" };
