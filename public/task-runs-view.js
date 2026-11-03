@@ -7,6 +7,24 @@ const roleLabels = {
   "pr-reviewer": "PR 推进员工", developer: "开发工程师", tester: "测试工程师",
 };
 
+function readableTaskText(value, taskId) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text || text === taskId || /^(?:(?:work-item|code-job|github-entity|task-run)-)?[a-f0-9]{32,}$/iu.test(text)) return "";
+  return text;
+}
+
+function taskTitle(task) {
+  const title = readableTaskText(task.title, task.taskId);
+  if (title) return title;
+  const action = {
+    orchestrator: "协调任务", "requirements-analyst": "分析需求",
+    "pr-engineer": "处理 PR", "pr-reviewer": "巡查 PR",
+    developer: "处理开发任务", tester: "验证测试任务",
+  }[task.roleId] || (task.kind === "code-job" ? "执行代码任务" : "处理工作项");
+  const subject = readableTaskText(task.subject, task.taskId);
+  return subject ? `${action} · ${subject}` : action;
+}
+
 function identity(task) {
   return `${task.kind}:${task.taskId}`;
 }
@@ -42,8 +60,8 @@ function timeMarkup(value) {
 
 function taskRow(task, selected = null) {
   return `<li><button type="button" class="task-run-row" ${selected && identity(task) === identity(selected) ? 'aria-current="true"' : ''} data-task-run-kind="${escapeHtml(task.kind)}" data-task-run-id="${escapeHtml(task.taskId)}">
-    <span class="task-run-row-title"><strong>${escapeHtml(task.title || task.taskId)}</strong><span class="status-pill">${escapeHtml(phaseLabel(task))}</span></span>
-    <span>${escapeHtml(roleLabels[task.roleId] || task.roleId)} · ${escapeHtml(task.subject || "无关联对象")}</span>
+    <span class="task-run-row-title"><strong>${escapeHtml(taskTitle(task))}</strong><span class="status-pill">${escapeHtml(phaseLabel(task))}</span></span>
+    <span>${escapeHtml(roleLabels[task.roleId] || task.roleId)} · ${escapeHtml(readableTaskText(task.subject, task.taskId) || "无关联对象")}</span>
     <span>${['waiting_model','preparing','starting_model'].includes(task.phase)?'登记于':'开始于'} ${timeMarkup(task.startedAt ?? task.queuedAt)} · 优先级：${escapeHtml(priorities[task.priority] || "未知")}</span>
     ${task.progress ? `<span>${escapeHtml(task.progress)}</span>` : ""}
   </button></li>`;
@@ -107,11 +125,11 @@ function allowedCommand(task, command) {
 export function renderTaskRunSummary(task) {
   if (!task) return '<p class="task-runs-empty">正在读取任务详情…</p>';
   return `<p class="eyebrow">${task.kind === "code-job" ? "CODE JOB" : "WORK ITEM"}</p>
-    <h2 id="task-run-detail-title">${escapeHtml(task.title || task.taskId)}</h2>
+    <h2 id="task-run-detail-title">${escapeHtml(taskTitle(task))}</h2>
     <p class="task-run-phase"><strong>${escapeHtml(phaseLabel(task))}</strong></p>
     <dl class="task-run-metadata">
       <div><dt>岗位</dt><dd>${escapeHtml(roleLabels[task.roleId] || task.roleId)}</dd></div>
-      <div><dt>关联对象</dt><dd>${escapeHtml(task.subject || "无")}</dd></div>
+      <div><dt>关联对象</dt><dd>${escapeHtml(readableTaskText(task.subject, task.taskId) || "无")}</dd></div>
       <div><dt>${['waiting_model','preparing','starting_model'].includes(task.phase)?'登记时间':'开始时间'}</dt><dd>${timeMarkup(task.receipt?.modelStartedAt ?? task.startedAt ?? task.queuedAt)}</dd></div>
       <div><dt>优先级</dt><dd>${escapeHtml(priorities[task.priority] || "未知")}</dd></div>
       <div><dt>${task.readOnly ? "作业修订" : "控制修订"}</dt><dd>${escapeHtml(task.revision)}${task.readOnly ? "" : ` · 已交给模型的修订 ${escapeHtml(task.appliedRevision)}`}</dd></div>
@@ -481,7 +499,7 @@ export function createTaskRunsView({ container, dialog, embedded = false, docume
     }
     const summaryMarkup = renderTaskRunSummary(state.detail);
     const heading = detailContent.querySelector('[data-task-workbench-title]');
-    if (heading) heading.textContent = state.detail?.title || state.selected.taskId;
+    if (heading) heading.textContent = state.detail ? taskTitle(state.detail) : "任务详情";
     const pinButton = detailContent.querySelector('[data-task-run-pin]');
     if (pinButton) {
       const pinned = state.pinned.includes(selected);
