@@ -87,5 +87,10 @@ export function threadConfiguration(config,{reader,execution,channel='review',na
     .map(([name])=>[name,{config_file:agentConfigPath,description:'Trusted read-only independent reviewer; follow the host task and current permissions.'}]));
   // Thread resumes retain prior overrides, including a code job's disabled agents.
   const reviewAgents = channel === 'review' && config.features?.multi_agent === true && config.agents?.enabled === true;
-  return {service_tier:'default',features:{multi_agent:reviewAgents},mcp_servers,agents:{...agents,enabled:reviewAgents}};
+  // The thread's features table replaces process-level overrides. Reapply the
+  // isolation flags here; a table containing only multi_agent reopens home apps
+  // and computer tools before the exact-tool admission check.
+  const features = { ...Object.fromEntries(DISABLED_FEATURES.map(name => [name, false])),
+    skip_host_skill_discovery: true, code_mode_host: true, multi_agent: reviewAgents };
+  return {service_tier:'default',features,mcp_servers,agents:{...agents,enabled:reviewAgents}};
 }

@@ -47,6 +47,20 @@ test('thread policy disables each inherited MCP without copying private configur
   assert.equal(JSON.stringify(result).includes('unsafe.toml'),false);
 });
 
+test('each thread preserves the process isolation flags instead of reopening desktop tools', () => {
+  const inherited = { features: { apps: true, computer_use: true, shell_tool: true, plugins: true, multi_agent: true }, agents: { enabled: true } };
+  for (const options of [{}, { channel: 'code-job', namespace: 'dih_code_job_0123456789abcdef', execution: { url: 'http://127.0.0.1:1234/execution' } }]) {
+    const thread = threadConfiguration(inherited, options);
+    for (const feature of ['apps', 'computer_use', 'shell_tool', 'plugins', 'remote_plugin', 'code_mode', 'multi_agent_v2']) {
+      assert.equal(thread.features[feature], false, feature);
+    }
+    assert.equal(thread.features.skip_host_skill_discovery, true);
+    assert.equal(thread.features.code_mode_host, true);
+    assert.equal(thread.features.multi_agent, options.channel !== 'code-job');
+    assert.equal(inherited.features.apps, true);
+  }
+});
+
 test('resuming a code-job thread for read-only review restores only the host-enabled reviewer capability', () => {
   const reviewer = { features: { multi_agent: true }, agents: { enabled: true, default: {} } };
   const code = threadConfiguration(reviewer, { channel: 'code-job', namespace: 'dih_code_job_0123456789abcdef',
