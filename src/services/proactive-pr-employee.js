@@ -377,7 +377,12 @@ function latestJobError(jobs) {
       (left, right) =>
         Date.parse(right.updatedAt || 0) - Date.parse(left.updatedAt || 0),
     )[0];
-  return job ? `#${job.number}: ${job.error}` : "";
+  if (!job) return "";
+  const primary = job.brain?.fallbackFrom;
+  if (!primary) return `#${job.number}: ${job.error}`;
+  const detail = primary.nativeFailure;
+  const stage = detail ? ` (${detail.method ?? detail.kind}, ${detail.code ?? "未知"})` : "";
+  return `#${job.number}：主模型 ${primary.provider}/${primary.model} 失败（${primary.reason}${stage}）；备用模型 ${job.brain.provider}/${job.brain.model} 失败（${job.error}）`;
 }
 
 function trimJobs(jobs, limit) {

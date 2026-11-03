@@ -403,6 +403,35 @@ test("primary and backup infrastructure failures retain attribution and back off
   assert.equal(retried.analysisAttemptBudget.attemptOffset, 5);
 });
 
+test("a PR waiting for both providers leaves the next PR eligible in the same patrol", async () => {
+  const first = pullRequest();
+  const second = pullRequest({ id: "github:pr:acme/repo#43", number: 43 });
+  const store = new MemoryStore({ snapshot: snapshot([first, second]) });
+  const reviewer = routedTriageReviewer({
+    primary: async request => {
+      if (request.sessionKey.endsWith("#42")) {
+        throw Object.assign(new Error("Codex process failed"), { code: "STRUCTURED_PROVIDER_PROCESS_FAILED" });
+      }
+      return JSON.stringify(reviewResult({ workType: "triage_plan", reviewVerdict: "none", reviewBody: "", requiresApproval: false }));
+    },
+    fallback: async () => {
+      throw Object.assign(new Error("Ollama 服务或配置的模型不可用"), { code: "STRUCTURED_PROVIDER_UNAVAILABLE" });
+    },
+  });
+  const service = createService({ store, reviewer, config: { triageOnly: true },
+    github: { async loadReviewContext(candidate) { return candidate; } },
+    triageHandoff: durableTriageHandoff() });
+  await service.tick();
+  const state = await store.read("pr-employee-state");
+  const waiting = state.jobs.find(job => job.number === 42);
+  assert.equal(waiting.status, "retry_wait");
+  assert.equal(waiting.analysisFailure.infrastructureFailure, true);
+  assert.equal(waiting.analysisAttemptBudget.attemptOffset, 1);
+  assert.equal(state.jobs.find(job => job.number === 43).status, "ready");
+  const view = await service.roleView();
+  assert.match(view.lastError, /主模型 .*STRUCTURED_PROVIDER_PROCESS_FAILED.*备用模型 .*Ollama 服务或配置的模型不可用/);
+});
+
 for (const [receiptName, failureReceipt] of [
   ["legacy", {}],
   ["recorded", { analysisAttemptBudget: { provider: "ollama", model: "qwen3.5:9b", attemptOffset: 0 },

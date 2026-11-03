@@ -1,7 +1,7 @@
 import { types as utilTypes } from "node:util";
 
 import { normalizePullRequestGitTarget } from "../domain/git-tool-contract.js";
-import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
+import { normalizeAbortSignal, runStructuredProviderRequest } from "../lib/structured-provider-request.js";
 
 const DEFAULT_MODEL = "qwen3.5:9b";
 const DEFAULT_BASE_URL = "http://127.0.0.1:11434";
@@ -606,6 +606,34 @@ export class OllamaPrEmployeeReviewer {
     this.remoteCodeContext = endpoint.remoteCodeContext;
     this.timeoutMs = positiveNumber(timeoutMs, DEFAULT_TIMEOUT_MS);
     this.contextTokens = positiveNumber(contextTokens, DEFAULT_CONTEXT_TOKENS);
+  }
+
+  async checkAvailability(options) {
+    const signal = analysisSignal(options);
+    const controller = new AbortController();
+    const unavailable = () => Object.assign(new Error("Ollama 服务或配置的模型不可用"), {
+      code: "STRUCTURED_PROVIDER_UNAVAILABLE",
+    });
+    try {
+      await runStructuredProviderRequest({
+        controller, signal, timeoutMs: Math.min(this.timeoutMs, 3_000),
+        cancellationError: () => signal.reason,
+        timeoutError: unavailable,
+        operation: async () => {
+          const response = await this.fetch(`${this.baseUrl}/api/tags`, {
+            redirect: "error", signal: controller.signal,
+          });
+          if (!response.ok) throw unavailable();
+          const body = await response.json();
+          if (!body.models?.some(entry => entry.name === this.model || entry.model === this.model)) {
+            throw unavailable();
+          }
+        },
+      });
+    } catch {
+      signal?.throwIfAborted();
+      throw unavailable();
+    }
   }
 
   async analyze(input, options) {
