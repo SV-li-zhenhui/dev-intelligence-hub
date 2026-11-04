@@ -12,6 +12,7 @@ import {
   unlink,
 } from "node:fs/promises";
 import path from "node:path";
+import { isWindowsGitImplementationPath } from "../lib/windows-git-implementation.js";
 import { MAX_BLOBS_PER_BATCH, parseGitBlobBatch } from "../lib/git-blob-batch.js";
 
 import {
@@ -238,14 +239,7 @@ function isWindowsNetworkPath(value) {
 }
 
 function isTrustedWindowsGitImplementation(value) {
-  if (process.platform !== "win32") return true;
-  const normalized = path.win32.normalize(value).toLowerCase();
-  const segments = normalized.split("\\").filter(Boolean);
-  return (
-    segments.at(-1) === "git.exe" &&
-    segments.at(-2) === "bin" &&
-    /^mingw(?:32|64)$/u.test(segments.at(-3) ?? "")
-  );
+  return process.platform !== "win32" || isWindowsGitImplementationPath(value);
 }
 
 function sameFileIdentity(left, right) {
@@ -1094,7 +1088,7 @@ export class GitObjectSnapshotter {
     ) {
       throw snapshotError(
         "GIT_SNAPSHOT_EXECUTABLE_UNTRUSTED",
-        "Git executable 必须直接指向仓库外的本地 Git 实现（Windows 使用 mingw64/bin/git.exe）",
+        "Git executable 必须直接指向仓库外的本地 Git 实现（Windows 使用 mingw64/bin/git.exe 或 ucrt64/bin/git.exe）",
       );
     }
     const initialPathStats = await lstat(this.#gitCommand);

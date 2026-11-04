@@ -174,6 +174,22 @@ test("trusted runtime budgets are bounded data and passed to the service without
   assert.equal(getterCalls, 0);
 });
 
+test("controlled runtime accepts the UCRT64 native Git implementation", async (t) => {
+  if (process.platform !== "win32") return;
+  const setup = await fixture(t);
+  setup.config.gitCommand = path.join(setup.root, "ucrt64", "bin", "git.exe");
+  await mkdir(path.dirname(setup.config.gitCommand), { recursive: true });
+  await writeFile(setup.config.gitCommand, "trusted UCRT64 Git executable\n");
+  let called = false;
+  await createControlledGitRuntimeBundle(setup.config, {
+    controlledGitServiceFactory() {
+      called = true;
+      return fakeService(preparationFor(pullRequestBinding()));
+    },
+  });
+  assert.equal(called, true);
+});
+
 test("one Controlled Git service is hidden behind frozen least-authority ports", async (t) => {
   const setup = await fixture(t);
   const inputBinding = pullRequestBinding();

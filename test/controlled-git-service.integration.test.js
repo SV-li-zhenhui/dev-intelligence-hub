@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
+import { windowsGitImplementationCandidates } from "../src/lib/windows-git-implementation.js";
 
 import { GitBareMirrorInspector } from "../src/adapters/git-bare-mirror-inspector.js";
 import {
@@ -37,13 +38,7 @@ function locateGit() {
   const candidate = result.stdout.split(/\r?\n/u).find(Boolean);
   if (!candidate || !path.isAbsolute(candidate)) return null;
   if (process.platform !== "win32") return path.resolve(candidate);
-  const implementation = path.join(
-    path.dirname(path.dirname(candidate)),
-    "mingw64",
-    "bin",
-    "git.exe",
-  );
-  return existsSync(implementation) ? path.resolve(implementation) : null;
+  return windowsGitImplementationCandidates(candidate).find(existsSync) ?? null;
 }
 
 async function git(gitCommand, cwd, args, options = {}) {

@@ -1,5 +1,6 @@
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import path from "node:path";
+import { isWindowsGitImplementationPath } from "./lib/windows-git-implementation.js";
 import { types as utilTypes } from "node:util";
 
 import { GitBareMirrorInspector } from "./adapters/git-bare-mirror-inspector.js";
@@ -291,10 +292,6 @@ async function trustedGitExecutable(value) {
     );
   }
   const permissions = initial.mode & 0o7777;
-  const windowsSegments = path.win32
-    .normalize(canonical)
-    .toLowerCase()
-    .split("\\");
   if (
     initial.isSymbolicLink() ||
     !initial.isFile() ||
@@ -303,11 +300,7 @@ async function trustedGitExecutable(value) {
     !samePath(canonical, value) ||
     !sameIdentity(initial, final) ||
     (process.platform === "win32"
-      ? !(
-          windowsSegments.at(-1) === "git.exe" &&
-          windowsSegments.at(-2) === "bin" &&
-          /^mingw(?:32|64)$/u.test(windowsSegments.at(-3) ?? "")
-        )
+      ? !isWindowsGitImplementationPath(canonical)
       : (permissions & 0o111) === 0 || (permissions & 0o7022) !== 0)
   ) {
     throw runtimeError(

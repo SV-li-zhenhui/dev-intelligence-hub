@@ -108,6 +108,7 @@ async function fixture(t, {
   mergeBaseOutput = Buffer.from(`${MERGE_BASE}\n`),
   mergeBaseExitCode = 0,
   extraBlobs = [],
+  windowsGitImplementation = "mingw64",
 } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "controlled-git-service-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -116,7 +117,7 @@ async function fixture(t, {
   const headMirrorRoot = path.resolve(root, "head.git");
   const gitCommand = path.resolve(
     root,
-    process.platform === "win32" ? "mingw64/bin/git.exe" : "bin/git",
+    process.platform === "win32" ? `${windowsGitImplementation}/bin/git.exe` : "bin/git",
   );
   for (const directory of [
     preparationRoot,
@@ -393,6 +394,14 @@ test("result sealing drains cancellation before starting another batch", async (
   assert.equal(state.active, 0);
   assert.deepEqual(state.cleanupActive, [0]);
   assert.deepEqual(await readdir(setup.preparationRoot), []);
+});
+
+test("controlled conflict inspection accepts a pinned UCRT64 Git executable", async (t) => {
+  if (process.platform !== "win32") return;
+  const setup = await fixture(t, { windowsGitImplementation: "ucrt64" });
+  const result = await setup.createService().inspectConflict(inspectionRequest(setup));
+  assert.equal(result.status, "conflicted");
+  assert.equal(result.resultTreeOid, TREE);
 });
 
 test("seals a both-modified conflict behind fixed Git commands and a content manifest", async (t) => {

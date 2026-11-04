@@ -622,6 +622,18 @@ test("Git Head snapshot workspaces require a bounded Git configuration", () => {
   assertInvalid(relativeCommand);
 });
 
+test("Windows Git Head snapshots accept the UCRT64 native implementation", () => {
+  if (process.platform !== "win32") return;
+  const configuration = document();
+  configuration.codeExecutor = {
+    enabled: false,
+    gitCommand: "C:/Program Files/Git/ucrt64/bin/git.exe",
+    workspaces: [{ id: "dashboard", sourceRoot: "dashboard", gitHeadSnapshot: true }],
+  };
+  assert.equal(normalizeConfigurationDocument(configuration).codeExecutor.gitCommand,
+    configuration.codeExecutor.gitCommand);
+});
+
 test("Windows Git Head snapshots reject wrapper executables before activation", () => {
   if (process.platform !== "win32") return;
   const wrapper = document();

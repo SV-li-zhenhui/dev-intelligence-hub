@@ -142,6 +142,18 @@ function fakeRunner(sourceRoot, {
   };
 }
 
+test("snapshot preflight accepts a pinned UCRT64 native Git executable", async (t) => {
+  if (process.platform !== "win32") return;
+  const setup = await fixture(t);
+  const runner = fakeRunner(setup.sourceRoot);
+  runner.gitCommand = path.join(setup.root, "ucrt64", "bin", "git.exe");
+  await mkdir(path.dirname(runner.gitCommand), { recursive: true });
+  await writeFile(runner.gitCommand, "trusted UCRT64 Git executable\n");
+  const boundary = await snapshotter(runner).preflight({ sourceRoot: setup.sourceRoot });
+  assert.equal(boundary.gitCommand, await realpath(runner.gitCommand));
+  assert.match(boundary.gitExecutableSha256, /^[a-f0-9]{64}$/u);
+});
+
 function snapshotter(processRunner, limits) {
   return new GitObjectSnapshotter({
     gitCommand: processRunner.gitCommand,

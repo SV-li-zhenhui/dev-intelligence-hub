@@ -17,6 +17,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
+import { isWindowsGitImplementationPath } from "../lib/windows-git-implementation.js";
 import { MAX_BLOBS_PER_BATCH, parseGitBlobBatch } from "../lib/git-blob-batch.js";
 import { types as utilTypes } from "node:util";
 
@@ -866,7 +867,6 @@ async function executableIdentity(gitCommand) {
       cause,
     );
   }
-  const windowsSegments = path.win32.normalize(canonical).toLowerCase().split("\\");
   const permissions = initial.mode & 0o7777;
   if (
     initial.isSymbolicLink() ||
@@ -876,10 +876,7 @@ async function executableIdentity(gitCommand) {
     !samePath(canonical, gitCommand) ||
     (process.platform !== "win32" &&
       ((permissions & 0o111) === 0 || (permissions & 0o7022) !== 0)) ||
-    (process.platform === "win32" &&
-      !(windowsSegments.at(-1) === "git.exe" &&
-        windowsSegments.at(-2) === "bin" &&
-        /^mingw(?:32|64)$/u.test(windowsSegments.at(-3) ?? "")))
+    (process.platform === "win32" && !isWindowsGitImplementationPath(canonical))
   ) {
     throw controlledGitError(
       "CONTROLLED_GIT_EXECUTABLE_UNTRUSTED",

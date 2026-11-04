@@ -1,4 +1,5 @@
 import nodePath from "node:path";
+import { isWindowsGitImplementationPath } from "../lib/windows-git-implementation.js";
 import { isWindowsTestProfile, normalizeWindowsTestProfile } from "./windows-test-profile.js";
 import { types as utilTypes } from "node:util";
 
@@ -38,12 +39,7 @@ const SECRET_VALUE =
 const URL_USERINFO = /:\/\/[^/@\s:]+:[^/@\s]+@/;
 
 function isTrustedWindowsGitImplementation(value) {
-  if (process.platform !== "win32") return true;
-  const normalized = value.replaceAll("\\", "/").toLowerCase();
-  return (
-    /^[a-z]:\//u.test(normalized) &&
-    /\/mingw(?:32|64)\/bin\/git\.exe$/u.test(normalized)
-  );
+  return process.platform !== "win32" || isWindowsGitImplementationPath(value);
 }
 
 const TOP_LEVEL_FIELDS = Object.freeze([
@@ -957,7 +953,7 @@ function normalizeCodeExecutor(value) {
   ) {
     throw invalid(
       `${path}.gitCommand`,
-      "Windows Git 必须直接使用 mingw64/bin/git.exe 实现",
+      "Windows Git 必须直接使用 mingw64/bin/git.exe 或 ucrt64/bin/git.exe 实现",
     );
   }
   const profileIds = new Set();

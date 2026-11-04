@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { inspect, promisify } from "node:util";
 import test from "node:test";
+import { windowsGitImplementationCandidates } from "../src/lib/windows-git-implementation.js";
 
 import { OwnPrRepairObjectSync } from "../src/adapters/own-pr-repair-object-sync.js";
 import { createCredentialLease } from "../src/lib/github-credential-source.js";
@@ -23,8 +24,7 @@ function locateGit() {
   const candidate = found.stdout?.split(/\r?\n/u).find(Boolean);
   if (found.status !== 0 || !candidate || !path.isAbsolute(candidate)) return null;
   if (process.platform !== "win32") return candidate;
-  const implementation = path.join(path.dirname(path.dirname(candidate)), "mingw64", "bin", "git.exe");
-  return existsSync(implementation) ? implementation : null;
+  return windowsGitImplementationCandidates(candidate).find(existsSync) ?? null;
 }
 
 const gitCommand = locateGit();
