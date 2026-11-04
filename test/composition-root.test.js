@@ -4556,6 +4556,9 @@ test("automatic own PR repair composes internal push with ownership guards and c
         assert.equal(await calls.contextAssembler.ciDiagnosticReader.read({ repository: 'acme/repo', headRefOid: 'a'.repeat(40), headRefName: 'main', checks: [], maximumBytes: 1000 }), null);
         assert.equal(Object.isFrozen(calls.codeJobRuntime.automaticPauseRecovery), true);
         assert.equal(await calls.codeJobRuntime.automaticPauseRecovery.canRecover({}), false);
+        assert.deepEqual(await calls.codeJobRuntime.automaticPauseRecovery.withNativeQuiescence({}, () => {
+          throw new Error('unbound native recovery must stay closed');
+        }), { executed: false });
         assert.equal(Object.isFrozen(calls.coordination.codeJobPauseRecovery), true);
         assert.deepEqual(await calls.coordination.codeJobPauseRecovery.runCycle({ limit: 2 }), { resumed: 1 });
         assert.deepEqual(calls.pauseRecoveryRequest, { limit: 2 });

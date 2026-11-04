@@ -38,6 +38,79 @@ test('settled provider format pause automatically resumes the same checkpoint on
   assert.equal((await f.create().runCycle()).scanned, 0);
 });
 
+function busyPauseFixture() {
+  const f = fixture();
+  f.job.execution.pause.reason = '等待人工处理（STRUCTURED_PROVIDER_BUSY）';
+  Object.assign(f.proof, { kind: 'code-job', taskId: f.job.jobId, roleId: 'developer' });
+  Object.assign(f.proof.receipt, { outcomeCode: 'STRUCTURED_PROVIDER_BUSY',
+    registeredAt: '2026-10-10T03:00:10Z', modelStartedAt: null, session: null,
+    eventCount: 0, stopConfirmed: false });
+  let held = false;
+  const resume = f.jobs.resume;
+  f.jobs.resume = value => { assert.equal(held, true, 'native entity exclusion must cover resume'); return resume(value); };
+  f.eligibility.withNativeQuiescence = async (job, operation) => {
+    assert.equal(job.jobId, f.job.jobId);
+    held = true;
+    try { return { executed: true, result: await operation() }; }
+    finally { held = false; }
+  };
+  return f;
+}
+
+test('an unstarted busy pause resumes under certified native entity exclusion without rewriting its receipt', async () => {
+  const f = busyPauseFixture(), before = structuredClone(f.proof);
+  assert.equal((await f.create().runCycle()).resumed, 1);
+  assert.deepEqual(f.calls, [{ jobId: 'job-1', expectedRevision: 12 }]);
+  assert.deepEqual(f.proof, before);
+  assert.equal((await f.create().runCycle()).scanned, 0);
+});
+
+test('busy pause recovery forwards cancellation to native entity inspection', async () => {
+  const f = busyPauseFixture();
+  const controller = new AbortController();
+  f.eligibility.withNativeQuiescence = async (job, operation, { signal } = {}) => {
+    assert.strictEqual(signal, controller.signal);
+    controller.abort(new Error('native inspection cancelled'));
+    signal.throwIfAborted();
+  };
+  await assert.rejects(f.create().runCycle({ signal: controller.signal }), /native inspection cancelled/);
+  assert.equal(f.calls.length, 0);
+});
+
+for (const [name, change] of [
+  ['no certified native fence', f => { delete f.eligibility.withNativeQuiescence; }],
+  ['native owner remains', f => { f.eligibility.withNativeQuiescence = async () => ({ executed: false }); }],
+  ['model started', f => { f.proof.receipt.modelStartedAt = '2026-10-10T03:00:30Z'; }],
+  ['native session exists', f => { f.proof.receipt.session = { transport: 'app-server' }; }],
+  ['native event exists', f => { f.proof.receipt.eventCount = 1; }],
+  ['wrong task', f => { f.proof.receipt.taskId = 'other'; }],
+  ['wrong role', f => { f.proof.roleId = 'tester'; }],
+  ['other run', f => { f.proof.receipt.runId = 'other'; }],
+  ['registered before job', f => { f.proof.receipt.registeredAt = '2026-10-09T03:00:00Z'; }],
+  ['finished after pause', f => { f.proof.receipt.finishedAt = '2026-10-10T03:02:00Z'; }],
+  ['active model', f => { f.proof.active = true; }],
+  ['owner pause', f => { f.proof.mode = 'paused'; }],
+  ['owner command', f => { f.proof.pendingCommand = 'pause'; }],
+  ['stop uncertainty', f => { f.proof.stopUnconfirmed = true; }],
+  ['pending action', f => { f.job.execution.pendingAction = {}; }],
+  ['admitted action', f => { f.job.execution.actionAdmission = {}; }],
+  ['unknown action', f => { f.job.execution.uncertainty = {}; }],
+  ['source revoked', f => { f.setEligible(false); }],
+  ['source revoked inside fence', f => { let reads = 0;
+    f.eligibility.canRecover = async () => ++reads === 1; }],
+  ['owner command after authority recheck', f => { let reads = 0;
+    f.eligibility.canRecover = async () => { if (++reads === 2) f.proof.pendingCommand = 'pause'; return true; }; }],
+  ['checkpoint changed before fence', f => { const fence = f.eligibility.withNativeQuiescence;
+    f.eligibility.withNativeQuiescence = (job, operation) => { f.job.revision++; return fence(job, operation); }; }],
+  ['run changed before fence', f => { const fence = f.eligibility.withNativeQuiescence;
+    f.eligibility.withNativeQuiescence = (job, operation) => {
+      f.proof.runId = f.proof.receipt.runId = 'later'; return fence(job, operation); }; }],
+]) test(`busy pause recovery preserves ${name}`, async () => {
+  const f = busyPauseFixture(); change(f);
+  assert.equal((await f.create().runCycle()).resumed, 0);
+  assert.equal(f.calls.length, 0);
+});
+
 function preparedReadFixture() {
   const f = fixture();
   const action = { type: 'read_text', actionId: 'pending-read', path: 'src/app.js', expectedWorkspaceRevision: 'a'.repeat(64) };

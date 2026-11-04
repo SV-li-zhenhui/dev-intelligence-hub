@@ -1842,11 +1842,11 @@ export async function createApplication({
       }
       codeJobBrainDirectory = trackRuntime(codeJobBrainDirectory);
       if (typeof codeJobBrainDirectory.withEntityQuiescence === "function") {
-        codeJobNativeExecution = Object.freeze({ withEntityQuiescence: (grant, operation) => {
+        codeJobNativeExecution = Object.freeze({ withEntityQuiescence: (grant, operation, { signal = null } = {}) => {
           if (!Number.isSafeInteger(grant.subject?.number) ||
               grant.inputBinding?.pullRequestNumber !== grant.subject.number) return { executed: false };
           return codeJobBrainDirectory.withEntityQuiescence({ roleId: grant.requestedBy.roleId,
-            brainDigest: grant.brainDigest, entityKey: githubEntitySessionKey({ kind: "pull_request",
+            brainDigest: grant.brainDigest, signal, entityKey: githubEntitySessionKey({ kind: "pull_request",
               repository: grant.repository, number: grant.subject.number }) }, operation);
         } });
       }
@@ -1932,6 +1932,8 @@ export async function createApplication({
           ...(ownPrRepairEnabled ? { automaticPauseRecovery: Object.freeze({
             canRecover: job => automaticLocalCodeAuthorization?.canRecoverPausedCodeJob(job) ?? false,
             canReplanUnstartedWrite: job => automaticLocalCodeAuthorization?.canReplanUnstartedWrite(job) ?? false,
+            withNativeQuiescence: (job, operation, options) => job?.grant && codeJobNativeExecution !== null
+              ? codeJobNativeExecution.withEntityQuiescence(job.grant, operation, options) : { executed: false },
           }) } : {}),
           ...runtimeDependencies(codeJobRuntimeDependencies),
           store,
