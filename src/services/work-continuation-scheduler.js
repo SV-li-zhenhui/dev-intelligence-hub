@@ -11,7 +11,7 @@ import {
 
 const WAITING = new Set(['waiting_external', 'waiting_condition', 'dispatch_pending', 'retry_wait', 'paused']);
 const TERMINAL = new Set(['completed', 'cancelled', 'superseded']);
-const DETERMINISTIC_DECISION_FAILURES = new Set(['ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION', 'STRUCTURED_BRAIN_RESPONSE_INVALID', 'STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED']);
+const DETERMINISTIC_DECISION_FAILURES = new Set(['ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION', 'STRUCTURED_BRAIN_RESPONSE_INVALID', 'STRUCTURED_PROVIDER_RESPONSE_INVALID', 'STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED']);
 const UNCHANGED_CONFIGURATION_FAILURES = new Set(['ROLE_TASK_BRAIN_NOT_CONFIGURED', 'BRAIN_PROVIDER_NOT_CONFIGURED', 'REMOTE_DATA_NOT_AUTHORIZED']);
 const UNCHANGED_INPUT_FAILURES = new Set([...DETERMINISTIC_DECISION_FAILURES, ...UNCHANGED_CONFIGURATION_FAILURES, 'PR_FACTS_STALE', 'WORK_CONTINUATION_UNCHANGED_DECISION']);
 const timeout = () => Object.assign(new Error('Work continuation execution exceeded its lease budget'), { code: 'WORK_CONTINUATION_TIMEOUT' });
@@ -274,8 +274,11 @@ export class WorkContinuationScheduler {
       else if (!item || continuationFingerprint(item) !== claim.fingerprint) result = 'input_changed';
       else if (this.#ports.taskRuns && (await this.#ports.taskRuns.order([item], 'work-item', 'itemId')).length === 0) result = 'runtime_deferred';
       else {
-        const beforeProgress = /^graph:[a-f0-9]{64}$/.test(claim.condition.reference ?? '')
-          ? await this.#relatedProgress(claim.itemId) : null;
+        // An orchestrator with no children still needs an unchanged-input
+        // budget. A known absent graph is different from a failed observation.
+        const expectsGraph = /^graph:[a-f0-9]{64}$/.test(claim.condition.reference ?? '');
+        const beforeProgress = claim.roleId === 'orchestrator' || expectsGraph
+          ? await this.#relatedProgress(claim.itemId, expectsGraph) : undefined;
         const dispatched = await dispatch({ roleId: claim.roleId, signal,
           continuationTarget: { itemId: claim.itemId, fingerprint: claim.fingerprint } });
         signal.throwIfAborted();
@@ -283,10 +286,10 @@ export class WorkContinuationScheduler {
         else {
           const latest = await this.#ports.ledger.readItemForReconciliation({ itemId: claim.itemId });
           observedRevision = latest?.revision ?? null;
-          if (latest !== null && observedRevision === item.revision && beforeProgress !== null) {
-            const afterProgress = await this.#relatedProgress(claim.itemId);
-            relatedProgressed = beforeProgress !== null && afterProgress !== null && beforeProgress !== afterProgress;
-            unchangedGraph = beforeProgress !== null && beforeProgress === afterProgress;
+          if (latest !== null && observedRevision === item.revision && beforeProgress !== undefined) {
+            const afterProgress = await this.#relatedProgress(claim.itemId, expectsGraph);
+            relatedProgressed = afterProgress !== undefined && beforeProgress !== afterProgress;
+            unchangedGraph = afterProgress !== undefined && beforeProgress === afterProgress;
           }
           result = latest === null ? 'input_changed' : observedRevision !== item.revision || relatedProgressed ? 'role_woken' : 'no_progress';
           const outcome = dispatched?.continuationOutcome;
@@ -347,13 +350,15 @@ export class WorkContinuationScheduler {
     });
   }
 
-  async #relatedProgress(itemId) {
+  async #relatedProgress(itemId, expectsGraph = false) {
     try {
       const items = await this.#ports.ledger.readItemProgress([itemId]);
-      return graphProgress(items.find(item => item.itemId === itemId));
+      const item = items.find(item => item.itemId === itemId);
+      const digest = item ? graphProgress(item) : null;
+      return !item || (expectsGraph && digest === null) ? undefined : digest;
     } catch {
       this.#status.lastError = 'progress_observation_failed';
-      return null;
+      return undefined;
     }
   }
 

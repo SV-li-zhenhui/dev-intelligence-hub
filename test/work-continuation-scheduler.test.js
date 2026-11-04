@@ -286,7 +286,7 @@ test('repeated unchanged inputs back off and remain recoverable after stalled di
 });
 
 test('unchanged deterministic decision failures stop model retries across restart and rearm on effective input changes', async t => {
-  for (const code of ['ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION', 'STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED'])
+  for (const code of ['ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION', 'STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED', 'STRUCTURED_PROVIDER_RESPONSE_INVALID', 'STRUCTURED_BRAIN_RESPONSE_INVALID'])
     for (const status of ['queued', 'retry_wait']) for (const change of ['task', 'related-child', 'configuration', 'runtime']) await t.test(`${code}: ${status}: ${change}`, async () => {
     const f = relatedProgressFixture();
     f.items[0].status = status;
@@ -340,6 +340,30 @@ test('configuration failures wait for effective changes instead of repeating eve
   });
 });
 
+test('a root without children also stops repeating completed unchanged model decisions', async () => {
+  const f = fixture(); f.items[0].currentTarget.id = 'orchestrator';
+  let receipt, calls = 0;
+  f.options.taskRuns = { async order(items) { return items; }, async get() { return { active: false, receipt }; } };
+  let scheduler = new WorkContinuationScheduler(f.options);
+  const dispatch = async () => {
+    calls++;
+    receipt = { taskId: f.items[0].itemId, roleId: 'orchestrator', taskRevision: f.items[0].revision,
+      registeredAt: f.options.clock().toISOString(), modelStartedAt: f.options.clock().toISOString(),
+      finishedAt: f.options.clock().toISOString(), phase: 'completed', stopConfirmed: true,
+      session: { transport: 'app-server', status: 'completed' } };
+  };
+  const run = async () => { await scheduler.runCycle({ ...f, dispatch }); await f.drain(); };
+  for (let i = 0; i < 3; i++) { await run(); f.advance(90_000); }
+  assert.equal(calls, 3);
+  assert.equal(f.state().records[0].recovery.action, 'await_condition');
+  scheduler = new WorkContinuationScheduler(f.options);
+  f.advance(3600_000); await run();
+  assert.equal(calls, 3, 'elapsed time and restart cannot justify another identical model call');
+  f.items[0].revision++;
+  await run();
+  assert.equal(calls, 4, 'a real root revision change resumes the same work');
+});
+
 test('completed model decisions without graph progress wait across restart and wake on child changes', async () => {
   const f = relatedProgressFixture(); let calls = 0, receipt;
   f.options.taskRuns = { async order(items) { return items; }, async get() { return { active: false, receipt }; } };
@@ -362,8 +386,10 @@ test('completed model decisions without graph progress wait across restart and w
 });
 
 test('missing or unconfirmed model/graph evidence keeps a continuation recoverable', async t => {
-  for (const variant of ['no-graph', 'active', 'unconfirmed', 'no-model', 'unfinished', 'old-run', 'future-finish']) await t.test(variant, async () => {
-    const f = variant === 'no-graph' ? fixture() : relatedProgressFixture(); let calls = 0, receipt;
+  for (const variant of ['missing-graph-progress', 'active', 'unconfirmed', 'no-model', 'unfinished', 'old-run', 'future-finish']) await t.test(variant, async () => {
+    const f = relatedProgressFixture(); let calls = 0, receipt;
+    if (variant === 'missing-graph-progress') f.ledger.readItemProgress = async ids =>
+      f.items.filter(item => ids.includes(item.itemId)).map(item => structuredClone(item));
     f.items[0].currentTarget.id = 'orchestrator';
     f.options.taskRuns = { async order(items) { return items; }, async get() { return { active: variant === 'active', receipt }; } };
     const scheduler = new WorkContinuationScheduler(f.options);
