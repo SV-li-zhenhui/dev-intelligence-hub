@@ -95,7 +95,10 @@ jobs:
           $hostSkipPattern = $hostOnlyNames -join '|'
           node --test --test-concurrency=2 --test-reporter=tap --test-skip-pattern $hostSkipPattern $portableTests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          node --test --test-concurrency=1 --test-reporter=tap test/open-source-distribution.mjs
+          # The hosted command job cannot launch an independent Windows service.
+          # Keep payload installation/composition checks here; npm test also
+          # exercises the real manager lifecycle on the configured workstation.
+          node --test --test-concurrency=1 --test-reporter=tap --test-skip-pattern 'the clean payload starts, reports status, and stops through its trusted manager' test/open-source-distribution.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           @"
           ### Host-level validation
