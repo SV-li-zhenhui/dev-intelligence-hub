@@ -10,6 +10,7 @@ import {
   isTerminalCodeJobStatus,
   normalizeApprovedCodeJobRequest,
   normalizeCodeJob,
+  normalizeCodeJobCompletionReport,
   normalizeCodeJobTimestamp,
   normalizeCodeJobTimeoutContinuation,
   codeJobTimeoutContinuationDelayMs,
@@ -2176,6 +2177,9 @@ function createArchiveTombstone(entry) {
       memoryProjection: job.execution.memoryProjection,
       changePackageDelivery: entry.changePackageDelivery,
       verificationOutcome,
+      ...(job.execution.result.detail.completionReport === undefined ? {} : {
+        completionReport: job.execution.result.detail.completionReport,
+      }),
     },
   };
   if (
@@ -2316,6 +2320,7 @@ function normalizeArchivedOutcome(value, tombstone, error) {
       "memoryProjection",
       ...(packageVersion ? ["changePackageDelivery"] : []),
       ...(verificationVersion ? ["verificationOutcome"] : []),
+      ...(Object.hasOwn(value ?? {}, "completionReport") ? ["completionReport"] : []),
     ],
     error,
   );
@@ -2403,6 +2408,14 @@ function normalizeArchivedOutcome(value, tombstone, error) {
   const verificationOutcome = verificationVersion
     ? value.verificationOutcome
     : null;
+  let completionReport;
+  if (Object.hasOwn(value, "completionReport")) {
+    if (tombstone.status !== "completed" || latestObservation?.actionType !== "complete" ||
+        latestObservation.status !== "succeeded") throw error;
+    const report = value.completionReport;
+    completionReport = normalizeCodeJobCompletionReport(report, { type: "complete",
+      actionId: report?.actionId, expectedWorkspaceRevision: report?.workspaceRevision }, error);
+  }
   if (
     verificationOutcome !== null &&
     (tombstone.status !== "failed" || tombstone.operation !== "verify" ||
@@ -2418,6 +2431,7 @@ function normalizeArchivedOutcome(value, tombstone, error) {
     memoryProjection,
     ...(packageVersion ? { changePackageDelivery } : {}),
     ...(verificationVersion ? { verificationOutcome } : {}),
+    ...(completionReport === undefined ? {} : { completionReport }),
   };
 }
 
@@ -3104,7 +3118,8 @@ export class CodeJobStore {
   }
 
   prepareAction(value) {
-    const request = normalizeMutationBase(value, ["action"]);
+    const hasReport = Object.hasOwn(value ?? {}, "completionReport");
+    const request = normalizeMutationBase(value, ["action", ...(hasReport ? ["completionReport"] : [])]);
     return this.#mutate((state) => {
       const { job, index } = this.#requireJob(state, request.jobId);
       let action;
@@ -3134,6 +3149,8 @@ export class CodeJobStore {
         throw transitionConflict("测试配置不在代码任务授权范围内");
       }
       const actionDigest = digestValue(action);
+      const completionReport = hasReport
+        ? normalizeCodeJobCompletionReport(value.completionReport, action, request.error) : undefined;
       const pending = job.execution.pendingAction;
       const observed = job.execution.observations.find(
         (entry) => entry.actionId === action.actionId,
@@ -3144,6 +3161,10 @@ export class CodeJobStore {
           pending.actionDigest === actionDigest) ||
         (observed !== undefined && observed.actionDigest === actionDigest)
       ) {
+        const saved = pending?.actionId === action.actionId ? pending : observed;
+        if (digestValue(saved.completionReport ?? null) !== digestValue(completionReport ?? null)) {
+          throw transitionConflict("actionId 已绑定不同的完成报告");
+        }
         return {
           state,
           value: workerMutationResult("already", job),
@@ -3169,6 +3190,7 @@ export class CodeJobStore {
             actionId: action.actionId,
             actionDigest,
             action,
+            ...(completionReport === undefined ? {} : { completionReport }),
             preparedAt: at,
           },
           actionAdmission: null,
@@ -3431,6 +3453,7 @@ export class CodeJobStore {
                 actionType: pending.action.type,
                 actionDigest: pending.actionDigest,
                 action: pending.action,
+                ...(pending.completionReport === undefined ? {} : { completionReport: pending.completionReport }),
                 status,
                 workspaceRevision,
                 detail,
@@ -4046,7 +4069,14 @@ export class CodeJobStore {
         historyAvailable: false,
         observations: [],
         nextCursor: null,
-        terminalDetail: null,
+        terminalDetail: archived.outcome.completionReport === undefined ? null : projectCodeJobTerminalDetailForBrowser({
+          status: archived.status, execution: { result: { detail: {
+            schemaVersion: 1, outcome: archived.outcome.completionReport.outcome,
+            completedActionId: archived.outcome.completionReport.actionId,
+            workspaceRevision: archived.outcome.completionReport.workspaceRevision,
+            evidence: archived.grant.evidence, completionReport: archived.outcome.completionReport,
+          } } },
+        }),
         changePackage: archivedChangePackageProjection(archived),
       });
     });
@@ -4249,10 +4279,10 @@ export class CodeJobStore {
   #finish(value, terminalStatus) {
     const normalized = normalizeFinishRequest(value, terminalStatus);
     const { request, changePackageDelivery } = normalized;
-    const detail = createCodeJobDetail(value.result);
-    const detailDigest = digestValue(detail);
     return this.#mutate((state) => {
       const { job, index } = this.#requireJob(state, request.jobId);
+      const detail = createCodeJobDetail(value.result, terminalStatus === "completed" ? { completionGrant: job.grant } : undefined);
+      const detailDigest = digestValue(detail);
       if (isTerminalCodeJobStatus(job.status)) {
         if (
           job.status !== terminalStatus ||

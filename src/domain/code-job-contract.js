@@ -3,6 +3,7 @@ import {
   normalizeActionRequest,
 } from "./code-executor-contract.js";
 import { normalizeWorkspacePath } from "./code-execution-policy.js";
+import { normalizeCodeCompletionReport } from "./structured-code-action-contract.js";
 import {
   codeExecutionSourceAllowsWrite,
   codeExecutionSourceWritablePaths,
@@ -714,11 +715,24 @@ function normalizeDetail(value, error) {
   return detail;
 }
 
+export function normalizeCodeJobCompletionReport(value, action, error = invalidJob()) {
+  const fields = exactObject(value, ["actionId", "actionDigest", "workspaceRevision", "outcome", "evidence"], error);
+  if (action.type !== "complete" || fields.get("actionId") !== action.actionId ||
+      fields.get("actionDigest") !== digestValue(action) ||
+      fields.get("workspaceRevision") !== action.expectedWorkspaceRevision) throw error;
+  let report;
+  try { report = normalizeCodeCompletionReport({ outcome: fields.get("outcome"), evidence: fields.get("evidence") }); }
+  catch { throw error; }
+  return { actionId: action.actionId, actionDigest: digestValue(action),
+    workspaceRevision: action.expectedWorkspaceRevision, ...report };
+}
+
 function normalizePendingAction(value, sessionId, error) {
   if (value === null) return null;
   const fields = exactObject(
     value,
-    ["turn", "actionId", "actionDigest", "action", "preparedAt"],
+    ["turn", "actionId", "actionDigest", "action", "preparedAt",
+      ...(Object.hasOwn(value ?? {}, "completionReport") ? ["completionReport"] : [])],
     error,
   );
   let action;
@@ -753,6 +767,9 @@ function normalizePendingAction(value, sessionId, error) {
     actionId,
     actionDigest,
     action,
+    ...(fields.has("completionReport") ? {
+      completionReport: normalizeCodeJobCompletionReport(fields.get("completionReport"), action, error),
+    } : {}),
     preparedAt: normalizeCodeJobTimestamp(fields.get("preparedAt"), error),
   };
 }
@@ -836,6 +853,7 @@ function normalizeObservation(value, sessionId, grant, error) {
       "detail",
       "detailDigest",
       "recordedAt",
+      ...(Object.hasOwn(value ?? {}, "completionReport") ? ["completionReport"] : []),
     ],
     error,
   );
@@ -896,6 +914,9 @@ function normalizeObservation(value, sessionId, grant, error) {
     actionType,
     actionDigest,
     action,
+    ...(fields.has("completionReport") ? {
+      completionReport: normalizeCodeJobCompletionReport(fields.get("completionReport"), action, error),
+    } : {}),
     status,
     workspaceRevision: sha256(
       fields.get("workspaceRevision"),
@@ -908,7 +929,23 @@ function normalizeObservation(value, sessionId, grant, error) {
   };
 }
 
-function normalizeTerminalResult(value, error) {
+function normalizeCompletionDetail(value, grant, error) {
+  if (!Object.hasOwn(value ?? {}, "completionReport")) return normalizeDetail(value, error);
+  const detail = normalizeJsonValue(value, error);
+  const report = normalizeCodeJobCompletionReport(detail.completionReport, {
+    type: "complete", actionId: detail.completedActionId, expectedWorkspaceRevision: detail.workspaceRevision,
+  }, error);
+  if (detail.schemaVersion !== 1 || detail.outcome !== report.outcome) throw error;
+  const hostDetail = { ...detail, outcome: grant.summary };
+  delete hostDetail.completionReport;
+  normalizeDetail(hostDetail, error);
+  // A bounded model report has its own budget; it cannot enlarge the host
+  // manifest/evidence budget or fail only after the executor has settled.
+  if (Buffer.byteLength(JSON.stringify(detail), "utf8") > MAX_DETAIL_BYTES + 100 * 1024) throw error;
+  return detail;
+}
+
+function normalizeTerminalResult(value, error, grant) {
   if (value === null) return null;
   const fields = exactObject(
     value,
@@ -917,7 +954,8 @@ function normalizeTerminalResult(value, error) {
   );
   const kind = fields.get("kind");
   if (!TERMINAL_JOB_STATUSES.has(kind)) throw error;
-  const detail = normalizeDetail(fields.get("detail"), error);
+  const detail = kind === "completed" ? normalizeCompletionDetail(fields.get("detail"), grant, error)
+    : normalizeDetail(fields.get("detail"), error);
   const detailDigest = sha256(
     fields.get("detailDigest"),
     "result.detailDigest",
@@ -1230,7 +1268,9 @@ function normalizeExecution(
         revision,
         error,
       );
-  const result = normalizeTerminalResult(fields.get("result"), error);
+  const result = normalizeTerminalResult(fields.get("result"), error, grant);
+  if (result?.kind === "completed" &&
+      digestValue(observations.at(-1)?.completionReport ?? null) !== digestValue(result.detail.completionReport ?? null)) throw error;
   const pause = normalizePause(fields.get("pause"), error);
   const uncertainty = legacyAdmittedPending
     ? {
@@ -1840,8 +1880,9 @@ export function updateCodeJobLifecycle(
   return normalizeCodeJob({ ...content, recordDigest: digestValue(content) });
 }
 
-export function createCodeJobDetail(value) {
-  return normalizeDetail(value, invalidJob("代码任务执行详情无效"));
+export function createCodeJobDetail(value, { completionGrant = null } = {}) {
+  const error = invalidJob("代码任务执行详情无效");
+  return completionGrant === null ? normalizeDetail(value, error) : normalizeCompletionDetail(value, completionGrant, error);
 }
 
 export function isTerminalCodeJobStatus(value) {

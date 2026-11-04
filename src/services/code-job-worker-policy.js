@@ -1,5 +1,6 @@
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { digestValue } from "../domain/code-executor-contract.js";
+import { normalizeCodeJobCompletionReport } from "../domain/code-job-contract.js";
 import { normalizeWorkspacePath } from "../domain/code-execution-policy.js";
 import { codeExecutionSourceAllowsWrite } from "../domain/code-execution-source.js";
 import { projectTestSummary } from "../domain/test-result-summary.js";
@@ -620,12 +621,21 @@ export function bindTrustedAction(job, session, semanticAction, remainingProfile
   return common;
 }
 
-export function terminalResult(job, action, detail, workspaceRevision) {
+export function completionReportForAction(action, semanticAction) {
+  return action.type === "complete" ? { completionReport: normalizeCodeJobCompletionReport({
+    actionId: action.actionId, actionDigest: digestValue(action), workspaceRevision: action.expectedWorkspaceRevision,
+    outcome: semanticAction.outcome, evidence: semanticAction.evidence,
+  }, action) } : {};
+}
+
+export function terminalResult(job, action, detail, workspaceRevision, completionReport) {
   const result = detail?.result ?? {};
+  const report = completionReport === undefined ? null : normalizeCodeJobCompletionReport(completionReport, action);
   return {
     schemaVersion: 1,
-    outcome: job.grant.summary,
+    outcome: report?.outcome ?? job.grant.summary,
     evidence: [...job.grant.evidence],
+    ...(report === null ? {} : { completionReport: report }),
     checks: job.grant.requiredProfiles.map(({ id }) => id),
     workspaceRevision,
     manifest: result,

@@ -358,6 +358,63 @@ async function readyStore({
   return { jobs, store, time, exclusiveLease };
 }
 
+for (const escaped of [false, true]) test(`completion reports survive archive with exact binding and escaped bounds ${escaped}`, async () => {
+  const f = await readyStore();
+  const hostGrant = grant(escaped ? { evidence: Array.from({ length: 20 }, (_, i) => `${i}` + '"'.repeat(2040)) } : {});
+  const created = await f.jobs.createApprovedJob(approval({ grant: hostGrant }));
+  const starting = await f.jobs.claimStarting({ jobId: created.job.jobId, expectedRevision: created.job.revision });
+  const active = await f.jobs.activate({ jobId: created.job.jobId, expectedRevision: starting.job.revision,
+    workspaceRevision: '4'.repeat(64) });
+  const action = { type: 'complete', actionId: 'completion-report-action', expectedWorkspaceRevision: '4'.repeat(64) };
+  const report = { actionId: action.actionId, actionDigest: digestValue(action), workspaceRevision: action.expectedWorkspaceRevision,
+    outcome: escaped ? '"'.repeat(4096) : 'Inspection findings and remaining verification.',
+    evidence: escaped ? Array.from({ length: 20 }, (_, i) => `${i}` + '"'.repeat(2040)) : ['model evidence only'] };
+  for (const [key, value] of [['actionId', 'other-action'], ['actionDigest', '0'.repeat(64)],
+    ['workspaceRevision', '0'.repeat(64)], ['outcome', ''], ['evidence', ['duplicate', 'duplicate']]]) {
+    await assert.rejects(f.jobs.prepareAction({ jobId: active.job.jobId, expectedRevision: active.job.revision,
+      action, completionReport: { ...report, [key]: value } }), { code: 'INVALID_CODE_JOB_MUTATION' });
+  }
+  const prepared = await f.jobs.prepareAction({ jobId: active.job.jobId, expectedRevision: active.job.revision,
+    action, completionReport: report });
+  const persisted = normalizeCodeJob(f.store.value.jobs[0]);
+  assert.deepEqual(persisted.execution.pendingAction.completionReport, report);
+  await assert.rejects(f.jobs.prepareAction({ jobId: active.job.jobId, expectedRevision: prepared.job.revision,
+    action, completionReport: { ...report, outcome: 'substituted report' } }), { code: 'CODE_JOB_TRANSITION_CONFLICT' });
+  const observed = await f.jobs.recordObservation({ jobId: active.job.jobId, expectedRevision: prepared.job.revision,
+    actionId: action.actionId, status: 'succeeded', workspaceRevision: action.expectedWorkspaceRevision,
+    detail: { result: { created: [], modified: [], deleted: [] } } });
+  assert.deepEqual(normalizeCodeJob(f.store.value.jobs[0]).execution.observations[0].completionReport, report);
+  const recovered = await readyStore({ store: f.store, time: f.time });
+  let current = await recovered.jobs.getForWorker(active.job.jobId);
+  assert.deepEqual(current.execution.observations[0].completionReport, report);
+  if (current.status === 'paused') current = (await recovered.jobs.resume({ jobId: current.jobId, expectedRevision: current.revision })).job;
+  const manifest = { created: [], modified: [], deleted: [] };
+  if (escaped) {
+    while (Buffer.byteLength(JSON.stringify({ evidence: hostGrant.evidence, manifest })) < 120 * 1024) {
+      manifest.created.push({ path: `src/${'x'.repeat(500)}${manifest.created.length}.js`, sha256: 'a'.repeat(64) });
+    }
+  }
+  const terminalDetail = { schemaVersion: 1, outcome: report.outcome, evidence: hostGrant.evidence, completionReport: report,
+      workspaceRevision: action.expectedWorkspaceRevision, completedActionId: action.actionId,
+      checks: ['node-tests'], manifest };
+  const withoutReport = { ...terminalDetail };
+  delete withoutReport.completionReport;
+  await assert.rejects(recovered.jobs.complete({ jobId: current.jobId, expectedRevision: current.revision,
+    result: withoutReport }), { code: 'INVALID_CODE_JOB' });
+  const completed = await recovered.jobs.complete({ jobId: current.jobId, expectedRevision: current.revision,
+    result: terminalDetail });
+  assert.equal((await recovered.jobs.getDetail({ jobId: current.jobId })).terminalDetail.outcome, report.outcome);
+  const batch = await recovered.jobs.readMemoryProjectionBatch({ limit: 10 });
+  for (const event of batch.items) await recovered.jobs.acknowledgeMemoryProjection(memoryAcknowledgement(event));
+  await recovered.jobs.compactTerminalPrefix(compactionRequest(f.store, { targetThroughSequence: completed.job.sequence }));
+  const archived = await recovered.jobs.getDetail({ jobId: current.jobId });
+  assert.equal(archived.archived, true);
+  assert.equal(archived.terminalDetail.outcome, report.outcome);
+  assert.deepEqual(archived.terminalDetail.completionReport.evidence, report.evidence);
+  const reopened = await readyStore({ store: f.store, time: f.time });
+  assert.deepEqual((await reopened.jobs.getDetail({ jobId: current.jobId })).terminalDetail, archived.terminalDetail);
+});
+
 test("unchanged versioned code jobs reuse certified state without reading and validating history again", async () => {
   const store = new VersionedMemoryStore();
   const fixture = await readyStore({ store });

@@ -327,13 +327,14 @@ class FakeJobStore {
     }, "cancelled");
   }
 
-  async prepareAction({ jobId, expectedRevision, action }) {
+  async prepareAction({ jobId, expectedRevision, action, completionReport }) {
     return this.#mutate(jobId, expectedRevision, (current) => {
       current.execution.pendingAction = {
         turn: current.execution.turn + 1,
         actionId: action.actionId,
         actionDigest: digestValue(action),
         action: structuredClone(action),
+        ...(completionReport === undefined ? {} : { completionReport: structuredClone(completionReport) }),
         preparedAt: "2026-08-01T00:00:01.000Z",
       };
       current.execution.actionAdmission = null;
@@ -499,6 +500,7 @@ class FakeJobStore {
         actionType: pending.action.type,
         actionDigest: pending.actionDigest,
         action: structuredClone(pending.action),
+        ...(pending.completionReport === undefined ? {} : { completionReport: structuredClone(pending.completionReport) }),
         status,
         workspaceRevision,
         detail: structuredClone(detail),
@@ -806,6 +808,51 @@ function continuousFixture(decide, { content = "\uFEFForiginal\n", maxTurns = 64
 function continuousDecision(action) {
   return { schemaVersion: 1, confidence: 100, summary: "Controlled development", reason: "Current evidence", action };
 }
+
+for (const continuous of [false, true]) {
+  test(`${continuous ? 'continuous' : 'single-turn'} completion retains model report separately from host verification`, async () => {
+    const report = { type: 'complete', outcome: 'Inspection found one defect and an unverified GPU scenario.',
+      evidence: ['model: file.cpp:42 needs follow-up', 'model claim: every check passed'] };
+    const f = continuousFixture(async () => continuousDecision(report));
+    const worker = new CodeJobWorkerService({ jobStore: f.jobs, executor: f.executor, grantVerifier: verifier([]),
+      brainDirectory: { describe: () => ({ supportsCodeExecution: continuous }),
+        decide: async () => continuousDecision(report) } });
+    assert.equal((await worker.runCycle()).outcomes[0].status, 'completed');
+    const job = await f.jobs.getForWorker(f.initial.jobId);
+    assert.equal(job.execution.result.detail.outcome, report.outcome);
+    assert.deepEqual(job.execution.result.detail.evidence, f.initial.grant.evidence);
+    assert.deepEqual(job.execution.result.detail.completionReport.evidence, report.evidence);
+    const action = f.executor.calls.find(x => x.method === 'perform' && x.value.action.type === 'complete').value.action;
+    assert.deepEqual(Object.keys(action).sort(), ['actionId', 'expectedWorkspaceRevision', 'type']);
+    const saved = job.execution.observations.at(-1).completionReport;
+    assert.equal(saved.actionDigest, digestValue(action));
+    assert.equal(saved.actionId, action.actionId);
+    assert.equal(saved.workspaceRevision, action.expectedWorkspaceRevision);
+  });
+}
+
+test('completion report survives executor settlement followed by worker restart', async () => {
+  const report = { type: 'complete', outcome: 'One finding; hardware verification is still pending.', evidence: ['src/app.js:1'] };
+  const f = continuousFixture(async () => continuousDecision(report));
+  const complete = f.jobs.complete.bind(f.jobs);
+  let failed = false;
+  f.jobs.complete = async value => {
+    if (!failed) { failed = true; throw new Error('completion acknowledgement lost'); }
+    return complete(value);
+  };
+  await f.worker.runCycle();
+  const observed = (await f.jobs.getForWorker(f.initial.jobId)).execution.observations.at(-1);
+  assert.equal(observed.actionType, 'complete');
+  assert.equal(observed.completionReport.outcome, report.outcome);
+  f.jobs.jobs.get(f.initial.jobId).status = 'active';
+  const resumed = new CodeJobWorkerService({ jobStore: f.jobs, executor: f.executor, grantVerifier: verifier([]),
+    brainDirectory: { decide: async () => assert.fail('settled completion must not call the model again') } });
+  assert.equal((await resumed.runCycle()).outcomes[0].status, 'completed');
+  const result = (await f.jobs.getForWorker(f.initial.jobId)).execution.result.detail;
+  assert.equal(result.outcome, report.outcome);
+  assert.deepEqual(result.completionReport.evidence, report.evidence);
+  assert.equal(f.executor.calls.filter(x => x.method === 'perform').length, 1);
+});
 
 for (const continuous of [false, true]) {
   test(`shutdown abort reaches an active ${continuous ? 'continuous' : 'single-turn'} code model and preserves its checkpoint`, async () => {
@@ -4516,7 +4563,7 @@ test("a profile cancelled before launch remains unexecuted and a verify job retr
     error: { code: "SANDBOX_ABORTED", message: "Windows fixed test was cancelled before launch",
       details: { origin: "windows_fixed_prelaunch", notExecuted: true, cleanupPending: false } } });
   const worker = new CodeJobWorkerService({ jobStore: store, executor,
-    brainDirectory: brain([{ type: "run_profile" }, { type: "run_profile" }, { type: "complete" }], calls), grantVerifier: verifier(events) });
+    brainDirectory: brain([{ type: "run_profile" }, { type: "run_profile" }, { type: "complete", outcome: "Retest passed.", evidence: [] }], calls), grantVerifier: verifier(events) });
   const first = await worker.runCycle();
   assert.equal(first.outcomes[0].status, "active");
   assert.equal((await store.getForWorker(initial.jobId)).execution.observations[0].status, "failed");
@@ -4605,7 +4652,7 @@ test("upgraded verify jobs keep a later passing retest instead of reviving an ol
   });
   const store = new FakeJobStore([initial]);
   const executor = new FakeExecutor(initial);
-  const worker = new CodeJobWorkerService({ jobStore: store, executor, brainDirectory: brain([{ type: "complete" }]), grantVerifier: verifier([]) });
+  const worker = new CodeJobWorkerService({ jobStore: store, executor, brainDirectory: brain([{ type: "complete", outcome: "Latest retest passed.", evidence: [] }]), grantVerifier: verifier([]) });
   const result = await worker.runCycle();
   assert.equal(result.outcomes[0].status, "completed");
   assert.equal(executor.calls.filter(({ method }) => method === "perform").length, 1);
@@ -4761,7 +4808,7 @@ test("modify jobs can repair and retest after a trusted profile failure", async 
   failFirstProfileRun(executor, { exitCode: 1, error: { code: "TESTS_FAILED", message: "checks failed" } });
   const worker = new CodeJobWorkerService({
     jobStore: store, executor,
-    brainDirectory: brain([{ type: "run_profile" }, { type: "write_text", path: "src/new.js", content: "export const fixed = true;\n" }, { type: "run_profile" }, { type: "complete" }]),
+    brainDirectory: brain([{ type: "run_profile" }, { type: "write_text", path: "src/new.js", content: "export const fixed = true;\n" }, { type: "run_profile" }, { type: "complete", outcome: "Repair and retest completed.", evidence: [] }]),
     grantVerifier: verifier([]),
   });
 
@@ -5438,6 +5485,7 @@ test("known infrastructure failures retry between actions while other brain fail
     "STRUCTURED_PROVIDER_IDLE_TIMEOUT",
     "STRUCTURED_PROVIDER_OUTPUT_LIMIT",
     "STRUCTURED_PROVIDER_PROCESS_FAILED",
+    "STRUCTURED_PROVIDER_PROCESS_EXITED",
     "STRUCTURED_PROVIDER_REAP_FAILED",
     "STRUCTURED_PROVIDER_REQUEST_TOO_LARGE",
     "STRUCTURED_PROVIDER_REQUEST_FAILED",

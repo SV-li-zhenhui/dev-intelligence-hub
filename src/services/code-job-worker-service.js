@@ -37,6 +37,7 @@ import {
   selectCycleCandidates,
   successfulProfiles,
   terminalResult,
+  completionReportForAction,
   trustedObservationAction,
   verificationFailure,
   workerError,
@@ -875,6 +876,7 @@ export class CodeJobWorkerService {
       jobId,
       expectedRevision: job.revision,
       action,
+      ...completionReportForAction(action, decision.action),
     })).job;
     await this.#verifyAuthority(job.grant);
     return this.#performPending(job, session);
@@ -971,7 +973,8 @@ export class CodeJobWorkerService {
     const action = bindTrustedAction(job, session, decision.action, remainingProfiles, context.observations, codeReadContext);
     await this.#verifyAuthority(job.grant);
     currentTaskExecution()?.assertRunning?.();
-    const prepared = (await this.#jobs.prepareAction({ jobId: job.jobId, expectedRevision: job.revision, action })).job;
+    const prepared = (await this.#jobs.prepareAction({ jobId: job.jobId, expectedRevision: job.revision, action,
+      ...completionReportForAction(action, decision.action) })).job;
     currentTaskExecution()?.reportProgress(`正在执行受控动作：${action.type}`);
     currentTaskExecution()?.reportEvent?.({ type: "tool", text: `${action.type}${action.path ? ` · ${action.path}` : ""}`, itemId: action.actionId });
     return this.#executePending(prepared, session, { continuous: true, signal });
@@ -1902,6 +1905,7 @@ export class CodeJobWorkerService {
         pending.action,
         detail,
         response.session.workspaceRevision,
+        pending.completionReport,
       );
       return { jobId: job.jobId, status: "completed", actionType: "complete" };
     }
@@ -1944,15 +1948,16 @@ export class CodeJobWorkerService {
       observation.action,
       observation.detail,
       observation.workspaceRevision,
+      observation.completionReport,
     );
     return { jobId: job.jobId, status: "completed", actionType: "complete" };
   }
 
-  async #completeJob(job, action, detail, workspaceRevision) {
+  async #completeJob(job, action, detail, workspaceRevision, completionReport) {
     const changed = await this.#jobs.complete({
       jobId: job.jobId,
       expectedRevision: job.revision,
-      result: terminalResult(job, action, detail, workspaceRevision),
+      result: terminalResult(job, action, detail, workspaceRevision, completionReport),
       ...(this.#changePackageDeliveryEnabled &&
           canCreateCodeJobChangePackageEvent(job)
         ? { changePackageDelivery: true }
@@ -2070,7 +2075,9 @@ export class CodeJobWorkerService {
     const authorityVerificationUnavailable = code === "CODE_JOB_AUTHORITY_VERIFICATION_UNAVAILABLE" && current &&
       ["queued", "starting", "active"].includes(current.status) && current.execution.actionAdmission === null;
     if (authorityVerificationUnavailable ||
-        ((brainFailureOwnerAttention(code) !== null || code === "STRUCTURED_PROVIDER_RESPONSE_INVALID" || stoppedQueueWait) && current?.status === "active" &&
+        (((brainFailureOwnerAttention(code) !== null &&
+          !["STRUCTURED_PROVIDER_PROCESS_FAILED", "STRUCTURED_PROVIDER_PROCESS_EXITED"].includes(code)) ||
+          code === "STRUCTURED_PROVIDER_RESPONSE_INVALID" || stoppedQueueWait) && current?.status === "active" &&
           (current.execution.pendingAction === null || stoppedPreparedRead) && current.execution.actionAdmission === null)) {
       const now = new Date(this.#clock()).getTime();
       if (!Number.isFinite(now)) throw workerError("CODE_JOB_CLOCK_INVALID", "Code job worker clock is invalid");

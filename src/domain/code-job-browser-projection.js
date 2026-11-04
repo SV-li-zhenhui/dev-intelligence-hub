@@ -389,6 +389,15 @@ function projectedTerminalDetail(detail) {
       result[key] = detail[key].filter((entry) => typeof entry === "string");
     }
   }
+  if (detail.completionReport && typeof detail.completionReport === "object") {
+    const report = detail.completionReport;
+    result.completionReport = Object.fromEntries(
+      ["actionId", "actionDigest", "workspaceRevision", "outcome"]
+        .filter(key => typeof report[key] === "string").map(key => [key, report[key]]),
+    );
+    result.completionReport.evidence = Array.isArray(report.evidence)
+      ? report.evidence.filter(entry => typeof entry === "string") : [];
+  }
   if (detail.manifest && typeof detail.manifest === "object") {
     result.manifest = {
       created: projectedPathEntries(detail.manifest.created),
