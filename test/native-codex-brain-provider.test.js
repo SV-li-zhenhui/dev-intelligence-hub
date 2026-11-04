@@ -8,7 +8,8 @@ import { PassThrough } from 'node:stream';
 import test from "node:test";
 
 import { createNativeCodexBrainProvider } from "../src/adapters/native-codex-brain-provider.js";
-import { nativeCodexDigest, nativeCodexHomeIdentity } from "../src/adapters/codex-native-session-store.js";
+import { reconcileNativeBootRecovery } from '../src/adapters/native-codex-boot-recovery.js';
+import { CodexNativeSessionStore, nativeCodexDigest, nativeCodexHomeIdentity } from "../src/adapters/codex-native-session-store.js";
 import { createTestSupervisedProcessRunner } from "../src/lib/supervised-process-runner.js";
 import { BrainRouter } from "../src/services/brain-router.js";
 import { CodexAppServerRunner } from '../src/lib/codex-app-server-runner.js';
@@ -297,6 +298,148 @@ test('unknown concurrent-home markers block admission after recovery without rem
   await assert.rejects(provider.generate(request()),{code:'STRUCTURED_PROVIDER_REAP_FAILED'});
   assert.equal(f.calls.length,0);assert.equal((await readdir(f.runtime)).includes(marker),true);
   await assert.rejects(provider.withAdmission({entityKey:'pr:42'},()=>assert.fail('unknown process owner')),{code:'STRUCTURED_PROVIDER_REAP_FAILED'});
+});
+
+test('a sealed full home remains blocked until a verified new boot restores admission without calling a model', async t => {
+  const f = await fixture(t);
+  await mkdir(f.runtime);
+  let now = Date.parse('2026-11-04T10:00:00Z');
+  let boot = { schemaVersion: 1, machineDigest: 'b'.repeat(64), startedAt: '2026-10-31T00:00:00.000Z', recordId: 10, uptimeMs: 300_000_000 };
+  const prefix = `active-${nativeCodexDigest(nativeCodexHomeIdentity(f.home))}`;
+  const markers = [];
+  for (let index = 0; index < 2; index += 1) {
+    const invocation = `invocation-${randomUUID()}`;
+    await mkdir(path.join(f.runtime, invocation));
+    const marker = path.join(f.runtime, `${prefix}-${randomUUID()}.json`);
+    const bytes = JSON.stringify({ schemaVersion: 2, invocation, createdAt: now - 1000, entity: nativeCodexDigest(`old-${index}`) });
+    await writeFile(marker, bytes);
+    markers.push({ marker, bytes });
+  }
+  await mkdir(path.join(f.runtime, 'sessions'));
+  const sessions = new CodexNativeSessionStore({ root: path.join(f.runtime, 'sessions'), nativeHome: f.home });
+  await sessions.begin({ sessionKey: 'old-0', threadId: 'original-native-thread' });
+  const provider = f.create(call => result(call, { ok: true }, 'original-native-thread'), {}, { maxConcurrentTurns: 2, allowConcurrentNativeHome: true, clock: () => now,
+    nativeBootRecovery: input => reconcileNativeBootRecovery({ ...input, bootIdentity: boot }) });
+  await assert.rejects(provider.generate(request()), { code: 'STRUCTURED_PROVIDER_REAP_FAILED' });
+  await assert.rejects(provider.withAdmission({ entityKey: 'new-task' }, () => assert.fail('same boot admitted work')), { code: 'STRUCTURED_PROVIDER_REAP_FAILED' });
+  assert.equal(f.calls.length, 0);
+  for (const { marker, bytes } of markers) assert.equal(await readFile(marker, 'utf8'), bytes);
+  now = Date.parse('2026-11-05T00:02:00Z');
+  boot = { ...boot, startedAt: '2026-11-05T00:00:00.000Z', recordId: 20, uptimeMs: 120_000 };
+  assert.equal(await provider.withAdmission({ entityKey: 'new-task' }, () => 'admitted'), 'admitted');
+  assert.equal(f.calls.length, 0, 'host recovery must not generate another model request');
+  for (const { marker, bytes } of markers) {
+    await assert.rejects(readFile(marker), { code: 'ENOENT' });
+    assert.equal(await readFile(path.join(f.runtime, 'recovered-invocations', path.basename(marker)), 'utf8'), bytes);
+  }
+  assert.deepEqual(JSON.parse(await provider.generate(request({ sessionKey: 'old-0' }))), { ok: true });
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].args[f.calls[0].args.indexOf('resume') + 1], 'original-native-thread');
+  assert.equal(await sessions.read({ sessionKey: 'old-0' }), 'original-native-thread');
+  await provider.close();
+});
+
+test('fresh provider checks a quarantine even when its sealed active marker is missing', async t => {
+  const f = await fixture(t);
+  await mkdir(f.runtime);
+  const now = Date.parse('2026-11-04T10:00:00Z');
+  const boot = { schemaVersion: 1, machineDigest: 'b'.repeat(64), startedAt: '2026-10-31T00:00:00.000Z', recordId: 10, uptimeMs: 300_000_000 };
+  const prefix = `active-${nativeCodexDigest(nativeCodexHomeIdentity(f.home))}`;
+  const invocation = `invocation-${randomUUID()}`;
+  await mkdir(path.join(f.runtime, invocation));
+  const marker = path.join(f.runtime, `${prefix}-${randomUUID()}.json`);
+  const entity = nativeCodexDigest('old-task');
+  await writeFile(marker, JSON.stringify({ schemaVersion: 2, invocation, createdAt: now - 1000, entity }));
+  await reconcileNativeBootRecovery({ root: f.runtime, prefix, entries: [{ file: marker, entity }], bootIdentity: boot, clock: () => now });
+  await rm(marker);
+  const provider = f.create(undefined, {}, { maxConcurrentTurns: 2, allowConcurrentNativeHome: true, clock: () => now,
+    nativeBootRecovery: input => reconcileNativeBootRecovery({ ...input, bootIdentity: boot }) });
+  await assert.rejects(provider.withAdmission({ entityKey: 'old-task' }, () => assert.fail('missing seal admitted')), { code: 'STRUCTURED_PROVIDER_REAP_FAILED' });
+  await assert.rejects(provider.generate(request()), { code: 'STRUCTURED_PROVIDER_REAP_FAILED' });
+  assert.equal(f.calls.length, 0);
+});
+
+for (const verified of [false, true]) test(`native quiescence cannot bypass a missing sealed marker after verification=${verified}`, async t => {
+  const f = await fixture(t);
+  await mkdir(f.runtime);
+  const now = Date.parse('2026-11-04T10:00:00Z');
+  const boot = { schemaVersion: 1, machineDigest: 'b'.repeat(64), startedAt: '2026-10-31T00:00:00.000Z', recordId: 10, uptimeMs: 300_000_000 };
+  const prefix = `active-${nativeCodexDigest(nativeCodexHomeIdentity(f.home))}`;
+  const invocation = `invocation-${randomUUID()}`;
+  await mkdir(path.join(f.runtime, invocation));
+  const marker = path.join(f.runtime, `${prefix}-${randomUUID()}.json`);
+  const entity = nativeCodexDigest('old-task');
+  await writeFile(marker, JSON.stringify({ schemaVersion: 2, invocation, createdAt: now - 1000, entity }));
+  const otherInvocation = `invocation-${randomUUID()}`;
+  await mkdir(path.join(f.runtime, otherInvocation));
+  const otherMarker = path.join(f.runtime, `${prefix}-${randomUUID()}.json`);
+  const otherEntity = nativeCodexDigest('other-old-task');
+  await writeFile(otherMarker, JSON.stringify({ schemaVersion: 2, invocation: otherInvocation, createdAt: now - 1000, entity: otherEntity }));
+  await reconcileNativeBootRecovery({ root: f.runtime, prefix, entries: [{ file: marker, entity }, { file: otherMarker, entity: otherEntity }], bootIdentity: boot, clock: () => now });
+  const provider = createNativeCodexBrainProvider(options, { ...f.dependencies, maxConcurrentTurns: 2,
+    allowConcurrentNativeHome: true, clock: () => now,
+    nativeBootRecovery: input => reconcileNativeBootRecovery({ ...input, bootIdentity: boot }) });
+  if (verified) await assert.rejects(provider.withAdmission({ entityKey: 'unrelated' }, () => assert.fail('full home admitted')), { code: 'STRUCTURED_PROVIDER_REAP_FAILED' });
+  await rm(marker);
+  const outcome = await provider.withEntityQuiescence({ entityKey: 'old-task' }, () => assert.fail('missing marker certified stopped'));
+  assert.deepEqual(outcome, { executed: false });
+  await assert.rejects(provider.close(), { code: 'STRUCTURED_PROVIDER_REAP_FAILED' });
+});
+
+for (const identity of ['unavailable', 'different-machine']) test(`missing sealed invocation stays fenced with ${identity} boot evidence`, async t => {
+  const f = await fixture(t);
+  await mkdir(f.runtime);
+  const now = Date.parse('2026-11-04T10:00:00Z');
+  const boot = { schemaVersion: 1, machineDigest: 'b'.repeat(64), startedAt: '2026-10-31T00:00:00.000Z', recordId: 10, uptimeMs: 300_000_000 };
+  const prefix = `active-${nativeCodexDigest(nativeCodexHomeIdentity(f.home))}`;
+  const entries = [];
+  for (const key of ['missing-task', 'other-task']) {
+    const invocation = `invocation-${randomUUID()}`;
+    await mkdir(path.join(f.runtime, invocation));
+    const file = path.join(f.runtime, `${prefix}-${randomUUID()}.json`), entity = nativeCodexDigest(key);
+    await writeFile(file, JSON.stringify({ schemaVersion: 2, invocation, createdAt: now - 1000, entity }));
+    entries.push({ file, entity });
+  }
+  await reconcileNativeBootRecovery({ root: f.runtime, prefix, entries, bootIdentity: boot, clock: () => now });
+  await rm(entries[0].file);
+  const provider = f.create(undefined, {}, { maxConcurrentTurns: 2, allowConcurrentNativeHome: true, clock: () => now,
+    nativeBootRecovery: input => reconcileNativeBootRecovery({ ...input, bootIdentity: identity === 'unavailable' ? null : { ...boot, machineDigest: 'd'.repeat(64) } }) });
+  let claimed = false;
+  await assert.rejects(provider.withAdmission({ entityKey: 'missing-task' }, () => { claimed = true; }), { code: 'STRUCTURED_PROVIDER_REAP_FAILED' });
+  assert.equal(claimed, false);
+  assert.equal(f.calls.length, 0);
+});
+
+test('capacity one recovers a legacy marker and a later distinct unknown invocation across two boots', async t => {
+  const f = await fixture(t);
+  await mkdir(f.runtime);
+  let now = Date.parse('2026-11-04T10:00:00Z');
+  let boot = { schemaVersion: 1, machineDigest: 'b'.repeat(64), startedAt: '2026-10-31T00:00:00.000Z', recordId: 10, uptimeMs: 300_000_000 };
+  const prefix = `active-${nativeCodexDigest(nativeCodexHomeIdentity(f.home))}`;
+  const invocation = `invocation-${randomUUID()}`;
+  await mkdir(path.join(f.runtime, invocation));
+  const legacy = path.join(f.runtime, `${prefix}.json`);
+  const legacyBytes = JSON.stringify({ schemaVersion: 2, invocation, createdAt: now - 1000, entity: nativeCodexDigest('legacy-task') });
+  await writeFile(legacy, legacyBytes);
+  const provider = f.create(async () => { throw error('STRUCTURED_PROVIDER_REAP_FAILED'); }, {}, { clock: () => now,
+    nativeBootRecovery: input => reconcileNativeBootRecovery({ ...input, bootIdentity: boot, clock: () => now }) });
+  await assert.rejects(provider.generate(request()), { code: 'STRUCTURED_PROVIDER_REAP_FAILED' });
+  await assert.rejects(provider.withAdmission({ entityKey: 'other' }, () => assert.fail('old boot admitted')), { code: 'STRUCTURED_PROVIDER_REAP_FAILED' });
+  now = Date.parse('2026-11-05T01:00:00Z');
+  boot = { ...boot, startedAt: '2026-11-05T00:00:00.000Z', recordId: 20, uptimeMs: 3_600_000 };
+  await provider.withAdmission({ entityKey: 'other' }, () => 'recovered legacy');
+  await assert.rejects(provider.generate(request({ sessionKey: 'next-task' })), { code: 'STRUCTURED_PROVIDER_REAP_FAILED' });
+  const nextName = (await readdir(f.runtime)).find(name => name.startsWith(prefix) && name.endsWith('.json'));
+  assert.notEqual(nextName, path.basename(legacy));
+  const nextBytes = await readFile(path.join(f.runtime, nextName), 'utf8');
+  await assert.rejects(provider.withAdmission({ entityKey: 'other' }, () => assert.fail('same boot admitted second orphan')), { code: 'STRUCTURED_PROVIDER_REAP_FAILED' });
+  now = Date.parse('2026-11-06T00:02:00Z');
+  boot = { ...boot, startedAt: '2026-11-06T00:00:00.000Z', recordId: 30, uptimeMs: 120_000 };
+  await provider.withAdmission({ entityKey: 'other' }, () => 'recovered second orphan');
+  assert.equal(await readFile(path.join(f.runtime, 'recovered-invocations', path.basename(legacy)), 'utf8'), legacyBytes);
+  assert.equal(await readFile(path.join(f.runtime, 'recovered-invocations', nextName), 'utf8'), nextBytes);
+  assert.equal((await readdir(f.runtime)).filter(name => name.startsWith('boot-recovery-')).length, 2);
+  await provider.close();
 });
 
 test('concurrent model slots serialize private runtime bootstrap before either process launch',async(t)=>{

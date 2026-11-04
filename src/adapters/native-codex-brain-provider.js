@@ -22,6 +22,8 @@ import { currentTaskExecution } from "../lib/task-execution-context.js";
 import { createCodeExecutionWatchdog, codeExecutionWatchdogSignal, closeCodeExecutionWatchdog } from '../lib/code-execution-watchdog.js';
 import { acquireNativeAdmission, createNativeModelAdmission, currentNativeAdmission, retainUnknownNativeInvocations, withNativeAdmission, withNativeEntityExclusion } from '../lib/native-model-admission.js';
 import { readUnknownNativeInvocations } from './native-codex-marker-identity.js';
+import { reconcileNativeBootRecovery } from './native-codex-boot-recovery.js';
+import { readWindowsBootIdentity } from '../lib/windows-boot-identity.js';
 import {createNativeExecLifecycle} from '../lib/native-exec-lifecycle.js';
 import {readNativeModelCapacity} from '../lib/native-model-capacity.js';
 import { parseStructuredCodeActionDecision } from "../domain/structured-code-action-contract.js";
@@ -194,6 +196,7 @@ export class NativeCodexBrainProvider {
   #controllers = new Set();
   #operations = new Set();
   #closed = false;
+  #bootRecovery = null;
 
   constructor(options, dependencies = {}) {
     if (!options || options.cliKind !== "codex-cli" || options.credentialMode !== "codex-native-login" ||
@@ -247,19 +250,63 @@ export class NativeCodexBrainProvider {
     if (this.#state.capacity !== capacity) throw new TypeError('Native home admission capacity differs between providers');
     this.#state.launchJournalCertified = this.#state.launchJournalCertified !== false &&
       isProductionSupervisedProcessRunner(this.#dependencies.processRunner) && dependencies.appServerRunner === undefined;
+    this.#bootRecovery = dependencies.nativeBootRecovery ?? (this.#state.launchJournalCertified
+      ? async input => reconcileNativeBootRecovery({ ...input, bootIdentity: await readWindowsBootIdentity() })
+      : null);
     this.#sessions = dependencies.nativeSessionStore ?? new CodexNativeSessionStore({ root: path.join(this.#root, "sessions"), nativeHome: this.#nativeHome });
   }
 
-  #marker() { return path.join(this.#root, `active-${nativeCodexDigest(nativeCodexHomeIdentity(this.#nativeHome))}${this.#state.capacity > 1 ? `-${randomUUID()}` : ''}.json`); }
+  #marker() { return path.join(this.#root, `active-${nativeCodexDigest(nativeCodexHomeIdentity(this.#nativeHome))}-${randomUUID()}.json`); }
+
+  #needsBootRecoveryInspection(files, prefix) {
+    return this.#bootRecovery !== null && !this.#state.bootRecoveryInspected &&
+      files.includes(`boot-quarantine-${prefix.slice(7)}.json`);
+  }
+
+  async #ensureBootRecoveryBoundary(signal) {
+    if (!this.#bootRecovery || this.#state.bootRecoveryInspected) return;
+    await this.#state.preparation.enqueue(async () => {
+      signal?.throwIfAborted();
+      if (this.#state.bootRecoveryInspected) return;
+      let files;
+      try { files = await readdir(this.#root); }
+      catch (error) { if (error.code !== 'ENOENT') this.#state.blocked = true; return; }
+      const prefix = `active-${nativeCodexDigest(nativeCodexHomeIdentity(this.#nativeHome))}`;
+      if (this.#needsBootRecoveryInspection(files, prefix)) this.#state.blocked = true;
+      else this.#state.bootRecoveryInspected = true;
+    });
+    signal?.throwIfAborted();
+  }
 
   async #isolateUnknownInvocations(signal = null) {
-    if (!this.#state.blocked || this.#state.capacity <= 1) return;
+    if (!this.#state.blocked) return;
     let pending = FENCE_RECONCILIATIONS.get(this.#state);
     if (!pending) {
       pending = this.#state.preparation.enqueue(async () => {
         if (!this.#state.blocked || [...this.#state.active].some(token => token.exclusive)) return;
-        const entries = await readUnknownNativeInvocations({ root: this.#root,
+        let entries = await readUnknownNativeInvocations({ root: this.#root,
           prefix: `active-${nativeCodexDigest(nativeCodexHomeIdentity(this.#nativeHome))}`, clock: this.#dependencies.clock });
+        if (entries !== null && this.#bootRecovery && [...this.#state.active].every(token => token.unknown)) {
+          let result;
+          try {
+            result = await this.#bootRecovery({ root: this.#root,
+              prefix: `active-${nativeCodexDigest(nativeCodexHomeIdentity(this.#nativeHome))}`,
+              entries, clock: this.#dependencies.clock });
+          } catch { this.#state.bootRecoveryInspected = false; return; }
+          this.#state.bootRecoveryInspected = result.sealed === true;
+          entries = result.entries;
+          for (const { file } of result.recovered) {
+            const token = this.#state.unknownInvocations.get(file);
+            if (token) this.#state.active.delete(token);
+            this.#state.unknownInvocations.delete(file);
+            this.#state.markers.delete(file);
+          }
+          if (result.sealed && entries.length === 0 && this.#state.active.size === 0 && this.#state.markers.size === 0) {
+            this.#state.blocked = false;
+            this.#state.lastStatus = null;
+            return;
+          }
+        }
         if (entries !== null && retainUnknownNativeInvocations(this.#state, entries) &&
             [...this.#state.markers].every(marker => this.#state.unknownInvocations.has(marker))) {
           this.#state.blocked = false;
@@ -290,10 +337,13 @@ export class NativeCodexBrainProvider {
     await prepare(this.#root);
     await prepare(path.join(this.#root, "sessions"));
     const prefix = `active-${nativeCodexDigest(nativeCodexHomeIdentity(this.#nativeHome))}`;
-    if ((await readdir(this.#root)).some(name => name.startsWith(prefix) && name.endsWith('.json') && !this.#state.markers.has(path.join(this.#root,name)))) {
+    const files = await readdir(this.#root);
+    if (this.#needsBootRecoveryInspection(files, prefix) ||
+        files.some(name => name.startsWith(prefix) && name.endsWith('.json') && !this.#state.markers.has(path.join(this.#root,name)))) {
       this.#state.blocked = true;
       throw failure("STRUCTURED_PROVIDER_REAP_FAILED");
     }
+    if (this.#bootRecovery) this.#state.bootRecoveryInspected = true;
     signal.throwIfAborted();
     return prepare;
   }
@@ -418,6 +468,8 @@ export class NativeCodexBrainProvider {
     if (typeof entityKey !== 'string' || !entityKey || Buffer.byteLength(entityKey) > 1024 || /[\u0000-\u001f]/u.test(entityKey) || typeof operation !== 'function') throw new TypeError('Native admission request is invalid');
     if (typeof waitForCapacity !== 'boolean') throw new TypeError('Native admission wait option is invalid');
     const caller = normalizeAbortSignal(signal);
+    if (this.#bootRecovery && !this.#state.bootRecoveryInspected) await this.#ensureBootRecoveryBoundary(caller);
+    if (this.#closed) throw failure('STRUCTURED_PROVIDER_CANCELLED');
     if (this.#state.blocked) {
       await this.#isolateUnknownInvocations(caller);
       if (this.#closed) throw failure('STRUCTURED_PROVIDER_CANCELLED');
@@ -444,8 +496,14 @@ export class NativeCodexBrainProvider {
     signal = normalizeAbortSignal(signal);
     signal?.throwIfAborted();
     if (!this.#state.launchJournalCertified) return { executed: false };
+    if (this.#bootRecovery && !this.#state.bootRecoveryInspected) await this.#ensureBootRecoveryBoundary(signal);
+    if (this.#state.blocked) await this.#isolateUnknownInvocations(signal);
     const attempt = withNativeEntityExclusion(this.#state, nativeCodexDigest(entityKey), signal, async () => {
       const settled = await this.#state.preparation.enqueue(async () => {
+        const prefix = `active-${nativeCodexDigest(nativeCodexHomeIdentity(this.#nativeHome))}`;
+        let files;
+        try { files = await readdir(this.#root); } catch { return false; }
+        if (this.#needsBootRecoveryInspection(files, prefix)) return false;
         const entries = await readUnknownNativeInvocations({ root: this.#root,
           prefix: `active-${nativeCodexDigest(nativeCodexHomeIdentity(this.#nativeHome))}`,
           clock: this.#dependencies.clock, signal });
@@ -466,6 +524,7 @@ export class NativeCodexBrainProvider {
   async generate(rawRequest) {
     const input = readStructuredBrainGenerateInput(rawRequest);
     const signal = normalizeAbortSignal(input.signal);
+    if (this.#bootRecovery && !this.#state.bootRecoveryInspected) await this.#ensureBootRecoveryBoundary(signal);
     if (this.#state.blocked) await this.#isolateUnknownInvocations(signal);
     const request = normalizeStructuredBrainRequest({ model: input.model, messages: input.messages, schema: input.schema,
       ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
@@ -616,6 +675,7 @@ export class NativeCodexBrainProvider {
     signal = normalizeAbortSignal(signal);
     if (signal?.aborted) throw failure("STRUCTURED_PROVIDER_CANCELLED");
     if (this.#closed) throw failure();
+    if (this.#bootRecovery && !this.#state.bootRecoveryInspected) await this.#ensureBootRecoveryBoundary(signal);
     if (this.#state.blocked) await this.#isolateUnknownInvocations(signal);
     if (this.transport === 'app-server' && this.#dependencies.appServerRunner.supportsContainedExecution === false) return status('cli_unavailable');
     if (this.#state.blocked) return status("broker_blocked");
@@ -650,6 +710,8 @@ export class NativeCodexBrainProvider {
   async checkAvailability(request = {}) {
     const signal = normalizeAbortSignal(request.signal ?? null);
     if (signal?.aborted) throw failure("STRUCTURED_PROVIDER_CANCELLED");
+    if (this.#closed) throw failure();
+    if (this.#bootRecovery && !this.#state.bootRecoveryInspected) await this.#ensureBootRecoveryBoundary(signal);
     if (this.#closed) throw failure();
     if (this.#state.blocked) await this.#isolateUnknownInvocations(signal);
     if (this.#state.blocked) throw failure("STRUCTURED_PROVIDER_REAP_FAILED");

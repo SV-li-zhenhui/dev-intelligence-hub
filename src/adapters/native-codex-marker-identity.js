@@ -12,7 +12,7 @@ const UUID = "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}";
 const INVOCATION = new RegExp(`^(?:invocation|probe)-${UUID}$`);
 const ADMISSION_ENTITY = new RegExp(`^(?:[a-f0-9]{64}|${UUID})$`);
 
-async function readArtifact(file, maximum) {
+export async function readNativeJsonArtifact(file, maximum) {
   let handle;
   try {
     const before = await lstat(file, { bigint: true });
@@ -23,9 +23,14 @@ async function readArtifact(file, maximum) {
     const buffer = Buffer.alloc(maximum + 1);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
     if (bytesRead !== Number(opened.size)) return null;
-    return parseJsonWithUniqueKeys(new TextDecoder("utf8", { fatal: true }).decode(buffer.subarray(0, bytesRead)));
+    const bytes = buffer.subarray(0, bytesRead);
+    return { value: parseJsonWithUniqueKeys(new TextDecoder("utf8", { fatal: true }).decode(bytes)), digest: nativeCodexDigest(bytes) };
   } catch { return null; }
   finally { await handle?.close(); }
+}
+
+async function readArtifact(file, maximum) {
+  return (await readNativeJsonArtifact(file, maximum))?.value ?? null;
 }
 
 function legacyTriageIdentity(wire) {
