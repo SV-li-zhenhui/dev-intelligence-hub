@@ -11,7 +11,7 @@ import { GitObjectSnapshotter } from "./git-object-snapshotter.js";
 const OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
 const NULL_FILE = process.platform === "win32" ? "NUL" : "/dev/null";
 const OBJECT_FETCH_TIMEOUT_MS = 5 * 60_000;
-const MAX_PREPARATION_TIMEOUT_MS = 17 * 60_000;
+export const OWN_PR_REPAIR_OBJECT_MAX_PREPARATION_MS = 17 * 60_000;
 const MESSAGES = Object.freeze({
   OWN_PR_REPAIR_OBJECT_INPUT_INVALID: "自动修复 Git 对象请求无效",
   OWN_PR_REPAIR_OBJECT_PREFLIGHT_FAILED: "自动修复 Git 仓库可信边界预检失败",
@@ -194,16 +194,22 @@ async function rejectTransportConfiguration(runGit) {
 export class OwnPrRepairObjectSync {
   #credentialSource;
   #processRunner;
+  #maxPreparationMs;
   #queue = new OperationQueue();
   #closed = false;
   #activeController = null;
 
-  constructor({ credentialSource, processRunner = new ManagedProcessRunner() } = {}) {
+  constructor({ credentialSource, processRunner = new ManagedProcessRunner(),
+    maxPreparationMs = OWN_PR_REPAIR_OBJECT_MAX_PREPARATION_MS } = {}) {
     if (!credentialSource || typeof credentialSource.acquire !== "function" || !processRunner || typeof processRunner.run !== "function") {
       throw new TypeError("Own PR object sync requires a credential source and process runner");
     }
+    if (!Number.isSafeInteger(maxPreparationMs) || maxPreparationMs < 1 || maxPreparationMs > OWN_PR_REPAIR_OBJECT_MAX_PREPARATION_MS) {
+      throw new TypeError("Own PR object preparation deadline is invalid");
+    }
     this.#credentialSource = credentialSource;
     this.#processRunner = processRunner;
+    this.#maxPreparationMs = maxPreparationMs;
     Object.freeze(this);
   }
 
@@ -225,7 +231,7 @@ export class OwnPrRepairObjectSync {
     // Local inspections retain their configured bound. Missing object packs
     // need a separate network allowance; restarting an active download at the
     // metadata deadline discards its progress on every retry.
-    const preparationTimeoutMs = timeoutMs * 3;
+    const preparationTimeoutMs = Math.min(timeoutMs * 3, this.#maxPreparationMs);
     const startedAt = Date.now();
     let deadline = startedAt + preparationTimeoutMs;
     let timedOut = false;
@@ -283,7 +289,7 @@ export class OwnPrRepairObjectSync {
         // At most three stores can be missing. Extend once, only after the
         // read-only fences pass. Leave cleanup time before the runner's lease.
         deadline = Math.min(deadline + missing.length * OBJECT_FETCH_TIMEOUT_MS,
-          startedAt + MAX_PREPARATION_TIMEOUT_MS);
+          startedAt + this.#maxPreparationMs);
         clearTimeout(timer);
         timer = setTimeout(abortOnTimeout, deadline - Date.now());
         stage = "OWN_PR_REPAIR_OBJECT_CREDENTIAL_FAILED";

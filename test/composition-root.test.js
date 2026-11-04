@@ -4423,8 +4423,8 @@ test("automatic own PR repair composes internal push with ownership guards and c
     {
       name: "automatic preparation can finish after the ordinary handler deadline",
       leaseDurationMs: 1_080_000, resolveTimeoutMs: 30_000, decisionTimeoutMs: 60_000,
-      githubTimeoutMs: 60_000, gitTimeoutMs: 30_000, expectedBudget: 180_000,
-      elapsedMs: 75_000, expectedStatus: "succeeded",
+      githubTimeoutMs: 60_000, gitTimeoutMs: 30_000, expectedBudget: 1_079_000,
+      elapsedMs: 240_000, expectedStatus: "succeeded",
     },
     {
       name: "automatic preparation still times out before its lease expires",
@@ -4433,9 +4433,9 @@ test("automatic own PR repair composes internal push with ownership guards and c
       elapsedMs: 89_000, expectedStatus: "waiting_retry",
     },
     {
-      name: "short preparation stages retain the ordinary 30 second minimum",
+      name: "network preparation remains bounded by a short configured lease",
       leaseDurationMs: 120_000, resolveTimeoutMs: 5_000, decisionTimeoutMs: 10_000,
-      githubTimeoutMs: 5_000, gitTimeoutMs: 2_000, expectedBudget: 30_000,
+      githubTimeoutMs: 5_000, gitTimeoutMs: 2_000, expectedBudget: 119_000,
     },
   ];
   for (const scenario of scenarios) {

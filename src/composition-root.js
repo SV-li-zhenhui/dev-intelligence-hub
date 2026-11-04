@@ -16,7 +16,7 @@ import { ReviewRepairContextReader, normalizeReviewRepairFeedbackContext } from 
 import { CiRepairContextReader } from './services/ci-repair-context-reader.js';
 import { isHeadRepairExecutionSource } from './domain/code-execution-source.js';
 import { OriginalRepairFeedbackReader } from "./services/original-repair-feedback-reader.js";
-import { OwnPrRepairObjectSync } from "./adapters/own-pr-repair-object-sync.js";
+import { OwnPrRepairObjectSync, OWN_PR_REPAIR_OBJECT_MAX_PREPARATION_MS } from "./adapters/own-pr-repair-object-sync.js";
 import { createGitHubPullRequestActionTransport } from "./adapters/github-pull-request-action-transport.js";
 import { createGhLoginCredentialSource } from "./adapters/gh-login-credential-source.js";
 import { OllamaBrain } from "./adapters/ollama-brain.js";
@@ -1397,6 +1397,16 @@ export async function createApplication({
         )
       : null;
     const configuredGithubActions = config.githubActions || {};
+    const automaticCodeHandlerTimeoutMs = coordinationTiming === null ? null : Math.min(
+      Math.max(30_000, 2 * (configuredGithubActions.timeoutMs ?? 60_000) +
+        OWN_PR_REPAIR_OBJECT_MAX_PREPARATION_MS + coordinationTiming.resolveTimeoutMs),
+      coordinationTiming.leaseDurationMs - coordinationTiming.evidenceMutationMarginMs,
+    );
+    const automaticObjectPreparationMs = coordinationTiming === null ? null : Math.max(1, Math.min(
+      OWN_PR_REPAIR_OBJECT_MAX_PREPARATION_MS,
+      automaticCodeHandlerTimeoutMs - 2 * (configuredGithubActions.timeoutMs ?? 60_000) -
+        coordinationTiming.resolveTimeoutMs - coordinationTiming.evidenceMutationMarginMs,
+    ));
     const explicitPullRequestActions = Array.isArray(
       configuredGithubActions.enabledActions,
     )
@@ -2251,7 +2261,8 @@ export async function createApplication({
             return ownerWorkRequests.submitInternalReview(request);
           },
         }),
-        objectSync: trackRuntime(new OwnPrRepairObjectSync({ credentialSource: githubCredentialSource })),
+        objectSync: trackRuntime(new OwnPrRepairObjectSync({ credentialSource: githubCredentialSource,
+          maxPreparationMs: automaticObjectPreparationMs })),
       };
       automaticOwnPrRepair = new AutomaticOwnPrRepair({ ...ownPrRepairDependencies,
         conflictRepair: new AutomaticOwnPrConflict({ ...ownPrRepairDependencies,
@@ -2444,13 +2455,7 @@ export async function createApplication({
             automaticOwnPrRepair: automaticLocalCodeAuthorization,
             // Two current-fact checks bracket globally bounded Git preparation.
             // Leave a margin for persisting the result before the lease expires.
-            handlerTimeoutMs: Math.min(
-              Math.max(30_000,
-                2 * (configuredGithubActions.timeoutMs ?? 60_000) +
-                  (config.codeExecutor.gitTimeoutMs ?? 30_000) +
-                  coordinationTiming.resolveTimeoutMs),
-              coordinationTiming.leaseDurationMs - coordinationTiming.evidenceMutationMarginMs,
-            ),
+            handlerTimeoutMs: automaticCodeHandlerTimeoutMs,
           }),
           leaseDurationMs: automaticOwnPrRepair === null
             ? coordinationConfig.leaseDurationMs

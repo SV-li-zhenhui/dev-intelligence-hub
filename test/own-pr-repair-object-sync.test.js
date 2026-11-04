@@ -462,6 +462,24 @@ test("three missing stores at the largest metadata timeout leave cleanup time be
   await sync.close();
 });
 
+test("the host's remaining preparation budget also bounds local inspections and object downloads", realGit, async (t) => {
+  const s = await fixture(t);
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const startedAt = Date.now();
+  const sync = new OwnPrRepairObjectSync({ ...s, maxPreparationMs: 120_000,
+    processRunner: { async run(request) {
+      if (!request.args.includes("fetch")) return s.processRunner.run(request);
+      assert.equal(s.acquired[0].deadline - startedAt, 120_000);
+      assert.equal(request.timeoutMs, 120_000);
+      t.mock.timers.tick(120_001);
+      assert.equal(request.signal.aborted, true);
+      throw Object.assign(new Error(TOKEN), { code: "PROCESS_ABORTED" });
+    } },
+  });
+  await assert.rejects(sync.prepare(s), { code: "OWN_PR_REPAIR_OBJECT_TIMEOUT" });
+  await sync.close();
+});
+
 test("bounds a managed child with the configured deadline and cancellation signal", realGit, async (t) => {
   const s = await fixture(t);
   s.configuration.codeExecutor.gitTimeoutMs = 200;
