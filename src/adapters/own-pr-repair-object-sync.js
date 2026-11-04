@@ -10,6 +10,8 @@ import { GitObjectSnapshotter } from "./git-object-snapshotter.js";
 
 const OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
 const NULL_FILE = process.platform === "win32" ? "NUL" : "/dev/null";
+const OBJECT_FETCH_TIMEOUT_MS = 5 * 60_000;
+const MAX_PREPARATION_TIMEOUT_MS = 17 * 60_000;
 const MESSAGES = Object.freeze({
   OWN_PR_REPAIR_OBJECT_INPUT_INVALID: "自动修复 Git 对象请求无效",
   OWN_PR_REPAIR_OBJECT_PREFLIGHT_FAILED: "自动修复 Git 仓库可信边界预检失败",
@@ -220,13 +222,15 @@ export class OwnPrRepairObjectSync {
     const { binding, actorAccountId, gitCommand, sourceRoot, mirrorRoot, baseMirrorRoot, timeoutMs } = normalizeRequest(request);
     const controller = new AbortController();
     this.#activeController = controller;
-    // Source, Head mirror and Base mirror each need preflight and may fetch.
-    // Keep each Git command bounded by timeoutMs without spending its network
-    // allowance on the preceding stores' metadata checks.
+    // Local inspections retain their configured bound. Missing object packs
+    // need a separate network allowance; restarting an active download at the
+    // metadata deadline discards its progress on every retry.
     const preparationTimeoutMs = timeoutMs * 3;
-    const deadline = Date.now() + preparationTimeoutMs;
+    const startedAt = Date.now();
+    let deadline = startedAt + preparationTimeoutMs;
     let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, preparationTimeoutMs);
+    const abortOnTimeout = () => { timedOut = true; controller.abort(); };
+    let timer = setTimeout(abortOnTimeout, preparationTimeoutMs);
     const checkDeadline = () => {
       if (timedOut || Date.now() >= deadline) throw failure("OWN_PR_REPAIR_OBJECT_TIMEOUT");
       if (controller.signal.aborted) throw failure("OWN_PR_REPAIR_OBJECT_CANCELLED");
@@ -240,8 +244,8 @@ export class OwnPrRepairObjectSync {
       checkDeadline();
       return output(result);
     };
-    const runGit = (root, args, env = environment(gitCommand)) => run({
-      command: gitCommand, cwd: root, args: [...PREFIX, `--git-dir=${root}`, ...args], env,
+    const runGit = (root, args, env = environment(gitCommand), commandTimeoutMs = timeoutMs) => run({
+      command: gitCommand, cwd: root, args: [...PREFIX, `--git-dir=${root}`, ...args], env, timeoutMs: commandTimeoutMs,
     });
     let stage = "OWN_PR_REPAIR_OBJECT_PREFLIGHT_FAILED";
     try {
@@ -275,6 +279,13 @@ export class OwnPrRepairObjectSync {
         if (type.exitCode !== 0) missing.push(store);
       }
       if (missing.length > 0) {
+        checkDeadline();
+        // At most three stores can be missing. Extend once, only after the
+        // read-only fences pass. Leave cleanup time before the runner's lease.
+        deadline = Math.min(deadline + missing.length * OBJECT_FETCH_TIMEOUT_MS,
+          startedAt + MAX_PREPARATION_TIMEOUT_MS);
+        clearTimeout(timer);
+        timer = setTimeout(abortOnTimeout, deadline - Date.now());
         stage = "OWN_PR_REPAIR_OBJECT_CREDENTIAL_FAILED";
         const lease = await this.#credentialSource.acquire({ actorAccountId, signal: controller.signal, deadline });
         await lease.use(async (token) => {
@@ -291,7 +302,7 @@ export class OwnPrRepairObjectSync {
                 "fetch", "--no-write-fetch-head", "--no-tags", "--no-prune", "--no-prune-tags", "--no-recurse-submodules",
                 "--no-auto-maintenance", "--no-write-commit-graph", "--no-progress", "--refmap=", "--",
                 `https://github.com/${store.repository}.git`, store.oid,
-              ], env);
+              ], env, OBJECT_FETCH_TIMEOUT_MS);
               if (fetched.exitCode !== 0) throw failure(stage);
             } finally {
               delete env.GIT_CONFIG_VALUE_1;

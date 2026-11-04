@@ -163,7 +163,7 @@ test("fetches exact Head into both local stores without changing checkout, index
     assert.ok(call.args.includes("credential.helper="));
     assert.equal(call.env.GIT_ASKPASS, "");
     assert.equal(call.signal, s.acquired[0].signal);
-    assert.ok(call.timeoutMs > 0 && call.timeoutMs <= 60_000);
+    assert.ok(call.timeoutMs > 0 && call.timeoutMs <= 300_000);
   }
   for (const call of s.calls) {
     assert.equal(call.env.GIT_CONFIG_NOSYSTEM, "1");
@@ -385,7 +385,28 @@ test("sanitizes credential and Git failures, clears ephemeral authentication and
   }
 });
 
-test("three-store preflight does not consume a later fetch command's configured timeout", realGit, async (t) => {
+test("object downloads can outlive the local Git inspection deadline without losing their bound", realGit, async (t) => {
+  const s = await fixture(t);
+  s.configuration.codeExecutor.gitTimeoutMs = 1_000;
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  let fetches = 0;
+  const sync = new OwnPrRepairObjectSync({ ...s, processRunner: { async run(request) {
+    if (request.args.includes("fetch")) {
+      fetches += 1;
+      t.mock.timers.tick(30_001);
+      assert.equal(request.signal.aborted, false, "an active download must survive the metadata deadline");
+      assert.equal(request.timeoutMs, 300_000);
+    } else {
+      assert.ok(request.timeoutMs > 0 && request.timeoutMs <= 1_000);
+    }
+    return s.processRunner.run(request);
+  } } });
+  await sync.prepare(s);
+  assert.equal(fetches, 2);
+  await sync.close();
+});
+
+test("three-store preflight does not consume a later fetch command's network timeout", realGit, async (t) => {
   const s = await fixture(t);
   s.configuration.codeExecutor.gitTimeoutMs = 1_000;
   t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
@@ -395,12 +416,49 @@ test("three-store preflight does not consume a later fetch command's configured 
     if (!delayed) { delayed = true; t.mock.timers.tick(800); }
     if (request.args.includes("fetch")) {
       fetches += 1;
-      assert.equal(request.timeoutMs, 1_000);
+      assert.equal(request.timeoutMs, 300_000);
     }
     return s.processRunner.run(request);
   } } });
   await sync.prepare(s);
   assert.equal(fetches, 2);
+  await sync.close();
+});
+
+test("object download allowance still aborts the entire preparation at its finite deadline", realGit, async (t) => {
+  const s = await fixture(t);
+  s.configuration.codeExecutor.gitTimeoutMs = 1_000;
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  let cancelled = false;
+  const sync = new OwnPrRepairObjectSync({ ...s, processRunner: { async run(request) {
+    if (!request.args.includes("fetch")) return s.processRunner.run(request);
+    request.signal.addEventListener("abort", () => { cancelled = true; }, { once: true });
+    // This fixture has exactly two missing stores. No retry can extend again.
+    t.mock.timers.tick(2 * 300_000 + 3 * 1_000 + 1);
+    assert.equal(request.signal.aborted, true);
+    throw Object.assign(new Error(TOKEN), { code: "PROCESS_ABORTED" });
+  } } });
+  await assert.rejects(sync.prepare(s), { code: "OWN_PR_REPAIR_OBJECT_TIMEOUT" });
+  assert.equal(cancelled, true);
+  await assert.rejects(s.leases[0].use(() => {}), /unavailable/u);
+  await sync.close();
+});
+
+test("three missing stores at the largest metadata timeout leave cleanup time before the runner lease", realGit, async (t) => {
+  const s = await fixture(t);
+  s.configuration.codeExecutor.gitTimeoutMs = 60_000;
+  s.inputBinding.gitTarget.baseRefOid = s.laterOid;
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const startedAt = Date.now();
+  const sync = new OwnPrRepairObjectSync({ ...s, processRunner: { async run(request) {
+    if (!request.args.includes("fetch")) return s.processRunner.run(request);
+    assert.equal(s.acquired[0].deadline - startedAt, 17 * 60_000);
+    assert.equal(request.timeoutMs, 300_000);
+    t.mock.timers.tick(17 * 60_000 + 1);
+    assert.equal(request.signal.aborted, true);
+    throw Object.assign(new Error(TOKEN), { code: "PROCESS_ABORTED" });
+  } } });
+  await assert.rejects(sync.prepare(s), { code: "OWN_PR_REPAIR_OBJECT_TIMEOUT" });
   await sync.close();
 });
 
