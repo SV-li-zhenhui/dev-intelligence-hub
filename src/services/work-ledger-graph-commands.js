@@ -1,6 +1,7 @@
 import { normalizeWorkGraphAcceptanceContract } from "../domain/work-graph-contract.js";
 import { hasPendingHostContextRecovery } from "./work-ledger-host-context-recovery.js";
 import { hasPendingCiMaterialRecovery } from "./work-ledger-ci-material-recovery.js";
+import { assertWorkLedgerGraphClaimable } from "./work-ledger-graph.js";
 import {
   normalizeStoredWorkflowEvent,
   normalizeWorkflowEvent,
@@ -59,6 +60,20 @@ const CHILD_PARENT_STATUSES = new Set([
   "queued",
   "working",
 ]);
+
+function retryParentReady(state, parent, now) {
+  if (parent.status !== "retry_wait" || !Number.isFinite(Date.parse(parent.availableAt)) ||
+      Date.parse(parent.availableAt) > Date.parse(now)) return false;
+  try {
+    // A due retry follows ordinary claim readiness. Failed or unfinished
+    // children still require their existing, separately verified recovery.
+    assertWorkLedgerGraphClaimable(state, parent.itemId);
+    return true;
+  } catch (error) {
+    if (error?.code === "WORK_LEDGER_GRAPH_BLOCKED") return false;
+    throw error;
+  }
+}
 
 function graphCommandError(message, statusCode = 400) {
   return workLedgerError(
@@ -346,9 +361,10 @@ export function planWorkGraphChildCreation({ state, input, clock }) {
 
   assertExpectedWorkGraphRevision(command.expectedGraphRevision, state);
   assertTaskRevisionBindings(state, command.expectedTaskRevisions);
+  const retryReady = retryParentReady(state, parent, now);
   if (
     !["assignment", "graph_task", "source_root"].includes(parent.kind) ||
-    (!CHILD_PARENT_STATUSES.has(parent.status) && !hasPendingHostContextRecovery(state, parent) && !hasPendingCiMaterialRecovery(state, parent))
+    (!CHILD_PARENT_STATUSES.has(parent.status) && !retryReady && !hasPendingHostContextRecovery(state, parent) && !hasPendingCiMaterialRecovery(state, parent))
   ) {
     throw workLedgerError(
       "WORK_LEDGER_GRAPH_PARENT_CONFLICT",

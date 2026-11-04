@@ -2014,6 +2014,29 @@ async function createFixture({
   return { service, source, store, lease, time };
 }
 
+test("an orchestrator parent can create a child once its scheduled retry is due", async () => {
+  const record = ownerRequestedPrAssignment(1);
+  record.assignment.target = { type: "role", id: "orchestrator" };
+  const f = await createFixture({ records: [record] });
+  await f.service.intake();
+  let parent = (await f.service.listItems()).items[0];
+  parent = await f.service.claim({ itemId: parent.itemId, expectedRevision: parent.revision,
+    workerId: "employee-orchestrator", leaseDurationMs: 30_000 });
+  await f.service.scheduleRetry({ itemId: parent.itemId, expectedRevision: parent.revision,
+    leaseId: parent.leaseId, actorId: "employee-orchestrator", reason: "system_maintenance_auto_retry",
+    availableAt: new Date(Date.parse(f.time.clock()) + 1000).toISOString() });
+  parent = (await f.service.listItems()).items[0];
+  const before = f.store.stored();
+  await assert.rejects(f.service.createGraphChild(prGraphChildCommand(parent, (await f.service.getSummary()).revision)),
+    { code: "WORK_LEDGER_GRAPH_PARENT_CONFLICT" });
+  assert.deepEqual(f.store.stored(), before, "early retries must not mutate the graph");
+  f.time.advance(1000);
+  const created = await f.service.createGraphChild(prGraphChildCommand(parent, (await f.service.getSummary()).revision));
+  const child = (await f.service.listItems()).items.find(item => item.itemId === created.taskId);
+  assert.equal(child.graph.parentItemId, parent.itemId);
+  assert.equal(child.currentTarget.id, "developer");
+});
+
 test("automatic Review lookup binds the existing root and survives a same-target metadata refresh", async () => {
   const facts = { ...prGitFacts(PR_HEAD_A), relation: "review_requested", state: "open", isDraft: false,
     author: "contributor", assignees: ["runtime-user", "contributor"] };
