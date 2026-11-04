@@ -2393,11 +2393,24 @@ test(
       true,
     );
     assert.equal(
-      archivedDetails.every(({ historyAvailable, observations, terminalDetail }) =>
-        historyAvailable === false && observations.length === 0 && terminalDetail === null
+      archivedDetails.every(({ historyAvailable, observations }) =>
+        historyAvailable === false && observations.length === 0
       ),
       true,
     );
+    assert.ok(finalCodeJobDetails.some(({ terminalDetail }) => terminalDetail?.completionReport));
+    for (const { job, terminalDetail } of archivedDetails) {
+      const original = finalCodeJobDetails.find(({ job: before }) => before.jobId === job.jobId);
+      const report = original.terminalDetail?.completionReport;
+      assert.deepEqual(terminalDetail, report ? {
+        schemaVersion: 1,
+        outcome: original.terminalDetail.outcome,
+        completedActionId: original.terminalDetail.completedActionId,
+        workspaceRevision: original.terminalDetail.workspaceRevision,
+        evidence: original.terminalDetail.evidence,
+        completionReport: report,
+      } : null);
+    }
     assert.deepEqual(
       archivedProjection(archivedDetails),
       stateBeforeFinalArchive.codeJobs,
