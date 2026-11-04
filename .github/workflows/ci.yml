@@ -73,6 +73,7 @@ jobs:
             'manage-mydashboard.integration.test.js'
             'windows-codex-credential-file.test.js'
             'windows-fixed-test-runner.test.js'
+            'windows-test-launcher.test.js'
           )
           $portableTests = @(
             Get-Item 'test/00-u9-priority.mjs'
@@ -88,6 +89,7 @@ jobs:
             '^real offline CLI teardown survives an injected post-start failure$'
             '^real Windows asset, broker, journal and executor produce a restartable completed proof \('
             '^gh-login production-shaped pipeline runs a controlled executable and recovers post-create failure$'
+            '^gh-login production factory constructs from sealed production ports$'
             '^Windows production root creation binds parent ACL trust to its creation handle across ABA$'
           )
           $hostSkipPattern = $hostOnlyNames -join '|'

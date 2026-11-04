@@ -75,6 +75,7 @@ async function createValidationFixture(t) {
     "src/lib/preparation-cancellation.js",
     "src/lib/repository-source-state.js",
     "src/lib/runtime-source-identity.js",
+    "src/lib/windows-git-implementation.js",
   ]) {
     await writeFile(
       path.join(root, relativePath),
