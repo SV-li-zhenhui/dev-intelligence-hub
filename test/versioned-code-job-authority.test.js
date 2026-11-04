@@ -333,7 +333,7 @@ function legacyGrant(configurations) {
   return createCodeJobGrant(legacyContent);
 }
 
-function proposal(config, { conflicts = null } = {}) {
+function proposal(config, { conflicts = null, operation = "modify" } = {}) {
   const event = normalizeWorkflowEvent({
     schemaVersion: 1,
     eventType: "pull_request.updated",
@@ -418,7 +418,7 @@ function proposal(config, { conflicts = null } = {}) {
     intent: {
       schemaVersion: 1,
       type: "propose_code_action",
-      operation: "modify",
+      operation,
       objective: "修复并发覆盖",
       acceptanceCriteria: ["回归测试通过"],
       evidence: ["revision 未校验"],
@@ -491,8 +491,10 @@ function fixture({
   inputAuthorityVerifier = acceptingInputAuthorityVerifier(),
   conflictPreparationVerifier,
   executorAuthorityValue = executorAuthority(),
+  runtimeFactory,
 } = {}) {
   const startup = configuration();
+  const runtime = runtimeFactory?.(startup);
   let current = active(startup);
   const versions = [current];
   let snapshotReads = 0;
@@ -513,7 +515,8 @@ function fixture({
         return { versions: structuredClone(versions) };
       },
     },
-    executorAuthority: executorAuthorityValue,
+    executorAuthority: runtime?.authority ?? executorAuthorityValue,
+    ...(runtime ? { inspectAuthorityForWritablePaths: runtime.inspectAuthorityForWritablePaths } : {}),
     startupConfiguration: startup,
     actionAdmissionGate: admissionGate,
     inputAuthorityVerifier,
@@ -533,6 +536,7 @@ function fixture({
       versions.push(current);
     },
     restart() {
+      const restartedRuntime = runtimeFactory?.(current.configuration);
       const restartGate = new ActionAdmissionGate();
       restartGate.bindEffective({
         version: current.version,
@@ -547,7 +551,8 @@ function fixture({
             return { versions: structuredClone(versions) };
           },
         },
-        executorAuthority: executorAuthorityValue,
+        executorAuthority: restartedRuntime?.authority ?? executorAuthorityValue,
+        ...(restartedRuntime ? { inspectAuthorityForWritablePaths: restartedRuntime.inspectAuthorityForWritablePaths } : {}),
         startupConfiguration: current.configuration,
         actionAdmissionGate: restartGate,
         inputAuthorityVerifier,
@@ -558,6 +563,115 @@ function fixture({
     },
   };
 }
+
+function inspectRuntime(config) {
+  const workspace = executorAuthority().workspaces[0];
+  const writablePaths = config.codeExecutor.workspaces[0].writablePaths;
+  const boundary = { schemaVersion: 3, workspaceId: workspace.id, sourceRoot: "D:/fixture/repository",
+    capabilities: workspace.capabilities, gitSnapshot: { boundaryDigest: "a".repeat(64) },
+    excludePaths: workspace.excludePaths, requiredProfiles: workspace.requiredProfiles };
+  const authority = { workspaces: [{ ...workspace, writablePaths,
+    authorityDigest: digestValue({ ...boundary, writablePaths }) }] };
+  return { authority, inspectAuthorityForWritablePaths: ({ workspaceId, writablePaths: previous }) => {
+    assert.equal(workspaceId, workspace.id);
+    return { workspaces: [{ ...workspace, writablePaths: previous,
+      authorityDigest: digestValue({ ...boundary, writablePaths: previous }) }] };
+  } };
+}
+
+test("inspect checkpoints survive additive writable paths after a runtime restart without changing grants", async () => {
+  const context = fixture({ runtimeFactory: inspectRuntime });
+  const inspect = (await context.authority.create(proposal(context.startup, { operation: "inspect" }))).grant;
+  const modify = (await context.authority.create(proposal(context.startup))).grant;
+  const added = structuredClone(context.startup);
+  added.codeExecutor.workspaces[0].writablePaths.push("docs/one.cpp", "docs/two.cpp");
+  context.activate(added);
+  const restarted = context.restart();
+  try {
+    assert.deepEqual(await restarted.verify(inspect), inspect);
+    await assert.rejects(restarted.verify(modify), { code: "INVALID_CODE_JOB_AUTHORITY" });
+    const fresh = (await restarted.create(proposal(added, { operation: "inspect" }))).grant;
+    assert.notEqual(fresh.workspaceAuthorityDigest, inspect.workspaceAuthorityDigest);
+    assert.deepEqual(await restarted.verify(fresh), fresh);
+  } finally { await restarted.close(); await context.authority.close(); }
+});
+
+test("inspect compatibility never resurrects paths removed and restored in configuration history", async () => {
+  const context = fixture({ runtimeFactory: inspectRuntime });
+  const grant = (await context.authority.create(proposal(context.startup, { operation: "inspect" }))).grant;
+  const removed = structuredClone(context.startup);
+  removed.codeExecutor.workspaces[0].writablePaths = ["src"];
+  context.activate(removed);
+  const added = structuredClone(context.startup);
+  added.codeExecutor.workspaces[0].writablePaths.push("docs/one.cpp");
+  context.activate(added);
+  const restarted = context.restart();
+  try { await assert.rejects(restarted.verify(grant), { code: "INVALID_CODE_JOB_AUTHORITY" }); }
+  finally { await restarted.close(); await context.authority.close(); }
+});
+
+test("inspect projection caches preserve epochs when earlier write lists changed ordering", async () => {
+  const context = fixture({ runtimeFactory: inspectRuntime });
+  const grant = (await context.authority.create(proposal(context.startup, { operation: "inspect" }))).grant;
+  const reordered = structuredClone(context.startup);
+  reordered.codeExecutor.workspaces[0].writablePaths.reverse();
+  context.activate(reordered);
+  context.activate(context.startup);
+  const added = structuredClone(context.startup);
+  added.codeExecutor.workspaces[0].writablePaths.push("docs/one.cpp");
+  context.activate(added);
+  const restarted = context.restart();
+  try { assert.deepEqual(await restarted.verify(grant), grant); }
+  finally { await restarted.close(); await context.authority.close(); }
+});
+
+test("inspect write extensions preserve all other authority and current input fences", async t => {
+  const cases = {
+    exclusions: config => { config.codeExecutor.workspaces[0].excludePaths.push("private"); },
+    source: config => { config.codeExecutor.workspaces[0].sourceRoot = "other"; },
+    profile: config => { config.codeExecutor.profiles["node-tests"].timeoutMs += 1000; },
+    role: config => { config.employees.roles.developer.enabled = false; },
+    policy: config => { config.workCoordination.policy.version++; },
+    repository: config => { config.workCoordination.policy.workspaceByRepository["acme/repo"] = "auxiliary"; },
+    model: config => { config.employees.roles.developer.taskBrain.model = "replacement"; },
+    provider: config => { config.brainProviders[config.employees.roles.developer.taskBrain.provider].baseUrl = "http://127.0.0.1:9999"; },
+    git: config => { config.codeExecutor.gitCommand = "C:\\Other\\ucrt64\\bin\\git.exe"; },
+  };
+  for (const [name, change] of Object.entries(cases)) {
+    await t.test(name, async () => {
+      const context = fixture({ runtimeFactory: inspectRuntime });
+      const grant = (await context.authority.create(proposal(context.startup, { operation: "inspect" }))).grant;
+      const changed = structuredClone(context.startup);
+      change(changed);
+      context.activate(changed);
+      const restored = structuredClone(context.startup);
+      restored.codeExecutor.workspaces[0].writablePaths.push("docs/one.cpp");
+      context.activate(restored);
+      const restarted = context.restart();
+      try { await assert.rejects(restarted.verify(grant), { code: "INVALID_CODE_JOB_AUTHORITY" }); }
+      finally { await restarted.close(); await context.authority.close(); }
+    });
+  }
+  await t.test("current source input", async () => {
+    let inputValid = true;
+    const context = fixture({ runtimeFactory: inspectRuntime, inputAuthorityVerifier: {
+      verify(binding) {
+        if (!inputValid) throw Object.assign(new Error("input changed"), { code: "INVALID_CODE_JOB_AUTHORITY" });
+        return structuredClone(binding);
+      },
+    } });
+    const grant = (await context.authority.create(proposal(context.startup, { operation: "inspect" }))).grant;
+    const added = structuredClone(context.startup);
+    added.codeExecutor.workspaces[0].writablePaths.push("docs/one.cpp");
+    context.activate(added);
+    const restarted = context.restart();
+    try {
+      assert.deepEqual(await restarted.verify(grant), grant);
+      inputValid = false;
+      await assert.rejects(restarted.verify(grant), { code: "INVALID_CODE_JOB_AUTHORITY" });
+    } finally { await restarted.close(); await context.authority.close(); }
+  });
+});
 
 function deferred() {
   let resolve;

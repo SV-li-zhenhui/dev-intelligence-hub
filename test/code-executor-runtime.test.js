@@ -308,6 +308,11 @@ test("enabled runtime resolves local workspaces and recovers before use", async 
     /^[a-f0-9]{64}$/,
   );
   assert.equal(Object.isFrozen(runtime.authority.workspaces[0]), true);
+  assert.deepEqual(runtime.inspectAuthorityForWritablePaths({ workspaceId: "dashboard", writablePaths: ["src"] }), runtime.authority);
+  assert.throws(() => runtime.inspectAuthorityForWritablePaths({ workspaceId: "dashboard", writablePaths: ["extra"] }),
+    { code: "INVALID_CODE_EXECUTOR_CONFIG" });
+  assert.throws(() => runtime.inspectAuthorityForWritablePaths({ workspaceId: "dashboard", writablePaths: ["src", "src"] }),
+    { code: "INVALID_CODE_EXECUTOR_CONFIG" });
   assert.deepEqual(runtime.changePackageTargets, [
     {
       workspaceId: "dashboard",
@@ -705,6 +710,12 @@ test("workspace authority binds source, exclusions, writes, and fixed profiles",
   const changedExclusions = structuredClone(base);
   changedExclusions.workspaces[0].excludePaths = ["src/private"];
   const third = await makeRuntime(changedExclusions, "exclude");
+  const addedWrites = structuredClone(base);
+  addedWrites.workspaces[0].writablePaths.push("docs/one.cpp");
+  const fourth = await makeRuntime(addedWrites, "added-writes");
+  assert.notEqual(first.authority.workspaces[0].authorityDigest, fourth.authority.workspaces[0].authorityDigest);
+  assert.deepEqual(fourth.inspectAuthorityForWritablePaths({ workspaceId: "dashboard", writablePaths: ["src"] }),
+    first.authority);
 
   assert.notEqual(
     first.authority.workspaces[0].authorityDigest,

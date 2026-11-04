@@ -640,6 +640,8 @@ test("versioned automatic composition wires durable continuations to the shared 
   });
   const application = await createApplication({
     ...stubs, config, store: memoryStore(), versionedConfiguration: true,
+    codeJobRuntimeDependencies: { createGuard: () => ({ ...inProcessExclusiveGuard(), async acquire() {} }) },
+    confirmationRuntimeDependencies: { createGuard: () => ({ ...inProcessExclusiveGuard(), async acquire() {} }) },
     configurationRuntimeFactory: configurationRuntimeFactory(config, closeCalls),
     workLedgerRuntimeFactory: async () => ledger,
     workProposalResultReconcilerFactory: () => ({ async runCycle() { reconciled += 1; } }),

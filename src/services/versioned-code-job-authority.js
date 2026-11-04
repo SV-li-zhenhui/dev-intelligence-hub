@@ -1,6 +1,7 @@
 import {
   CODE_JOB_LEGACY_BRAIN_BINDING_SCHEMA,
   CODE_JOB_TASK_BRAIN_BINDING_SCHEMA,
+  CODE_JOB_ACTIONS_BY_OPERATION,
 } from "../domain/code-job-contract.js";
 import {
   normalizeConfigurationDocument,
@@ -347,6 +348,7 @@ class AuthorityHistory {
   #scopeTimelines;
   #roleTimelines;
   #legacyStates;
+  #inspectPlans = new Map();
 
   constructor(versions, executorAuthority) {
     this.#versions = versions;
@@ -358,6 +360,67 @@ class AuthorityHistory {
 
   versionAt(index) {
     return this.#versions[index];
+  }
+
+  inspectExtensionPlan(grant, currentIndex, projectAuthority) {
+    if (grant.schemaVersion !== 2 || grant.operation !== "inspect" ||
+        grantBrainBindingSchema(grant) !== CODE_JOB_TASK_BRAIN_BINDING_SCHEMA ||
+        grant.writablePaths.length !== 0 || typeof projectAuthority !== "function" ||
+        canonicalJsonDigest(grant.allowedActions) !== canonicalJsonDigest(CODE_JOB_ACTIONS_BY_OPERATION.inspect)) return null;
+    const planKey = canonicalJsonDigest({ workspaceAuthorityDigest: grant.workspaceAuthorityDigest,
+      repository: grant.repository, workspaceId: grant.workspaceId, roleId: grant.requestedBy.roleId,
+      policyVersion: grant.policyVersion, brainDigest: grant.brainDigest, requiredProfiles: grant.requiredProfiles });
+    if (this.#inspectPlans.has(planKey)) return this.#inspectPlans.get(planKey);
+    const workspaceAt = configuration => configuration.codeExecutor.workspaces.find(x => x.id === grant.workspaceId);
+    const currentConfiguration = this.#versions[currentIndex].configuration;
+    const currentWorkspace = workspaceAt(currentConfiguration);
+    const gitSettings = configuration => canonicalJsonDigest({
+      command: configuration.codeExecutor.gitCommand ?? null,
+      timeoutMs: configuration.codeExecutor.gitTimeoutMs ?? null,
+    });
+    let projection = null;
+    let projectionPaths = null;
+    let plan = null;
+    for (let candidate = currentIndex - 1; currentWorkspace && candidate >= 0; candidate--) {
+      const originalConfiguration = this.#versions[candidate].configuration;
+      const nextConfiguration = this.#versions[candidate + 1].configuration;
+      const original = workspaceAt(originalConfiguration);
+      const next = workspaceAt(nextConfiguration);
+      if (!original || !next || original.writablePaths.some(entry => !next.writablePaths.includes(entry)) ||
+          gitSettings(originalConfiguration) !== gitSettings(nextConfiguration) ||
+          roleTaskBrainDigest(originalConfiguration, grant.requestedBy.roleId) !==
+            roleTaskBrainDigest(nextConfiguration, grant.requestedBy.roleId)) break;
+      if (original.writablePaths.length >= currentWorkspace.writablePaths.length) continue;
+      // Rebuild only the historical write list against the current runtime's
+      // exact Git, source, exclusion and profile boundaries. Never accept a
+      // caller-supplied digest or change the persisted grant.
+      const pathsKey = canonicalJsonDigest(original.writablePaths);
+      if (projectionPaths !== pathsKey) {
+        const executorAuthority = projectAuthority({ workspaceId: grant.workspaceId,
+          writablePaths: original.writablePaths });
+        const versions = this.#versions.map((version, index) => {
+          if (index <= candidate) return version;
+          const configuration = structuredClone(version.configuration);
+          workspaceAt(configuration).writablePaths = [...original.writablePaths];
+          return { ...version, configuration, digest: canonicalJsonDigest(configuration) };
+        });
+        const history = new AuthorityHistory(versions, executorAuthority);
+        projection = { executorAuthority, history, active: versions[currentIndex],
+          timeline: history.verificationTimeline(grant).scopedDigests };
+        projectionPaths = pathsKey;
+      }
+      const { executorAuthority, timeline } = projection;
+      // Keeping all prior epochs prevents revocation followed by restoration
+      // from resurrecting a checkpoint, including changes unrelated to writes.
+      if (timeline[candidate] !== grant.workspaceAuthorityDigest ||
+          timeline[currentIndex] !== grant.workspaceAuthorityDigest ||
+          !configurationAdmitsGrant(currentConfiguration, grant, executorAuthority)) continue;
+      plan = projection;
+      break;
+    }
+    this.#inspectPlans.set(planKey, plan);
+    if (this.#inspectPlans.size > 32) this.#inspectPlans.delete(this.#inspectPlans.keys().next().value);
+    return plan;
   }
 
   verificationTimeline(grant) {
@@ -691,6 +754,7 @@ export class VersionedCodeJobAuthority {
   #readActive;
   #readSnapshot;
   #executorAuthority;
+  #inspectAuthorityForWritablePaths;
   #startupCodeExecutorDigest;
   #brainDependencies;
   #grantFactoryFactory;
@@ -708,6 +772,7 @@ export class VersionedCodeJobAuthority {
   constructor({
     configurationReader,
     executorAuthority,
+    inspectAuthorityForWritablePaths = null,
     startupConfiguration,
     brainDependencies = {},
     actionAdmissionGate,
@@ -769,6 +834,10 @@ export class VersionedCodeJobAuthority {
     }
     const startup = normalizeConfigurationDocument(startupConfiguration);
     this.#executorAuthority = executorAuthority;
+    if (inspectAuthorityForWritablePaths !== null && typeof inspectAuthorityForWritablePaths !== "function") {
+      throw new TypeError("inspectAuthorityForWritablePaths must be a function");
+    }
+    this.#inspectAuthorityForWritablePaths = inspectAuthorityForWritablePaths;
     this.#startupCodeExecutorDigest = canonicalJsonDigest(startup.codeExecutor);
     this.#brainDependencies = brainDependencies;
     this.#grantFactoryFactory = grantFactoryFactory;
@@ -855,6 +924,15 @@ export class VersionedCodeJobAuthority {
           if (error?.code !== "INVALID_CODE_JOB_AUTHORITY") throw error;
         }
       }
+    }
+    const inspectPlan = current.history.inspectExtensionPlan(grant, currentIndex,
+      this.#inspectAuthorityForWritablePaths);
+    if (inspectPlan) {
+      const context = this.#context(inspectPlan.active, inspectPlan.history, currentIndex, {
+        executorAuthority: inspectPlan.executorAuthority,
+        cacheKey: `inspect:${grant.workspaceAuthorityDigest}`,
+      });
+      return this.#verifyWithContext(grant, context, context);
     }
     throw currentError;
   }
@@ -994,10 +1072,10 @@ export class VersionedCodeJobAuthority {
     active,
     history,
     historyIndex,
-    { requireStartupBoundary = false } = {},
+    { requireStartupBoundary = false, executorAuthority = this.#executorAuthority, cacheKey = null } = {},
   ) {
     this.#assertOpen();
-    const contextKey = `${active.version}:${active.digest}`;
+    const contextKey = cacheKey ?? `${active.version}:${active.digest}`;
     const cached = this.#contexts.get(contextKey);
     if (cached) return cached;
     const configuration = active.configuration;
@@ -1035,7 +1113,7 @@ export class VersionedCodeJobAuthority {
       );
     };
     const grants = this.#grantFactoryFactory({
-      executorAuthority: this.#executorAuthority,
+      executorAuthority,
       policyVersion: policy.version,
       workspaceByRepository: policy.workspaceByRepository,
       codeActionRoles: roleIds,
@@ -1071,7 +1149,7 @@ export class VersionedCodeJobAuthority {
           historyIndex,
           {
             executorAuthorityDigest: executorWorkspaceAuthorityDigest(
-              this.#executorAuthority,
+              executorAuthority,
               grant.workspaceId,
             ),
             repository: grant.repository,

@@ -1788,6 +1788,7 @@ export async function createApplication({
         grantFactory = versionedCodeJobAuthorityFactory({
           configurationReader: configurationRuntime.reader,
           executorAuthority: codeExecutorRuntime.authority,
+          inspectAuthorityForWritablePaths: codeExecutorRuntime.inspectAuthorityForWritablePaths,
           startupConfiguration: config,
           brainDependencies: brainDependencies(
             workCoordinationDependencies.brainDependencies || {},

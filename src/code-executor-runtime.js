@@ -213,10 +213,13 @@ function createWorkspaceAuthority(
   sandbox,
   gitSettings,
   conflictMaterializerAvailable,
+  inspectProjection = null,
 ) {
   return Object.freeze({
     workspaces: Object.freeze(
       workspaces.map((workspace) => {
+        const writablePaths = inspectProjection?.workspaceId === workspace.id
+          ? inspectProjection.writablePaths : workspace.writablePaths;
         const profiles = requiredProfiles[workspace.id].map((id) =>
           Object.freeze({
             id,
@@ -240,7 +243,7 @@ function createWorkspaceAuthority(
         return Object.freeze({
           id: workspace.id,
           capabilities: Object.freeze(capabilities),
-          writablePaths: Object.freeze([...workspace.writablePaths]),
+          writablePaths: Object.freeze([...writablePaths]),
           excludePaths: Object.freeze([...workspace.excludePaths]),
           requiredProfiles: Object.freeze(profiles),
           authorityDigest: digestValue({
@@ -249,7 +252,7 @@ function createWorkspaceAuthority(
             capabilities,
             sourceRoot: workspace.sourceRoot,
             gitSnapshot,
-            writablePaths: workspace.writablePaths,
+            writablePaths,
             excludePaths: workspace.excludePaths,
             requiredProfiles: profiles,
           }),
@@ -609,6 +612,17 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
     workspaces,
     authority,
   );
+  const inspectAuthorityForWritablePaths = ({ workspaceId, writablePaths }) => {
+    const workspace = workspaces.find(entry => entry.id === workspaceId);
+    if (!workspace || !Array.isArray(writablePaths) ||
+        new Set(writablePaths).size !== writablePaths.length ||
+        writablePaths.some(entry => !workspace.writablePaths.includes(entry))) {
+      throw invalidConfig("只读历史授权只能投影当前可写路径的子集");
+    }
+    return createWorkspaceAuthority(workspaces, enabledConfig.requiredProfilesByWorkspace,
+      sandbox, gitSettings, conflictMaterializer !== null,
+      { workspaceId, writablePaths: [...writablePaths] });
+  };
   const completedChangeExporter = createCompletedChangeExporter(executor);
   const auditArtifactReader = createAuditArtifactReader(journal);
   const settledVerificationReader = typeof sandbox.readSettledPreparationFailure === 'function'
@@ -619,6 +633,7 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
     journal,
     executor,
     authority,
+    inspectAuthorityForWritablePaths,
     changePackageTargets,
     completedChangeExporter,
     auditArtifactReader,
