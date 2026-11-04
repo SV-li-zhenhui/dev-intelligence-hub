@@ -411,6 +411,20 @@ for (const escaped of [false, true]) test(`completion reports survive archive wi
   assert.equal(archived.archived, true);
   assert.equal(archived.terminalDetail.outcome, report.outcome);
   assert.deepEqual(archived.terminalDetail.completionReport.evidence, report.evidence);
+  if (!escaped) {
+    const storageKey = `code-job-tombstone-record-${current.jobId}`;
+    const original = await f.store.read(storageKey, null);
+    for (const replacement of [{ actionId: '../invalid' }, { workspaceRevision: 'not-a-sha256' },
+      { actionId: 123, workspaceRevision: 456 }]) {
+      const changed = structuredClone(original);
+      Object.assign(changed.outcome.completionReport, replacement);
+      const bad = changed.outcome.completionReport;
+      bad.actionDigest = digestValue({ type: 'complete', actionId: bad.actionId, expectedWorkspaceRevision: bad.workspaceRevision });
+      const sealed = resealArchiveFixture(changed, f.store.value.archiveIndex[0]);
+      assert.throws(() => normalizeCodeJobArchiveTombstoneRecord(sealed.tombstone, { storageKey, manifest: sealed.manifest }),
+        { code: 'CODE_JOB_ARCHIVE_CORRUPTED' });
+    }
+  }
   const reopened = await readyStore({ store: f.store, time: f.time });
   assert.deepEqual((await reopened.jobs.getDetail({ jobId: current.jobId })).terminalDetail, archived.terminalDetail);
 });

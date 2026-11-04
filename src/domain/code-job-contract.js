@@ -717,14 +717,16 @@ function normalizeDetail(value, error) {
 
 export function normalizeCodeJobCompletionReport(value, action, error = invalidJob()) {
   const fields = exactObject(value, ["actionId", "actionDigest", "workspaceRevision", "outcome", "evidence"], error);
-  if (action.type !== "complete" || fields.get("actionId") !== action.actionId ||
-      fields.get("actionDigest") !== digestValue(action) ||
-      fields.get("workspaceRevision") !== action.expectedWorkspaceRevision) throw error;
+  const actionId = safeId(fields.get("actionId"), "completionReport.actionId", error);
+  const actionDigest = sha256(fields.get("actionDigest"), "completionReport.actionDigest", error);
+  const workspaceRevision = sha256(fields.get("workspaceRevision"), "completionReport.workspaceRevision", error);
+  const expectedDigest = digestValue(action);
+  if (action.type !== "complete" || actionId !== action.actionId ||
+      actionDigest !== expectedDigest || workspaceRevision !== action.expectedWorkspaceRevision) throw error;
   let report;
   try { report = normalizeCodeCompletionReport({ outcome: fields.get("outcome"), evidence: fields.get("evidence") }); }
   catch { throw error; }
-  return { actionId: action.actionId, actionDigest: digestValue(action),
-    workspaceRevision: action.expectedWorkspaceRevision, ...report };
+  return { actionId, actionDigest, workspaceRevision, ...report };
 }
 
 function normalizePendingAction(value, sessionId, error) {
