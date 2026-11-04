@@ -17,8 +17,8 @@ import {
 } from "./configured-workforce.js";
 import {
   codeJobBrainDigest,
+  codeJobBrainBindingDigests,
   CodeJobGrantFactory,
-  legacyCodeJobBrainDigest,
   prepareCodeJobGrantVerification,
 } from "./code-job-grant-factory.js";
 
@@ -581,21 +581,10 @@ function roleTaskBrainDigest(configuration, roleId) {
   });
 }
 
-function legacyRoleBrainDigest(configuration, roleId) {
-  const role = configuration.employees.roles[roleId];
-  if (!role) return null;
-  return legacyCodeJobBrainDigest({
-    roleId,
-    brain: role.brain,
-    brainProviders: configuration.brainProviders,
-  });
-}
-
-function grantRoleBrainDigest(configuration, grant) {
-  return grantBrainBindingSchema(grant) ===
-      CODE_JOB_TASK_BRAIN_BINDING_SCHEMA
-    ? roleTaskBrainDigest(configuration, grant.requestedBy.roleId)
-    : legacyRoleBrainDigest(configuration, grant.requestedBy.roleId);
+function roleBrainDigestMatches(configuration, roleId, brainDigest, brainBindingSchema = CODE_JOB_TASK_BRAIN_BINDING_SCHEMA) {
+  const brain = roleBrainForBinding(configuration.employees.roles[roleId], brainBindingSchema);
+  return brain !== null && codeJobBrainBindingDigests({ roleId, brain,
+    brainProviders: configuration.brainProviders, brainBindingSchema }).includes(brainDigest);
 }
 
 function executableConfiguration(configuration) {
@@ -629,7 +618,7 @@ function configurationAdmitsGrant(configuration, grant, executorAuthority) {
     !policy.codeOperationsByRole[roleId]?.includes(grant.operation) ||
     !configuration.trackedRepositories.includes(grant.repository) ||
     !workspace ||
-    grantRoleBrainDigest(configuration, grant) !== grant.brainDigest
+    !roleBrainDigestMatches(configuration, roleId, grant.brainDigest, grantBrainBindingSchema(grant))
   ) {
     return false;
   }
@@ -887,12 +876,14 @@ export class VersionedCodeJobAuthority {
   }
 
   #brainCandidateContext(current, roleId, brainDigest) {
+    if (configurationAdmitsRole(current.configuration, roleId) &&
+        roleBrainDigestMatches(current.configuration, roleId, brainDigest)) return current;
     for (let index = current.historyIndex - 1; index >= 0; index -= 1) {
       const version = current.history.versionAt(index);
       try {
         if (
           configurationAdmitsRole(version.configuration, roleId) &&
-          roleTaskBrainDigest(version.configuration, roleId) === brainDigest
+          roleBrainDigestMatches(version.configuration, roleId, brainDigest)
         ) {
           return this.#context(version, current.history, index);
         }

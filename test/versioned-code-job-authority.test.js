@@ -15,6 +15,8 @@ import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSourc
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
+import { digestValue } from "../src/domain/code-executor-contract.js";
+import { normalizeBrainConfig } from "../src/services/brain-router.js";
 import { canonicalJsonDigest } from "../src/lib/canonical-json-digest.js";
 import {
   CodeJobGrantFactory,
@@ -442,6 +444,45 @@ function acceptingInputAuthorityVerifier() {
     },
   };
 }
+
+test("default-denied DingTalk keeps an old task binding verifiable, describable and quiescent without old config rows", async () => {
+  let fenced = false;
+  const context = fixture({ brainDirectoryFactory: ({ roles }) => ({
+    async decide(_input, authorization) { await authorization.beforeGenerate(); return { action: { type: "complete" } }; },
+    describe(roleId) { return { model: roles[roleId].taskBrain.model }; },
+    async withEntityQuiescence({ roleId }, operation) {
+      assert.equal(roleId, "developer");
+      fenced = true;
+      return { executed: true, result: await operation() };
+    },
+  }) });
+  try {
+    const current = (await context.authority.create(proposal(context.startup))).grant;
+    const brain = structuredClone(normalizeBrainConfig(context.startup.employees.roles.developer.taskBrain));
+    assert.equal(brain.remoteData.dingtalk, false);
+    delete brain.remoteData.dingtalk;
+    const { grantDigest, ...fields } = current;
+    const historical = createCodeJobGrant({ ...fields, brainDigest: digestValue({
+      schemaVersion: 2, roleId: "developer", taskBrain: brain,
+      provider: context.startup.brainProviders[brain.provider],
+    }) });
+    assert.notEqual(current.brainDigest, historical.brainDigest);
+    assert.deepEqual(await context.authority.verify(historical), historical);
+    assert.deepEqual(await context.authority.verify(current), current);
+    assert.equal((await context.authority.describe("developer", historical.brainDigest)).model, brain.model);
+    assert.deepEqual(await context.authority.withEntityQuiescence({ roleId: "developer",
+      brainDigest: historical.brainDigest, entityKey: "github:pull_request:acme/repo#42" },
+    async () => { assert.equal(fenced, true); return "held"; }), { executed: true, result: "held" });
+    await context.authority.decide({ roleId: "developer" }, {
+      brainDigest: historical.brainDigest, beforeGenerate: () => context.authority.verify(historical),
+    });
+    const revoked = structuredClone(context.startup);
+    revoked.employees.roles.developer.taskBrain.remoteData.code = !brain.remoteData.code;
+    context.activate(revoked);
+    await assert.rejects(context.authority.verify(historical), { code: "INVALID_CODE_JOB_AUTHORITY" });
+    await assert.rejects(context.authority.describe("developer", historical.brainDigest), { code: "INVALID_CODE_JOB_AUTHORITY" });
+  } finally { await context.authority.close(); }
+});
 
 function fixture({
   brainDirectoryFactory,

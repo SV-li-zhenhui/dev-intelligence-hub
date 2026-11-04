@@ -341,13 +341,12 @@ export function codeJobBrainDigest({
   taskBrain: rawBrain,
   brainProviders,
 } = {}) {
-  return configuredBrainDigest({
+  return codeJobBrainBindingDigests({
     roleId: roleIdValue,
-    rawBrain,
+    brain: rawBrain,
     brainProviders,
-    binding: "taskBrain",
-    schemaVersion: 2,
-  });
+    brainBindingSchema: CODE_JOB_TASK_BRAIN_BINDING_SCHEMA,
+  })[0];
 }
 
 export function legacyCodeJobBrainDigest({
@@ -355,22 +354,25 @@ export function legacyCodeJobBrainDigest({
   brain: rawBrain,
   brainProviders,
 } = {}) {
-  return configuredBrainDigest({
+  return codeJobBrainBindingDigests({
     roleId: roleIdValue,
-    rawBrain,
+    brain: rawBrain,
     brainProviders,
-    binding: "brain",
-    schemaVersion: 1,
-  });
+    brainBindingSchema: CODE_JOB_LEGACY_BRAIN_BINDING_SCHEMA,
+  })[0];
 }
 
-function configuredBrainDigest({
+export function codeJobBrainBindingDigests({
   roleId: roleIdValue,
-  rawBrain,
+  brain: rawBrain,
   brainProviders,
-  binding,
-  schemaVersion,
+  brainBindingSchema,
 }) {
+  if (![CODE_JOB_LEGACY_BRAIN_BINDING_SCHEMA, CODE_JOB_TASK_BRAIN_BINDING_SCHEMA].includes(brainBindingSchema)) {
+    throw invalid("代码任务大脑绑定版本无效");
+  }
+  const schemaVersion = brainBindingSchema;
+  const binding = schemaVersion === CODE_JOB_TASK_BRAIN_BINDING_SCHEMA ? "taskBrain" : "brain";
   const roleId = safeRoleId(roleIdValue, "roleId");
   const providers = plainRecord(brainProviders, "brainProviders");
   let brain;
@@ -386,7 +388,15 @@ function configuredBrainDigest({
     providers[brain.provider],
     `brainProviders.${brain.provider}`,
   );
-  return digestValue({ schemaVersion, roleId, [binding]: brain, provider });
+  const digests = [digestValue({ schemaVersion, roleId, [binding]: brain, provider })];
+  // Adding a default-denied data class must not revoke grants serialized before
+  // that class existed. Keep the current digest for new grants and accept only
+  // the equivalent missing-false encoding; explicit permission changes stay bound.
+  if (brain.remoteData.dingtalk === false) {
+    const { dingtalk, ...remoteData } = brain.remoteData;
+    digests.push(digestValue({ schemaVersion, roleId, [binding]: { ...brain, remoteData }, provider }));
+  }
+  return Object.freeze(digests);
 }
 
 function normalizeBrainDigests({
@@ -410,17 +420,8 @@ function normalizeBrainDigests({
     }
     result.set(
       roleId,
-      legacy
-        ? legacyCodeJobBrainDigest({
-            roleId,
-            brain: brainByRole[roleId],
-            brainProviders: providers,
-          })
-        : codeJobBrainDigest({
-            roleId,
-            taskBrain: brainByRole[roleId],
-            brainProviders: providers,
-          }),
+      codeJobBrainBindingDigests({ roleId, brain: brainByRole[roleId], brainProviders: providers,
+        brainBindingSchema: legacy ? CODE_JOB_LEGACY_BRAIN_BINDING_SCHEMA : CODE_JOB_TASK_BRAIN_BINDING_SCHEMA }),
     );
   }
   return result;
@@ -675,7 +676,7 @@ export class CodeJobGrantFactory {
       operation,
       executionSource,
     });
-    const brainDigest = this.#brainDigests.get(roleId);
+    const brainDigest = this.#brainDigests.get(roleId)?.[0];
     if (brainDigest === undefined) throw taskBrainNotConfigured(roleId);
     const locallyAdmittedSource = this.#verifyExecutionSource(
       executionSource,
@@ -759,10 +760,12 @@ export class CodeJobGrantFactory {
     }
     assertExecutionInputKind(grant);
     const roleId = grant.requestedBy.roleId;
-    const brainDigest = this.#brainDigests.get(roleId);
-    if (brainDigest === undefined) {
+    const brainDigests = this.#brainDigests.get(roleId);
+    if (brainDigests === undefined) {
       throw invalid("代码任务授权对应的任务大脑已移除");
     }
+    if (!brainDigests.includes(grant.brainDigest)) throw invalid("代码任务授权已不符合当前执行配置");
+    const brainDigest = grant.brainDigest;
     const workspace = this.#currentAuthority({
       policyVersion: grant.policyVersion,
       repository: grant.repository,

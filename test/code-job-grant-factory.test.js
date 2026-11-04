@@ -463,6 +463,38 @@ test("task brain digests are domain-separated from historical routine brains", (
   );
 });
 
+test("default-denied DingTalk preserves pre-extension task grants and current grant identities", () => {
+  const current = factory().create(proposal()).grant;
+  assert.equal(current.brainDigest, "eb7fdaf4962af507bb79f538da3982575d9d4764e33cd613063165fe03b619e6");
+  const { grantDigest, ...fields } = current;
+  const historical = createCodeJobGrant({ ...fields,
+    brainDigest: "e3a6dd7132fc7e63c65dacb4be0e9cb2e728088b3c1abe192b77709777f6dcf7" });
+  assert.deepEqual(factory().verify(historical), historical, "accept the historical encoding without rewriting it");
+  assert.deepEqual(factory().verify(current), current);
+  for (const changes of [
+    { model: "different-model" }, { reasoningEffort: "high" },
+    { remoteData: { requirements: true, code: false, memory: false } },
+    { remoteData: { requirements: false, code: false, memory: false, dingtalk: true } },
+  ]) {
+    const changed = { ...localBrain(), ...changes };
+    assert.throws(() => factory({ taskBrainByRole: brainsByRole(changed) }).verify(historical),
+      { code: "INVALID_CODE_JOB_AUTHORITY" });
+  }
+  assert.throws(() => factory({ brainProviders: {
+    ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:11435" },
+  } }).verify(historical), { code: "INVALID_CODE_JOB_AUTHORITY" });
+});
+
+test("default-denied DingTalk preserves verify-only historical routine grants", () => {
+  const { grantDigest, brainBindingSchema, ...fields } = factory().create(proposal()).grant;
+  const historical = createCodeJobGrant({ ...fields,
+    brainDigest: "3935ce513e9ae4eb666bad711f0696ecf1237c8e556b7c05f9ab55246d2a62dd" });
+  const recovery = factory({ taskBrainByRole: undefined, legacyBrainByRole: brainsByRole() });
+  assert.deepEqual(recovery.verify(historical), historical);
+  assert.throws(() => factory().verify(historical), { code: "INVALID_CODE_JOB_AUTHORITY" });
+  assert.throws(() => recovery.create(proposal()), { code: "INVALID_CODE_JOB_AUTHORITY" });
+});
+
 test("historical brain bindings require an explicit verify-only factory", () => {
   const brain = localBrain();
   const brainProviders = {
