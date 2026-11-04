@@ -307,7 +307,9 @@ export function createManagedFileDiagnostics(
   }
   mkdirSync(logDirectory, { recursive: true, mode: 0o700 });
   const logPath = path.join(logDirectory, "server.log");
-  function write(level, value) {
+  let droppedRecords = 0;
+  let lastErrorCode = null;
+  function writeRecord(level, value) {
     const record = boundedLogRecord(level, value);
     const recordBytes = Buffer.byteLength(record, "utf8");
     const currentBytes = existsSync(logPath) ? statSync(logPath).size : 0;
@@ -322,12 +324,30 @@ export function createManagedFileDiagnostics(
     }
     appendFileSync(logPath, record, { encoding: "utf8", mode: 0o600 });
   }
+  function write(level, value) {
+    try {
+      const message = droppedRecords === 0 ? value :
+        `Managed diagnostics recovered after ${droppedRecords} dropped record(s) (${lastErrorCode}).\n${
+          value instanceof Error ? value.stack || `${value.name}: ${value.message}` : String(value)
+        }`;
+      writeRecord(level, message);
+      droppedRecords = 0;
+      lastErrorCode = null;
+    } catch (error) {
+      // Diagnostics are observational. A full or unavailable log disk must not
+      // turn a handled worker failure into an unhandled process failure.
+      droppedRecords = Math.min(Number.MAX_SAFE_INTEGER, droppedRecords + 1);
+      lastErrorCode = typeof error?.code === "string" && /^[A-Z0-9_]{1,64}$/.test(error.code)
+        ? error.code : "LOG_WRITE_FAILED";
+    }
+  }
   return Object.freeze({
     log: (value) => write("INFO", value),
     reportError: (value) => write("ERROR", value),
     logPath,
     maximumBytes,
     archiveCount,
+    get writeStatus() { return Object.freeze({ droppedRecords, lastErrorCode }); },
   });
 }
 
