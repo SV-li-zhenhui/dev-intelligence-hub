@@ -21,7 +21,7 @@ const execFileAsync = promisify(execFile);
 
 async function detachedFailureFixture(t, prepareLogs = async () => {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "mydashboard-native-stderr-"));
-  t.after(() => rm(root, { force: true, recursive: true }));
+  t.after(() => rm(root, { force: true, recursive: true, maxRetries: 10, retryDelay: 50 }));
   await mkdir(path.join(root, "scripts"), { recursive: true });
   await copyFile(path.resolve(import.meta.dirname, "../scripts/launch-mydashboard-process.mjs"),
     path.join(root, "scripts/launch-mydashboard-process.mjs"));
@@ -51,14 +51,17 @@ async function detachedFailureFixture(t, prepareLogs = async () => {}) {
       MYDASHBOARD_MANAGED_CLAIM_TIMEOUT_MS: "10000",
     },
   });
-  await writeFile(gate, "launcher exited");
-  let status;
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    try { status = JSON.parse(await readFile(exitStatus, "utf8")); break; }
-    catch (error) { if (error.code !== "ENOENT") throw error; await wait(20); }
-  }
-  assert.deepEqual(status, { code: 1 });
   const launch = JSON.parse(await readFile(resultPath, "utf8"));
+  await writeFile(gate, "launcher exited");
+  let stopped = false;
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try { process.kill(launch.processId, 0); }
+    catch (error) { if (error.code !== "ESRCH") throw error; stopped = true; }
+    if (stopped) break;
+    await wait(20);
+  }
+  assert.equal(stopped, true, "wait for the owned child to exit before removing its working directory");
+  assert.deepEqual(JSON.parse(await readFile(exitStatus, "utf8")), { code: 1 });
   return { launch, logDirectory, token };
 }
 
