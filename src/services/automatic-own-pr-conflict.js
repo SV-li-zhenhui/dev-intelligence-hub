@@ -68,7 +68,7 @@ export class AutomaticOwnPrConflict {
       controlledCommitReader, objectSync, grantVerifier, conflictInspectionReader, codeJobControl, taskRuns });
     this.inspectionRecovery = objectSync && typeof ledger.listItems === "function" && typeof ledger.transition === "function" &&
       typeof codeJobReader?.getDetail === "function" && typeof ledger.listTimeline === "function"
-      ? new AutomaticOwnPrInspectionRecovery({ store, ledger, codeJobReader, objectSync, current: binding => this.#current(binding) }) : null;
+      ? new AutomaticOwnPrInspectionRecovery({ store, ledger, codeJobReader, objectSync, current: binding => this.#current(binding, { inspectionRecovery: true }) }) : null;
     this.conflictRecovery = objectSync && conflictInspectionReader && typeof ledger.listOutbox === "function" &&
       typeof ledger.listItems === "function" && typeof ledger.transition === "function" &&
       typeof codeJobReader?.get === "function" && typeof codeJobReader.getDetail === "function"
@@ -178,7 +178,7 @@ export class AutomaticOwnPrConflict {
     }
   }
 
-  async #current(binding, { rejectChangedTarget = false } = {}) {
+  async #current(binding, { rejectChangedTarget = false, inspectionRecovery = false } = {}) {
     const config = (await this.configurationReader.readActive())?.configuration;
     if (config?.githubActions?.enabled !== true || config.githubActions.automaticOwnPrRepair !== true ||
         !config.trackedRepositories.includes(binding.repository) ||
@@ -187,6 +187,17 @@ export class AutomaticOwnPrConflict {
     if (!samePullRequestExecutionBinding(context.inputBinding, binding)) return null;
     const root = await this.ledger.readItemForReconciliation({ itemId: binding.rootItemId });
     const event = currentWorkItemEvent(root);
+    // Object recovery may requeue a failed read-only inspection of an owned PR.
+    // Conflict repair and publication still use the default conflict-only gate.
+    const ordinaryInspection = inspectionRecovery && !conflictTask(event);
+    if (ordinaryInspection && (root.kind !== "source_root" || root.source?.kind !== "pull_request" ||
+        root.source.scope.kind !== "automatic" || root.source.scope.active !== true ||
+        root.source.pendingRevision != null || root.sourceQuarantine != null ||
+        ["paused", "cancelled", "superseded", "completed"].includes(root.status) ||
+        (root.status === "blocked" && root.statusReason !== "proposal_failed") ||
+        event?.source?.provider !== "github" || event.payload.relation !== "authored" ||
+        root.source.identity.provider !== event.source.provider || root.source.identity.scopeId !== event.source.scopeId ||
+        !sameLogin(context.author, config.githubActions.actorAccountId))) return null;
     const internal = isInternalRepairReviewEvent(event);
     const ownerCi = isOwnerRequestedCiRepairEvent(event);
     if ((internal || ownerCi) && (root.source?.scope.kind !== (internal ? "internal_review" : "owner_requested") || root.source.scope.active !== true ||
@@ -194,7 +205,7 @@ export class AutomaticOwnPrConflict {
         root.source.pendingRevision != null || root.sourceQuarantine != null || ["paused", "cancelled", "superseded"].includes(root.status) ||
         (context.author !== null && !sameLogin(context.author, config.githubActions.actorAccountId)))) return null;
     if (ownerCi && !["queued", "working", "dispatch_pending", "retry_wait", "waiting_condition", "waiting_external", "completed"].includes(root.status)) return null;
-    if (!conflictTask(event) || (event.payload.relation === "authored" && !sameLogin(context.author, config.githubActions.actorAccountId))) return null;
+    if ((!ordinaryInspection && !conflictTask(event)) || (event.payload.relation === "authored" && !sameLogin(context.author, config.githubActions.actorAccountId))) return null;
     const facts = await this.github.readOwnPullRequestConflict({ repository: binding.repository,
       number: binding.pullRequestNumber, account: config.githubActions.actorAccountId });
     if (rejectChangedTarget && sameLogin(facts.author, config.githubActions.actorAccountId) &&
@@ -203,7 +214,7 @@ export class AutomaticOwnPrConflict {
     }
     if (facts.state !== "open" ||
         !sameLogin(facts.author, config.githubActions.actorAccountId) || facts.headRefOid !== binding.headRefOid ||
-        facts.baseRefOid !== binding.gitTarget.baseRefOid || facts.mergeStateStatus !== "DIRTY") return null;
+        facts.baseRefOid !== binding.gitTarget.baseRefOid || (!ordinaryInspection && facts.mergeStateStatus !== "DIRTY")) return null;
     return config;
   }
 

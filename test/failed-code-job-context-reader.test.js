@@ -5,6 +5,8 @@ import { projectNormalizedCodeJobForBrowser } from "../src/domain/code-job-brows
 import { FailedCodeJobContextReader, VERIFICATION_RECOVERY_ACTOR, VERIFICATION_RECOVERY_REASON,
   AUTOMATIC_VERIFICATION_FAILURE } from "../src/services/failed-code-job-context-reader.js";
 import { AutomaticOwnPrInspectionRecovery } from "../src/services/automatic-own-pr-inspection-recovery.js";
+import { AutomaticOwnPrConflict } from "../src/services/automatic-own-pr-conflict.js";
+import { pullRequestExternalActionBinding } from './support/pull-request-external-action-fixture.js';
 import { encodeVerificationRecoveryEvidence } from '../src/domain/verification-recovery-evidence.js';
 import { normalizeWorkflowEvent } from '../src/domain/workflow-events.js';
 import { createPullRequestExecutionBinding } from '../src/domain/pull-request-execution-binding.js';
@@ -296,6 +298,97 @@ test("automatic inspection recovery prepares objects then requeues the same fail
   assert.equal((await (await f.makeService()).runCycle()).requeued, 0, "restart cannot replay a settled recovery");
   assert.equal(f.calls.length, 2);
 });
+
+async function ordinaryInspectionRecoveryFixture({ child = false } = {}) {
+  const inputBinding = pullRequestExternalActionBinding({ rootItemId: child ? 'work-root' : 'work-item-repair', pullRequestNumber: 17,
+    gitTarget: { baseRepository: 'acme/widgets', headRepository: 'acme/widgets', headRefOid: '1'.repeat(40) } });
+  const f = await recoveryFixture({ inputBinding });
+  const root = child ? { ...structuredClone(f.item), itemId: inputBinding.rootItemId, status: 'waiting_external',
+    currentTarget: { type: 'role', id: 'orchestrator' } } : f.item;
+  Object.assign(root, { kind: 'source_root', sourceQuarantine: null,
+    source: { kind: 'pull_request', identity: { provider: 'github', scopeId: 'github-dashboard' },
+      scope: { kind: 'automatic', active: true }, pendingRevision: null,
+      current: { event: { eventType: 'pull_request.updated', source: { provider: 'github', scopeId: 'github-dashboard' },
+        subject: { repository: 'acme/widgets', number: 17 },
+        payload: { relation: 'authored', author: 'runtime-user', nextAction: 'continue_draft' } } } } });
+  const config = { trackedRepositories: ['acme/widgets'],
+    githubActions: { enabled: true, automaticOwnPrRepair: true, actorAccountId: 'runtime-user' } };
+  const context = { inputBinding, author: 'runtime-user' };
+  const facts = { state: 'open', isDraft: true, author: 'runtime-user',
+    headRefOid: inputBinding.headRefOid, baseRefOid: inputBinding.gitTarget.baseRefOid, mergeStateStatus: 'CLEAN' };
+  const dependencies = { ...f.dependencies,
+    configurationReader: { async readActive() { return { configuration: structuredClone(config) }; } },
+    ledger: { ...f.dependencies.ledger,
+      async readItemForReconciliation({ itemId }) { return structuredClone(itemId === root.itemId ? root : f.item); },
+      async readPullRequestExecutionContext() { return structuredClone(context); },
+      async listTimeline() { return structuredClone(f.page); } },
+    github: { async readOwnPullRequestConflict() { return structuredClone(facts); } },
+    codeJobReader: { ...f.dependencies.codeJobReader, async getDetail() { return structuredClone(f.detail); } },
+    confirmations: { async approve() { assert.fail('inspection recovery cannot approve a task'); } },
+  };
+  const service = new AutomaticOwnPrConflict(dependencies);
+  await service.recover();
+  return { ...f, root, config, context, facts, dependencies, service };
+}
+
+test('ordinary owned PR inspections recover missing Git objects without requiring a merge conflict', async () => {
+  const f = await ordinaryInspectionRecoveryFixture();
+  const oldJob = structuredClone(f.detail.job);
+  const result = await f.service.runRecoveryCycle();
+  assert.equal(result.inspectionRecovery.requeued, 1);
+  assert.equal(f.calls[0], 'objects-ready');
+  assert.equal(f.calls[1].reason, 'automatic_inspection_objects_ready');
+  assert.equal(f.item.status, 'queued');
+  assert.deepEqual(f.detail.job, oldJob, 'historical failed execution stays unchanged');
+  f.item.status = 'blocked';
+  const restarted = new AutomaticOwnPrConflict(f.dependencies);
+  await restarted.recover();
+  assert.equal((await restarted.runRecoveryCycle()).inspectionRecovery.requeued, 0);
+  assert.equal(f.calls.length, 2, 'recovery receipt prevents replay');
+});
+
+for (const change of ['disabled', 'other-author', 'changed-head', 'changed-base', 'inactive-source',
+  'pending-source', 'quarantined-source', 'paused', 'conflict-no-longer-present']) {
+  test(`ordinary inspection recovery preserves ${change} boundary`, async () => {
+    const f = await ordinaryInspectionRecoveryFixture();
+    if (change === 'disabled') f.config.githubActions.automaticOwnPrRepair = false;
+    if (change === 'other-author') f.context.author = f.facts.author = 'another-user';
+    if (change === 'changed-head') f.facts.headRefOid = '9'.repeat(40);
+    if (change === 'changed-base') f.facts.baseRefOid = '9'.repeat(40);
+    if (change === 'inactive-source') f.item.source.scope.active = false;
+    if (change === 'pending-source') f.item.source.pendingRevision = { revision: 99 };
+    if (change === 'quarantined-source') f.item.sourceQuarantine = { reason: 'unsettled-cutover' };
+    if (change === 'paused') f.item.status = 'paused';
+    if (change === 'conflict-no-longer-present') f.item.source.current.event.payload.nextAction = 'resolve_conflict';
+    assert.equal((await f.service.runRecoveryCycle()).inspectionRecovery.requeued, 0);
+    assert.deepEqual(f.calls, []);
+  });
+}
+
+test('ordinary inspection recovery rechecks the target after synchronizing objects', async () => {
+  const f = await ordinaryInspectionRecoveryFixture();
+  f.dependencies.objectSync.prepare = async () => { f.calls.push('objects-ready'); f.facts.headRefOid = '9'.repeat(40); };
+  assert.equal((await f.service.runRecoveryCycle()).inspectionRecovery.requeued, 0);
+  assert.equal(f.item.status, 'blocked');
+  assert.deepEqual(f.calls, ['objects-ready']);
+});
+
+test('ordinary child inspections recover under an active source root assigned to another role', async () => {
+  const f = await ordinaryInspectionRecoveryFixture({ child: true });
+  assert.equal((await f.service.runRecoveryCycle()).inspectionRecovery.requeued, 1);
+  assert.equal(f.item.status, 'queued');
+  assert.equal(f.root.status, 'waiting_external');
+});
+
+for (const status of ['paused', 'cancelled', 'completed', 'superseded', 'blocked']) {
+  test(`ordinary child inspection recovery respects a ${status} source root`, async () => {
+    const f = await ordinaryInspectionRecoveryFixture({ child: true });
+    f.root.status = status;
+    f.root.statusReason = 'attention_rejected';
+    assert.equal((await f.service.runRecoveryCycle()).inspectionRecovery.requeued, 0);
+    assert.deepEqual(f.calls, []);
+  });
+}
 
 for (const code of ["WORK_LEDGER_CURSOR_INVALID", "MEMORY_STORAGE_FAILED"]) {
   test(`automatic inspection recovery handles a retired page cursor only (${code})`, async () => {
