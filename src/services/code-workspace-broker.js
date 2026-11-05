@@ -30,6 +30,7 @@ import { sameConflictPreparationBinding } from "../domain/conflict-preparation-b
 import { normalizePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { workspaceRevisionFromFileHashes } from "../domain/workspace-revision.js";
 import { throwIfPreparationAborted, isPreparationAbort, withoutPreparationCancellation } from "../lib/preparation-cancellation.js";
+import { gitSnapshotFailureDiagnostic } from "../adapters/git-object-snapshotter.js";
 
 const DEFAULT_LIMITS = Object.freeze({
   maxFiles: 5_000,
@@ -457,7 +458,8 @@ function gitSnapshotFailure(error) {
     : typeof error?.code === "string" && error.code.startsWith("GIT_")
       ? error.code
       : "GIT_HEAD_SNAPSHOT_FAILED";
-  return new CodeExecutionError(code, "无法从指定 Git Head 创建代码快照");
+  const diagnostic = gitSnapshotFailureDiagnostic(error);
+  return new CodeExecutionError(code, "无法从指定 Git Head 创建代码快照" + (diagnostic ? `；${diagnostic}` : ""));
 }
 
 export class CodeWorkspaceBroker {

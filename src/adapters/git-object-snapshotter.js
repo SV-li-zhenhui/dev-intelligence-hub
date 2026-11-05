@@ -50,6 +50,10 @@ const SAFE_GIT_PREFIX = Object.freeze([
 const MAX_PACK_DATABASE_ENTRIES = 100_000;
 const MAX_LOOSE_OBJECT_ENTRIES = 100_000;
 const MAX_GIT_EXECUTABLE_BYTES = 256 * 1024 * 1024;
+// Error properties and messages may originate outside the process producer.
+// Only these private records can supply persistent command diagnostics.
+const processFailureObservations = new WeakMap();
+const snapshotFailureDiagnostics = new WeakMap();
 const DEFAULT_LIMITS = Object.freeze({
   maxFiles: 5_000,
   maxFileBytes: 1_000_000,
@@ -70,7 +74,37 @@ export class GitObjectSnapshotterError extends Error {
 }
 
 function snapshotError(code, message, cause) {
-  return new GitObjectSnapshotterError(code, message, { cause });
+  const error = new GitObjectSnapshotterError(code, message, { cause });
+  const diagnostic = snapshotFailureDiagnostics.get(cause);
+  if (diagnostic) snapshotFailureDiagnostics.set(error, diagnostic);
+  return error;
+}
+
+export function gitSnapshotFailureDiagnostic(error) {
+  const diagnostic = snapshotFailureDiagnostics.get(error);
+  if (!diagnostic) return null;
+  const batch = diagnostic.batchIndex === undefined ? "" :
+    ` batch=${diagnostic.batchIndex}/${diagnostic.batchCount} objects=${diagnostic.objectCount}`;
+  return `Git snapshot: stage=${diagnostic.stage} operation=${diagnostic.operation}${batch}` +
+    ` elapsedMs=${diagnostic.elapsedMs} budgetMs=${diagnostic.budgetMs}` +
+    ` stdoutBytes=${diagnostic.stdoutBytes} stderrBytes=${diagnostic.stderrBytes} process=${diagnostic.process}`;
+}
+
+function commandDiagnostic(args) {
+  if (args[0] === "cat-file" && args[1] === "--batch") return { stage: "blob_read", operation: "blob_batch" };
+  if (args[0] === "cat-file") return { stage: "head_validation", operation: "commit_type" };
+  if (args[0] === "ls-tree") return { stage: "tree_read", operation: "tree_list" };
+  return { stage: "preflight", operation: args[0] === "config" ? "configuration_read" : "repository_identity" };
+}
+
+function observeProcessFailure(error, child, stdout, stderr) {
+  processFailureObservations.set(error, {
+    stdoutBytes: Buffer.isBuffer(stdout) ? stdout.length : "unknown",
+    stderrBytes: Buffer.isBuffer(stderr) ? stderr.length : "unknown",
+    process: !Number.isSafeInteger(child?.pid) ? "not_started" :
+      child.exitCode !== null || child.signalCode !== null ? "stopped" : "unknown",
+  });
+  return error;
 }
 
 function sha256(value) {
@@ -530,7 +564,7 @@ function parseBlobs(value, oids, limits, objectFormat) {
   }
 }
 
-class BinaryExecFileRunner {
+export class BinaryExecFileRunner {
   async run({ command, args, cwd, env, input, timeoutMs, maxOutputBytes }) {
     throwIfPreparationAborted();
     return new Promise((resolve, reject) => {
@@ -551,13 +585,16 @@ class BinaryExecFileRunner {
             windowsHide: true,
           },
           (error, stdout, stderr) => {
-            if (releaseAbort() && error?.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") { reject(new PreparationAbortedError()); return; }
+            if (releaseAbort() && error?.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+              reject(observeProcessFailure(new PreparationAbortedError(), child, stdout, stderr));
+              return;
+            }
             if (
               error &&
               (error.killed || error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")
             ) {
               reject(
-                snapshotError(
+                observeProcessFailure(snapshotError(
                   error.killed
                     ? "GIT_SNAPSHOT_TIMEOUT"
                     : "GIT_SNAPSHOT_OUTPUT_LIMIT",
@@ -565,26 +602,28 @@ class BinaryExecFileRunner {
                     ? "Git object snapshot 命令超时"
                     : "Git object snapshot 输出超过限制",
                   error,
-                ),
+                ), child, stdout, stderr),
               );
               return;
             }
-            resolve({
+            const result = {
               exitCode: error ? Number.isSafeInteger(error.code) ? error.code : -1 : 0,
               signal: error?.signal ?? null,
               stdout: Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout ?? ""),
               stderr: Buffer.isBuffer(stderr) ? stderr : Buffer.from(stderr ?? ""),
               truncated: false,
-            });
+            };
+            if (error) observeProcessFailure(result, child, stdout, stderr);
+            resolve(result);
           },
         );
       } catch (cause) {
         reject(
-          snapshotError(
+          observeProcessFailure(snapshotError(
             "GIT_SNAPSHOT_PROCESS_FAILED",
             "Git object snapshot 命令无法启动",
             cause,
-          ),
+          ), child, undefined, undefined),
         );
         return;
       }
@@ -789,6 +828,11 @@ export class GitObjectSnapshotter {
           sourceRoot,
           Buffer.from(batchOids.map((oid) => `${oid}\n`).join("")),
           Math.min(Number.MAX_SAFE_INTEGER, remainingBytes + batchOids.length * 160 + 1),
+          {
+            batchIndex: offset / MAX_BLOBS_PER_BATCH + 1,
+            batchCount: Math.ceil(oids.length / MAX_BLOBS_PER_BATCH),
+            objectCount: batchOids.length,
+          },
         );
         const batchBlobs = parseBlobs(
           blobOutput,
@@ -1387,57 +1431,52 @@ export class GitObjectSnapshotter {
   }
 
   async #gitOptionalText(args, cwd) {
-    throwIfPreparationAborted();
-    const result = await this.#run({
-      command: this.#gitCommand,
-      args: [...SAFE_GIT_PREFIX, ...args],
-      cwd,
-      env: SAFE_ENV,
-      timeoutMs: this.#timeoutMs,
-      maxOutputBytes: this.#limits.maxTreeBytes,
-    });
-    if (
-      result === null ||
-      typeof result !== "object" ||
-      !Number.isSafeInteger(result.exitCode) ||
-      result.signal !== null ||
-      result.truncated !== false ||
-      !Buffer.isBuffer(result.stdout) ||
-      !Buffer.isBuffer(result.stderr)
-    ) {
-      throw snapshotError(
-        "GIT_SNAPSHOT_PROCESS_FAILED",
-        "Git object snapshot 命令失败",
+    return this.#executeGit(args, cwd, undefined, this.#limits.maxTreeBytes, result => {
+      if (
+        result === null ||
+        typeof result !== "object" ||
+        !Number.isSafeInteger(result.exitCode) ||
+        result.signal !== null ||
+        result.truncated !== false ||
+        !Buffer.isBuffer(result.stdout) ||
+        !Buffer.isBuffer(result.stderr)
+      ) {
+        throw snapshotError(
+          "GIT_SNAPSHOT_PROCESS_FAILED",
+          "Git object snapshot 命令失败",
+        );
+      }
+      if (result.exitCode !== 0) return null;
+      return decodeSingleLine(
+        result.stdout,
+        "GIT_SNAPSHOT_PROTOCOL_ERROR",
+        "Git object snapshot 输出无效",
       );
-    }
-    if (result.exitCode !== 0) return null;
-    return decodeSingleLine(
-      result.stdout,
-      "GIT_SNAPSHOT_PROTOCOL_ERROR",
-      "Git object snapshot 输出无效",
-    );
+    });
   }
 
   async #gitOptionalBytes(args, cwd, maxOutputBytes) {
-    throwIfPreparationAborted();
-    return optionalOutput(
-      await this.#run({
-        command: this.#gitCommand,
-        args: [...SAFE_GIT_PREFIX, ...args],
-        cwd,
-        env: SAFE_ENV,
-        timeoutMs: this.#timeoutMs,
-        maxOutputBytes,
-      }),
+    return this.#executeGit(args, cwd, undefined, maxOutputBytes, result => optionalOutput(
+      result,
       "GIT_SNAPSHOT_PROCESS_FAILED",
       "Git object snapshot 配置检查失败",
-    );
+    ));
   }
 
-  async #gitBytes(args, cwd, input, maxOutputBytes) {
-    throwIfPreparationAborted();
-    return successfulOutput(
-      await this.#run({
+  async #gitBytes(args, cwd, input, maxOutputBytes, batch = {}) {
+    return this.#executeGit(args, cwd, input, maxOutputBytes, result => successfulOutput(
+      result,
+      "GIT_SNAPSHOT_PROCESS_FAILED",
+      "Git object snapshot 命令失败",
+    ), batch);
+  }
+
+  async #executeGit(args, cwd, input, maxOutputBytes, consume, batch = {}) {
+    const startedAt = performance.now();
+    let result;
+    try {
+      throwIfPreparationAborted();
+      result = await this.#run({
         command: this.#gitCommand,
         args: [...SAFE_GIT_PREFIX, ...args],
         cwd,
@@ -1445,9 +1484,18 @@ export class GitObjectSnapshotter {
         ...(input === undefined ? {} : { input }),
         timeoutMs: this.#timeoutMs,
         maxOutputBytes,
-      }),
-      "GIT_SNAPSHOT_PROCESS_FAILED",
-      "Git object snapshot 命令失败",
-    );
+      });
+      return consume(result);
+    } catch (cause) {
+      const observed = processFailureObservations.get(cause) ?? processFailureObservations.get(result);
+      if (cause !== null && (typeof cause === "object" || typeof cause === "function")) snapshotFailureDiagnostics.set(cause, {
+        ...commandDiagnostic(args), ...batch,
+        elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)), budgetMs: this.#timeoutMs,
+        stdoutBytes: observed?.stdoutBytes ?? (Buffer.isBuffer(result?.stdout) ? result.stdout.length : "unknown"),
+        stderrBytes: observed?.stderrBytes ?? (Buffer.isBuffer(result?.stderr) ? result.stderr.length : "unknown"),
+        process: observed?.process ?? "unknown",
+      });
+      throw cause;
+    }
   }
 }

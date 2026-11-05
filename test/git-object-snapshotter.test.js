@@ -19,7 +19,15 @@ import test from "node:test";
 import {
   GitObjectSnapshotter,
   GitObjectSnapshotterError,
+  gitSnapshotFailureDiagnostic,
+  BinaryExecFileRunner,
 } from "../src/adapters/git-object-snapshotter.js";
+import { CodeWorkspaceBroker } from "../src/services/code-workspace-broker.js";
+import { ControlledCodeExecutor } from "../src/services/controlled-code-executor.js";
+import { CodeExecutionJournal } from "../src/services/code-execution-journal.js";
+import { StateStore } from "../src/lib/state-store.js";
+import { digestValue } from "../src/domain/code-executor-contract.js";
+import { PreparationAbortedError, withPreparationCancellation } from "../src/lib/preparation-cancellation.js";
 
 const HEAD = "1".repeat(40);
 const APP_CONTENT = Buffer.from("export const value = 1;\n");
@@ -267,6 +275,199 @@ function manyBlobs(count) {
   }
   return { entries, blobs };
 }
+
+async function snapshotBroker(setup, service) {
+  const boundary = await service.preflight({ sourceRoot: setup.sourceRoot });
+  const identityKeys = ["gitCommand", "gitExecutableSha256", "gitExecutableBytes",
+    "gitExecutableMode", "gitExecutableUid", "gitExecutableGid"];
+  return new CodeWorkspaceBroker({
+    scratchRoot: path.join(setup.root, "scratch"),
+    gitSnapshotter: service,
+    workspaces: [{
+      id: "dashboard", sourceRoot: setup.sourceRoot, writablePaths: [],
+      gitBoundaryDigest: boundary.boundaryDigest,
+      gitExecutableIdentity: Object.fromEntries(identityKeys.map(key => [key, boundary[key]])),
+    }],
+  });
+}
+
+function snapshotInputBinding() {
+  return {
+    schemaVersion: 1, kind: "pull_request", repository: "acme/dashboard", pullRequestNumber: 42,
+    rootItemId: "pr-root-42", workKey: "pr-work-42", inputRevision: 1, headRevision: 1,
+    headRefOid: HEAD, eventId: "event-42", eventDigest: "2".repeat(64), inputDigest: "3".repeat(64),
+  };
+}
+
+test("broker retains the failing later Git blob batch's own diagnostic context", async t => {
+  const setup = await fixture(t);
+  const { entries, blobs } = manyBlobs(257);
+  let batchCalls = 0;
+  const runner = fakeRunner(setup.sourceRoot, {
+    treeOutput: tree(entries), blobs,
+    override(request) {
+      if (request.args.includes("--batch") && ++batchCalls === 3) {
+        throw Object.assign(new GitObjectSnapshotterError("GIT_SNAPSHOT_TIMEOUT", "secret https://token@example.invalid/private/path"), {
+          diagnostics: { batchIndex: 999, stdoutBytes: 0, process: "stopped" },
+          details: { durationMs: 0, stdoutBytes: 0, process: "stopped" },
+        });
+      }
+    },
+  });
+  const broker = await snapshotBroker(setup, snapshotter(runner));
+  await assert.rejects(broker.createExecution({
+    workspaceId: "dashboard", executionId: "later-batch", inputBinding: snapshotInputBinding(),
+  }), error => {
+    assert.equal(error.code, "GIT_SNAPSHOT_TIMEOUT");
+    assert.match(error.message, /stage=blob_read/);
+    assert.match(error.message, /operation=blob_batch/);
+    assert.match(error.message, /batch=3\/3 objects=1/);
+    assert.match(error.message, /elapsedMs=\d+ budgetMs=30000/);
+    assert.match(error.message, /stdoutBytes=unknown stderrBytes=unknown process=unknown/);
+    assert.doesNotMatch(error.message, /secret|token|example\.invalid|private\/path|--batch/);
+    return true;
+  });
+  assert.equal(batchCalls, 3);
+
+  // Exercise the existing trusted persistence boundary, including restart, with
+  // a failure freshly generated through the real producer and broker again.
+  batchCalls = 0;
+  const profile = { kind: "node-test" };
+  const store = new StateStore(path.join(setup.root, "state"));
+  let sandboxCalls = 0;
+  const createExecutor = () => new ControlledCodeExecutor({
+    broker, store, journal: new CodeExecutionJournal({ root: path.join(setup.root, "journal") }),
+    sandbox: {
+      async run() { sandboxCalls++; assert.fail("preparation must fail before any sandbox action"); },
+      async cleanup() {}, getProfileFingerprint: () => digestValue(profile),
+    },
+    profileDefinitions: { checks: profile }, requiredProfilesByWorkspace: { dashboard: ["checks"] },
+  });
+  const executor = createExecutor();
+  await executor.recover();
+  const request = { sessionId: "failed-batch-session", workspaceId: "dashboard",
+    requestedBy: { roleId: "developer", workItemId: "dev-task-42" }, inputBinding: snapshotInputBinding() };
+  await assert.rejects(executor.start(request), { code: "START_FAILED" });
+  const failed = await executor.view({ sessionId: request.sessionId });
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.error.code, "GIT_SNAPSHOT_TIMEOUT");
+  assert.match(failed.error.message, /batch=3\/3 objects=1/);
+  assert.equal(failed.actions.length, 0);
+  assert.deepEqual(failed.inputBinding, request.inputBinding);
+  assert.equal(sandboxCalls, 0);
+  const restarted = createExecutor();
+  await restarted.recover();
+  assert.deepEqual((await restarted.view({ sessionId: request.sessionId })).error, failed.error);
+  await assert.rejects(restarted.start({ ...request,
+    inputBinding: { ...request.inputBinding, headRefOid: "9".repeat(40) },
+  }), { code: "IDEMPOTENCY_CONFLICT" });
+  assert.equal(batchCalls, 3, "changed source cannot replay old preparation");
+});
+
+test("broker diagnoses preflight command failures without borrowing blob-batch context", async t => {
+  const setup = await fixture(t);
+  let failPreflight = false;
+  const runner = fakeRunner(setup.sourceRoot, { override(request) {
+    if (failPreflight && request.args.includes("--show-toplevel")) {
+      return output("private output", { exitCode: 1, stderr: Buffer.from("token https://secret.invalid/path") });
+    }
+  } });
+  const broker = await snapshotBroker(setup, snapshotter(runner));
+  failPreflight = true;
+  await assert.rejects(broker.createExecution({ workspaceId: "dashboard", executionId: "failed-preflight",
+    inputBinding: snapshotInputBinding() }), error => {
+    assert.equal(error.code, "GIT_SNAPSHOT_PROCESS_FAILED");
+    assert.match(error.message, /stage=preflight operation=repository_identity/);
+    assert.match(error.message, /stdoutBytes=14 stderrBytes=33 process=unknown/);
+    assert.doesNotMatch(error.message, /batch=|objects=|token|private|secret\.invalid/);
+    return true;
+  });
+});
+
+test("owned process timeout retains only measured partial byte counts and settled process proof", async t => {
+  const setup = await fixture(t);
+  const processRunner = new BinaryExecFileRunner();
+  const runner = fakeRunner(setup.sourceRoot, { override(request) {
+    if (request.args.includes("--batch")) return processRunner.run({
+      ...request, command: process.execPath,
+      args: ["-e", 'process.stdout.write("ok"); process.stderr.write("secret"); setInterval(() => {}, 1000);'],
+      input: undefined,
+    });
+  } });
+  const service = new GitObjectSnapshotter({ gitCommand: runner.gitCommand, processRunner: runner, timeoutMs: 500 });
+  const broker = await snapshotBroker(setup, service);
+  await assert.rejects(broker.createExecution({ workspaceId: "dashboard", executionId: "owned-process-timeout",
+    inputBinding: snapshotInputBinding() }), error => {
+    assert.equal(error.code, "GIT_SNAPSHOT_TIMEOUT");
+    assert.match(error.message, /stage=blob_read operation=blob_batch batch=1\/1 objects=1/);
+    assert.match(error.message, /elapsedMs=\d+ budgetMs=500/);
+    assert.match(error.message, /stdoutBytes=2 stderrBytes=6 process=stopped/);
+    assert.doesNotMatch(error.message, /secret|setInterval|node\.exe|--batch/);
+    return true;
+  });
+});
+
+test("owned nonzero process exit retains result byte counts and stopped proof without raw output", async t => {
+  const setup = await fixture(t);
+  const stdout = "synthetic stdout https://user:token@example.invalid/private";
+  const stderr = "synthetic error https://secret.invalid/path";
+  const processRunner = new BinaryExecFileRunner();
+  const runner = fakeRunner(setup.sourceRoot, { override(request) {
+    if (request.args.includes("--batch")) return processRunner.run({
+      ...request, command: process.execPath,
+      args: ["-e", `process.stdout.write(${JSON.stringify(stdout)}); process.stderr.write(${JSON.stringify(stderr)}); process.exitCode = 7;`],
+      input: undefined,
+    });
+  } });
+  const broker = await snapshotBroker(setup, snapshotter(runner));
+  await assert.rejects(broker.createExecution({ workspaceId: "dashboard", executionId: "owned-process-nonzero",
+    inputBinding: snapshotInputBinding() }), error => {
+    assert.equal(error.code, "GIT_SNAPSHOT_PROCESS_FAILED");
+    assert.match(error.message, /stage=blob_read operation=blob_batch batch=1\/1 objects=1/);
+    assert.match(error.message, new RegExp(`stdoutBytes=${Buffer.byteLength(stdout)} stderrBytes=${Buffer.byteLength(stderr)} process=stopped`));
+    assert.doesNotMatch(error.message, /synthetic|stdout https|error https|token|example\.invalid|secret\.invalid|private/);
+    return true;
+  });
+});
+
+test("snapshot diagnostics preserve cancellation identity and actual command stage", async t => {
+  const setup = await fixture(t);
+  const { entries, blobs } = manyBlobs(129);
+  let batches = 0;
+  const aborted = new PreparationAbortedError();
+  const runner = fakeRunner(setup.sourceRoot, { treeOutput: tree(entries), blobs, override(request) {
+    if (request.args.includes("--batch") && ++batches === 2) throw aborted;
+  } });
+  const broker = await snapshotBroker(setup, snapshotter(runner));
+  const controller = new AbortController();
+  await assert.rejects(withPreparationCancellation(controller.signal, () => broker.createExecution({
+    workspaceId: "dashboard", executionId: "cancelled-batch", inputBinding: snapshotInputBinding(),
+  })), error => {
+    assert.equal(error, aborted);
+    assert.equal(error.code, "CODE_PREPARATION_ABORTED");
+    assert.match(gitSnapshotFailureDiagnostic(error), /stage=blob_read operation=blob_batch batch=2\/2 objects=1/);
+    assert.match(gitSnapshotFailureDiagnostic(error), /process=unknown/);
+    return true;
+  });
+});
+
+test("errors outside the snapshot producer cannot forge persistent diagnostic metadata", async t => {
+  const setup = await fixture(t);
+  const service = snapshotter(fakeRunner(setup.sourceRoot));
+  const forged = Object.assign(new GitObjectSnapshotterError("GIT_SNAPSHOT_TIMEOUT", "private content"), {
+    diagnostics: { stage: "blob_read", batchIndex: 999, stdoutBytes: 0, process: "stopped" },
+  });
+  assert.equal(gitSnapshotFailureDiagnostic(forged), null);
+  const broker = await snapshotBroker(setup, {
+    preflight: service.preflight.bind(service), async materialize() { throw forged; },
+  });
+  await assert.rejects(broker.createExecution({ workspaceId: "dashboard", executionId: "forged-diagnostic",
+    inputBinding: snapshotInputBinding() }), error => {
+    assert.equal(error.code, "GIT_SNAPSHOT_TIMEOUT");
+    assert.equal(error.message, "无法从指定 Git Head 创建代码快照");
+    return true;
+  });
+});
 
 test("reads bounded blob batches with global deduplication and an intact large final blob", async (t) => {
   const { sourceRoot, targetRoot } = await fixture(t);
