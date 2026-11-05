@@ -4,6 +4,8 @@ import { lstat, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createNativeCodexBrainProvider } from "../src/adapters/native-codex-brain-provider.js";
+import { readGitHubReviewFeedbackSnapshot } from "../src/adapters/github-review-feedback-snapshot.js";
+import { GitHubReviewReader } from "../src/adapters/github-review-reader.js";
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { continuationFingerprint } from '../src/services/work-continuation-state.js';
 import { createTaskRunSettler, planWorkItemRunControl } from '../src/services/work-ledger-run-control.js';
@@ -1399,6 +1401,60 @@ test(`real native provider ${code} follows the existing decision retry budget`, 
     assert.equal(ledger.calls.transition.length, 0);
   }
   assert.equal(materialReads, materialFailure ? 2 : 0);
+  assert.equal(modelStarts, 0);
+  assert.equal(ledger.outbox.length, 0);
+  assert.equal(ledger.calls.stageIntent.length, 0);
+});
+
+for (const source of ["missing-feedback", "forged-raw-io", "unknown-factory", "forged-factory"])
+test(`reader-owned ${source} failure crosses the native provider and exhausts the finite work budget`, async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "work-loop-feedback-failure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  await mkdir(home);
+  let modelStarts = 0;
+  const sourceCode = source === "missing-feedback" ? "PR_REVIEW_READ_FEEDBACK_UNAVAILABLE"
+    : source === "forged-raw-io" ? "PR_REVIEW_READ_UNAVAILABLE" : "STRUCTURED_PROVIDER_REQUEST_FAILED";
+  const reader = new GitHubReviewReader({ async run() {
+    throw { code: "STRUCTURED_PROVIDER_UNAVAILABLE", domain: "infrastructure", retryable: true, infrastructure: true, message: "private source body" };
+  } });
+  const provider = createNativeCodexBrainProvider({ id: "native-feedback-budget-test", cliKind: "codex-cli", credentialMode: "codex-native-login" }, {
+    environment: { CODEX_HOME: home, DIH_CODEX_NATIVE_TRANSPORT: "exec" }, temporaryRoot: path.join(root, "runtime"),
+    commandLocator: { async resolve() { return { command: process.execPath, prefixArgs: [] }; } },
+    rootDirectoryManager: { async prepare({ directory, validateLocation, signal }) {
+      signal?.throwIfAborted(); await validateLocation(); await mkdir(directory, { recursive: true });
+      const stat = await lstat(directory, { bigint: true });
+      return { path: await realpath(directory), device: String(stat.dev), inode: String(stat.ino) };
+    } },
+    processRunner: { async run() { modelStarts++; assert.fail("missing required feedback must prevent model startup"); } },
+    reviewReaderFactory: (target, options) => {
+      if (source === "unknown-factory") throw new Error("private unclassified reader failure");
+      if (source === "forged-factory") throw { code: "PR_REVIEW_READ_UNKNOWN", domain: "infrastructure", retryable: true, infrastructure: true };
+      return source === "missing-feedback" ? readGitHubReviewFeedbackSnapshot({ target, options }) : reader.open(target, options);
+    },
+  });
+  t.after(() => provider.close());
+  const time = controlledClock(), ledger = new FakeLedger({ source: [workItem(1)], time });
+  const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "owner", baseRepository: "owner/repo", headRepository: "owner/repo", baseRefName: "main", headRefName: "feature", baseRefOid: "a".repeat(40), headRefOid: "b".repeat(40) };
+  const directory = new FakeRoleDirectory({ "pr-reviewer": worker({ decide: () => provider.generate({
+    model: "gpt-6.1-sol", reasoningEffort: "high", messages: [{ role: "user", content: "Read required feedback" }], schema: { type: "object" },
+    reviewTarget: { gitTarget, pullRequestNumber: 42, feedbackSnapshot: { taskId: "review-child", materialDigest: "c".repeat(64) } },
+  }) }) });
+  const loop = createLoop({ ledger, directory, time, maxAttempts: 2 });
+  const first = await loop.runCycle();
+  assert.equal(first.retried, 1);
+  assert.equal(ledger.items[0].attempt, 1);
+  assert.equal(first.outcomes[0].code, sourceCode);
+  assert.equal(ledger.calls.scheduleRetry[0].reason, "decision_failed");
+  time.advance(60_000);
+  const second = await loop.runCycle();
+  assert.equal(second.outcomes[0].code, sourceCode);
+  assert.equal(second.blocked, 1);
+  assert.equal(ledger.items[0].attempt, 2);
+  assert.equal(ledger.items[0].status, "blocked");
+  assert.equal(ledger.calls.transition[0].reason, "decision_attempts_exhausted");
+  time.advance(60_000);
+  assert.equal((await loop.runCycle()).claimed, 0);
   assert.equal(modelStarts, 0);
   assert.equal(ledger.outbox.length, 0);
   assert.equal(ledger.calls.stageIntent.length, 0);

@@ -6,10 +6,7 @@ import { samePullRequestGitTarget } from "../domain/git-tool-contract.js";
 import { readGitHubCurrentPullRequestTarget } from "./github-current-pull-request-target.js";
 import { normalizeOriginalRepairFeedbackSnapshot } from "../domain/original-repair-feedback.js";
 import { readGitHubReviewFeedbackSnapshot } from "./github-review-feedback-snapshot.js";
-
-function failure(code) {
-  return Object.assign(new Error(code), { code });
-}
+import { createReviewSourceFailure as failure, isReviewSourceFailure, withReviewSourceFailure } from "../domain/review-source-failure.js";
 
 function repositoryPath(value, { directory = false } = {}) {
   if (directory && value === "") return "";
@@ -61,6 +58,10 @@ export class GitHubReviewReader {
     if (skills.some(([name, value]) => !/^review-skill\/(?:SKILL\.md|manifest\.json|references\/[a-z-]+\.md)$/.test(name) ||
       typeof value !== "string" || Buffer.byteLength(value) > 128 * 1024)) throw failure("PR_REVIEW_READ_DOCUMENT_INVALID");
     const target = normalizeReviewReadTarget(rawTarget);
+    return withReviewSourceFailure(() => this.#open(target, { signal, skills }), { signal });
+  }
+
+  async #open(target, { signal, skills }) {
     const git = target.gitTarget;
     const controller = new AbortController();
     const requestSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
@@ -109,9 +110,12 @@ export class GitHubReviewReader {
     if (target.repairFeedback) {
       if (typeof this.originalRepairFeedbackReader?.read !== "function") throw failure("OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE");
       const descriptor = target.repairFeedback;
-      const snapshot = normalizeOriginalRepairFeedbackSnapshot(await this.originalRepairFeedbackReader.read({ snapshotId: descriptor.snapshotId,
+      const rawSnapshot = await this.originalRepairFeedbackReader.read({ snapshotId: descriptor.snapshotId,
         repository: git.baseRepository, number: target.pullRequestNumber, feedbackDigest: descriptor.feedbackDigest,
-        originalHeadRefOid: descriptor.originalHeadRefOid }));
+        originalHeadRefOid: descriptor.originalHeadRefOid });
+      let snapshot;
+      try { snapshot = normalizeOriginalRepairFeedbackSnapshot(rawSnapshot); }
+      catch (cause) { throw failure("OWN_PR_REPAIR_ORIGINAL_FEEDBACK_INVALID", cause); }
       if (snapshot.snapshotId !== descriptor.snapshotId || snapshot.repository !== git.baseRepository || snapshot.number !== target.pullRequestNumber ||
           snapshot.feedbackDigest !== descriptor.feedbackDigest || snapshot.originalHeadRefOid !== descriptor.originalHeadRefOid) throw failure("OWN_PR_REPAIR_ORIGINAL_FEEDBACK_INVALID");
       feedbackDocuments = { "repair-feedback-manifest.json": JSON.stringify({ ...descriptor,
@@ -226,7 +230,7 @@ export class GitHubReviewReader {
             const value = await callTool(message.params?.name, message.params?.arguments);
             result = { content: [{ type: "text", text: JSON.stringify(value) }] };
           } catch (error) {
-            result = { isError: true, content: [{ type: "text", text: /^[A-Z][A-Z0-9_]+$/.test(error.code || "") ? error.code : "PR_REVIEW_READ_FAILED" }] };
+            result = { isError: true, content: [{ type: "text", text: isReviewSourceFailure(error) ? error.code : "PR_REVIEW_READ_FAILED" }] };
           }
         } else throw failure("PR_REVIEW_READ_METHOD_NOT_ALLOWED");
         response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
@@ -249,14 +253,16 @@ export class GitHubReviewReader {
     return {
       url: `http://127.0.0.1:${server.address().port}${endpointPath}`,
       diffText, manifestText,
-      async assertComplete() {
-        if (requiredDocuments.some((name) => !coversAll(reads[name], documents[name].length))) {
-          throw failure("PR_REVIEW_READ_INCOMPLETE");
-        }
-        if (feedbackSnapshot) {
-          const current = await readCurrentFeedback();
-          if (current.feedbackSnapshot.snapshotDigest !== feedbackSnapshot.snapshotDigest) throw failure("PR_REVIEW_READ_MATERIAL_CHANGED");
-        } else await checkTarget();
+      assertComplete() {
+        return withReviewSourceFailure(async () => {
+          if (requiredDocuments.some((name) => !coversAll(reads[name], documents[name].length))) {
+            throw failure("PR_REVIEW_READ_INCOMPLETE");
+          }
+          if (feedbackSnapshot) {
+            const current = await readCurrentFeedback();
+            if (current.feedbackSnapshot.snapshotDigest !== feedbackSnapshot.snapshotDigest) throw failure("PR_REVIEW_READ_MATERIAL_CHANGED");
+          } else await checkTarget();
+        }, { signal: requestSignal });
       },
       close,
     };

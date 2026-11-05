@@ -9,6 +9,10 @@ import test from "node:test";
 
 import { createNativeCodexBrainProvider } from "../src/adapters/native-codex-brain-provider.js";
 import { readGitHubReferencedMaterials } from "../src/adapters/github-referenced-materials.js";
+import { GitHubReviewReader } from "../src/adapters/github-review-reader.js";
+import { readGitHubReviewFeedbackSnapshot } from "../src/adapters/github-review-feedback-snapshot.js";
+import { createReviewSourceFailure, isReviewSourceFailure } from "../src/domain/review-source-failure.js";
+import { createTestKnownCliLocator } from "../src/lib/known-cli-locator.js";
 import { reconcileNativeBootRecovery } from '../src/adapters/native-codex-boot-recovery.js';
 import { CodexNativeSessionStore, nativeCodexDigest, nativeCodexHomeIdentity } from "../src/adapters/codex-native-session-store.js";
 import { createTestSupervisedProcessRunner } from "../src/lib/supervised-process-runner.js";
@@ -889,7 +893,10 @@ test('registered tasks retain live transport even without a saved session or cod
 
 test('unavailable production live transport leaves no unknown native session or active marker',async(t)=>{
   const f=await fixture(t);f.environment.DIH_CODEX_NATIVE_TRANSPORT='app-server';
-  const provider=f.create(()=>assert.fail('must not fall back to exec'));
+  const provider=f.create(call=>{
+    assert.deepEqual(call.args,['login','status'],'a status probe must not fall back to exec');
+    throw error('STRUCTURED_PROVIDER_UNAVAILABLE');
+  });
   assert.equal((await provider.readStatus()).state,'cli_unavailable');
   await assert.rejects(provider.generate(request({sessionKey:'pr:42'})),{code:'STRUCTURED_PROVIDER_UNAVAILABLE'});
   assert.deepEqual(await readdir(path.join(f.runtime,'sessions')),[]);
@@ -1658,6 +1665,27 @@ test('idle native status probes recover login and notice credential loss while a
   await provider.close();
 });
 
+for (const source of ["missing-feedback", "raw-gh-failure"])
+test(`native review preserves reader-owned ${source} before starting the model`, async (t) => {
+  const f = await fixture(t);
+  const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "owner", baseRepository: "owner/repo", headRepository: "owner/repo", baseRefName: "main", headRefName: "feature", baseRefOid: "a".repeat(40), headRefOid: "b".repeat(40) };
+  const reviewTarget = { gitTarget, pullRequestNumber: 42, ...(source === "missing-feedback"
+    ? { feedbackSnapshot: { taskId: "review-child", materialDigest: "c".repeat(64) } } : {}) };
+  const reader = new GitHubReviewReader({ async run() { throw new Error("private gh stderr and business response"); } });
+  const provider = f.create(() => assert.fail("source failure must prevent model execution"), {}, {
+    reviewReaderFactory: (target, options) => source === "missing-feedback"
+      ? readGitHubReviewFeedbackSnapshot({ target, options }) : reader.open(target, options),
+  });
+  t.after(() => provider.close());
+  await assert.rejects(provider.generate(request({ reviewTarget })), {
+    code: source === "missing-feedback" ? "PR_REVIEW_READ_FEEDBACK_UNAVAILABLE" : "PR_REVIEW_READ_UNAVAILABLE",
+    statusCode: 503,
+    message: source === "missing-feedback" ? "PR review feedback is unavailable" : "PR review source is unavailable",
+  });
+  assert.equal(f.calls.length, 0);
+  assert.deepEqual(await readdir(f.runtime), ["sessions"]);
+});
+
 test("native review preserves a real referenced-material read failure before starting the model", async (t) => {
   const f = await fixture(t);
   let reads = 0;
@@ -1680,6 +1708,88 @@ test("native review preserves a real referenced-material read failure before sta
     message: "PR review referenced material is unavailable",
   });
   assert.equal(reads, 1);
+  assert.equal(f.calls.length, 0);
+  assert.deepEqual(await readdir(f.runtime), ["sessions"]);
+});
+
+test("native review preserves trusted source identity without provider registration and strips forged metadata", async (t) => {
+  const f = await fixture(t);
+  const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "owner", baseRepository: "owner/repo", headRepository: "owner/repo", baseRefName: "main", headRefName: "feature", baseRefOid: "a".repeat(40), headRefOid: "b".repeat(40) };
+  let source = createReviewSourceFailure("PR_REVIEW_READ_ACCOUNT_CHANGED", new Error("private account response"));
+  const provider = f.create(() => assert.fail("source failure must prevent model execution"), {}, {
+    reviewReaderFactory: async () => { throw source; },
+  });
+  t.after(() => provider.close());
+  const generate = () => provider.generate(request({ reviewTarget: { gitTarget, pullRequestNumber: 42 } }));
+  await assert.rejects(generate(), error => error === source && isReviewSourceFailure(error));
+  for (const forged of [{ ...source, domain: "source", infrastructure: true, retryable: true },
+    Object.assign(new Error("private forged response"), { code: "PR_REVIEW_READ_UNKNOWN", retryable: true }),
+    Object.assign(new Error("private forged response"), { code: "PR_REVIEW_READ_FEEDBACK_UNAVAILABLE", infrastructure: true })]) {
+    source = forged;
+    await assert.rejects(generate(), error => {
+      assert.equal(error.code, "STRUCTURED_PROVIDER_REQUEST_FAILED");
+      assert.equal(error.message, "Native Codex request failed");
+      assert.equal(isReviewSourceFailure(error), false);
+      assert.deepEqual(Object.keys(error), ["code", "statusCode"]);
+      return true;
+    });
+  }
+  assert.equal(f.calls.length, 0);
+  assert.deepEqual(await readdir(f.runtime), ["sessions"]);
+});
+
+for (const boundary of ["locator", "runner"])
+test(`unclassified ${boundary} failures are safe finite request failures`, async (t) => {
+  const f = await fixture(t);
+  let cause = new Error("private unclassified diagnostic");
+  const provider = f.create(async () => { throw cause; }, {}, boundary === "locator"
+    ? { commandLocator: { async resolve() { throw cause; } } } : {});
+  t.after(() => provider.close());
+  for (const value of [cause, new TypeError("private unclassified type error"),
+    { code: "__proto__", domain: "provider", infrastructure: true, retryable: true }]) {
+    cause = value;
+    await assert.rejects(provider.generate(request()), { code: "STRUCTURED_PROVIDER_REQUEST_FAILED", statusCode: 502, message: "Native Codex request failed" });
+  }
+  assert.deepEqual(await readdir(f.runtime), ["sessions"]);
+});
+
+for (const method of ["readStatus", "checkAvailability"])
+test(`unclassified status lookup cannot become an outage through ${method}`, async (t) => {
+  const f = await fixture(t);
+  const provider = f.create(result, {}, { commandLocator: { async resolve() { throw new Error("private lookup diagnostic"); } } });
+  t.after(() => provider.close());
+  await assert.rejects(provider[method](), { code: "STRUCTURED_PROVIDER_REQUEST_FAILED", statusCode: 502, message: "Native Codex request failed" });
+});
+
+test("a real missing CLI remains a classified provider outage", async (t) => {
+  const f = await fixture(t);
+  const provider = f.create(() => assert.fail("missing CLI cannot start a model"), {}, {
+    commandLocator: createTestKnownCliLocator({ platform: "unsupported", pathValue: "" }),
+  });
+  t.after(() => provider.close());
+  await assert.rejects(provider.generate(request()), { code: "STRUCTURED_PROVIDER_UNAVAILABLE", statusCode: 503, message: "Native Codex provider is unavailable" });
+  assert.equal((await provider.readStatus()).state, "cli_unavailable");
+  await assert.rejects(provider.checkAvailability(), { code: "STRUCTURED_PROVIDER_UNAVAILABLE" });
+  assert.equal(f.calls.length, 0);
+});
+
+for (const stop of ["caller-cancellation", "provider-timeout"])
+test(`native review raw source failure preserves ${stop} and preparation cleanup`, async (t) => {
+  const f = await fixture(t), entered = gate(), controller = new AbortController();
+  const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "owner", baseRepository: "owner/repo", headRepository: "owner/repo", baseRefName: "main", headRefName: "feature", baseRefOid: "a".repeat(40), headRefOid: "b".repeat(40) };
+  const reader = new GitHubReviewReader({ run: async (_command, _args, { signal }) => {
+    entered.resolve();
+    return new Promise((_, reject) => signal.addEventListener("abort", () => reject(new Error("private aborted gh stderr")), { once: true }));
+  } });
+  const provider = f.create(() => assert.fail("cancelled preparation must not launch a model"), { timeoutMs: 100 }, {
+    reviewReaderFactory: (target, options) => reader.open(target, options),
+  });
+  t.after(() => provider.close());
+  const pending = provider.generate(request({ signal: controller.signal, reviewTarget: { gitTarget, pullRequestNumber: 42 } }));
+  const rejected = assert.rejects(pending, { code: stop === "caller-cancellation" ? "STRUCTURED_PROVIDER_CANCELLED" : "STRUCTURED_PROVIDER_TIMEOUT" });
+  await entered.promise;
+  if (stop === "caller-cancellation") controller.abort();
+  await rejected;
   assert.equal(f.calls.length, 0);
   assert.deepEqual(await readdir(f.runtime), ["sessions"]);
 });

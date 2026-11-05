@@ -4,6 +4,7 @@ import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { createPullRequestExecutionBinding } from "../src/domain/pull-request-execution-binding.js";
 import { createPullRequestReadFacts, createPullRequestReadIdentity, projectPullRequestReadFactsContext } from "../src/domain/pull-request-read-facts.js";
 import { BoundReviewFeedbackReader } from "../src/services/bound-review-feedback-reader.js";
+import { isReviewSourceFailure } from "../src/domain/review-source-failure.js";
 
 function fixture() {
   const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "reviewer", baseRepository: "acme/repo",
@@ -69,4 +70,27 @@ test("the production ledger adapter resolves an inherited review binding and rej
   item.status = "paused";
   await assert.rejects(reader.read(f.request), { code: "PR_REVIEW_READ_FEEDBACK_UNAVAILABLE" });
   assert.equal(refreshes, 1);
+});
+
+for (const boundary of ["task", "authority", "facts"])
+test(`bound feedback reader owns raw ${boundary} failures and preserves cancellation`, async () => {
+  const f = fixture();
+  const controller = new AbortController();
+  const reason = new Error("caller cancellation");
+  let cancel = false;
+  const fail = () => { if (cancel) controller.abort(reason); throw new Error("private source response"); };
+  const reader = new BoundReviewFeedbackReader({
+    taskReader: { async read() { if (boundary === "task") fail(); return f.task; } },
+    inputAuthorityVerifier: { async verify(value) { if (boundary === "authority") fail(); return value; } },
+    factsReader: { async refresh() { if (boundary === "facts") fail(); return f.facts; } },
+  });
+  await assert.rejects(reader.read(f.request), error => {
+    assert.equal(isReviewSourceFailure(error), true);
+    assert.equal(error.code, "PR_REVIEW_READ_FEEDBACK_UNAVAILABLE");
+    assert.equal(error.message, "PR review feedback is unavailable");
+    assert.equal(Object.hasOwn(error, "cause"), false);
+    return true;
+  });
+  cancel = true;
+  await assert.rejects(reader.read(f.request, { signal: controller.signal }), error => error === reason);
 });

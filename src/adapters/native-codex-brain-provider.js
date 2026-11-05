@@ -14,6 +14,7 @@ import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { parseJsonWithUniqueKeys } from "../lib/strict-json.js";
 import { parseNativeResultJson } from "../lib/native-result-json.js";
 import { GitHubReviewReader } from "./github-review-reader.js";
+import { isReviewSourceFailure, normalizeLegacyReviewSourceFailure } from "../domain/review-source-failure.js";
 import { createCodeJobArtifactReader } from "./code-job-artifact-reader.js";
 import { describeCodeReadContext, revokeCodeReadContext } from "../lib/code-read-context.js";
 import { createCodeJobExecutionMcp } from "./code-job-execution-mcp.js";
@@ -41,6 +42,7 @@ const SAFE_MODEL = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$/u;
 const ENVELOPE_SCHEMA = { type: "object", additionalProperties: false, required: ["result"], properties: { result: { type: "string" } } };
 const DEFINITIONS = {
   STRUCTURED_PROVIDER_UNAVAILABLE: [503, "Native Codex provider is unavailable"],
+  STRUCTURED_PROVIDER_REQUEST_FAILED: [502, "Native Codex request failed"],
   STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE: [503, "Native Codex login is unavailable"],
   STRUCTURED_PROVIDER_CANCELLED: [499, "Native Codex request was cancelled"],
   STRUCTURED_PROVIDER_TIMEOUT: [504, "Native Codex request timed out"],
@@ -56,11 +58,6 @@ const DEFINITIONS = {
   STRUCTURED_PROVIDER_REAP_FAILED: [500, "Native Codex process termination could not be confirmed"],
   STRUCTURED_PROVIDER_CLEANUP_FAILED: [500, "Native Codex invocation cleanup failed"],
   STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED: [500, "Native Codex session reference could not be saved or read; native history was preserved"],
-  PR_REVIEW_READ_INCOMPLETE: [503, "PR review did not finish reading the complete change set"],
-  PR_REVIEW_READ_UNAVAILABLE: [503, "PR review source is unavailable"],
-  PR_REVIEW_READ_REFERENCED_MATERIAL_UNAVAILABLE: [503, "PR review referenced material is unavailable"],
-  PR_REVIEW_READ_HEAD_CHANGED: [409, "PR changed while its review source was being read"],
-  PR_REVIEW_READ_MATERIAL_CHANGED: [409, "PR review materials changed while they were being read"],
   CODE_ARTIFACT_READ_INCOMPLETE: [503, "Controlled code source was not fully read before writing or completing"],
   CODE_ARTIFACT_READ_INVALID: [503, "Controlled code source is invalid"],
   CODE_EXECUTION_UNAVAILABLE: [503, "Continuous controlled code execution is unavailable"],
@@ -68,9 +65,13 @@ const DEFINITIONS = {
 };
 
 function failure(code = "STRUCTURED_PROVIDER_UNAVAILABLE") {
+  // The process runner explicitly classifies an early exit as unavailable.
+  // Unknown caught errors have no such transport evidence and consume budget.
+  if (code === "STRUCTURED_PROVIDER_PROCESS_EXITED") code = "STRUCTURED_PROVIDER_UNAVAILABLE";
   if (typeof code === "string" && code.startsWith("CODE_READ_")) code = "CODE_ARTIFACT_READ_INVALID";
-  const [statusCode, message] = DEFINITIONS[code] ?? DEFINITIONS.STRUCTURED_PROVIDER_UNAVAILABLE;
-  return Object.assign(new Error(message), { code: Object.hasOwn(DEFINITIONS, code) ? code : "STRUCTURED_PROVIDER_UNAVAILABLE", statusCode });
+  if (typeof code !== "string" || !Object.hasOwn(DEFINITIONS, code)) code = "STRUCTURED_PROVIDER_REQUEST_FAILED";
+  const [statusCode, message] = DEFINITIONS[code];
+  return Object.assign(new Error(message), { code, statusCode });
 }
 
 function bounded(value, fallback, maximum, name) {
@@ -447,8 +448,10 @@ export class NativeCodexBrainProvider {
       } catch (error) {
         if (!token && operation.signal.aborted) context?.confirmStopped?.();
         if (model) this.#invalidateAvailability(error);
-        if (error instanceof TypeError) throw error;
-        const mapped = failure(error?.code);
+        if (isReviewSourceFailure(error)) throw error;
+        const sourceFailure = normalizeLegacyReviewSourceFailure(error);
+        if (sourceFailure) throw sourceFailure;
+        const mapped = failure(error?.code ?? "STRUCTURED_PROVIDER_REQUEST_FAILED");
         const diagnostic = readAppServerFailureDiagnostic(error);
         if (diagnostic) Object.defineProperty(mapped, 'nativeFailure', { value: diagnostic });
         throw mapped;
@@ -686,7 +689,11 @@ export class NativeCodexBrainProvider {
         const prepare = await this.#prepare(operationSignal);
         let descriptor;
         try { descriptor = await this.#dependencies.commandLocator.resolve("codex-cli", { signal: operationSignal }); }
-        catch { operationSignal.throwIfAborted(); return this.#state.lastStatus = status("cli_unavailable"); }
+        catch (error) {
+          operationSignal.throwIfAborted();
+          if (error?.code !== "STRUCTURED_PROVIDER_UNAVAILABLE") throw error;
+          return this.#state.lastStatus = status("cli_unavailable");
+        }
         const directory = path.join(this.#root, `probe-${randomUUID()}`);
         await prepare(directory);
         try {
@@ -702,7 +709,7 @@ export class NativeCodexBrainProvider {
         } finally { if (!this.#state.blocked) await this.#cleanup(directory, []); }
       }, Math.min(30_000,this.#options.timeoutMs), {exclusive:this.#state.unknownInvocations.size === 0});
     } catch (error) {
-      if (error?.code === "STRUCTURED_PROVIDER_CANCELLED") throw error;
+      if (["STRUCTURED_PROVIDER_CANCELLED", "STRUCTURED_PROVIDER_REQUEST_FAILED"].includes(error?.code)) throw error;
       return this.#state.lastStatus = status(this.#state.blocked || error?.code === "STRUCTURED_PROVIDER_REAP_FAILED" ? "broker_blocked" :
         error?.code === "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE" ? "file_login_unavailable" : "cli_unavailable");
     }

@@ -3,6 +3,7 @@ import test from "node:test";
 import { GitHubReviewReader } from "../src/adapters/github-review-reader.js";
 import { summarizeOwnReviewFeedback } from "../src/adapters/github-own-review-feedback.js";
 import { createOriginalRepairFeedbackSnapshot } from "../src/domain/original-repair-feedback.js";
+import { isReviewSourceFailure } from "../src/domain/review-source-failure.js";
 
 const TARGET = { pullRequestNumber: 42, gitTarget: {
   schemaVersion: 1, provider: "github", sourceAccountId: "reviewer",
@@ -71,6 +72,39 @@ test("an account change after reading the diff cannot produce a review session",
   };
   await assert.rejects(reader.open(TARGET), { code: "PR_REVIEW_READ_ACCOUNT_CHANGED" });
   assert.equal(accountReads, 2);
+});
+
+for (const boundary of ["files", "diff", "final-target"])
+test(`raw GitHub ${boundary} I/O failures belong to the review reader`, async () => {
+  const { reader } = fixture({ changed: 1 });
+  const original = reader.run;
+  let targetReads = 0;
+  reader.run = async (...args) => {
+    const endpoint = args[1][3];
+    if ((boundary === "files" && endpoint.includes("/files?")) ||
+        (boundary === "final-target" && endpoint === "graphql" && ++targetReads === 2)) {
+      throw new Error("private raw gh response");
+    }
+    return original(...args);
+  };
+  if (boundary === "diff") reader.runText = async () => { throw new Error("private raw diff stderr"); };
+  await assert.rejects(reader.open(TARGET), error => {
+    assert.equal(isReviewSourceFailure(error), true);
+    assert.equal(error.code, "PR_REVIEW_READ_UNAVAILABLE");
+    assert.equal(error.statusCode, 503);
+    assert.equal(error.message, "PR review source is unavailable");
+    assert.equal(Object.hasOwn(error, "cause"), false);
+    return true;
+  });
+});
+
+test("raw source I/O during final completeness validation keeps source identity", async (t) => {
+  const { reader } = fixture({ changed: 1 });
+  const session = await reader.open(TARGET);
+  t.after(() => session.close());
+  for (const document of ["review-manifest.json", "review.diff"]) await tool(session, "read_document", { document, offset: 0, length: 48000 });
+  reader.run = async () => { throw new Error("private final gh response"); };
+  await assert.rejects(session.assertComplete(), error => isReviewSourceFailure(error) && error.code === "PR_REVIEW_READ_UNAVAILABLE");
 });
 
 async function rpc(session, method, params = {}) {
@@ -224,7 +258,7 @@ test("source paging reuses the decoded immutable blob and retries a failed fetch
     if (args[3].includes("/contents/src/large.js")) return { type: "file", encoding: "none", sha: "c".repeat(40) };
     if (args[3].includes("/git/blobs/")) {
       blobs += 1;
-      if (blobs === 1) throw new Error("temporary upstream error");
+      if (blobs === 1) throw Object.assign(new Error("temporary upstream error"), { code: "PRIVATE_REMOTE_RESPONSE" });
       return { encoding: "base64", content: Buffer.from(source).toString("base64") };
     }
     return original(command, args, options);
@@ -333,4 +367,25 @@ test("semantic feedback coverage survives CI observations and changes with the P
   assert.equal(afterCI.feedbackSnapshot.coverageDigest, first.feedbackSnapshot.coverageDigest);
   description = "QA added execution results";
   assert.notEqual((await capture()).feedbackSnapshot.coverageDigest, first.feedbackSnapshot.coverageDigest);
+});
+
+for (const boundary of ["facts", "description", "account"])
+test(`feedback snapshot owns raw ${boundary} I/O and preserves its caller abort reason`, async () => {
+  const { readGitHubReviewFeedbackSnapshot } = await import("../src/adapters/github-review-feedback-snapshot.js");
+  const { facts, materialDigest } = await fullFeedbackFixture("Complete evidence");
+  const { reader } = fixture({ changed: 1 });
+  const controller = new AbortController(), reason = new Error("snapshot cancelled");
+  let cancel = false;
+  const fail = () => { if (cancel) controller.abort(reason); throw new Error("private source response"); };
+  const capture = () => readGitHubReviewFeedbackSnapshot({
+    target: { ...TARGET, feedbackSnapshot: { taskId: "review-child", materialDigest } },
+    factsReader: { async read() { if (boundary === "facts") fail(); return facts; } },
+    run: async (...args) => {
+      if (args[1][3] === (boundary === "account" ? "user" : "repos/acme/repo/pulls/42")) fail();
+      return reader.run(...args);
+    }, options: { signal: controller.signal },
+  });
+  await assert.rejects(capture(), error => isReviewSourceFailure(error) && error.code === "PR_REVIEW_READ_UNAVAILABLE");
+  cancel = true;
+  await assert.rejects(capture(), error => error === reason);
 });

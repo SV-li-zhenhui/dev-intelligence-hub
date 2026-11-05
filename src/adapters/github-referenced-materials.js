@@ -1,7 +1,7 @@
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
+import { createReviewSourceFailure } from "../domain/review-source-failure.js";
 
-const failure = cause => Object.assign(new Error("PR_REVIEW_READ_REFERENCED_MATERIAL_UNAVAILABLE", { cause }),
-  { code: "PR_REVIEW_READ_REFERENCED_MATERIAL_UNAVAILABLE" });
+const failure = cause => createReviewSourceFailure("PR_REVIEW_READ_REFERENCED_MATERIAL_UNAVAILABLE", cause);
 const api = (endpoint, extra = []) => ["api", "--hostname", "github.com", endpoint, ...extra];
 const text = value => { if (typeof value !== "string") throw new Error("Invalid referenced text"); return value; };
 const instant = value => { if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) throw new Error("Invalid source time"); return new Date(value).toISOString(); };
