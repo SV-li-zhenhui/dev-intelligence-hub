@@ -22,7 +22,8 @@ import {
 import { createWorkDecisionContext } from "./work-ledger-state.js";
 import { moveWorkItem } from "./work-ledger-transitions.js";
 import { isSettledIssueReason } from "./work-ledger-issue-lifecycle.js";
-import { automaticBrainRetryCode, requiresBrainMaintenance } from "./brain-failure-policy.js";
+import { automaticBrainRetryCode } from "./brain-failure-policy.js";
+import { requiresBrainMaintenance } from "../domain/brain-failure-recovery.js";
 import { hostContextRetirement } from "./work-ledger-host-context-recovery.js";
 import { automaticTriageRetirement } from './work-ledger-triage-retirement.js';
 import { ciMaterialRetirement } from "./work-ledger-ci-material-recovery.js";

@@ -2,6 +2,7 @@ import { normalizeBrainConfig } from "../services/brain-router.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { githubEntitySessionKey } from "../lib/session-key.js";
 import { normalizeNativeFailure } from "../services/task-run-execution-receipts.js";
+import { isBrainCapacityFailure, isBrainModelFailure, isBrainRequestInfrastructureFailure } from "../domain/brain-failure-recovery.js";
 import { InvalidEmployeeResultError, preparePrEmployeeAnalysis, parsePrEmployeeResult } from "./ollama-pr-employee-reviewer.js";
 
 const FALLBACK_CODES = new Set([
@@ -11,8 +12,6 @@ const FALLBACK_CODES = new Set([
   "STRUCTURED_PROVIDER_RESPONSE_INVALID", "STRUCTURED_PROVIDER_RESPONSE_TOO_LARGE",
   "STRUCTURED_PROVIDER_OUTPUT_LIMIT",
 ]);
-const CAPACITY_CODES = new Set(["STRUCTURED_PROVIDER_BUSY", "STRUCTURED_PROVIDER_QUEUE_TIMEOUT", "STRUCTURED_PROVIDER_MODEL_CAPACITY"]);
-const MODEL_FAILURE_CODES = new Set(["STRUCTURED_PROVIDER_RESPONSE_INVALID", "STRUCTURED_PROVIDER_RESPONSE_TOO_LARGE", "STRUCTURED_PROVIDER_OUTPUT_LIMIT"]);
 
 function transportFailure(error, provider) {
   return provider === "ollama" && error?.code === undefined && error?.message === "Ollama employee transport request failed";
@@ -74,7 +73,7 @@ export class RoutedPrEmployeeReviewer {
     } catch (error) {
       this.#failureReceipts.delete(error);
       signal?.throwIfAborted();
-      if (CAPACITY_CODES.has(error?.code)) {
+      if (isBrainCapacityFailure(error?.code)) {
         this.#failureReceipts.set(error, { brain: { provider: this.provider, model: this.model }, modelFailure: false, infrastructureFailure: true });
         throw error;
       }
@@ -105,10 +104,10 @@ export class RoutedPrEmployeeReviewer {
       signal?.throwIfAborted();
       if (error !== null && (typeof error === "object" || typeof error === "function")) {
         const knownFailure = error instanceof InvalidEmployeeResultError || FALLBACK_CODES.has(error?.code) || transportFailure(error, brain.provider);
-        const modelFailure = error?.code !== "STRUCTURED_PROVIDER_UNAVAILABLE" && knownFailure && (fallbackReason === "PR_EMPLOYEE_RESULT_INVALID" || MODEL_FAILURE_CODES.has(fallbackReason) ||
-          error instanceof InvalidEmployeeResultError || MODEL_FAILURE_CODES.has(error?.code));
+        const modelFailure = error?.code !== "STRUCTURED_PROVIDER_UNAVAILABLE" && knownFailure && (fallbackReason === "PR_EMPLOYEE_RESULT_INVALID" || isBrainModelFailure(fallbackReason) ||
+          error instanceof InvalidEmployeeResultError || isBrainModelFailure(error?.code));
         const infrastructureFailure = !modelFailure && (transportFailure(error, brain.provider) ||
-          (FALLBACK_CODES.has(error?.code) && !MODEL_FAILURE_CODES.has(error.code)));
+          (FALLBACK_CODES.has(error?.code) && isBrainRequestInfrastructureFailure(error.code)));
         this.#failureReceipts.set(error, { brain, modelFailure, ...(infrastructureFailure ? { infrastructureFailure: true } : {}) });
       }
       throw error;

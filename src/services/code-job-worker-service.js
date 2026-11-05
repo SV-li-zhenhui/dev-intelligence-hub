@@ -5,7 +5,7 @@ import { createCodeExecutionContext, closeCodeExecutionContext, revokeCodeExecut
 import { normalizeStructuredCodeActionDecision } from "../domain/structured-code-action-contract.js";
 import { TaskRunControlError } from './task-run-registry.js';
 import { codeProtocolRecoveryFor, hasUnadmittedProtocolRead, MODEL_QUEUE_TIMEOUT, stoppedCodeJobQueueTimeout } from './code-job-protocol-recovery.js';
-import { brainFailureOwnerAttention } from "./brain-failure-policy.js";
+import { isCodeJobBrainRetryableFailure } from "../domain/brain-failure-recovery.js";
 import { currentTaskExecution } from '../lib/task-execution-context.js';
 import { normalizeCodeSourceEdits, applyCodeSourceEdits } from '../lib/code-source-edits.js';
 import { digestValue } from "../domain/code-executor-contract.js";
@@ -2075,9 +2075,7 @@ export class CodeJobWorkerService {
     const authorityVerificationUnavailable = code === "CODE_JOB_AUTHORITY_VERIFICATION_UNAVAILABLE" && current &&
       ["queued", "starting", "active"].includes(current.status) && current.execution.actionAdmission === null;
     if (authorityVerificationUnavailable ||
-        (((brainFailureOwnerAttention(code) !== null &&
-          !["STRUCTURED_PROVIDER_PROCESS_FAILED", "STRUCTURED_PROVIDER_PROCESS_EXITED"].includes(code)) ||
-          code === "STRUCTURED_PROVIDER_RESPONSE_INVALID" || stoppedQueueWait) && current?.status === "active" &&
+        ((isCodeJobBrainRetryableFailure(code) || stoppedQueueWait) && current?.status === "active" &&
           (current.execution.pendingAction === null || stoppedPreparedRead) && current.execution.actionAdmission === null)) {
       const now = new Date(this.#clock()).getTime();
       if (!Number.isFinite(now)) throw workerError("CODE_JOB_CLOCK_INVALID", "Code job worker clock is invalid");

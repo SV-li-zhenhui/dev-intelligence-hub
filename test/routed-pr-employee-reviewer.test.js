@@ -176,6 +176,28 @@ test("backup failure remains a real failed analysis", async () => {
   assert.equal(run.reviewer.getFailureReceipt(new Error("unrelated failure")), null);
 });
 
+test("fallback receipts distinguish transport outages from model output failures", async (t) => {
+  for (const [primaryCode, fallbackCode, modelFailure, infrastructureFailure] of [
+    ["STRUCTURED_PROVIDER_PROCESS_FAILED", "STRUCTURED_PROVIDER_TIMEOUT", false, true],
+    ["STRUCTURED_PROVIDER_PROCESS_FAILED", "STRUCTURED_PROVIDER_RESPONSE_TOO_LARGE", true, undefined],
+    ["STRUCTURED_PROVIDER_OUTPUT_LIMIT", "STRUCTURED_PROVIDER_PROCESS_EXITED", true, undefined],
+    ["STRUCTURED_PROVIDER_RESPONSE_INVALID", "STRUCTURED_PROVIDER_UNAVAILABLE", false, true],
+  ]) {
+    await t.test(`${primaryCode}:${fallbackCode}`, async () => {
+      const error = fail(fallbackCode);
+      const run = setup(async () => { throw fail(primaryCode); }, { fallback: {
+        provider: "ollama", model: "qwen3.5:9b", async analyze() { throw error; },
+      } });
+      await assert.rejects(run.reviewer.analyze(input), caught => caught === error);
+      const receipt = run.reviewer.getFailureReceipt(error);
+      assert.equal(receipt.modelFailure, modelFailure);
+      assert.equal(receipt.infrastructureFailure, infrastructureFailure);
+      assert.equal(receipt.brain.fallbackFrom.reason, primaryCode);
+      assert.equal(receipt.brain.provider, "ollama");
+    });
+  }
+});
+
 test("an unavailable backup never receives PR data and retains the primary protocol failure", async () => {
   const nativeFailure = { kind: "rpc_error", method: "turn/start", code: -32603 };
   const fallback = new OllamaPrEmployeeReviewer({ fetch: async (url, options) => {

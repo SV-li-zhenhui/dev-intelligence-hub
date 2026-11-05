@@ -4,7 +4,7 @@ import { normalizeCodeJobCompletionReport } from "../domain/code-job-contract.js
 import { normalizeWorkspacePath } from "../domain/code-execution-policy.js";
 import { codeExecutionSourceAllowsWrite } from "../domain/code-execution-source.js";
 import { projectTestSummary } from "../domain/test-result-summary.js";
-import { requiresBrainOperatorPause } from "./brain-failure-policy.js";
+import { requiresBrainOperatorPause } from "../domain/brain-failure-recovery.js";
 import { hasCompleteCodeRead, isCodeReadContext } from "../lib/code-read-context.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;

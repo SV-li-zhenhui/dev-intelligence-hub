@@ -7,7 +7,8 @@ import { automaticReviewWorkEligibility } from "../domain/automatic-review-polic
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { TargetedCycleQueue } from "../lib/targeted-cycle-queue.js";
 import { normalizeContinuationTarget, matchesContinuationTarget } from "./work-continuation-state.js";
-import { brainFailureOwnerAttention, requiresBrainMaintenance } from "./brain-failure-policy.js";
+import { brainFailureOwnerAttention } from "./brain-failure-policy.js";
+import { isWorkItemBrainInfrastructureFailure, requiresBrainMaintenance } from "../domain/brain-failure-recovery.js";
 import { OrchestratorServiceError } from "./orchestrator-service.js";
 import { RoleContextAssemblerError } from "./role-context-error.js";
 import { PrEngineerServiceError } from "./pr-engineer-service.js";
@@ -1482,7 +1483,7 @@ export class ProactiveWorkLoop {
     } catch (error) {
       throwIfLoopAborted(signal);
       const code = stableFailureCode(error);
-      if (brainFailureOwnerAttention(code) !== null) {
+      if (isWorkItemBrainInfrastructureFailure(code)) {
         return { status: "degraded", code };
       }
       return { status: "resolution_failed", code };
@@ -1824,7 +1825,7 @@ export class ProactiveWorkLoop {
           },
         };
       }
-      if (brainFailureOwnerAttention(code) === null) throw error;
+      if (!isWorkItemBrainInfrastructureFailure(code)) throw error;
       const claim = await this.#claim(item, worker, options);
       if (!claim.item) {
         return {
@@ -2473,7 +2474,11 @@ export class ProactiveWorkLoop {
     if (error instanceof TaskRunControlError) return {status:error.code === 'TASK_RUN_CANCELLED' ? 'cancelled' : error.code === 'TASK_RUN_CONTROL_PENDING' ? 'control_pending' : 'paused',workerId:actorId,code:error.code};
     const code = stableFailureCode(error);
     if (requiresBrainMaintenance(code)) {
-      const failure = brainFailureOwnerAttention(code);
+      const failure = brainFailureOwnerAttention(code) ?? {
+        summary: "岗位任务大脑需要维护",
+        remediation: "请由维护人员检查并修复；修复前保留会话历史和隔离运行环境，不要删除。重试只会重新排队。",
+        retryLabel: "修复后重试",
+      };
       const outcome = await this.#stageDecision(item, worker, options, {
         intent: {
           schemaVersion: 1, type: "ask_user",
@@ -2492,7 +2497,7 @@ export class ProactiveWorkLoop {
     const contextTimeout = beforeDecision && code === "ROLE_CONTEXT_TIMEOUT";
     const unavailablePrFacts = beforeDecision && error instanceof RoleContextAssemblerError &&
       code === "ROLE_CONTEXT_PR_FACT_UNAVAILABLE" && error.statusCode === 503;
-    const infrastructure = brainFailureOwnerAttention(code) !== null || contextTimeout || unavailablePrFacts;
+    const infrastructure = isWorkItemBrainInfrastructureFailure(code) || contextTimeout || unavailablePrFacts;
     const restoreAttempt = contention || infrastructure;
     const budget = restoreAttempt ? null : await this.#readRepairDecisionBudget(item, options.signal) ?? persistedPullRequestDecisionAttemptBudget(item);
     const attempt = budget?.attempt ?? item.attempt;

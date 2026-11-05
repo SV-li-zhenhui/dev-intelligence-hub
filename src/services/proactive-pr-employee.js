@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isBrainRequestInfrastructureFailure } from "../domain/brain-failure-recovery.js";
 import { normalizeConfirmationPlan } from "../domain/confirmation-contract.js";
 import { automaticReviewEligibility } from "../domain/automatic-review-policy.js";
 import { normalizePullRequestGitTarget } from "../domain/git-tool-contract.js";
@@ -235,12 +236,6 @@ function isLegacyOllamaTransportFailure(job) {
     job.error === "Ollama employee transport request failed";
 }
 
-const INFRASTRUCTURE_FALLBACK_REASONS = new Set([
-  "PR_EMPLOYEE_PRIMARY_TIMEOUT", "STRUCTURED_PROVIDER_BUSY", "STRUCTURED_PROVIDER_QUEUE_TIMEOUT", "STRUCTURED_PROVIDER_MODEL_CAPACITY",
-  "STRUCTURED_PROVIDER_UNAVAILABLE", "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE",
-  "STRUCTURED_PROVIDER_PROCESS_FAILED", "STRUCTURED_PROVIDER_PROCESS_EXITED", "STRUCTURED_PROVIDER_TIMEOUT",
-]);
-
 function hasRecoverableAnalysisIdentity(job, brain) {
   return Boolean(brain && ["blocked", "retry_wait"].includes(job.status) &&
     !job.confirmationId && !job.confirmationFailure && !job.confirmationIntent && !job.handoffWorkItemId &&
@@ -253,13 +248,14 @@ function knownAnalysisTransportFailure(job) {
   const failure = job.analysisFailure;
   return job.brain?.provider === "ollama" && job.error === "Ollama employee transport request failed" &&
     (failure === undefined ? isLegacyOllamaTransportFailure(job) : failure.phase === "analysis" && failure.code === "PR_EMPLOYEE_JOB_FAILED") &&
-    (!job.brain.fallbackFrom || INFRASTRUCTURE_FALLBACK_REASONS.has(job.brain.fallbackFrom.reason));
+    (!job.brain.fallbackFrom || job.brain.fallbackFrom.reason === "PR_EMPLOYEE_PRIMARY_TIMEOUT" ||
+      isBrainRequestInfrastructureFailure(job.brain.fallbackFrom.reason));
 }
 
 function recordedInfrastructureFailure(job) {
   const failure = job.analysisFailure;
   return failure?.phase === "analysis" && failure.infrastructureFailure === true && failure.modelFailure === false &&
-    (INFRASTRUCTURE_FALLBACK_REASONS.has(failure.code) || knownAnalysisTransportFailure(job));
+    (failure.code === "PR_EMPLOYEE_PRIMARY_TIMEOUT" || isBrainRequestInfrastructureFailure(failure.code) || knownAnalysisTransportFailure(job));
 }
 
 function canRebindAnalysisModel(job, brain) {

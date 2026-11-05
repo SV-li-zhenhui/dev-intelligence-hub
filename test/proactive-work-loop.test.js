@@ -3305,27 +3305,22 @@ const STRUCTURED_BRAIN_ATTENTION_CASES = Object.freeze([
   Object.freeze({
     code: "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
     failurePoint: "brain",
-    remediation: /保留.*会话历史.*不要删除/,
   }),
   Object.freeze({
     code: "STRUCTURED_PROVIDER_UNAVAILABLE",
     failurePoint: "context",
-    remediation: /安装|配置|可执行/,
   }),
   Object.freeze({
     code: "STRUCTURED_PROVIDER_CREDENTIAL_UNAVAILABLE",
     failurePoint: "brain",
-    remediation: /登录|认证|凭据/,
   }),
   Object.freeze({
     code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
     failurePoint: "context",
-    remediation: /进程|清理|运行环境/,
   }),
   Object.freeze({
     code: "STRUCTURED_PROVIDER_REAP_FAILED",
     failurePoint: "brain",
-    remediation: /进程|清理|运行环境/,
   }),
 ]);
 
@@ -3938,7 +3933,13 @@ test("infrastructure failures separate maintenance from transient retries", asyn
           assert.equal(cycle.outcomes[0].status, "maintenance_required");
           assert.equal(cycle.retried, 0);
           assert.equal(ledger.outbox.length, 1);
-          assert.match(ledger.outbox[0].intent.question, STRUCTURED_BRAIN_ATTENTION_CASES.find(entry => entry.code === code).remediation);
+          const intent = ledger.outbox[0].intent;
+          assert.equal(intent.reason, `真实任务不得回退到例行大脑；系统已安全停止（${code}）`);
+          assert.match(intent.question, /修复|清理/);
+          assert.equal(intent.choices.length, 1);
+          assert.equal(intent.choices[0].id, "configured-retry");
+          assert.equal(intent.choices[0].description, "修复环境后重新排队；保留原任务权限与输入绑定。");
+          assert.equal(JSON.stringify(intent).includes("sk-owner-secret"), false);
           time.advance(60_000);
           assert.equal((await loop.runCycle({ roleId })).claimed, 0);
           assert.equal(ledger.calls.scheduleRetry.length, 0);
@@ -3961,6 +3962,36 @@ test("infrastructure failures separate maintenance from transient retries", asyn
         assert.equal(JSON.stringify(ledger.calls.scheduleRetry).includes("sk-owner-secret"), false);
       });
     }
+  }
+});
+
+test("unknown recovery metadata cannot exempt a work item from its decision budget", async (t) => {
+  for (const code of ["UNKNOWN_RECOVERY_FAILURE", "STRUCTURED_PROVIDER_FUTURE_FAILURE"]) {
+    await t.test(code, async () => {
+      const time = controlledClock();
+      const ledger = new FakeLedger({ source: [workItem(83, { type: "role", id: "developer" })], time });
+      let decisions = 0;
+      const loop = createLoop({ ledger, time, maxAttempts: 2,
+        directory: new FakeRoleDirectory({ developer: worker({ roleId: "developer", async decide() {
+          decisions += 1;
+          throw Object.assign(new Error("display or recovery claims are not authority"), {
+            code, infrastructureFailure: true, modelFailure: false,
+            recovery: { kind: "infrastructure", consumeAttempt: false },
+          });
+        } }) }),
+      });
+      assert.equal((await loop.runCycle({ roleId: "developer" })).retried, 1);
+      assert.equal(ledger.items[0].attempt, 1);
+      assert.equal(ledger.calls.scheduleRetry[0].reason, "decision_failed");
+      assert.equal(ledger.calls.scheduleRetry[0].consumeAttempt, undefined);
+      time.advance(60_000);
+      assert.equal((await loop.runCycle({ roleId: "developer" })).blocked, 1);
+      assert.equal(ledger.items[0].attempt, 2);
+      time.advance(60_000);
+      assert.equal((await loop.runCycle({ roleId: "developer" })).claimed, 0);
+      assert.equal(decisions, 2);
+      assert.equal(ledger.outbox.length, 0);
+    });
   }
 });
 
