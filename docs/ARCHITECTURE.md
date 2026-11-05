@@ -50,6 +50,31 @@ independent roles. Their schedules, pause states, permissions, routine brains,
 and task brains are configurable. Replacing a brain changes reasoning quality,
 not authority.
 
+### State and recovery ownership
+
+The work ledger owns business state, input bindings, leases and deliveries. A
+task-run receipt describes one invocation; a completed invocation does not prove
+that its business task is complete. Continuations own wake times and backoff,
+while the graph and user interface project these records without granting
+execution authority.
+
+Recovery policy is defined independently of display text. Work-item decisions
+and controlled code jobs intentionally use different policies for process exits
+and session failures. Review readers retain trusted source-failure identity
+across the provider boundary; unreadable source material and unclassified
+request failures consume the ordinary bounded decision budget. They cannot
+become provider outages simply because a transport adapter lacks their code.
+
+New host maintenance questions carry a validated outbox recovery stamp bound to
+the task, input, intent and source. Model JSON cannot create the live host
+capability. New ordinary records have an explicit null marker; historical absent
+markers retain an isolated legacy reader. Both ordinary staging and graph
+escalation use the same failed-intent rearm boundary, which preserves ordinary
+historical retries without transferring maintenance origin. Inbox and browser
+projections use derived machine codes, so changing localized wording cannot
+change retry behavior. Existing source, lease, approval and delivery checks
+remain authoritative.
+
 ### Supervised CLI brain boundary
 
 Codex CLI and Claude CLI are remote reasoning providers behind the same brain

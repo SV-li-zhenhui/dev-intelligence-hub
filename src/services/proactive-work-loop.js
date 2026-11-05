@@ -8,6 +8,7 @@ import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { TargetedCycleQueue } from "../lib/targeted-cycle-queue.js";
 import { normalizeContinuationTarget, matchesContinuationTarget } from "./work-continuation-state.js";
 import { brainFailureOwnerAttention } from "./brain-failure-policy.js";
+import { createBrainRecoveryIntent } from "./brain-recovery-intent.js";
 import { isWorkItemBrainInfrastructureFailure, requiresBrainMaintenance } from "../domain/brain-failure-recovery.js";
 import { OrchestratorServiceError } from "./orchestrator-service.js";
 import { RoleContextAssemblerError } from "./role-context-error.js";
@@ -2480,14 +2481,14 @@ export class ProactiveWorkLoop {
         retryLabel: "修复后重试",
       };
       const outcome = await this.#stageDecision(item, worker, options, {
-        intent: {
+        intent: createBrainRecoveryIntent(code, {
           schemaVersion: 1, type: "ask_user",
           summary: `${failure.summary}（${worker.roleId}）`,
           reason: `真实任务不得回退到例行大脑；系统已安全停止（${code}）`,
           question: failure.remediation,
           choices: [{ id: "configured-retry", label: failure.retryLabel,
             description: "修复环境后重新排队；保留原任务权限与输入绑定。" }],
-        },
+        }),
       });
       return ["staged", "stage_recovered"].includes(outcome.status)
         ? { status: "maintenance_required", workerId: actorId, code, decisionSkipped: true }

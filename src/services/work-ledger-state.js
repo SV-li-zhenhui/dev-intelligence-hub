@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { validBrainRecoveryStamp } from "./brain-recovery-intent.js";
 import { normalizeWorkIntent } from "../domain/work-intent.js";
 import {
   LEGACY_UNKNOWN_WORK_INTENT_BINDING,
@@ -1090,7 +1091,7 @@ function normalizeRequestedBy(value) {
 }
 
 function normalizeOutboxEntry(value, stateRevision, limits) {
-  if (!hasExactLedgerKeys(value, OUTBOX_KEYS)) {
+  if (!hasExactLedgerKeys(value, OUTBOX_KEYS) && !hasExactLedgerKeys(value, [...OUTBOX_KEYS, "brainRecovery"])) {
     throw corrupted("员工工作 outbox 字段损坏");
   }
   const intent = normalizeIntent(value.intent);
@@ -1166,6 +1167,7 @@ function normalizeOutboxEntry(value, stateRevision, limits) {
     inputDigest,
     requestedBy,
     intent,
+    ...(Object.hasOwn(value, "brainRecovery") ? { brainRecovery: value.brainRecovery } : {}),
     sourceBinding,
     dispatchBinding,
     status: value.status,
@@ -1180,6 +1182,9 @@ function normalizeOutboxEntry(value, stateRevision, limits) {
     createdAt: timestamp(value.createdAt, "outbox.createdAt"),
     updatedAt: timestamp(value.updatedAt, "outbox.updatedAt"),
   };
+  if (Object.hasOwn(entry, "brainRecovery") && !validBrainRecoveryStamp(entry)) {
+    throw corrupted("员工工作意图恢复来源绑定损坏");
+  }
   if (prettySerializedLedgerBytes(entry.intent) > limits.intentByteBudget) {
     throw corrupted("员工工作意图超过容量");
   }

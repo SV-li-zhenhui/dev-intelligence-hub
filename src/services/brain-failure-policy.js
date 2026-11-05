@@ -95,12 +95,3 @@ export function brainFailureOwnerAttention(code) {
   if (typeof code !== "string") return null;
   return OWNER_ATTENTION_BY_CODE.get(code) ?? null;
 }
-
-export function automaticBrainRetryCode(intent) {
-  if (intent?.type !== "ask_user" || intent.choices?.length !== 1 ||
-      intent.choices[0].id !== "configured-retry") return null;
-  const code = /^真实任务不得回退到例行大脑；系统已安全停止（([A-Z_]+)）$/.exec(intent.reason)?.[1];
-  const failure = brainFailureOwnerAttention(code);
-  return failure && intent.summary.startsWith(`${failure.summary}（`) && intent.summary.endsWith("）")
-    ? code : null;
-}

@@ -13,6 +13,7 @@ import { planWorkGraphCancellation, planWorkGraphChildCreation } from "./work-le
 import { hasRequiredReviewDeliverable, requiredReviewDeliverables } from "../domain/pr-review-work-policy.js";
 import {
   createWorkIntentRecord,
+  pendingWorkIntentRecord,
   normalizeLedgerWorkIntent,
   WORK_LEDGER_OUTBOX_DELIVERY_SEMANTICS,
 } from "./work-ledger-records.js";
@@ -463,21 +464,6 @@ function normalizeEscalationCommand(input) {
   };
 }
 
-function pendingEscalation(existing, candidate, now) {
-  if (!existing) return candidate;
-  return {
-    ...existing,
-    status: "pending",
-    revision: existing.revision + 1,
-    dispatcherId: null,
-    dispatchLeaseId: null,
-    dispatchLeaseUntil: null,
-    dispatchBinding: null,
-    outcome: null,
-    updatedAt: now,
-  };
-}
-
 export function planWorkGraphEscalation({ state, input, clock }) {
   const { authority, command } = normalizeEscalationCommand(input);
   const item = requireScopedTask(state, authority, command.taskId);
@@ -524,7 +510,7 @@ export function planWorkGraphEscalation({ state, input, clock }) {
       409,
     );
   }
-  const outboxResult = pendingEscalation(existing, candidate, now);
+  const outboxResult = pendingWorkIntentRecord(existing, candidate, now);
   const itemResult = moveWorkItem(item, {
     status: "dispatch_pending",
     now,

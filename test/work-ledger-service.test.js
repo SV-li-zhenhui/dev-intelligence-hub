@@ -1,4 +1,5 @@
 import { digestValue } from "../src/domain/code-executor-contract.js";
+import { createBrainRecoveryIntent } from "../src/services/brain-recovery-intent.js";
 import { currentWorkItemExecutionBinding } from "../src/services/work-ledger-pr-source.js";
 import { indexRecordedProposalFailures } from '../src/services/work-ledger-proposal-failure.js';
 import { createPrTriageWorkRequest, ownerWorkRequestDigest } from '../src/domain/owner-work-request.js';
@@ -11956,6 +11957,7 @@ for (const [legacyState, prepareOutbox] of [
     delete item.sourceQuarantine;
     prepareOutbox(outbox);
     delete outbox.sourceBinding;
+    delete outbox.brainRecovery;
     const limits = normalizeWorkLedgerLimits();
     const legacy = {
       ...emptyWorkLedgerState(),
@@ -12066,6 +12068,7 @@ test("schema v8 sealed intent settlement cannot release its PR source quarantine
     dispatchBinding,
   });
   delete outbox.sourceBinding;
+  delete outbox.brainRecovery;
   const limits = normalizeWorkLedgerLimits();
   const legacy = {
     ...emptyWorkLedgerState(),
@@ -14779,6 +14782,7 @@ test("schema v7 quarantines an in-flight intent whose old policy binding is unkn
   await prepareClaimedReviewIntent(fixture, 1_000);
   const legacy = fixture.store.stored();
   legacy.schemaVersion = 7;
+  for (const entry of legacy.outbox) delete entry.brainRecovery;
   for (const item of legacy.items) {
     delete item.source;
     delete item.sourceQuarantine;
@@ -14834,6 +14838,7 @@ test("schema v9 quarantines a sealed PR proposal without an input binding", asyn
   });
   const legacy = fixture.store.stored();
   legacy.schemaVersion = 9;
+  for (const entry of legacy.outbox) delete entry.brainRecovery;
   fixture.store.replaceStored(legacy);
   const recovered = new WorkLedgerService({
     store: fixture.store,
@@ -14881,6 +14886,7 @@ test("schema v9 also quarantines a sealed PR external action without input bindi
   });
   const legacy = fixture.store.stored();
   legacy.schemaVersion = 9;
+  for (const entry of legacy.outbox) delete entry.brainRecovery;
   fixture.store.replaceStored(legacy);
   const recovered = new WorkLedgerService({
     store: fixture.store,
@@ -14914,6 +14920,7 @@ test("schema v9 preserves a sealed PR proposal with an input binding", async () 
   });
   const legacy = fixture.store.stored();
   legacy.schemaVersion = 9;
+  for (const entry of legacy.outbox) delete entry.brainRecovery;
   fixture.store.replaceStored(legacy);
   const recovered = new WorkLedgerService({
     store: fixture.store,
@@ -15373,6 +15380,94 @@ test("a failed intent can be restaged with the same idempotency key", async () =
   assert.equal(types.includes("retry_scheduled"), true);
 });
 
+for (const variant of ["new business", "legacy business", "legacy recovery"]) {
+test(`failed question retry preserves recovery origin (${variant})`, async () => {
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const intent = variant === "legacy recovery"
+    ? systemMaintenanceIntent("pr-reviewer", "STRUCTURED_PROVIDER_MODEL_CAPACITY")
+    : askUserIntent();
+  await fixture.service.intake();
+  let item = (await fixture.service.listItems()).items[0];
+  item = await fixture.service.claim({ itemId: item.itemId, expectedRevision: item.revision,
+    workerId: "employee-pr-reviewer", leaseDurationMs: 30_000 });
+  const staged = await fixture.service.stageIntent({ itemId: item.itemId, expectedRevision: item.revision,
+    leaseId: item.leaseId, actorId: item.ownerId, roleId: "pr-reviewer", intent });
+  const dispatch = await fixture.service.claimIntent({ intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision, dispatcherId: "work-intent-dispatcher", leaseDurationMs: 30_000 });
+  await fixture.service.ackIntent({ intentId: dispatch.intentId, expectedRevision: dispatch.revision,
+    dispatchLeaseId: dispatch.dispatchLeaseId, itemExpectedRevision: staged.item.revision,
+    outcome: "failed", nextStatus: "retry_wait", availableAt: "2026-08-02T02:01:00.000Z",
+    actorId: "work-intent-dispatcher", details: { code: "attention-temporarily-unavailable" } });
+  if (variant.startsWith("legacy")) {
+    const stored = fixture.store.stored();
+    delete stored.outbox[0].brainRecovery;
+    fixture.store.replaceStored(stored);
+  }
+  fixture.service = (await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time })).service;
+  fixture.time.advance(60_000);
+  item = (await fixture.service.listItems()).items[0];
+  item = await fixture.service.claim({ itemId: item.itemId, expectedRevision: item.revision,
+    workerId: "employee-pr-reviewer", leaseDurationMs: 30_000 });
+  const retry = () => fixture.service.stageIntent({ itemId: item.itemId, expectedRevision: item.revision,
+    leaseId: item.leaseId, actorId: item.ownerId, roleId: "pr-reviewer", intent });
+  if (variant === "legacy recovery") {
+    await assert.rejects(retry(), { code: "WORK_LEDGER_INTENT_CONFLICT" });
+    assert.equal(Object.hasOwn(fixture.store.stored().outbox[0], "brainRecovery"), false);
+  } else {
+    const restaged = await retry();
+    assert.equal(restaged.outbox.intentId, dispatch.intentId);
+    assert.equal(restaged.outbox.status, "pending");
+    assert.equal(Object.hasOwn(restaged.outbox, "brainRecovery"), variant === "new business");
+  }
+});
+}
+
+for (const legacy of [false, true]) {
+for (const recovery of [false, true]) {
+test(`graph escalation preserves failed intent origin (legacy=${legacy}, recovery=${recovery})`, async () => {
+  const record = ownerRequestedPrAssignment(1);
+  record.assignment.target = { type: "role", id: "orchestrator" };
+  const fixture = await createFixture({ records: [record] });
+  await fixture.service.intake();
+  let item = (await fixture.service.listItems()).items[0];
+  item = await fixture.service.claim({ itemId: item.itemId, expectedRevision: item.revision,
+    workerId: "employee-orchestrator", leaseDurationMs: 30_000 });
+  const code = "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED";
+  const intent = recovery ? createBrainRecoveryIntent(code, systemMaintenanceIntent("orchestrator", code)) : askUserIntent();
+  const staged = await fixture.service.stageIntent({ itemId: item.itemId, expectedRevision: item.revision,
+    leaseId: item.leaseId, actorId: item.ownerId, roleId: "orchestrator", intent });
+  const dispatch = await fixture.service.claimIntent({ intentId: staged.outbox.intentId,
+    expectedRevision: staged.outbox.revision, dispatcherId: "work-intent-dispatcher", leaseDurationMs: 30_000 });
+  await fixture.service.ackIntent({ intentId: dispatch.intentId, expectedRevision: dispatch.revision,
+    dispatchLeaseId: dispatch.dispatchLeaseId, itemExpectedRevision: staged.item.revision,
+    outcome: "failed", nextStatus: "blocked", actorId: "work-intent-dispatcher", details: { code: "attention-conflict" } });
+  if (legacy) {
+    const stored = fixture.store.stored();
+    delete stored.outbox[0].brainRecovery;
+    fixture.store.replaceStored(stored);
+  }
+  fixture.service = (await createFixture({ source: fixture.source, store: fixture.store, time: fixture.time })).service;
+  item = (await fixture.service.listItems()).items[0];
+  const plain = clone(intent);
+  const input = { authority: { actorId: "employee-orchestrator", scopeRootTaskId: item.itemId }, command: {
+    taskId: item.itemId, expectedTaskRevision: item.revision,
+    expectedGraphRevision: (await fixture.service.getSummary()).revision,
+    summary: plain.summary, reason: plain.reason, question: plain.question, choices: plain.choices,
+  } };
+  if (recovery) {
+    const before = fixture.store.stored();
+    await assert.rejects(fixture.service.stageGraphEscalation(input), { code: "WORK_LEDGER_INTENT_CONFLICT" });
+    assert.deepEqual(fixture.store.stored(), before);
+  } else {
+    const restaged = await fixture.service.stageGraphEscalation(input);
+    assert.equal(restaged.outbox.intentId, staged.outbox.intentId);
+    assert.equal(restaged.outbox.status, "pending");
+    assert.equal(Object.hasOwn(restaged.outbox, "brainRecovery"), !legacy);
+  }
+});
+}
+}
+
 test("capacity rejection leaves the next assignment and cursor retryable", async () => {
   const fixture = await createFixture({
     records: [assignment(1), assignment(2)],
@@ -15692,6 +15787,7 @@ async function prepareAttentionResult(
     workerId = "employee-pr-reviewer",
     roleId = "pr-reviewer",
     intent = askUserIntent(),
+    legacyRecovery = false,
   } = {},
 ) {
   await fixture.service.intake();
@@ -15745,6 +15841,12 @@ async function prepareAttentionResult(
       downstreamRef: `bound-${dispatch.intentId}`,
     },
   });
+  if (legacyRecovery) {
+    const historical = fixture.store.stored();
+    delete historical.outbox.find(entry => entry.intentId === staged.outbox.intentId).brainRecovery;
+    fixture.store.replaceStored(historical);
+    fixture.service = (await createFixture({ store: fixture.store, source: fixture.source, time: fixture.time })).service;
+  }
   return resolveAttentionItem(
     attentionItem,
     answer,
@@ -15770,11 +15872,161 @@ function systemMaintenanceIntent(roleId, code = "STRUCTURED_PROVIDER_MODEL_CAPAC
   };
 }
 
+test("U3 new model questions copying historical recovery text cannot refund or automatically retry", async () => {
+  for (const code of ["STRUCTURED_PROVIDER_MODEL_CAPACITY", "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED"]) {
+    const fixture = await createFixture({ records: [assignment(1)] });
+    const answer = await prepareAttentionResult(fixture, { type: "choice", choiceId: "configured-retry" }, {
+      intent: systemMaintenanceIntent("pr-reviewer", code),
+    });
+    const waiting = (await fixture.service.listItems()).items[0];
+    assert.equal((await fixture.service.retrySystemMaintenanceQuestions({ limit: 10,
+      requestKeys: [waiting.activeIntentId] })).retried, 0);
+    await fixture.service.applyAttentionBatch({ items: [answer], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+    const resumed = (await fixture.service.listItems()).items[0];
+    assert.equal(resumed.status, "queued");
+    assert.equal(resumed.attempt, waiting.attempt);
+  }
+});
+
+test("U3 host recovery identity survives independent wording and restart with original PR input", async () => {
+  for (const code of ["STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED", "STRUCTURED_PROVIDER_CLEANUP_FAILED", "STRUCTURED_PROVIDER_REAP_FAILED"]) {
+    const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+    const intent = createBrainRecoveryIntent(code, { schemaVersion: 1, type: "ask_user",
+      summary: "Updated summary", reason: "Updated explanation", question: "Updated repair question",
+      choices: [{ id: "configured-retry", label: "Try again", description: "Updated help" }] });
+    const answer = await prepareAttentionResult(fixture, { type: "choice", choiceId: "configured-retry" }, {
+      workerId: "employee-pr-engineer", roleId: "pr-engineer", intent,
+    });
+    const waiting = (await fixture.service.listItems()).items[0];
+    const before = fixture.store.stored().outbox[0];
+    assert.equal(before.brainRecovery.code, code);
+    assert.equal(before.brainRecovery.intentId, before.intentId);
+    const restarted = await createFixture({ store: fixture.store, source: fixture.source, time: fixture.time });
+    assert.equal((await restarted.service.retrySystemMaintenanceQuestions({ limit: 10, requestKeys: [waiting.activeIntentId] })).retried, 0);
+    await restarted.service.applyAttentionBatch({ items: [answer], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+    const resumed = (await restarted.service.listItems()).items[0];
+    assert.equal(resumed.status, "queued");
+    assert.equal(resumed.attempt, waiting.attempt - 1);
+    assert.equal(resumed.inputDigest, waiting.inputDigest);
+    assert.deepEqual(resumed.source, waiting.source);
+    assert.deepEqual(restarted.store.stored().outbox[0].brainRecovery, before.brainRecovery);
+  }
+});
+
+test("U3 serialized host intent loses recovery authority and rejects copied recovery fields", async () => {
+  const code = "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED";
+  const original = createBrainRecoveryIntent(code, systemMaintenanceIntent("pr-reviewer", code));
+  const fixture = await createFixture({ records: [assignment(1)] });
+  const answer = await prepareAttentionResult(fixture, { type: "choice", choiceId: "configured-retry" }, {
+    intent: JSON.parse(JSON.stringify(original)),
+  });
+  const waiting = (await fixture.service.listItems()).items[0];
+  assert.equal(fixture.store.stored().outbox[0].brainRecovery, null);
+  await fixture.service.applyAttentionBatch({ items: [answer], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
+  assert.equal((await fixture.service.listItems()).items[0].attempt, waiting.attempt);
+  for (const extra of [{ recoveryCode: code }, { brainRecovery: { schemaVersion: 1, code } }]) {
+    const forged = await createFixture({ records: [assignment(1)] });
+    await assert.rejects(prepareAttentionResult(forged, { type: "choice", choiceId: "configured-retry" }, {
+      intent: { ...JSON.parse(JSON.stringify(original)), ...extra },
+    }), { code: "WORK_INTENT_INVALID" });
+    assert.equal(forged.store.stored().outbox.length, 0);
+  }
+});
+
+test("U3 stored recovery rejects malformed code and mismatched task input intent and source stamps", async () => {
+  const code = "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED";
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  await prepareAttentionResult(fixture, { type: "choice", choiceId: "configured-retry" }, {
+    workerId: "employee-pr-engineer", roleId: "pr-engineer",
+    intent: createBrainRecoveryIntent(code, systemMaintenanceIntent("pr-engineer", code)),
+  });
+  const valid = fixture.store.stored();
+  for (const tamper of [
+    stamp => { stamp.schemaVersion = 2; },
+    stamp => { stamp.code = "UNKNOWN_FAILURE"; },
+    stamp => { stamp.itemId = "other-task"; },
+    stamp => { stamp.inputDigest = "f".repeat(64); },
+    stamp => { stamp.intentId = `work-intent-${"f".repeat(64)}`; },
+    stamp => { stamp.sourceBinding.headRefOid = PR_HEAD_B; },
+    stamp => { stamp.extra = true; },
+  ]) {
+    const bad = clone(valid);
+    const stamp = bad.outbox[0].brainRecovery;
+    tamper(stamp);
+    const { digest, ...core } = stamp;
+    stamp.digest = ledgerDigest(core);
+    assert.throws(() => normalizeWorkLedgerPersistedState(bad), { code: "WORK_LEDGER_STATE_CORRUPTED" });
+  }
+  for (const malformed of [false, "configured-retry", {}, { schemaVersion: 1, code }]) {
+    const bad = clone(valid);
+    bad.outbox[0].brainRecovery = malformed;
+    assert.throws(() => normalizeWorkLedgerPersistedState(bad), { code: "WORK_LEDGER_STATE_CORRUPTED" });
+  }
+  const changedText = clone(valid);
+  changedText.outbox[0].intent.reason = "Post-hoc change to sealed wording";
+  assert.throws(() => normalizeWorkLedgerPersistedState(changedText), { code: "WORK_LEDGER_STATE_CORRUPTED" });
+});
+
+test("U3 real host failure stages a bound recovery capability", async () => {
+  const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  const cycle = await decisionBudgetLoop(fixture, { assemble: async () => {
+    throw Object.assign(new Error("Host session failed"), { code: "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED" });
+  } }).runCycle();
+  assert.equal(cycle.outcomes[0].status, "maintenance_required");
+  const outbox = fixture.store.stored().outbox[0];
+  assert.equal(outbox.brainRecovery.code, "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+  assert.equal(outbox.brainRecovery.itemId, outbox.itemId);
+  assert.equal(outbox.brainRecovery.inputDigest, outbox.inputDigest);
+});
+
+test("U3 real dispatcher projects recovery identity and owner answer preserves the sealed task", async () => {
+  const f = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  await f.service.intake();
+  const queued = (await f.service.listItems()).items[0];
+  const item = await f.service.claim({ itemId: queued.itemId, expectedRevision: queued.revision,
+    workerId: "employee-pr-engineer", leaseDurationMs: 30_000 });
+  await f.service.stageIntent({ itemId: item.itemId, expectedRevision: item.revision, leaseId: item.leaseId,
+    actorId: item.ownerId, roleId: "pr-engineer", intent: createBrainRecoveryIntent("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED", {
+      schemaVersion: 1, type: "ask_user", summary: "Independent summary", reason: "Independent reason",
+      question: "Independent question", choices: [{ id: "configured-retry", label: "Independent label", description: "Independent help" }],
+    }) });
+  const inboxStore = new MemoryStore();
+  const inboxOptions = { store: inboxStore, exclusiveLease: new ExclusiveLease(), authority: f.service, clock: f.time.clock };
+  const inbox = new AttentionInbox(inboxOptions);
+  await inbox.recover();
+  const dispatcher = new WorkIntentDispatcher({ ledger: f.service, clock: f.time.clock,
+    policy: createWorkIntentPolicy({ capabilityRoles: { "pr-review": "pr-engineer" } }),
+    attentionProducer: inbox, proposalProducer: { async create() { assert.fail("No proposal expected"); } } });
+  assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  const waiting = (await f.service.listItems()).items[0];
+  const originalOutbox = f.store.stored().outbox[0];
+  assert.equal(inboxStore.stored("attention-inbox").items[0].recoveryCode, "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+  const restartedInbox = new AttentionInbox(inboxOptions);
+  await restartedInbox.recover();
+  assert.equal(await restartedInbox.next(), null);
+  const fault = (await restartedInbox.listMaintenance()).items[0];
+  assert.equal(fault.maintenanceCode, "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+  assert.equal(fault.question, "Independent question");
+  f.time.advance(1_000);
+  await restartedInbox.answer({ requestId: fault.requestId, expectedRevision: fault.revision,
+    contentDigest: fault.contentDigest, answer: { type: "choice", choiceId: "configured-retry" } });
+  const restarted = await createFixture({ store: f.store, source: f.source, time: f.time });
+  await restarted.service.applyAttentionBatch(await restartedInbox.readOutbox());
+  const resumed = (await restarted.service.listItems()).items[0];
+  assert.equal(resumed.status, "queued");
+  assert.equal(resumed.attempt, waiting.attempt - 1);
+  assert.deepEqual(resumed.source, waiting.source);
+  const delivered = restarted.store.stored().outbox[0];
+  assert.deepEqual(delivered.intent, originalOutbox.intent);
+  assert.deepEqual(delivered.brainRecovery, originalOutbox.brainRecovery);
+  assert.ok(delivered.outcome.details.resultAttestation);
+});
+
 test("session and process maintenance questions wait for explicit repair retry across restart", async () => {
   for (const code of ["STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED", "STRUCTURED_PROVIDER_CLEANUP_FAILED", "STRUCTURED_PROVIDER_REAP_FAILED"]) {
     const fixture = await createFixture({ records: [assignment(1)] });
     const answer = await prepareAttentionResult(fixture, { type: "choice", choiceId: "configured-retry" }, {
-      intent: systemMaintenanceIntent("pr-reviewer", code),
+      intent: systemMaintenanceIntent("pr-reviewer", code), legacyRecovery: true,
     });
     const waiting = (await fixture.service.listItems()).items[0];
     const input = { limit: 10, requestKeys: [waiting.activeIntentId] };
@@ -15795,7 +16047,7 @@ test("an explicit session repair retry preserves the PR source and Head budget",
   const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
   const answer = await prepareAttentionResult(fixture, { type: "choice", choiceId: "configured-retry" }, {
     workerId: "employee-pr-engineer", roleId: "pr-engineer",
-    intent: systemMaintenanceIntent("pr-engineer", "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED"),
+    intent: systemMaintenanceIntent("pr-engineer", "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED"), legacyRecovery: true,
   });
   const waiting = (await fixture.service.listItems()).items[0];
   await fixture.service.applyAttentionBatch({ items: [answer], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
@@ -15810,11 +16062,12 @@ test("an explicit session repair retry preserves the PR source and Head budget",
 test("system maintenance questions retry without an owner answer and discard a raced result", async () => {
   const fixture = await createFixture({ records: [assignment(1)] });
   const intent = systemMaintenanceIntent("pr-reviewer");
-  const raced = await prepareAttentionResult(fixture, { type: "choice", choiceId: "configured-retry" }, { intent });
+  const raced = await prepareAttentionResult(fixture, { type: "choice", choiceId: "configured-retry" }, { intent, legacyRecovery: true });
   const waiting = (await fixture.service.listItems()).items[0];
   const authority = { requestKey: waiting.activeIntentId,
     producer: { roleId: "pr-reviewer", workItemId: waiting.itemId } };
   const delivered = structuredClone(fixture.store.stored().outbox[0]);
+  assert.equal(Object.hasOwn(delivered, "brainRecovery"), false, "historical absence stays absent");
   assert.equal((await fixture.service.retrySystemMaintenanceQuestions({ limit: 10, requestKeys: fixture.store.stored().outbox.map(entry => entry.intentId) })).retried, 1);
   const retrying = (await fixture.service.listItems()).items[0];
   assert.equal(retrying.status, "retry_wait");
@@ -15828,6 +16081,7 @@ test("system maintenance questions retry without an owner answer and discard a r
   assert.equal((await fixture.service.retrySystemMaintenanceQuestions({ limit: 10, requestKeys: fixture.store.stored().outbox.map(entry => entry.intentId) })).retried, 0);
   assert.equal(fixture.store.stored().outbox[0].intentId, delivered.intentId);
   assert.deepEqual(fixture.store.stored().outbox[0].intent, delivered.intent);
+  assert.equal(Object.hasOwn(fixture.store.stored().outbox[0], "brainRecovery"), false);
   assert.equal(fixture.store.stored().outbox[0].outcome.details.resultAttestation, undefined);
   await fixture.service.applyAttentionBatch({ items: [raced], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 });
   assert.equal((await fixture.service.getSummary()).attentionCursor, 1);
@@ -15839,10 +16093,51 @@ test("system maintenance questions retry without an owner answer and discard a r
   });
 });
 
+test("U3 legacy retirement proofs reject mismatched bindings and cannot retire a new model question", async () => {
+  const historical = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  const intent = systemMaintenanceIntent("pr-engineer");
+  await prepareAttentionResult(historical, { type: "choice", choiceId: "configured-retry" }, {
+    workerId: "employee-pr-engineer", roleId: "pr-engineer", intent, legacyRecovery: true,
+  });
+  const waiting = (await historical.service.listItems()).items[0];
+  const authority = { requestKey: waiting.activeIntentId, producer: { roleId: "pr-engineer", workItemId: waiting.itemId } };
+  assert.equal((await historical.service.retrySystemMaintenanceQuestions({ limit: 10, requestKeys: [waiting.activeIntentId] })).retried, 1);
+  const valid = historical.store.stored();
+  const proof = valid.outbox[0].outcome.details.maintenanceRetirement;
+  assert.equal((await historical.service.readAttentionRequestRetirement(authority)).reason, "system_maintenance_auto_retry");
+  for (const tamper of [
+    value => { value.intentId = `work-intent-${"f".repeat(64)}`; },
+    value => { value.questionRef = `attention-${"f".repeat(64)}`; },
+    value => { value.inputBinding.headRefOid = PR_HEAD_B; },
+    value => { value.code = "UNKNOWN_FAILURE"; },
+  ]) {
+    const bad = clone(valid);
+    const value = bad.outbox[0].outcome.details.maintenanceRetirement;
+    tamper(value);
+    const { digest, ...core } = value;
+    value.digest = ledgerDigest(core);
+    const store = new MemoryStore();
+    store.replaceStored(bad);
+    const restarted = await createFixture({ store, source: historical.source, time: historical.time });
+    assert.equal(await restarted.service.readAttentionRequestRetirement(authority), null);
+  }
+  const model = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
+  await prepareAttentionResult(model, { type: "choice", choiceId: "configured-retry" }, {
+    workerId: "employee-pr-engineer", roleId: "pr-engineer", intent: JSON.parse(JSON.stringify(intent)),
+  });
+  const copied = model.store.stored();
+  copied.outbox[0].outcome.details.maintenanceRetirement = clone(proof);
+  model.store.replaceStored(copied);
+  const restarted = await createFixture({ store: model.store, source: model.source, time: model.time });
+  assert.equal(await restarted.service.readAttentionRequestRetirement(authority), null);
+  assert.equal((await restarted.service.retrySystemMaintenanceQuestions({ limit: 10, requestKeys: [waiting.activeIntentId] })).retried, 0);
+  assert.equal((await restarted.service.listItems()).items[0].status, "waiting_user");
+});
+
 test("automatic maintenance settles an old PR question through cross-root pending Head activation and restart", async () => {
   const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
   const raced = await prepareAttentionResult(fixture, { type: "choice", choiceId: "configured-retry" }, {
-    workerId: "employee-pr-engineer", roleId: "pr-engineer", intent: systemMaintenanceIntent("pr-engineer"),
+    workerId: "employee-pr-engineer", roleId: "pr-engineer", intent: systemMaintenanceIntent("pr-engineer"), legacyRecovery: true,
   });
   const old = (await fixture.service.listItems()).items[0];
   const authority = { requestKey: old.activeIntentId, producer: { roleId: "pr-engineer", workItemId: old.itemId } };
@@ -15888,7 +16183,7 @@ test("automatic maintenance never releases a business question or an applied rej
 test("retiring a historical infrastructure question restores the complete business decision budget", async () => {
   const fixture = await createFixture({ records: [prAssignment(1, { gitFacts: prGitFacts(PR_HEAD_A) })] });
   await prepareAttentionResult(fixture, { type: "choice", choiceId: "configured-retry" }, {
-    workerId: "employee-pr-engineer", roleId: "pr-engineer", intent: systemMaintenanceIntent("pr-engineer"),
+    workerId: "employee-pr-engineer", roleId: "pr-engineer", intent: systemMaintenanceIntent("pr-engineer"), legacyRecovery: true,
   });
   await fixture.service.retrySystemMaintenanceQuestions({ limit: 10,
     requestKeys: fixture.store.stored().outbox.map(entry => entry.intentId) });
@@ -18867,6 +19162,7 @@ test("schema v2 migration is lazy and preserves an active outbox through its nex
   for (const entry of legacy.outbox) {
     delete entry.dispatchBinding;
     delete entry.sourceBinding;
+    delete entry.brainRecovery;
   }
   fixture.store.replaceStored(legacy);
   const writesBeforeRecovery = fixture.store.writes.length;

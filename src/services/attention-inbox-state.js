@@ -1,3 +1,4 @@
+import { maintenanceAttentionCode } from "../domain/maintenance-attention.js";
 import {
   assertAttentionExactKeys,
   attentionArrayValues,
@@ -198,6 +199,7 @@ function requestFromItem(value) {
     question: value.question,
     context: value.context,
     choices: value.choices,
+    ...(Object.hasOwn(value, "recoveryCode") ? { recoveryCode: value.recoveryCode } : {}),
   });
 }
 
@@ -273,6 +275,7 @@ function normalizeItem(value, { legacy = false } = {}) {
       "result",
       "timeline",
       ...(legacy ? [] : ["archive"]),
+      ...(Object.hasOwn(value, "recoveryCode") ? ["recoveryCode"] : []),
     ],
     invalidState(),
   );
@@ -613,6 +616,7 @@ export function projectAttentionRequest(item) {
     question: item.question,
     context: item.context,
     choices: item.choices,
+    maintenanceCode: maintenanceAttentionCode(item),
     revision: item.revision,
     contentDigest: item.contentDigest,
     createdAt: item.createdAt,

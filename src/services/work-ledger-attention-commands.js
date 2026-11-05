@@ -22,7 +22,7 @@ import {
 import { createWorkDecisionContext } from "./work-ledger-state.js";
 import { moveWorkItem } from "./work-ledger-transitions.js";
 import { isSettledIssueReason } from "./work-ledger-issue-lifecycle.js";
-import { automaticBrainRetryCode } from "./brain-failure-policy.js";
+import { brainRecoveryCode } from "./brain-recovery-intent.js";
 import { requiresBrainMaintenance } from "../domain/brain-failure-recovery.js";
 import { hostContextRetirement } from "./work-ledger-host-context-recovery.js";
 import { automaticTriageRetirement } from './work-ledger-triage-retirement.js';
@@ -47,7 +47,7 @@ export function systemMaintenanceRetirement(outbox) {
       proof.schemaVersion !== 1 || proof.intentId !== outbox.intentId ||
       proof.questionRef !== outbox.outcome.details.questionRef ||
       proof.reason !== "system_maintenance_auto_retry" ||
-      proof.code !== automaticBrainRetryCode(outbox.intent) || proof.code === null ||
+      proof.code !== brainRecoveryCode(outbox) || proof.code === null ||
       !Number.isSafeInteger(proof.workItemRevision) || proof.workItemRevision < 1 ||
       outbox.status !== "delivered" || outbox.outcome.status !== "delivered") return null;
   const { digest, ...core } = proof;
@@ -79,7 +79,7 @@ export function planSystemMaintenanceRetry({ state, input, clock }) {
     if (item.status !== "waiting_user" || !pendingRequests.has(item.activeIntentId) || item.sourceQuarantine !== null ||
         item.ownerId !== null || item.leaseId !== null || item.leaseUntil !== null) continue;
     const outbox = outboxById.get(item.activeIntentId);
-    const code = automaticBrainRetryCode(outbox?.intent);
+    const code = brainRecoveryCode(outbox);
     if (code === null || requiresBrainMaintenance(code) || outbox.itemId !== item.itemId || outbox.status !== "delivered" ||
         outbox.outcome?.status !== "delivered" || outbox.outcome.details?.resultAttestation ||
         typeof outbox.outcome.details?.questionRef !== "string") continue;
@@ -616,7 +616,7 @@ export function planAttentionBatchApplication({ state, input, clock }) {
       activeIntentId: null,
       decisionContext,
     });
-    const maintenanceCode = automaticBrainRetryCode(outbox.intent);
+    const maintenanceCode = brainRecoveryCode(outbox);
     if (itemResult.status === "queued" && requiresBrainMaintenance(maintenanceCode) &&
         entry.result.answer.type === "choice" && entry.result.answer.choiceId === "configured-retry") {
       // The owner repaired infrastructure; this was not a business decision failure.

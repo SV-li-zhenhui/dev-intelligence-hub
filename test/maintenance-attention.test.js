@@ -6,7 +6,7 @@ import { maintenanceAttentionCode } from "../src/domain/maintenance-attention.js
 import { maintenanceAttentionMarkup } from "../public/maintenance-attention.js";
 import { brainFailureOwnerAttention } from "../src/services/brain-failure-policy.js";
 
-test("changing attention display entries cannot change loop budgets or code job recovery", async () => {
+test("changing attention display entries cannot change loop budgets code job recovery or historical approvals", async () => {
   const attentionUrl = new URL("../src/services/brain-failure-policy.js", import.meta.url).href;
   // Change presentation at the module boundary in a fresh process. Exercise the
   // real loop/worker matrices, including a display-only unknown failure.
@@ -37,8 +37,8 @@ test("changing attention display entries cannot change loop budgets or code job 
   const result = await new Promise(resolve => execFile(process.execPath, [
     "--import", `data:text/javascript,${encodeURIComponent(loader)}`,
     "--test", "--test-concurrency=1", "--test-reporter=tap",
-    "--test-name-pattern=infrastructure failures separate|real native provider|known infrastructure failures retry|proactive-only task-brain|unknown recovery metadata",
-    "test/proactive-work-loop.test.js", "test/code-job-worker-service.test.js",
+    "--test-name-pattern=infrastructure failures separate|real native provider|known infrastructure failures retry|proactive-only task-brain|unknown recovery metadata|session and process maintenance questions|system maintenance questions retry",
+    "test/proactive-work-loop.test.js", "test/code-job-worker-service.test.js", "test/work-ledger-service.test.js",
   ], { cwd: fileURLToPath(new URL("..", import.meta.url)), env: environment, maxBuffer: 1024 * 1024 },
   (error, stdout, stderr) => resolve({ error, stdout, stderr })));
   assert.equal(result.error, null, `${result.stdout}\n${result.stderr}`);

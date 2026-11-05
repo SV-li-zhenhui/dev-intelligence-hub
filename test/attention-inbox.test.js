@@ -138,6 +138,26 @@ test("maintenance failures stay readable without blocking business questions or 
   assert.equal((await inbox.readOutbox()).items.length, 1);
 });
 
+test("U3 projected recovery identity groups new maintenance after restart without localized text", async () => {
+  const { inbox, store } = await readyInbox();
+  const maintenance = await inbox.create(attentionRequest({ requestKey: "new-recovery",
+    recoveryCode: "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED", question: "Updated question",
+    context: [{ label: "Updated label", value: "Updated reason" }],
+    choices: [{ id: "configured-retry", label: "Updated retry" }] }));
+  const business = await inbox.create(attentionRequest({ requestKey: "new-business", recoveryCode: null,
+    context: [{ label: "判断依据", value: "系统已安全停止（STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED）" }],
+    choices: [{ id: "configured-retry", label: "修复后重试" }] }));
+  const restarted = (await readyInbox({ store, clock: tickingClock(Date.parse("2026-08-02T02:00:00.000Z")) })).inbox;
+  assert.equal((await restarted.next()).requestId, business.requestId);
+  assert.equal((await restarted.next()).maintenanceCode, null);
+  const faults = await restarted.listMaintenance();
+  assert.equal(faults.total, 1);
+  assert.equal(faults.items[0].requestId, maintenance.requestId);
+  assert.equal(faults.items[0].maintenanceCode, "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+  await restarted.answer(response(faults.items[0], { type: "choice", choiceId: "configured-retry" }));
+  assert.equal((await restarted.readOutbox()).items.length, 1);
+});
+
 test("maintenance lists validate one batch and omit stale task bindings without writes", async () => {
   const batches = [];
   const { inbox, store } = await readyInbox({ authority: {
@@ -423,6 +443,7 @@ test("a trusted producer persists a content-addressed request before it is visib
     question: attentionRequest().question,
     context: attentionRequest().context,
     choices: attentionRequest().choices,
+    maintenanceCode: null,
     revision: 1,
     contentDigest: created.contentDigest,
     createdAt: "2026-08-02T01:00:00.000Z",

@@ -1,4 +1,5 @@
 import { isInternalRepairReviewEvent } from "../domain/internal-repair-review.js";
+import { brainRecoveryCode } from "./brain-recovery-intent.js";
 import {
   createWorkIntentDispatchBinding,
   LEGACY_UNKNOWN_WORK_INTENT_BINDING,
@@ -919,6 +920,7 @@ function attentionRequest(claimed, item, bound) {
       { label: "来源事件", value: sourceContext(currentWorkItemEvent(item)) },
     ],
     choices: payload.get("choices"),
+    ...(Object.hasOwn(claimed, "brainRecovery") ? { recoveryCode: brainRecoveryCode(claimed) } : {}),
   };
 }
 
