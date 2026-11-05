@@ -534,6 +534,7 @@ import { ConfiguredRoleEmployee } from "../src/services/configured-role-employee
 import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
 import { RoleWorkerDirectory } from "../src/services/role-worker-directory.js";
 import { WorkCoordinationService } from "../src/services/work-coordination-service.js";
+import { createWorkProposalRunnerGroup } from "../src/services/work-proposal-runner-group.js";
 import { ReviewHandoffReconciler } from "../src/services/review-handoff-reconciler.js";
 import { createGitHubActionExecutor } from "../src/adapters/github-action-adapter.js";
 import { githubCredentialSourceError } from "../src/lib/github-credential-source.js";
@@ -8560,6 +8561,8 @@ test("shutdown drains the admitted memory projection port then stops its cycle",
 });
 
 async function configurationRestartShutdownRace({
+  proposalRunnerFactory = (runner) => runner,
+  expectedClaimExecutions = 1,
   transformRejection = (error) => error,
   additionalStage = async () => {},
   settleCutover = (control) => control.commit({
@@ -8582,7 +8585,7 @@ async function configurationRestartShutdownRace({
   const reportedErrors = [];
   const coordinator = new WorkCoordinationService({
     ledger: { async intake() {} },
-    proposalRunner: {
+    proposalRunner: proposalRunnerFactory({
       async runCycle() {
         if (racing) {
           proposalStarted.resolve();
@@ -8594,7 +8597,7 @@ async function configurationRestartShutdownRace({
           throw transformRejection(error);
         }
       },
-    },
+    }),
     proposalResultReconciler: {
       async runCycle() { if (racing) await additionalStage(gate); },
     },
@@ -8658,7 +8661,7 @@ async function configurationRestartShutdownRace({
     assert.ok(stopping, "shutdown must race the tracked rejection");
     const shutdown = await stopping;
     assert.equal(statusBeforeStop.activeTaskCount, 1);
-    assert.equal(claimExecutions, 1, "cutover must prevent another proposal claim");
+    assert.equal(claimExecutions, expectedClaimExecutions, "cutover must prevent another proposal claim");
     assert.deepEqual(backgroundWork.drainStatus().activeParticipants, []);
     assert.equal(backgroundWork.drainStatus().activeTaskCount, 0);
     assert.deepEqual(reportedErrors, [cycleFailure]);
@@ -8687,6 +8690,59 @@ test("shutdown drains an aggregate containing only real configuration restart re
   assert.deepEqual(result.shutdown, { succeeded: true });
   assert.equal(result.applicationCloses, 1);
   assert.equal(result.leaseCloses, 1);
+});
+
+test("shutdown drains real grouped proposal runners containing only configuration restart rejections", async (t) => {
+  for (const count of [2, 3]) {
+    await t.test(`${count} proposal runners`, async () => {
+      const result = await configurationRestartShutdownRace({
+        proposalRunnerFactory: (runner) => createWorkProposalRunnerGroup(
+          Array.from({ length: count }, () => runner),
+        ),
+        expectedClaimExecutions: count,
+        additionalStage: (gate) => gate.run(() => assert.fail("must not be admitted")),
+      });
+      assert.ok(result.cycleFailure instanceof AggregateError);
+      const groupFailure = result.cycleFailure.errors
+        .find((error) => error.stage === "proposal_execution").cause;
+      assert.ok(groupFailure instanceof AggregateError);
+      assert.equal(groupFailure.message, "one or more work proposal runners failed");
+      assert.equal(groupFailure.errors.length, count);
+      assert.deepEqual(result.shutdown, { succeeded: true });
+      assert.equal(result.applicationCloses, 1);
+      assert.equal(result.leaseCloses, 1);
+    });
+  }
+});
+
+test("shutdown retains real I/O and unknown write failures inside grouped proposal runners", async (t) => {
+  for (const [name, failure] of [
+    ["real I/O without an error code", new Error("durable append failed")],
+    ["unknown external write", Object.assign(new Error("external write was not confirmed"), {
+      code: "EXTERNAL_ACTION_UNKNOWN",
+    })],
+  ]) {
+    await t.test(name, async () => {
+      const result = await configurationRestartShutdownRace({
+        proposalRunnerFactory: (runner) => createWorkProposalRunnerGroup([
+          runner,
+          { async runCycle(options) {
+            try { return await runner.runCycle(options); }
+            catch { throw failure; }
+          } },
+        ]),
+        expectedClaimExecutions: 2,
+      });
+      const groupFailure = result.cycleFailure.cause;
+      assert.ok(groupFailure instanceof AggregateError);
+      assert.equal(groupFailure.errors.length, 2);
+      assert.ok(groupFailure.errors.includes(failure));
+      assert.equal(result.shutdown.succeeded, false);
+      assert.equal(result.shutdown.failure, result.cycleFailure);
+      assert.equal(result.applicationCloses, 0);
+      assert.equal(result.leaseCloses, 0);
+    });
+  }
 });
 
 test("shutdown retains non-admission failures alongside a configuration cutover", async (t) => {

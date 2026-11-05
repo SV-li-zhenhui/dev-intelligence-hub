@@ -4115,7 +4115,8 @@ function hasOnlyConfigurationRestartRejections(error, seen) {
   const message = value("message");
   const errors = value("errors");
   if (typeof message !== "string" ||
-      !(message.startsWith("员工主动循环有多个阶段失败: ") ||
+      !(message === "one or more work proposal runners failed" ||
+        message.startsWith("员工主动循环有多个阶段失败: ") ||
         message.startsWith("员工主动循环、旧岗位巡查或记忆投影失败: ")) ||
       !Array.isArray(errors) || errors.length === 0 || errors.length > 64) return false;
   for (let index = 0; index < errors.length; index += 1) {
