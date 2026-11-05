@@ -942,6 +942,117 @@ async function fixture(t) {
   return { root, home, calls, environment, dependencies, create, runtime: `${dependencies.temporaryRoot}-native` };
 }
 
+function checkpointAppServer({ complete = false, stopGate = null, returnedThread = 'checkpoint-native-thread' } = {}) {
+  const calls = [], turned = gate(), stopping = gate(); let options;
+  const send = value => options.onLine({ stream: 'stdout', line: JSON.stringify(value) });
+  const process = { exited: false, start(value) { options = value; }, write(line) {
+    const message = JSON.parse(line); if (!message.id) return;
+    calls.push(message); let result = {};
+    if (message.method === 'config/read') result = { config: {
+      features: { ...Object.fromEntries(['shell_tool','apps','browser_use','computer_use','image_generation','hooks','plugins','remote_plugin','plugin_sharing','skill_search','skill_mcp_dependency_install','goals','memories','workspace_dependencies','multi_agent_v2','code_mode','multi_agent'].map(name => [name, false])), skip_host_skill_discovery: true, code_mode_host: true },
+      agents: { enabled: false }, web_search: 'disabled', approval_policy: 'never', sandbox_mode: 'read-only', model_provider: 'openai', notify: [], mcp_servers: {},
+    } };
+    if (message.method.startsWith('thread/')) result = { thread: { id: returnedThread, sessionKey: 'pr:43' }, approvalPolicy: 'never', sandbox: { type: 'readOnly', networkAccess: false } };
+    if (message.method === 'mcpServerStatus/list') result = { data: [], nextCursor: null };
+    if (message.method === 'turn/start') result = { turn: { id: 'checkpoint-turn' } };
+    send({ id: message.id, result });
+    if (message.method === 'turn/start') {
+      turned.resolve();
+      if (complete) queueMicrotask(() => {
+        send({ method: 'item/completed', params: { threadId: returnedThread, turnId: 'checkpoint-turn', item: { type: 'agentMessage', text: JSON.stringify({ result: '{"ok":true}' }) } } });
+        send({ method: 'turn/completed', params: { threadId: returnedThread, turn: { id: 'checkpoint-turn', status: 'completed' } } });
+      });
+    }
+  }, async stop() { stopping.resolve(); await stopGate?.promise; this.exited = true; } };
+  return { calls, turned, stopping, runner: new CodexAppServerRunner({ processFactory: () => process, materialize: async () => ({ command: 'fixture', prefixArgs: [] }) }) };
+}
+
+test('live native checkpoint survives interruption before final publication and resumes the same thread', async t => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = 'app-server';
+  const store = new CodexNativeSessionStore({ root: path.join(f.runtime, 'sessions'), nativeHome: f.home });
+  const stopGate = gate(), server = checkpointAppServer({ stopGate }), controller = new AbortController();
+  const provider = f.create(() => assert.fail('must use app-server'), {}, { appServerRunner: server.runner, nativeSessionStore: {
+    read: value => store.read(value), begin: value => store.begin(value), cancel: value => store.cancel(value),
+    save: async () => { throw error('STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED'); },
+  } });
+  const running = provider.generate(request({ sessionKey: 'pr:42', signal: controller.signal }));
+  const outcome = running.then(value => ({ value }), error => ({ error }));
+  try {
+    await server.turned.promise;
+    controller.abort(); await server.stopping.promise;
+    const files = await readdir(store.root);
+    assert.equal(files.length, 1, 'final publication has not run');
+    assert.ok(files[0].endsWith('.pending'));
+    assert.equal(JSON.parse(await readFile(path.join(store.root, files[0]), 'utf8')).threadId, 'checkpoint-native-thread');
+    assert.equal(await store.read({ sessionKey: 'pr:42' }), 'checkpoint-native-thread');
+  } finally { controller.abort(); stopGate.resolve(); await outcome; await provider.close(); }
+  assert.equal((await outcome).error.code, 'STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED');
+  const restarted = checkpointAppServer({ complete: true });
+  const next = f.create(() => assert.fail('must not fall back'), {}, { appServerRunner: restarted.runner });
+  try {
+    assert.deepEqual(JSON.parse(await next.generate(request({ sessionKey: 'pr:42' }))), { ok: true });
+    assert.equal(restarted.calls.find(call => call.method.startsWith('thread/')).method, 'thread/resume');
+    assert.equal(restarted.calls.find(call => call.method === 'thread/resume').params.threadId, 'checkpoint-native-thread');
+    assert.equal(restarted.calls.filter(call => call.method === 'turn/start').length, 1);
+  } finally { await next.close(); }
+});
+
+for (const mode of ['continue', 'abort', 'failure']) test(`native provider awaits its durable identity checkpoint before a model turn (${mode})`, async t => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = 'app-server';
+  const store = new CodexNativeSessionStore({ root: path.join(f.runtime, 'sessions'), nativeHome: f.home });
+  const entered = gate(), release = gate(), controller = new AbortController();
+  const server = checkpointAppServer({ complete: true });
+  const provider = f.create(() => assert.fail('must use app-server'), {}, { appServerRunner: server.runner, nativeSessionStore: {
+    read: value => store.read(value), save: value => store.save(value), cancel: value => store.cancel(value),
+    async begin(value) {
+      if (value.threadId === null) return store.begin(value);
+      if (mode !== 'failure') await store.begin(value);
+      entered.resolve(); await release.promise;
+      if (mode === 'failure') throw error('STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED');
+    },
+  } });
+  const outcome = provider.generate(request({ sessionKey: 'pr:42', signal: controller.signal })).then(value => ({ value }), error => ({ error }));
+  try {
+    await Promise.race([entered.promise, outcome.then(() => assert.fail('model execution settled without awaiting the checkpoint'))]);
+    assert.equal(server.calls.some(call => call.method === 'turn/start'), false);
+    assert.equal(server.calls.at(-1).method, 'mcpServerStatus/list', 'isolation is validated before persistence');
+    if (mode !== 'failure') assert.equal(await store.read({ sessionKey: 'pr:42' }), 'checkpoint-native-thread');
+    if (mode === 'abort') controller.abort();
+    release.resolve();
+    const settled = await outcome;
+    assert.equal(server.calls.filter(call => call.method === 'turn/start').length, mode === 'continue' ? 1 : 0);
+    assert.equal(JSON.stringify(server.calls).includes('onThreadIdentified'), false, 'checkpoint is never an RPC parameter or tool');
+    if (mode === 'continue') assert.deepEqual(JSON.parse(settled.value), { ok: true });
+    else assert.equal(settled.error.code, mode === 'abort' ? 'STRUCTURED_PROVIDER_CANCELLED' : 'STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED');
+    if (mode === 'abort') assert.equal(await store.read({ sessionKey: 'pr:42' }), 'checkpoint-native-thread');
+    if (mode === 'failure') assert.equal(await store.read({ sessionKey: 'pr:42' }), null, 'existing no-model reap proof allows retry');
+  } finally { release.resolve(); await outcome; await provider.close(); }
+});
+
+for (const [label, returnedThread, valid] of [
+  ['different resumed ID', 'authorized-thread-43', false],
+  ['malformed thread ID', '../invalid-thread', false],
+  ['untrusted session binding', 'authorized-thread-42', true],
+]) test(`native thread metadata preserves the original authorized session binding (${label})`, async t => {
+  const f = await fixture(t); f.environment.DIH_CODEX_NATIVE_TRANSPORT = 'app-server';
+  await mkdir(f.runtime); await mkdir(path.join(f.runtime, 'sessions'));
+  const store = new CodexNativeSessionStore({ root: path.join(f.runtime, 'sessions'), nativeHome: f.home });
+  await store.save({ sessionKey: 'pr:42', threadId: 'authorized-thread-42' });
+  await store.save({ sessionKey: 'pr:43', threadId: 'authorized-thread-43' });
+  const before = await Promise.all((await readdir(store.root)).map(async name => [name, await readFile(path.join(store.root, name), 'utf8')]));
+  const server = checkpointAppServer({ returnedThread, complete: true });
+  const provider = f.create(() => assert.fail('no fallback'), {}, { appServerRunner: server.runner });
+  try {
+    const operation = provider.generate(request({ sessionKey: 'pr:42' }));
+    if (valid) assert.deepEqual(JSON.parse(await operation), { ok: true });
+    else await assert.rejects(operation, { code: 'STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED' });
+    assert.equal(server.calls.some(call => call.method === 'turn/start'), valid);
+    assert.equal(await store.read({ sessionKey: 'pr:42' }), 'authorized-thread-42');
+    assert.equal(await store.read({ sessionKey: 'pr:43' }), 'authorized-thread-43');
+    for (const [name, text] of before) assert.equal(await readFile(path.join(store.root, name), 'utf8'), text);
+  } finally { await provider.close(); }
+});
+
 test('native Windows transport defaults to live app-server with an explicit exec fallback',async(t)=>{
   const f=await fixture(t);delete f.environment.DIH_CODEX_NATIVE_TRANSPORT;
   const provider=f.create();

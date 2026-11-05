@@ -171,6 +171,26 @@ async function invocation(runner,execute=(run)=>run(),appServerOverrides={}) {
   finally{if (codeExecutionWatchdog) closeCodeExecutionWatchdog(codeExecutionWatchdog); await rm(directory,{recursive:true,force:true});}
 }
 
+for (const [label, options, overrides] of [
+  ['different resumed thread', {}, { previous: 'different-thread' }],
+  ['unauthorized tool inventory', { reviewAgents: true, toolInventory: ['untrusted_tool'] }, { isolation: { reader: { url: 'http://127.0.0.1/private' }, agentConfigPath: 'private.toml' } }],
+]) test(`thread checkpoint cannot precede validation (${label})`, async () => {
+  const f = fixture(options); let checkpointed = false;
+  await assert.rejects(invocation({ run: call => f.runner.run({ ...call, onThreadIdentified() { checkpointed = true; } }) }, run => run(), overrides));
+  assert.equal(checkpointed, false);
+  assert.equal(f.calls.some(call => call.method === 'turn/start'), false);
+});
+
+test('checkpoint failure with uncertain process stop retains reap uncertainty and starts no model', async () => {
+  const f = fixture({ stopFailure: true });
+  await assert.rejects(invocation({ run: call => f.runner.run({ ...call, onThreadIdentified: async () => { throw new Error('write failed'); } }) }), error => {
+    assert.equal(didAppServerReap(error), false);
+    assert.equal(didAppServerNotStartModel(error), false, 'no-model receipt cannot certify an unknown process');
+    return error.code === 'STRUCTURED_PROVIDER_REAP_FAILED';
+  });
+  assert.equal(f.calls.some(call => call.method === 'turn/start'), false);
+});
+
 test('large inherited MCP metadata does not prevent an isolated review from starting', async () => {
   const f=fixture({reviewAgents:true,largeInheritedInventory:true});
   await invocation(f.runner, async run=>{

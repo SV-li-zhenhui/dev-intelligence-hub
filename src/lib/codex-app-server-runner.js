@@ -45,7 +45,7 @@ export class CodexAppServerRunner {
     this.supportsContainedExecution=!processFactory && process.platform==='win32';
   }
 
-  async run({executable,args,cwd,env,signal,timeoutMs,appServer,codeExecutionWatchdog=null}) {
+  async run({executable,args,cwd,env,signal,timeoutMs,appServer,codeExecutionWatchdog=null,onThreadIdentified=null}) {
     // Protocol fixtures can inject a process. Production needs a contained,
     // bidirectional supervisor: a direct child's exit is not tree-reap proof.
     if ((!this.processFactory && !this.supportsContainedExecution) || !appServer ||
@@ -233,6 +233,11 @@ export class CodexAppServerRunner {
         }while(cursor);
         if((appServer.isolation.reader || appServer.isolation.execution) && !seenReader)throw failure('STRUCTURED_PROVIDER_UNAVAILABLE');
       }
+      // Host-only persistence runs after identity and isolation validation. A
+      // cancelled or failed transport must not start a turn when it settles.
+      await onThreadIdentified?.(threadId);
+      if (!accepting) await completed.promise;
+      signal?.throwIfAborted();
       context?.reportSession?.({transport:'app-server',threadId,turnId:null,status:'starting'});
       const skill=appServer.isolation?.skill;
       const input=codeExecution ? `For this invocation, references to the code-job MCP server mean ${namespace}.\n${appServer.input}`

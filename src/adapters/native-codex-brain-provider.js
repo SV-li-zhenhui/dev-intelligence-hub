@@ -595,11 +595,21 @@ export class NativeCodexBrainProvider {
         }
         const previous = request.sessionKey ? await this.#sessions.read({ sessionKey: request.sessionKey, signal: operationSignal }) : null;
         if (request.sessionKey) await this.#sessions.begin?.({ sessionKey: request.sessionKey, threadId: previous, signal: operationSignal });
+        let checkpointedThread = previous;
+        const onThreadIdentified = live && request.sessionKey ? async threadId => {
+          operationSignal.throwIfAborted();
+          if (!isNativeCodexThreadId(threadId) || (checkpointedThread && checkpointedThread !== threadId)) throw failure("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+          // This closure alone owns the admitted request's session key. Do not
+          // accept a binding from native output or expose it in the wire input.
+          await this.#sessions.begin({ sessionKey: request.sessionKey, threadId, signal: operationSignal });
+          checkpointedThread = threadId;
+        } : null;
         let processAttempted = false;
         const lifecycle=live?null:createNativeExecLifecycle(currentTaskExecution(),Buffer.from(wireInput));
         try {
           const args = argumentsFor(request, directory, previous, reader, Boolean(skill));
           processResult = await this.#runProcess({ nativeAdmissionEntity, executable: descriptor, args: live ? appServerArguments(request,instructionsFile,Boolean(skill)) : args, cwd: directory, env: this.#dependencies.environment,
+            ...(onThreadIdentified ? { onThreadIdentified } : {}),
             ...(live ? {appServer:{input:wireInput,model:request.model,effort:request.reasoningEffort,schema:ENVELOPE_SCHEMA,previous,
               isolation:{reader:reader?{url:reader.url}:null,agentConfigPath,ephemeral:!request.sessionKey,
                 ...(execution?{channel:'code-job',execution:{url:execution.url,revoke:execution.revoke}}:{}),
@@ -609,7 +619,7 @@ export class NativeCodexBrainProvider {
         } catch (failure) { processFailure = failure; this.#invalidateAvailability(failure); }
         finally {lifecycle?.close();}
         if (request.sessionKey && !this.#state.blocked) {
-          const threadId = threadFrom(processResult ?? SETTLED_FAILURE_OUTPUT.get(processFailure) ?? readReapedProcessFailureOutput(processFailure) ?? readAppServerFailureOutput(processFailure), previous);
+          const threadId = threadFrom(processResult ?? SETTLED_FAILURE_OUTPUT.get(processFailure) ?? readReapedProcessFailureOutput(processFailure) ?? readAppServerFailureOutput(processFailure), checkpointedThread);
           if (threadId) await this.#sessions.save({ sessionKey: request.sessionKey, threadId });
           else if (!processAttempted || didSupervisedProcessNotStart(processFailure) || didAppServerNotStart(processFailure) || didAppServerNotStartModel(processFailure) || SETTLED_NOT_STARTED.has(processFailure) || SETTLED_NO_MODEL.has(processFailure)) await this.#sessions.cancel?.({ sessionKey: request.sessionKey });
           else throw failure("STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
