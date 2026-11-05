@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { lstat, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { createNativeCodexBrainProvider } from "../src/adapters/native-codex-brain-provider.js";
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
 import { continuationFingerprint } from '../src/services/work-continuation-state.js';
 import { createTaskRunSettler, planWorkItemRunControl } from '../src/services/work-ledger-run-control.js';
@@ -1334,6 +1338,70 @@ test("decision failures use bounded retry and block at maxAttempts", async () =>
     code: "ROLE_DECISION_FAILED",
   });
   assert.equal(ledger.calls.transition[0].expectedRevision, 4);
+});
+
+for (const code of ["PR_REVIEW_READ_REFERENCED_MATERIAL_UNAVAILABLE", "STRUCTURED_PROVIDER_UNAVAILABLE"])
+test(`real native provider ${code} follows the existing decision retry budget`, async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "work-loop-native-failure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  await mkdir(home);
+  let materialReads = 0, modelStarts = 0;
+  const materialFailure = code === "PR_REVIEW_READ_REFERENCED_MATERIAL_UNAVAILABLE";
+  const provider = createNativeCodexBrainProvider({ id: "native-budget-test", cliKind: "codex-cli", credentialMode: "codex-native-login" }, {
+    environment: { CODEX_HOME: home, DIH_CODEX_NATIVE_TRANSPORT: "exec" },
+    temporaryRoot: path.join(root, "runtime"),
+    commandLocator: { async resolve() {
+      if (!materialFailure) throw Object.assign(new Error("CLI unavailable"), { code });
+      return { command: process.execPath, prefixArgs: [] };
+    } },
+    rootDirectoryManager: { async prepare({ directory, validateLocation, signal }) {
+      signal?.throwIfAborted(); await validateLocation(); await mkdir(directory, { recursive: true });
+      const stat = await lstat(directory, { bigint: true });
+      return { path: await realpath(directory), device: String(stat.dev), inode: String(stat.ino) };
+    } },
+    processRunner: { async run() { modelStarts += 1; assert.fail("preparation failed before model start"); } },
+    reviewReaderFactory: async () => {
+      materialReads += 1;
+      throw Object.assign(new Error("private material response"), { code });
+    },
+  });
+  t.after(() => provider.close());
+  const time = controlledClock(), ledger = new FakeLedger({ source: [workItem(1)], time });
+  const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "owner", baseRepository: "owner/repo", headRepository: "owner/repo", baseRefName: "main", headRefName: "feature", baseRefOid: "a".repeat(40), headRefOid: "b".repeat(40) };
+  const directory = new FakeRoleDirectory({ "pr-reviewer": worker({ decide: () => provider.generate({
+    model: "gpt-6.1-sol", reasoningEffort: "high", messages: [{ role: "user", content: "Review required materials" }],
+    schema: { type: "object" }, reviewTarget: { gitTarget, pullRequestNumber: 42 },
+  }) }) });
+  const loop = createLoop({ ledger, directory, time, maxAttempts: 2 });
+  const first = await loop.runCycle();
+  assert.equal(first.retried, 1);
+  assert.equal(first.outcomes[0].code, code);
+  assert.equal(ledger.items[0].attempt, materialFailure ? 1 : 0);
+  assert.equal(ledger.calls.scheduleRetry[0].reason, materialFailure ? "decision_failed" : "system_maintenance_auto_retry");
+  assert.equal(ledger.calls.scheduleRetry[0].consumeAttempt, materialFailure ? undefined : false);
+  time.advance(60_000);
+  const second = await loop.runCycle();
+  assert.equal(second.outcomes[0].code, code);
+  assert.equal(second.blocked, materialFailure ? 1 : 0);
+  assert.equal(ledger.items[0].attempt, materialFailure ? 2 : 0);
+  assert.equal(ledger.items[0].status, materialFailure ? "blocked" : "retry_wait");
+  if (materialFailure) {
+    assert.equal(ledger.calls.transition[0].reason, "decision_attempts_exhausted");
+    assert.deepEqual(ledger.calls.transition[0].details, { code });
+    time.advance(60_000);
+    assert.equal((await loop.runCycle()).claimed, 0);
+  } else {
+    time.advance(60_000);
+    assert.equal((await loop.runCycle()).retried, 1);
+    assert.equal(ledger.items[0].attempt, 0);
+    assert.ok(ledger.calls.scheduleRetry.every(call => call.consumeAttempt === false));
+    assert.equal(ledger.calls.transition.length, 0);
+  }
+  assert.equal(materialReads, materialFailure ? 2 : 0);
+  assert.equal(modelStarts, 0);
+  assert.equal(ledger.outbox.length, 0);
+  assert.equal(ledger.calls.stageIntent.length, 0);
 });
 
 test("a lost stage acknowledgement is observed as one durable intent", async () => {

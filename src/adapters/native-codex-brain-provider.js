@@ -58,6 +58,7 @@ const DEFINITIONS = {
   STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED: [500, "Native Codex session reference could not be saved or read; native history was preserved"],
   PR_REVIEW_READ_INCOMPLETE: [503, "PR review did not finish reading the complete change set"],
   PR_REVIEW_READ_UNAVAILABLE: [503, "PR review source is unavailable"],
+  PR_REVIEW_READ_REFERENCED_MATERIAL_UNAVAILABLE: [503, "PR review referenced material is unavailable"],
   PR_REVIEW_READ_HEAD_CHANGED: [409, "PR changed while its review source was being read"],
   PR_REVIEW_READ_MATERIAL_CHANGED: [409, "PR review materials changed while they were being read"],
   CODE_ARTIFACT_READ_INCOMPLETE: [503, "Controlled code source was not fully read before writing or completing"],

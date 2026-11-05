@@ -8,6 +8,7 @@ import { PassThrough } from 'node:stream';
 import test from "node:test";
 
 import { createNativeCodexBrainProvider } from "../src/adapters/native-codex-brain-provider.js";
+import { readGitHubReferencedMaterials } from "../src/adapters/github-referenced-materials.js";
 import { reconcileNativeBootRecovery } from '../src/adapters/native-codex-boot-recovery.js';
 import { CodexNativeSessionStore, nativeCodexDigest, nativeCodexHomeIdentity } from "../src/adapters/codex-native-session-store.js";
 import { createTestSupervisedProcessRunner } from "../src/lib/supervised-process-runner.js";
@@ -1655,6 +1656,32 @@ test('idle native status probes recover login and notice credential loss while a
   finish.resolve();await active;
   loggedIn=false;assert.equal((await provider.readStatus()).state,'file_login_unavailable');assert.equal(probes,3);
   await provider.close();
+});
+
+test("native review preserves a real referenced-material read failure before starting the model", async (t) => {
+  const f = await fixture(t);
+  let reads = 0;
+  const provider = f.create(() => assert.fail("required material failure must prevent model execution"), {}, {
+    reviewReaderFactory: async (_target, { signal }) => readGitHubReferencedMaterials({
+      repository: "owner/repo", pullRequestNumber: 42,
+      bodies: ["Required context: https://github.com/owner/repo/issues/43"], options: { signal },
+      run: async (command, args) => {
+        reads += 1;
+        assert.equal(command, "gh");
+        assert.ok(args.includes("repos/owner/repo/issues/43"));
+        throw Object.assign(new Error("private GitHub response"), { statusCode: 404 });
+      },
+    }),
+  });
+  t.after(() => provider.close());
+  const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "owner", baseRepository: "owner/repo", headRepository: "owner/repo", baseRefName: "main", headRefName: "feature", baseRefOid: "a".repeat(40), headRefOid: "b".repeat(40) };
+  await assert.rejects(provider.generate(request({ reviewTarget: { gitTarget, pullRequestNumber: 42 } })), {
+    code: "PR_REVIEW_READ_REFERENCED_MATERIAL_UNAVAILABLE", statusCode: 503,
+    message: "PR review referenced material is unavailable",
+  });
+  assert.equal(reads, 1);
+  assert.equal(f.calls.length, 0);
+  assert.deepEqual(await readdir(f.runtime), ["sessions"]);
 });
 
 for (const failureCode of ['PR_REVIEW_READ_INCOMPLETE', 'PR_REVIEW_READ_MATERIAL_CHANGED'])
