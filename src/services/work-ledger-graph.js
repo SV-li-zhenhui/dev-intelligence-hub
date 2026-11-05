@@ -18,6 +18,8 @@ import { unstartedConflictDispatchFailure } from "./work-ledger-conflict-failure
 import { unstartedDeliveryContractFailure, unstartedCodePolicyBindingFailure, recordedDeliveryFailure } from "./work-ledger-delivery-failure.js";
 import { indexRecordedDecisionFailures } from './work-ledger-decision-failure.js';
 import { indexRecordedProposalFailures } from './work-ledger-proposal-failure.js';
+import { indexParentCoordinationReturns } from './work-ledger-graph-responsibility.js';
+import { currentCoordinationReturnReport } from './work-ledger-role-handoff-evidence.js';
 
 export const WORK_LEDGER_GRAPH_ID = "work-ledger";
 
@@ -408,6 +410,17 @@ export function projectWorkLedgerGraphView(state, options) {
     }),
   );
   const timeline = fields.get("timeline") ?? [];
+  const coordinationReturns = indexParentCoordinationReturns(state);
+  const coordinationTimelineByItem = new Map(), timelineBySequence = new Map();
+  if (coordinationReturns.size > 0) for (const entry of timeline) {
+    // Preserve global find-first adjacency and original record identity while
+    // restricting each report's history searches to its own task.
+    if (!timelineBySequence.has(entry.sequence)) timelineBySequence.set(entry.sequence, entry);
+    if (!coordinationReturns.has(entry.itemId)) continue;
+    const history = coordinationTimelineByItem.get(entry.itemId) ?? [];
+    history.push(entry);
+    coordinationTimelineByItem.set(entry.itemId, history);
+  }
   for (let index = timeline.length - 1; index >= 0 && latestTimelineByItem.size < deliveryFailureIds.size; index--) {
     const entry = timeline[index];
     if (deliveryFailureIds.has(entry.itemId) && !latestTimelineByItem.has(entry.itemId)) {
@@ -433,6 +446,13 @@ export function projectWorkLedgerGraphView(state, options) {
       dispatchFailure = unstartedConflictDispatchFailure(failedItem, outboxes) ?? unstartedDeliveryContractFailure(failedItem, outboxes) ??
         unstartedCodePolicyBindingFailure(failedItem, outboxes);
     }
+    const coordinationRootTaskId = coordinationReturns.get(task.taskId);
+    const coordinationReturn = coordinationRootTaskId === undefined ? null : {
+      kind: 'parent_coordination', rootTaskId: coordinationRootTaskId,
+      handoff: currentCoordinationReturnReport(state, Object.fromEntries(item), {
+        outboxes: outboxesByItemId.get(task.taskId) ?? [], timeline: coordinationTimelineByItem.get(task.taskId) ?? [], timelineBySequence,
+      }),
+    };
     return {
       taskId: task.taskId,
       taskRevision: task.revision,
@@ -445,6 +465,7 @@ export function projectWorkLedgerGraphView(state, options) {
       ...(deliveryFailure === null ? {} : { deliveryFailure }),
       ...(decisionFailures.has(task.taskId) ? { decisionFailure: decisionFailures.get(task.taskId) } : {}),
       ...(proposalFailures.has(task.taskId) ? { proposalFailure: proposalFailures.get(task.taskId) } : {}),
+      ...(coordinationReturn === null ? {} : { coordinationReturn }),
       updatedAt: item.get("updatedAt"),
       work: projectedItemWork(item),
     };

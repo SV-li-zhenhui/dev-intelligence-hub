@@ -16,6 +16,7 @@ import {
   boundedLedgerString,
   workLedgerError,
 } from "./work-ledger-values.js";
+import { isParentCoordinationReturn } from './work-ledger-graph-responsibility.js';
 import {
   assertWorkLedgerGraphClaimable,
   assertWorkLedgerGraphCompletable,
@@ -134,6 +135,9 @@ export function planWorkItemClaim({ state, input, clock, newLeaseId }) {
       "工作项当前不可领取",
       409,
     );
+  }
+  if (isParentCoordinationReturn(item)) {
+    throw workLedgerError('WORK_LEDGER_GRAPH_BLOCKED', '专职子任务已交回父任务编排，当前不可独立领取', 409);
   }
   assertWorkLedgerGraphClaimable(state, itemId);
   const leaseId = newLeaseId();

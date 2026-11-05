@@ -42,6 +42,7 @@ const MAX_ROOT_DELIVERY_PAYLOADS = 1;
 const MAX_SPECIALIST_REJECTION_REASON_BYTES = 4 * 1024;
 const MAX_SPECIALIST_REJECTION_EVIDENCE = 8;
 const MAX_ROOT_CHILD_DESCRIPTION_BYTES = 512;
+const MAX_ROOT_RETURNED_TASKS = 4;
 const ORCHESTRATOR_ROLE_ID = "orchestrator";
 const INVALID_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
@@ -510,6 +511,31 @@ function normalizeDispatchFailure(value, task) {
     compatibleEvidenceKinds: kinds, expectedDeliverables: expected };
 }
 
+function normalizeCoordinationReturn(value, taskId, tasksById) {
+  if (value == null) return null;
+  const fields = exactData(value, ['kind', 'rootTaskId', 'handoff'], 'coordination return');
+  const rootTaskId = identifier(fields.get('rootTaskId'), 'coordination return root');
+  let task = tasksById.get(taskId);
+  if (!task || fields.get('kind') !== 'parent_coordination' || task.parentTaskId === null ||
+      task?.responsibility.type !== 'role' || task.responsibility.id !== 'orchestrator') throw invalid('coordination return task is invalid');
+  while (task?.parentTaskId != null) task = tasksById.get(task.parentTaskId);
+  if (task?.taskId !== rootTaskId || task.responsibility.type !== 'role' ||
+      task.responsibility.id !== 'orchestrator') throw invalid('coordination return root is invalid');
+  let handoff = null;
+  if (fields.get('handoff') !== null) {
+    const report = exactData(fields.get('handoff'), ['brief', 'reason', 'evidence', 'evidenceAuthority'], 'coordination return report');
+    if (report.get('evidenceAuthority') !== 'specialist_report') throw invalid('coordination return report authority is invalid');
+    handoff = {
+      brief: text(report.get('brief'), 'coordination return brief', 4096),
+      reason: text(report.get('reason'), 'coordination return reason', 4096),
+      evidence: denseArray(report.get('evidence'), 'coordination return evidence', 20)
+        .map(entry => text(entry, 'coordination return evidence entry', 2048)),
+      evidenceAuthority: 'specialist_report',
+    };
+  }
+  return { kind: 'parent_coordination', rootTaskId, handoff };
+}
+
 function normalizeSnapshot(value) {
   const snapshot = exactData(
     value,
@@ -575,6 +601,7 @@ function normalizeSnapshot(value) {
       deliveryFailure,
       decisionFailure,
       proposalFailure,
+      coordinationReturn: normalizeCoordinationReturn(fields.get('coordinationReturn'), taskId, tasksById),
       work: {
         title: nullableText(work.get("title"), "work.title", 256),
         description: nullableText(
@@ -928,6 +955,42 @@ function projectRootCoordination(roleId, currentTask, snapshot) {
   );
   const childIds = new Set(children.map(({ taskId }) => taskId));
   const deliveryPayloads = [];
+  let shownReturnReports = 0;
+  let shownReturnedTasks = 0;
+  const returnsByAncestor = new Map();
+  let returnReportCount = 0;
+  for (const task of snapshot.tasksById.values()) {
+    const returned = snapshot.statesById.get(task.taskId)?.coordinationReturn;
+    if (returned?.rootTaskId !== currentTask.taskId) continue;
+    if (returned.handoff) returnReportCount++;
+    if (childIds.has(task.taskId)) continue;
+    let ancestor = task;
+    while (ancestor && !childIds.has(ancestor.taskId)) ancestor = snapshot.tasksById.get(ancestor.parentTaskId);
+    if (!ancestor) continue;
+    const siblings = returnsByAncestor.get(ancestor.taskId) ?? [];
+    siblings.push(task);
+    returnsByAncestor.set(ancestor.taskId, siblings);
+  }
+  const projectReturn = returned => {
+    const report = returned.handoff;
+    // Share the ordinary root payload budget across direct and nested returns.
+    const showReport = report != null && shownReturnReports++ === 0;
+    return {
+      kind: returned.kind, rootTaskId: returned.rootTaskId, hasHandoffReport: report != null,
+      ...(showReport ? { handoff: {
+        brief: truncateUtf8(report.brief, MAX_ROOT_CHILD_DESCRIPTION_BYTES),
+        briefTruncated: Buffer.byteLength(report.brief, 'utf8') > MAX_ROOT_CHILD_DESCRIPTION_BYTES,
+        reason: truncateUtf8(report.reason, MAX_ROOT_CHILD_DESCRIPTION_BYTES),
+        reasonTruncated: Buffer.byteLength(report.reason, 'utf8') > MAX_ROOT_CHILD_DESCRIPTION_BYTES,
+        evidence: report.evidence.slice(0, MAX_SPECIALIST_REJECTION_EVIDENCE)
+          .map(entry => truncateUtf8(entry, MAX_ROOT_CHILD_DESCRIPTION_BYTES)),
+        evidenceTruncated: report.evidence.slice(0, MAX_SPECIALIST_REJECTION_EVIDENCE)
+          .some(entry => Buffer.byteLength(entry, 'utf8') > MAX_ROOT_CHILD_DESCRIPTION_BYTES),
+        hasMoreEvidence: report.evidence.length > MAX_SPECIALIST_REJECTION_EVIDENCE,
+        evidenceAuthority: 'specialist_report',
+      } } : {}),
+    };
+  };
   const directChildren = children.map((child) => {
     const taskState = snapshot.statesById.get(child.taskId);
     if (!taskState || taskState.taskRevision !== child.revision) {
@@ -945,6 +1008,17 @@ function projectRootCoordination(roleId, currentTask, snapshot) {
       0,
       MAX_ROOT_DELIVERABLE_SLOTS,
     );
+    const returned = taskState.coordinationReturn;
+    const descendants = (returnsByAncestor.get(child.taskId) ?? []).sort((left, right) => compareText(left.taskId, right.taskId));
+    const descendantReturns = descendants.slice(0, Math.max(0, MAX_ROOT_RETURNED_TASKS - shownReturnedTasks)).map(task => {
+      shownReturnedTasks++;
+      const state = snapshot.statesById.get(task.taskId), contract = projectChildDeliveries(task);
+      return { taskId: task.taskId, taskRevision: task.revision, parentTaskId: task.parentTaskId,
+        ledgerStatus: state.ledgerStatus, contractRevision: contract.contractRevision,
+        deliverableCount: contract.slots.length, hasMoreDeliverables: contract.slots.length > MAX_ROOT_DELIVERABLE_SLOTS,
+        deliverables: contract.slots.slice(0, MAX_ROOT_DELIVERABLE_SLOTS),
+        coordinationReturn: projectReturn(state.coordinationReturn) };
+    });
     return {
       taskId: child.taskId,
       taskRevision: child.revision,
@@ -955,6 +1029,10 @@ function projectRootCoordination(roleId, currentTask, snapshot) {
       ...(taskState.deliveryFailure === null ? {} : { deliveryFailure: { ...taskState.deliveryFailure } }),
       ...(taskState.decisionFailure === null ? {} : { decisionFailure: { ...taskState.decisionFailure } }),
       ...(taskState.proposalFailure === null ? {} : { proposalFailure: { ...taskState.proposalFailure } }),
+      ...(returned === null ? {} : { coordinationReturn: projectReturn(returned) }),
+      ...(descendants.length === 0 ? {} : { descendantCoordinationReturns: {
+        count: descendants.length, tasks: descendantReturns, hasMore: descendants.length > descendantReturns.length,
+      } }),
       responsibility: { ...child.responsibility },
       work: {
         title: taskState.work.title,
@@ -1006,6 +1084,9 @@ function projectRootCoordination(roleId, currentTask, snapshot) {
         shownCount: selectedPayloads.length,
         hasMore: sortedPayloads.length > selectedPayloads.length,
       },
+      ...(returnReportCount === 0 ? {} : { returnReportWindow: {
+        pendingCount: returnReportCount, shownCount: Math.min(shownReturnReports, 1), hasMore: returnReportCount > Math.min(shownReturnReports, 1),
+      } }),
     },
     requirements,
     code,

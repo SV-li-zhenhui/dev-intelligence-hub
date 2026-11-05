@@ -1,4 +1,6 @@
 import { normalizeWorkDecision } from "../domain/work-intent.js";
+import { isParentCoordinationReturn } from './work-ledger-graph-responsibility.js';
+import { indexWorkLedgerGraphProgress } from './work-ledger-graph-progress.js';
 import { isDeepStrictEqual } from "node:util";
 import { permitsReviewPublicationSettlementIntent } from "./review-publication-settlement.js";
 import { samePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
@@ -476,15 +478,13 @@ function isConfiguredRootItem(item, resolution) {
   );
 }
 
-function blockedRootSweepFingerprint(item, allItems) {
+function blockedRootSweepFingerprint(item, progress) {
   // Child delivery or contract changes need not revise the root. Include only
   // its related items so another role's unrelated writes cannot restart the sweep.
-  const current = allItems.find(({ itemId }) => itemId === item.itemId);
+  const current = progress.byId.get(item.itemId);
   if (current?.revision !== item.revision) return null;
   const dependencies = new Set(item.graph?.dependsOnItemIds ?? []);
-  const related = allItems.filter((candidate) =>
-    candidate.graph?.parentItemId === item.itemId || dependencies.has(candidate.itemId)
-  );
+  const related = progress.relatedItems(item);
   if ([...dependencies].some((itemId) => !related.some((candidate) => candidate.itemId === itemId)) ||
       related.some((candidate) => !Number.isSafeInteger(candidate.revision))) return null;
   return JSON.stringify([item.revision, related
@@ -1033,6 +1033,7 @@ export class ProactiveWorkLoop {
     const blockedRootSweep = this.blockedRootSweeps.get(scope) ?? new Map();
     this.blockedRootSweeps.set(scope, blockedRootSweep);
     let relatedItems;
+    let relatedProgress;
     const sweepFingerprint = async (item) => {
       if (relatedItems === undefined) {
         try {
@@ -1044,7 +1045,9 @@ export class ProactiveWorkLoop {
           relatedItems = null;
         }
       }
-      return relatedItems === null ? null : blockedRootSweepFingerprint(item, relatedItems);
+      if (relatedItems === null) return null;
+      relatedProgress ??= indexWorkLedgerGraphProgress(relatedItems);
+      return blockedRootSweepFingerprint(item, relatedProgress);
     };
     for (const [itemId, visited] of blockedRootSweep) {
       if (options.continuationTarget !== null && itemId !== options.continuationTarget.itemId) continue;
@@ -2638,6 +2641,7 @@ export class ProactiveWorkLoop {
       const allItems = await this.#listAllItems(options.signal);
       const items = allItems.filter((item) =>
         isAvailable(item, at) &&
+        !isParentCoordinationReturn(item) &&
         (
           roleId === null ||
           (

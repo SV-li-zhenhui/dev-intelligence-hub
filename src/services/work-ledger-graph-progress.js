@@ -1,6 +1,7 @@
 import { ledgerDigest } from './work-ledger-values.js';
 import { isDeepStrictEqual } from 'node:util';
 import { currentWorkItemExecutionBinding, verifyPullRequestExecutionBinding } from './work-ledger-pr-source.js';
+import { isParentCoordinationReturn } from './work-ledger-graph-responsibility.js';
 
 // A retained failure makes coordination ready; it never grants a child retry.
 export function recordedFailureParentIds(state, failures) {
@@ -33,6 +34,30 @@ export function indexWorkLedgerGraphProgress(items) {
     children.push(item);
     childrenByParent.set(parentId, children);
   }
+  // Nested handbacks can change without revising a direct ancestor. Observe
+  // only those returns within their structural root, independently of the
+  // source/idle proof that decides whether coordination may run.
+  const nestedReturnsByRoot = new Map();
+  for (const item of items) {
+    if (!isParentCoordinationReturn(item)) continue;
+    let root = byId.get(item.graph.parentItemId);
+    const seen = new Set([item.itemId]);
+    while (root?.graph?.parentItemId != null && !seen.has(root.itemId)) {
+      seen.add(root.itemId);
+      root = byId.get(root.graph.parentItemId);
+    }
+    if (!root || seen.has(root.itemId) || root.graph?.parentItemId !== null ||
+        root.itemId === item.graph.parentItemId || root.currentTarget?.type !== 'role' ||
+        root.currentTarget.id !== 'orchestrator') continue;
+    const returned = nestedReturnsByRoot.get(root.itemId) ?? [];
+    returned.push(item);
+    nestedReturnsByRoot.set(root.itemId, returned);
+  }
+  const relatedItems = item => {
+    const ids = new Set([...(childrenByParent.get(item.itemId) ?? []).map(child => child.itemId),
+      ...(item.graph?.dependsOnItemIds ?? []), ...(nestedReturnsByRoot.get(item.itemId) ?? []).map(child => child.itemId)]);
+    return [...ids].map(id => byId.get(id)).filter(Boolean);
+  };
   const summarize = id => {
     const item = byId.get(id);
     return { itemId: id, revision: item?.revision ?? null, status: item?.status ?? null };
@@ -40,14 +65,18 @@ export function indexWorkLedgerGraphProgress(items) {
   const graphProgressDigest = item => {
     const children = childrenByParent.get(item.itemId) ?? [];
     const dependencies = item.graph?.dependsOnItemIds ?? [];
+    const nestedReturns = nestedReturnsByRoot.get(item.itemId) ?? [];
     if (children.length === 0 && dependencies.length === 0) return null;
     return ledgerDigest({ domain: 'work-ledger-related-progress/v1', itemId: item.itemId,
       children: children.map(child => child.itemId).sort().map(summarize),
-      dependencies: [...dependencies].sort().map(summarize) }, {
+      dependencies: [...dependencies].sort().map(summarize),
+      // Leave the existing digest exactly intact for roots without newly
+      // relevant nested returns; unrelated work cannot reset their budgets.
+      ...(nestedReturns.length === 0 ? {} : { coordinationReturns: nestedReturns.map(child => child.itemId).sort().map(summarize) }) }, {
       // This trusted projection has five container/scalar entries plus four per
       // related task. Keep its budget bounded by the already-validated ledger.
-      maximumEntries: 5 + 4 * (children.length + dependencies.length),
+      maximumEntries: 5 + 4 * (children.length + dependencies.length) + (nestedReturns.length === 0 ? 0 : 1 + 4 * nestedReturns.length),
     });
   };
-  return { byId, childrenByParent, graphProgressDigest };
+  return { byId, childrenByParent, graphProgressDigest, relatedItems };
 }

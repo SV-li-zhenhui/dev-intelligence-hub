@@ -7,6 +7,7 @@ import { indexRecordedDecisionFailures } from './work-ledger-decision-failure.js
 import { indexRecordedProposalFailures } from './work-ledger-proposal-failure.js';
 import { indexUnstartedCodeDispatchFailures } from './work-ledger-delivery-failure.js';
 import { recordedFailureParentIds } from './work-ledger-graph-progress.js';
+import { isParentCoordinationReturn, indexParentCoordinationReturns } from './work-ledger-graph-responsibility.js';
 import { ciMaterialRecoveryCandidate, ciMaterialRetirement, planCiMaterialRecovery } from "./work-ledger-ci-material-recovery.js";
 import { hostContextRecoveryCandidate, planHostContextRecovery, hostContextRetirement, hasPendingHostContextRecovery } from "./work-ledger-host-context-recovery.js";
 import { automaticRoleHandoffCandidate } from "./work-ledger-role-handoff.js";
@@ -489,6 +490,7 @@ function queryClaimCandidatePage(records, options = {}) {
   const start = queryPageStart(records, "itemId", boundary.cursor);
   const selected = records.slice(start).filter((item) =>
     isClaimCandidateAt(item, at) &&
+    !isParentCoordinationReturn(item) &&
     (
       roleId === undefined ||
       (
@@ -892,8 +894,10 @@ export class WorkLedgerService {
     const failures = new Map([...indexRecordedDecisionFailures(this.state), ...indexUnstartedCodeDispatchFailures(this.state),
       ...indexRecordedProposalFailures(this.state)]);
     const failedChildParents = recordedFailureParentIds(this.state, failures);
+    const coordinationParents = new Set(indexParentCoordinationReturns(this.state).values());
     page.items.forEach((item, index) => {
-      if (hasPendingHostContextRecovery(this.state, item) || failedChildParents.has(item.itemId)) page.facts[index].orchestrationReady = true;
+      if (hasPendingHostContextRecovery(this.state, item) || failedChildParents.has(item.itemId) ||
+          coordinationParents.has(item.itemId)) page.facts[index].orchestrationReady = true;
     });
     return page;
   }

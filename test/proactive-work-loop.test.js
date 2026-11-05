@@ -4667,6 +4667,46 @@ test("changed root or hidden child revisions interrupt a partial blocked-root sw
   }
 });
 
+test('a second nested coordination return interrupts its partial blocked-root sweep without unrelated wakeups', async () => {
+  const { loop, ledger, roots, children, decisions } = await blockedRootSweepLoop();
+  const nested = [];
+  for (let index = 0; index < 2; index++) {
+    const parent = await ledger.readItemForReconciliation({ itemId: children[0].itemId });
+    const created = await ledger.createGraphChild({
+      authority: { actorId: 'employee-orchestrator', scopeRootTaskId: roots[0].itemId },
+      command: { parentTaskId: parent.itemId, childKey: `nested-return-${index}`,
+        work: { title: 'Nested specialist work', description: 'Retain its specialist contract' },
+        target: { type: 'role', id: 'developer' }, dependsOnTaskIds: [],
+        acceptanceContract: { revision: 1, acceptanceCriteria: [], expectedDeliverables: [] }, leaseId: null,
+        expectedGraphRevision: (await ledger.getSummary()).revision,
+        expectedTaskRevisions: [{ taskId: parent.itemId, revision: parent.revision }] },
+    });
+    nested.push(created.taskId);
+  }
+  const handback = async itemId => {
+    const item = await ledger.readItemForReconciliation({ itemId });
+    const claim = await ledger.claim({ itemId, expectedRevision: item.revision, workerId: 'employee-developer', leaseDurationMs: 30000 });
+    await ledger.handoff({ itemId, expectedRevision: claim.revision, leaseId: claim.leaseId, actorId: 'employee-developer',
+      target: { type: 'role', id: 'orchestrator' }, reason: 'Nested handback' });
+  };
+  await handback(nested[0]);
+  await loop.runCycle({ roleId: 'orchestrator', workLimit: 1 });
+  const before = (await ledger.readItemProgress([roots[0].itemId]))[0].graphProgressDigest;
+  const normal = await ledger.readItemForReconciliation({ itemId: nested[1] });
+  await ledger.reviseGraphAcceptance({ authority: { actorId: 'employee-orchestrator', scopeRootTaskId: roots[0].itemId },
+    command: { taskId: normal.itemId, expectedTaskRevision: normal.revision, expectedGraphRevision: (await ledger.getSummary()).revision,
+      reason: 'Ordinary nested specialist progress', acceptanceContract: { revision: 2, expectedDeliverables: [],
+        acceptanceCriteria: [{ criterionId: 'normal', description: 'Normal specialist revision' }] } } });
+  assert.equal((await ledger.readItemProgress([roots[0].itemId]))[0].graphProgressDigest, before,
+    'ordinary nested work is outside the new coordination-return observation');
+  await loop.runCycle({ roleId: 'orchestrator', workLimit: 1 });
+  assert.deepEqual(decisions, [roots[0].itemId, roots[1].itemId]);
+  await handback(nested[1]);
+  await loop.runCycle({ roleId: 'orchestrator', workLimit: 1 });
+  assert.deepEqual(decisions, [roots[0].itemId, roots[1].itemId, roots[0].itemId],
+    'related nested handback invalidates the cached root observation');
+});
+
 test("fresh urgent owner work and productive orchestration remain eligible during blocked-root sweeps", async (t) => {
   await t.test("new urgent request", async () => {
     const { loop, ledger, roots, records, decisions } = await blockedRootSweepLoop();

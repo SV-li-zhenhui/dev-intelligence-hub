@@ -12,6 +12,301 @@ import { EventEmitter } from "node:events";
 import test from "node:test";
 import { automaticRoleHandoffCandidate } from "../src/services/work-ledger-role-handoff.js";
 import { indexWorkLedgerGraphProgress, recordedFailureParentIds } from "../src/services/work-ledger-graph-progress.js";
+import { indexParentCoordinationReturns } from '../src/services/work-ledger-graph-responsibility.js';
+import { currentPrRoleHandoffProof } from '../src/services/work-ledger-role-handoff-evidence.js';
+import { OrchestratorService } from '../src/services/orchestrator-service.js';
+import { WorkGraphStore } from '../src/services/work-graph-store.js';
+import { projectWorkLedgerGraphView } from '../src/services/work-ledger-graph.js';
+
+async function parentCoordinationLedgerFixture({ binding = 'v2', direct = false, returned = true } = {}) {
+  const record = binding === 'generic' ? issueAssignment(1) : binding === 'v1' ? prAssignment(1) : ownerRequestedPrAssignment(1);
+  record.assignment.target = { type: 'role', id: 'orchestrator' };
+  const f = await createFixture({ records: [record] });
+  await f.service.intake();
+  f.read = async id => (await f.service.listItems({ limit: 100 })).items.find(item => item.itemId === id);
+  const root = (await f.service.listItems()).items[0];
+  const input = prGraphChildCommand(root, (await f.service.getSummary()).revision, 'retained-contract');
+  input.command.acceptanceContract.expectedDeliverables = [{ deliverableId: 'package', kind: 'change-package',
+    description: 'Retained specialist package', required: true }];
+  const created = await f.service.createGraphChild(input);
+  let child = await f.read(created.taskId);
+  if (!returned) { f.root = await f.read(root.itemId); f.child = child; return f; }
+  child = await f.service.claim({ itemId: child.itemId, expectedRevision: child.revision,
+    workerId: 'employee-developer', leaseDurationMs: 30000 });
+  if (direct) {
+    await f.service.handoff({ itemId: child.itemId, expectedRevision: child.revision, leaseId: child.leaseId,
+      actorId: 'employee-developer', target: { type: 'role', id: 'orchestrator' }, reason: 'Coordinate contract' });
+  } else {
+    await f.service.stageIntent({ itemId: child.itemId, expectedRevision: child.revision, leaseId: child.leaseId,
+      actorId: 'employee-developer', roleId: 'developer', intent: handoffIntent({ capability: 'coordination',
+        brief: 'Review the retained specialist contract', reason: 'Coordinate contract' }) });
+    const dispatcher = new WorkIntentDispatcher({ ledger: f.service, clock: f.time.clock,
+      policy: createWorkIntentPolicy({ capabilityRoles: { coordination: 'orchestrator' } }),
+      attentionProducer: { async create() { assert.fail('No attention request'); } },
+      proposalProducer: { async create() { assert.fail('No proposal'); } } });
+    assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  }
+  f.root = await f.read(root.itemId); f.child = await f.read(child.itemId);
+  return f;
+}
+
+for (const binding of ['generic', 'v1', 'v2']) for (const direct of [false, true]) {
+  test(`parent coordination return preserves ${binding} ${direct ? 'direct ledger' : 'dispatched'} handback after restart`, async () => {
+    const f = await parentCoordinationLedgerFixture({ binding, direct });
+    const restarted = await createFixture({ source: f.source, store: f.store, time: f.time });
+    const before = f.store.stored();
+    const page = await restarted.service.listClaimCandidates({ at: f.time.clock(), roleId: 'orchestrator', limit: 1 });
+    assert.deepEqual(page.items.map(item => item.itemId), [f.root.itemId]);
+    assert.equal(page.nextCursor, null); assert.equal(page.facts[0].orchestrationReady, true);
+    assert.deepEqual((await restarted.service.listClaimCandidates({ at: f.time.clock(), roleId: 'developer' })).items, []);
+    const state = (await restarted.service.getGraphSnapshot()).taskStates.find(entry => entry.taskId === f.child.itemId);
+    assert.equal(state.coordinationReturn.rootTaskId, f.root.itemId);
+    assert.equal(state.coordinationReturn.handoff?.brief ?? null, direct ? null : 'Review the retained specialist contract');
+    const proof = currentPrRoleHandoffProof(before, f.child, { fromRoleId: 'developer', targetRoleId: 'orchestrator', capability: 'coordination' });
+    assert.equal(proof !== null, binding === 'v2' && !direct, 'PR authority proof retains its existing schema restriction');
+    await assert.rejects(restarted.service.claim({ itemId: f.child.itemId, expectedRevision: f.child.revision,
+      workerId: 'employee-orchestrator', leaseDurationMs: 30000 }), { code: 'WORK_LEDGER_GRAPH_BLOCKED' });
+    assert.deepEqual(f.store.stored(), before, 'discovery, restart and refused claims preserve all history');
+  });
+}
+
+test('parent coordination return filters before every role page while normal specialist work remains claimable', async () => {
+  const f = await parentCoordinationLedgerFixture();
+  for (let index = 0; index < 3; index++) {
+    const parent = await f.read(f.root.itemId);
+    await f.service.createGraphChild(prGraphChildCommand(parent, (await f.service.getSummary()).revision, `normal-${index}`));
+  }
+  let cursor = null; const ids = [];
+  do {
+    const page = await f.service.listClaimCandidates({ at: f.time.clock(), limit: 1, ...(cursor === null ? {} : { cursor }) });
+    assert.equal(page.items.length, 1); assert.deepEqual(page.facts.map(row => row.itemId), page.items.map(row => row.itemId));
+    ids.push(page.items[0].itemId); cursor = page.nextCursor;
+  } while (cursor !== null);
+  assert.equal(ids.length, 4); assert(!ids.includes(f.child.itemId));
+  const developer = await f.service.listClaimCandidates({ at: f.time.clock(), limit: 1, roleId: 'developer' });
+  const claimed = await f.service.claim({ itemId: developer.items[0].itemId, expectedRevision: developer.items[0].revision,
+    workerId: 'employee-developer', leaseDurationMs: 30000 });
+  assert.equal(claimed.attempt, 1);
+});
+
+test('parent coordination return readiness preserves paused, active, unknown, submitted and stale boundaries', async () => {
+  const f = await parentCoordinationLedgerFixture(), base = f.store.stored();
+  const mutate = (which, update) => { const state = clone(base); update(state.items.find(item => item.itemId === f[which].itemId), state); return state; };
+  const cases = [
+    mutate('root', item => { item.status = 'paused'; }),
+    mutate('child', item => { item.status = 'paused'; }),
+    mutate('root', item => { item.status = 'blocked'; }),
+    mutate('child', item => { item.status = 'working'; item.ownerId = 'employee-orchestrator'; item.leaseId = 'active'; item.leaseUntil = '2026-08-03T00:00:00.000Z'; }),
+    mutate('child', item => { item.status = 'waiting_external'; item.activeIntentId = 'retained-active-effect'; }),
+    mutate('child', item => { item.decisionContext = { outcome: 'unknown' }; }),
+    mutate('child', item => { item.graph.deliveries.push({ deliverableId: 'package', revision: 1, status: 'submitted' }); }),
+    mutate('child', item => { item.assignment.graphTask.sourceBinding.rootItemId = 'wrong-root'; }),
+    mutate('child', item => { item.assignment.graphTask.sourceBinding.headRefOid = PR_HEAD_B; }),
+    mutate('root', item => { item.source.pendingRevision = item.source.activeRevision + 1; }),
+    mutate('child', (_item, state) => { state.outbox.push({ itemId: f.child.itemId, status: 'unknown' }); }),
+  ];
+  for (const state of cases) assert.equal(indexParentCoordinationReturns(state).size, 0);
+  const blocked = mutate('child', item => { item.status = 'blocked'; item.statusReason = 'decision_attempts_exhausted'; });
+  assert.equal(indexParentCoordinationReturns(blocked).get(f.child.itemId), f.root.itemId,
+    'safe blocked handbacks still need their existing root coordination');
+  assert.deepEqual(f.store.stored(), base);
+});
+
+test('parent coordination return exposes persisted blocked handback without inventing failure proof', async () => {
+  const f = await parentCoordinationLedgerFixture();
+  const child = await f.service.transition({ itemId: f.child.itemId, expectedRevision: f.child.revision,
+    leaseId: null, actorId: 'employee-orchestrator', toStatus: 'blocked', reason: 'historical_coordination_failure' });
+  const before = f.store.stored(), restarted = await createFixture({ store: f.store, source: f.source, time: f.time });
+  const facts = await restarted.service.listClaimCandidates({ at: f.time.clock(), roleId: 'orchestrator' });
+  assert.equal(facts.facts[0].orchestrationReady, true);
+  const visible = (await restarted.service.getGraphSnapshot()).taskStates.find(state => state.taskId === child.itemId);
+  assert.equal(visible.ledgerStatus, 'blocked');
+  assert.equal(visible.coordinationReturn.handoff.brief, 'Review the retained specialist contract');
+  assert.equal(visible.decisionFailure, undefined);
+  assert.equal(child.attempt, f.child.attempt);
+  assert.deepEqual(f.store.stored(), before);
+});
+
+test('parent coordination return separates ownership from forged or mismatched report content', async () => {
+  const f = await parentCoordinationLedgerFixture();
+  for (const field of ['brief', 'reason', 'evidence', 'source', 'target', 'timeline', 'missing-outbox']) {
+    const state = f.store.stored(), box = state.outbox.find(entry => entry.itemId === f.child.itemId);
+    if (field === 'brief') box.intent.brief = 'Forged model report';
+    if (field === 'reason') box.intent.reason = 'Forged reason';
+    if (field === 'evidence') box.intent.evidence = ['forged:artifact'];
+    if (field === 'source') box.sourceBinding.headRefOid = PR_HEAD_B;
+    if (field === 'target') box.dispatchBinding.boundIntent.binding.targetRoleId = 'developer';
+    if (field === 'timeline') state.timeline = state.timeline.filter(entry => entry.type !== 'handed_off');
+    if (field === 'missing-outbox') state.outbox = [];
+    const view = projectWorkLedgerGraphView(state);
+    const returned = view.taskStates.find(row => row.taskId === f.child.itemId).coordinationReturn;
+    assert.equal(returned.rootTaskId, f.root.itemId);
+    assert.equal(returned.handoff, null, field);
+    assert.equal(indexParentCoordinationReturns(state).get(f.child.itemId), f.root.itemId,
+      'report content cannot add or remove structural graph ownership');
+  }
+});
+
+test('parent coordination return authenticates the actual specialist role after an existing reassignment', async () => {
+  const f = await parentCoordinationLedgerFixture({ binding: 'generic', returned: false });
+  const moved = await f.service.reassignGraphTask({ authority: { actorId: 'employee-orchestrator', scopeRootTaskId: f.root.itemId },
+    command: { taskId: f.child.itemId, expectedTaskRevision: f.child.revision,
+      expectedGraphRevision: (await f.service.getSummary()).revision, target: { type: 'role', id: 'tester' }, reason: 'Existing scoped reassignment' } });
+  const claimed = await f.service.claim({ itemId: moved.itemId, expectedRevision: moved.revision, workerId: 'employee-tester', leaseDurationMs: 30000 });
+  await f.service.stageIntent({ itemId: claimed.itemId, expectedRevision: claimed.revision, leaseId: claimed.leaseId,
+    actorId: 'employee-tester', roleId: 'tester', intent: handoffIntent({ capability: 'coordination', brief: 'Tester returns the retained contract' }) });
+  const dispatcher = new WorkIntentDispatcher({ ledger: f.service, clock: f.time.clock,
+    policy: createWorkIntentPolicy({ capabilityRoles: { coordination: 'orchestrator' } }),
+    attentionProducer: { async create() { assert.fail('No attention'); } }, proposalProducer: { async create() { assert.fail('No proposal'); } } });
+  assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  const item = await f.read(moved.itemId);
+  assert.equal(item.assignment.target.id, 'developer');
+  const returned = (await f.service.getGraphSnapshot()).taskStates.find(row => row.taskId === item.itemId).coordinationReturn;
+  assert.equal(returned.handoff.brief, 'Tester returns the retained contract');
+});
+
+test('parent coordination return folds actual nested handback under its visible ancestor and preserves scope gates', async () => {
+  const f = await parentCoordinationLedgerFixture({ binding: 'generic', returned: false });
+  const graph = new WorkGraphStore({ ledger: f.service }), reader = graph.reader();
+  const nestedInput = prGraphChildCommand(f.child, (await f.service.getSummary()).revision, 'nested-return');
+  nestedInput.authority.scopeRootTaskId = f.root.itemId;
+  nestedInput.command.acceptanceContract.expectedDeliverables = [{ deliverableId: 'nested-package', kind: 'change-package', required: true, description: 'Nested retained contract' }];
+  const created = await f.service.createGraphChild(nestedInput);
+  let nested = await f.read(created.taskId);
+  nested = await f.service.claim({ itemId: nested.itemId, expectedRevision: nested.revision,
+    workerId: 'employee-developer', leaseDurationMs: 30000 });
+  nested = await f.service.handoff({ itemId: nested.itemId, expectedRevision: nested.revision, leaseId: nested.leaseId,
+    actorId: 'employee-developer', target: { type: 'role', id: 'orchestrator' }, reason: 'Nested coordination return' });
+  const page = await f.service.listClaimCandidates({ at: f.time.clock(), roleId: 'orchestrator' });
+  assert.deepEqual(page.items.map(item => item.itemId), [f.root.itemId]); assert.equal(page.facts[0].orchestrationReady, true);
+  const assembler = new RoleContextAssembler({ graphReader: reader });
+  const root = await f.read(f.root.itemId), packet = await assembler.assemble({ roleId: 'orchestrator', item: root, trigger: 'employee:orchestrator' });
+  const ancestor = packet.context.requirements.coordination.directChildren[0];
+  assert.equal(ancestor.taskId, f.child.itemId);
+  assert.equal(ancestor.descendantCoordinationReturns.count, 1);
+  assert.equal(ancestor.descendantCoordinationReturns.tasks[0].taskId, nested.itemId);
+  assert.equal(ancestor.descendantCoordinationReturns.tasks[0].deliverables[0].deliverableId, 'nested-package');
+  const host = new OrchestratorService({ contextAssembler: assembler, graphReader: reader,
+    scopedGraphPlannerFactory: { forRoot({ scopeRootTaskId }) { return graph.planner({ principalId: 'employee-orchestrator', scopeRootTaskId }); } },
+    graphDelivererFactory: { forClaim() { assert.fail('Root must not acquire child authority'); } } });
+  const makeIntent = task => ({ schemaVersion: 1, type: 'orchestrate', summary: 'Resolve nested return', reason: 'Resolve nested return',
+    action: { schemaVersion: 1, type: 'cancel', sourceTaskId: task.itemId, sourceTaskRevision: task.revision,
+      expectedGraphRevision: packet.binding.graphRevision, reason: 'Resolve nested return' } });
+  const before = f.store.stored();
+  await assert.rejects(host.execute({ worker: { roleId: 'orchestrator', workerId: 'employee-orchestrator' },
+    item: root, contextPacket: packet, intent: makeIntent(nested) }), { code: 'ORCHESTRATOR_AUTHORITY_DENIED' });
+  assert.deepEqual(f.store.stored(), before, 'nested metadata never grants direct grandchild authority');
+  const state = f.store.stored(), intermediate = state.items.find(item => item.itemId === f.child.itemId);
+  intermediate.status = 'working'; intermediate.ownerId = 'employee-developer'; intermediate.leaseId = 'active'; intermediate.leaseUntil = '2026-08-03T00:00:00.000Z';
+  assert.equal(indexParentCoordinationReturns(state).size, 0, 'an active historical ancestor cannot be bypassed');
+  const planner = graph.planner({ principalId: 'employee-orchestrator', scopeRootTaskId: root.itemId });
+  const parent = await f.read(f.child.itemId);
+  await planner.pauseTask({ taskId: parent.itemId, expectedTaskRevision: parent.revision,
+    expectedGraphRevision: (await reader.getSnapshot()).graph.revision, reason: 'Owner pauses intermediate' });
+  const paused = await f.service.listClaimCandidates({ at: f.time.clock(), roleId: 'orchestrator' });
+  assert.notEqual(paused.facts[0].orchestrationReady, true);
+  const pausedPacket = await assembler.assemble({ roleId: 'orchestrator', item: await f.read(root.itemId), trigger: 'employee:orchestrator' });
+  assert.equal(pausedPacket.context.requirements.coordination.directChildren[0].descendantCoordinationReturns, undefined);
+  const suspended = await f.read(parent.itemId);
+  await planner.resumeTask({ taskId: suspended.itemId, expectedTaskRevision: suspended.revision,
+    expectedGraphRevision: (await reader.getSnapshot()).graph.revision, reason: 'Owner resumes intermediate' });
+  const freshRoot = await f.read(root.itemId), freshPacket = await assembler.assemble({ roleId: 'orchestrator', item: freshRoot, trigger: 'employee:orchestrator' });
+  const visibleParent = await f.read(parent.itemId), intent = makeIntent(visibleParent);
+  intent.action.expectedGraphRevision = freshPacket.binding.graphRevision;
+  await host.execute({ worker: { roleId: 'orchestrator', workerId: 'employee-orchestrator' },
+    item: freshRoot, contextPacket: freshPacket, intent });
+  assert.equal((await f.read(nested.itemId)).status, 'cancelled');
+  assert.equal((await f.read(nested.itemId)).attempt, nested.attempt);
+});
+
+test('parent coordination return bounds nested contracts and shares one authenticated report payload', async () => {
+  const f = await parentCoordinationLedgerFixture({ binding: 'generic', returned: false });
+  const dispatcher = new WorkIntentDispatcher({ ledger: f.service, clock: f.time.clock,
+    policy: createWorkIntentPolicy({ capabilityRoles: { coordination: 'orchestrator' } }),
+    attentionProducer: { async create() { assert.fail('No attention'); } }, proposalProducer: { async create() { assert.fail('No proposal'); } } });
+  for (let index = 0; index < 6; index++) {
+    const parent = await f.read(f.child.itemId), input = prGraphChildCommand(parent, (await f.service.getSummary()).revision, `nested-${index}`);
+    input.authority.scopeRootTaskId = f.root.itemId;
+    input.command.acceptanceContract.expectedDeliverables = [{ deliverableId: 'retained-package', kind: 'change-package', required: true, description: 'Retained contract' }];
+    const created = await f.service.createGraphChild(input);
+    let child = await f.read(created.taskId);
+    child = await f.service.claim({ itemId: child.itemId, expectedRevision: child.revision, workerId: 'employee-developer', leaseDurationMs: 30000 });
+    await f.service.stageIntent({ itemId: child.itemId, expectedRevision: child.revision, leaseId: child.leaseId,
+      actorId: 'employee-developer', roleId: 'developer', intent: handoffIntent({ capability: 'coordination',
+        brief: '界'.repeat(1000), reason: 'r'.repeat(1500), evidence: Array.from({ length: 20 }, (_, n) => `${n}:` + 'e'.repeat(1000)) }) });
+    assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  }
+  const assembler = new RoleContextAssembler({ graphReader: { getSnapshot: () => f.service.getGraphSnapshot() } });
+  const packet = await assembler.assemble({ roleId: 'orchestrator', item: await f.read(f.root.itemId), trigger: 'employee:orchestrator' });
+  const coordination = packet.context.requirements.coordination;
+  const nested = coordination.directChildren[0].descendantCoordinationReturns;
+  assert.equal(nested.count, 6); assert.equal(nested.tasks.length, 4); assert.equal(nested.hasMore, true);
+  const reports = nested.tasks.flatMap(task => task.coordinationReturn.handoff ? [task.coordinationReturn.handoff] : []);
+  assert.equal(reports.length, 1);
+  assert(reports[0].briefTruncated); assert(reports[0].reasonTruncated); assert(reports[0].hasMoreEvidence);
+  assert(Buffer.byteLength(reports[0].brief, 'utf8') <= 512);
+  assert.equal(reports[0].evidence.length, 8);
+  assert(reports[0].evidence.every(entry => Buffer.byteLength(entry, 'utf8') <= 512));
+  assert.deepEqual(coordination.returnReportWindow, { pendingCount: 6, shownCount: 1, hasMore: true });
+  assert(Buffer.byteLength(JSON.stringify(packet), 'utf8') <= 128 * 1024);
+});
+
+test('parent coordination return rearms an already stalled root on a second nested handback', async () => {
+  const f = await parentCoordinationLedgerFixture({ binding: 'generic', returned: false }), nested = [];
+  for (let index = 0; index < 2; index++) {
+    const parent = await f.read(f.child.itemId);
+    const input = prGraphChildCommand(parent, (await f.service.getSummary()).revision, `nested-wake-${index}`);
+    input.authority.scopeRootTaskId = f.root.itemId;
+    nested.push((await f.service.createGraphChild(input)).taskId);
+  }
+  const handback = async id => {
+    const item = await f.read(id), claim = await f.service.claim({ itemId: id, expectedRevision: item.revision,
+      workerId: 'employee-developer', leaseDurationMs: 30000 });
+    await f.service.handoff({ itemId: id, expectedRevision: claim.revision, leaseId: claim.leaseId,
+      actorId: 'employee-developer', target: { type: 'role', id: 'orchestrator' }, reason: 'Actual nested return' });
+  };
+  await handback(nested[0]);
+  let persisted, calls = 0;
+  const options = { ledger: f.service, clock: f.time.clock,
+    store: { async read(_key, fallback) { return structuredClone(persisted ?? fallback); },
+      async write(_key, value) { persisted = structuredClone(value); } },
+    configurationReader: { async readActive() { return { configuration: { githubActions: { enabled: true, automaticOwnPrRepair: true } } }; } },
+    roleStateReader: { async read(id) { return { enabled: id === 'orchestrator', paused: false }; } } };
+  let scheduler = new WorkContinuationScheduler(options);
+  const run = async () => {
+    const operations = [];
+    const result = await scheduler.runCycle({ dispatch: async target => {
+      assert.equal(target.continuationTarget.itemId, f.root.itemId); calls++;
+      return { continuationOutcome: { ...target.continuationTarget, status: 'decision_deferred', code: 'PR_FACTS_STALE' } };
+    }, runOperation(operation) { const pending = operation(); operations.push(pending); return pending; } });
+    await Promise.all(operations); return result;
+  };
+  for (let index = 0; index < 3; index++) { await run(); f.time.advance(90000); }
+  assert.equal(calls, 3);
+  const record = persisted.records.find(row => row.itemId === f.root.itemId);
+  assert.equal(record.recovery.action, 'await_condition');
+  const previousCondition = record.condition.reference, fingerprint = record.fingerprint;
+  scheduler = new WorkContinuationScheduler(options);
+  await run(); assert.equal(calls, 3, 'restart alone preserves the stalled observation');
+  f.source.records.push(issueAssignment(2, { issueNumber: 43 })); f.source.highWatermark = 2;
+  await f.service.intake(); await run();
+  assert.equal(calls, 3, 'unrelated intake cannot rearm the root');
+  const before = (await f.service.readItemProgress([f.root.itemId]))[0].graphProgressDigest;
+  const rootRevision = (await f.read(f.root.itemId)).revision, ancestorRevision = (await f.read(f.child.itemId)).revision;
+  await handback(nested[1]);
+  assert.equal((await f.read(f.root.itemId)).revision, rootRevision);
+  assert.equal((await f.read(f.child.itemId)).revision, ancestorRevision);
+  const page = await f.service.listClaimCandidates({ at: f.time.clock(), roleId: 'orchestrator' });
+  assert.equal(page.facts[0].orchestrationReady, true);
+  assert(!page.items.some(item => nested.includes(item.itemId)));
+  assert.equal((await run()).started, 1);
+  assert.equal(calls, 4, 'the second actual nested handback rearms its existing root');
+  assert.notEqual((await f.service.readItemProgress([f.root.itemId]))[0].graphProgressDigest, before);
+  const nextRecord = persisted.records.find(row => row.itemId === f.root.itemId);
+  assert.equal(nextRecord.fingerprint, fingerprint, 'scheduling progress does not change execution input identity');
+  assert.notEqual(nextRecord.condition.reference, previousCondition);
+  await run(); assert.equal(calls, 4, 'unchanged nested returns retain ordinary backoff');
+});
 import { indexRecordedDecisionFailures, decisionFailureParentIds } from '../src/services/work-ledger-decision-failure.js';
 import { unstartedDeliveryContractFailure, unstartedCodePolicyBindingFailure, indexUnstartedCodeDispatchFailures } from "../src/services/work-ledger-delivery-failure.js";
 import { hostContextRecoveryCandidate, planHostContextRecovery, hasPendingHostContextRecovery } from "../src/services/work-ledger-host-context-recovery.js";

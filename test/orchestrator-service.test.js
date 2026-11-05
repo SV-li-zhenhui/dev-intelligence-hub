@@ -23,6 +23,7 @@ import { WorkGraphStore } from "../src/services/work-graph-store.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
 import { RoleDecisionEngine } from "../src/services/role-decision-engine.js";
 import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
+import { WorkIntentDispatcher } from "../src/services/work-intent-dispatcher.js";
 import { WorkContinuationScheduler } from "../src/services/work-continuation-scheduler.js";
 import { DeliveryEvidenceService } from "../src/services/delivery-evidence-service.js";
 import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
@@ -1441,7 +1442,8 @@ test("scoped rebase rejects changed inputs, forged digests and intent revisions"
 });
 
 async function refreshedPrDeliveryFixture({ workerId = "employee-pr-engineer", evidenceCatalog,
-  ciDiagnosticReader, checks = [], deliveryKind = "text-report", settlement = false } = {}) {
+  ciDiagnosticReader, checks = [], deliveryKind = "text-report", settlement = false,
+  nextAction = "rereview", roleId = "pr-engineer" } = {}) {
   const originalAt = "2026-10-15T18:23:34.401Z";
   const refreshedAt = "2026-10-15T18:39:53.208Z";
   const state = { observedAt: originalAt, factObservedAt: originalAt, facts: { checks }, mutatePacket: null };
@@ -1460,7 +1462,7 @@ async function refreshedPrDeliveryFixture({ workerId = "employee-pr-engineer", e
     schemaVersion: 1, eventType: "pull_request.owner_requested", occurredAt: originalAt,
     source: { provider: "local-owner", scopeId: "owner-request:12345678-1234-4123-8123-123456789abc" },
     subject: { id: "github:pr:acme/repo#42", repository: "acme/repo", number: 42 },
-    payload: { title: "Review current repair", workType: "general", nextAction: "rereview", state: "open",
+    payload: { title: "Review current repair", workType: "general", nextAction, state: "open",
       suggestedCapability: "pr-review", expectedHeadRefOid: gitTarget.headRefOid,
       headRefOid: gitTarget.headRefOid, gitTargetAvailable: true, gitTarget },
   });
@@ -1483,7 +1485,7 @@ async function refreshedPrDeliveryFixture({ workerId = "employee-pr-engineer", e
     const parent = (await ledger.listItems()).items.find(({ itemId }) => itemId === root.itemId);
     return planner.createChild({ parentTaskId: root.itemId, childKey,
       work: { title: childKey, description: "Assess every request against the pinned code" },
-      target: { type: "role", id: "pr-engineer" }, dependsOnTaskIds: [], leaseId: null,
+      target: { type: "role", id: roleId }, dependsOnTaskIds: [], leaseId: null,
       acceptanceContract: contract({ deliverableId: "rereview-report", kind: deliveryKind }),
       expectedGraphRevision: (await graphReader.getSnapshot()).graph.revision,
       expectedTaskRevisions: [{ taskId: parent.itemId, revision: parent.revision }] });
@@ -1511,7 +1513,7 @@ async function refreshedPrDeliveryFixture({ workerId = "employee-pr-engineer", e
       return projectPullRequestReadFactsContext(state.lastFacts);
     } },
   });
-  const original = await assembler.assemble({ roleId: "pr-engineer", item, trigger: "employee:pr-engineer" });
+  const original = await assembler.assemble({ roleId, item, trigger: `employee:${roleId}` });
   let deliveryCalls = 0;
   const service = new OrchestratorService({ graphReader, clock: () => "2026-10-15T18:34:00.000Z",
     contextAssembler: { async assemble(input) {
@@ -1529,9 +1531,9 @@ async function refreshedPrDeliveryFixture({ workerId = "employee-pr-engineer", e
     contractRevision: 1, deliverableId: "rereview-report", summary: "Review complete",
     reason: "All requests assessed", evidence: [], artifact: null };
   return { ledger, graph, graphReader, assembler, root, state, original, item, intent, createChild, refreshedAt,
-    writes: () => writes, deliveryCalls: () => deliveryCalls,
+    store, writes: () => writes, deliveryCalls: () => deliveryCalls,
     execute: (packet = original, claimed = item) => service.execute({
-      worker: { roleId: "pr-engineer", workerId },
+      worker: { roleId, workerId },
       item: claimed, contextPacket: packet, intent }),
   };
 }
@@ -3319,4 +3321,166 @@ test("rejects an explicit invalid action admission gate", () => {
     () => serviceFrom(fakes, undefined, null),
     /actionAdmissionGate is invalid/,
   );
+});
+
+
+async function coordinationReturnFixture({ direct = false, nextAction = "continue_draft" } = {}) {
+  const f = await refreshedPrDeliveryFixture({ workerId: "employee-developer", roleId: "developer",
+    deliveryKind: "change-package", nextAction });
+  if (direct) {
+    await f.ledger.handoff({ itemId: f.item.itemId, expectedRevision: f.item.revision,
+      leaseId: f.item.leaseId, actorId: "employee-developer", target: { type: "role", id: "orchestrator" },
+      reason: "Coordinate retained delivery contract" });
+  } else {
+    await f.ledger.stageIntent({ itemId: f.item.itemId, expectedRevision: f.item.revision,
+      leaseId: f.item.leaseId, actorId: "employee-developer", roleId: "developer",
+      intent: { schemaVersion: 1, type: "handoff", summary: "Coordinate contract",
+        reason: "Required package and available evidence differ", capability: "coordination",
+        brief: "Review delivery contract against current Head", evidence: ["developer-report:contract"] } });
+    const dispatcher = new WorkIntentDispatcher({ ledger: f.ledger,
+      policy: createWorkIntentPolicy({ capabilityRoles: { coordination: "orchestrator" } }),
+      actionAdmissionGate: readyActionAdmissionGate(), clock: () => "2026-10-15T18:34:00.000Z",
+      attentionProducer: { async create() { assert.fail("No attention request"); } },
+      proposalProducer: { async create() { assert.fail("No proposal"); } } });
+    assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  }
+  f.read = async id => (await f.ledger.listItems()).items.find(item => item.itemId === id);
+  f.handed = await f.read(f.item.itemId);
+  return f;
+}
+
+for (const nextAction of ["continue_draft", "rereview"]) test(`coordination return routes actual ${nextAction} handoff through parent and scoped correction`, async () => {
+  const f = await coordinationReturnFixture({ nextAction });
+  const before = await f.ledger.listTimeline({ itemId: f.item.itemId });
+  const candidates = await f.ledger.listClaimCandidates({ at: "2026-10-15T18:34:00.000Z", limit: 1, roleId: "orchestrator" });
+  assert.deepEqual(candidates.items.map(item => item.itemId), [f.root.itemId]);
+  assert.equal(candidates.nextCursor, null);
+  assert.equal(candidates.facts[0].orchestrationReady, true);
+  await assert.rejects(f.ledger.claim({ itemId: f.handed.itemId, expectedRevision: f.handed.revision,
+    workerId: "employee-orchestrator", leaseDurationMs: 600000 }), { code: "WORK_LEDGER_GRAPH_BLOCKED" });
+  assert.deepEqual(await f.read(f.handed.itemId), f.handed);
+  const packet = await f.assembler.assemble({ roleId: "orchestrator", item: await f.read(f.root.itemId), trigger: 'employee:orchestrator' });
+  const visible = packet.context.requirements.coordination.directChildren.find(child => child.taskId === f.item.itemId);
+  assert.equal(visible.coordinationReturn.kind, "parent_coordination");
+  assert.equal(visible.coordinationReturn.handoff.brief, "Review delivery contract against current Head");
+  assert.equal(visible.coordinationReturn.handoff.evidenceAuthority, "specialist_report");
+  assert.equal(visible.deliverables[0].kind, "change-package");
+  let persisted, childDecisions = 0, parentDecisions = 0;
+  const host = new OrchestratorService({ contextAssembler: f.assembler, graphReader: f.graphReader,
+    graphDelivererFactory: { forClaim() { assert.fail('Root cannot acquire specialist authority'); } },
+    scopedGraphPlannerFactory: { forRoot({ scopeRootTaskId }) {
+      assert.equal(scopeRootTaskId, f.root.itemId);
+      return f.graph.planner({ principalId: "employee-orchestrator", scopeRootTaskId });
+    } } });
+  const loop = new ProactiveWorkLoop({ ledger: f.ledger, roleContextAssembler: f.assembler,
+    orchestratorService: host, clock: () => "2026-10-15T18:34:00.000Z",
+    roleDirectory: { async resolve() { return { roleId: "orchestrator", workerId: "employee-orchestrator", enabled: true, paused: false,
+      async decide({ item, context }) {
+        if (item.itemId !== f.root.itemId) { childDecisions++; assert.fail("Child must not call a brain"); }
+        parentDecisions++;
+        assert(context.requirements.coordination.directChildren.some(child => child.coordinationReturn));
+        const snapshot = await f.graphReader.getSnapshot(), child = await f.read(f.item.itemId);
+        return { schemaVersion: 1, confidence: 90, summary: "Resolve retained contract", intent: {
+          schemaVersion: 1, type: "orchestrate", summary: "Resolve retained contract", reason: "Replace incompatible retained contract",
+          action: { schemaVersion: 1, type: "cancel", sourceTaskId: child.itemId,
+            sourceTaskRevision: child.revision, expectedGraphRevision: snapshot.graph.revision,
+            reason: "Replace incompatible retained contract" } } };
+      } }; } } });
+  const schedulerOptions = { ledger: f.ledger, clock: () => "2026-10-15T18:34:00.000Z",
+    store: { async read(_key, fallback) { return structuredClone(persisted ?? fallback); },
+      async write(_key, value) { persisted = structuredClone(value); } },
+    configurationReader: { async readActive() { return { configuration: { githubActions: { enabled: true, automaticOwnPrRepair: true } } }; } },
+    roleStateReader: { async read() { return { enabled: true, paused: false }; } } };
+  const scheduler = new WorkContinuationScheduler(schedulerOptions), operations = [], dispatched = [], cycles = [], errors = [];
+  const run = async target => { dispatched.push(target.continuationTarget.itemId);
+    try { const cycle = await loop.runCycle({ roleId: target.roleId, workLimit: 1 });
+      cycles.push(cycle); return cycle; } catch (error) { errors.push(error); throw error; } };
+  await scheduler.runCycle({ dispatch: run, runOperation(operation) { const pending = operation(); operations.push(pending); return pending; } });
+  await Promise.all(operations);
+  assert.deepEqual(errors, []);
+  assert.equal(cycles[0].orchestrated, 1, JSON.stringify(cycles));
+  assert.deepEqual(dispatched, [f.root.itemId]);
+  assert.equal(childDecisions, 0); assert.equal(parentDecisions, 1);
+  const settled = await f.read(f.item.itemId);
+  assert.equal(settled.status, "cancelled"); assert.equal(settled.attempt, f.handed.attempt);
+  assert.deepEqual(settled.graph.acceptanceContracts, f.handed.graph.acceptanceContracts);
+  assert.deepEqual((await f.ledger.listTimeline({ itemId: settled.itemId })).items.slice(0, before.items.length), before.items);
+  assert.equal((await f.read(f.root.itemId)).attempt, 0);
+  await f.createChild("compatible-specialist");
+  const specialist = await f.ledger.listClaimCandidates({ at: "2026-10-15T18:34:00.000Z", roleId: "developer" });
+  assert.equal(specialist.items.length, 1);
+  assert.equal(specialist.items[0].assignment.work.title, "compatible-specialist");
+  // The restart reads durable scheduler/ledger history and never reselects the return.
+  const restarted = new WorkContinuationScheduler(schedulerOptions), again = [];
+  await restarted.runCycle({ dispatch: async target => { again.push(target.continuationTarget.itemId); }, runOperation: operation => operation() });
+  assert(!again.includes(settled.itemId));
+  assert.equal((await f.read(settled.itemId)).attempt, f.handed.attempt);
+});
+
+test('coordination return compatibility loop skips direct ledger handback before a model or claim', async () => {
+  const f = await coordinationReturnFixture({ direct: true });
+  const compatibilityLedger = Object.fromEntries(Object.getOwnPropertyNames(WorkLedgerService.prototype)
+    .filter(key => key !== 'constructor' && key !== 'listClaimCandidates' && typeof f.ledger[key] === 'function')
+    .map(key => [key, f.ledger[key].bind(f.ledger)]));
+  let childCalls = 0, rootCalls = 0;
+  const loop = new ProactiveWorkLoop({ ledger: compatibilityLedger, roleContextAssembler: f.assembler,
+    orchestratorService: { async execute() { assert.fail('Observation must not execute graph actions'); } },
+    clock: () => '2026-10-15T18:34:00.000Z', roleDirectory: { async resolve() {
+      return { roleId: 'orchestrator', workerId: 'employee-orchestrator', enabled: true, paused: false,
+        async decide({ item, context }) {
+          if (item.itemId !== f.root.itemId) { childCalls++; assert.fail('Returned child must not call a model'); }
+          rootCalls++;
+          const child = context.requirements.coordination.directChildren[0];
+          assert.equal(child.coordinationReturn.hasHandoffReport, false);
+          return { schemaVersion: 1, confidence: 90, summary: 'Wait for scoped coordination', intent: {
+            schemaVersion: 1, type: 'complete', summary: 'Wait for scoped coordination', reason: 'Fixture observation', outcome: 'done', evidence: [] } };
+        } };
+    } } });
+  const first = await loop.runCycle({ roleId: 'orchestrator' });
+  assert.equal(first.claimed, 0); assert.equal(first.outcomes[0].status, 'graph_blocked');
+  await loop.runCycle({ roleId: 'orchestrator' });
+  assert.equal(childCalls, 0); assert.equal(rootCalls, 2, 'manual cycles retain ordinary root coordination');
+  assert.deepEqual(await f.read(f.handed.itemId), f.handed);
+  assert.equal((await f.read(f.root.itemId)).attempt, 0);
+});
+
+test('coordination return preserves actual paused child and root without scheduling a model', async () => {
+  for (const scope of ['child', 'root']) {
+    const f = await coordinationReturnFixture();
+    let discoveries = 0;
+    const listClaimCandidates = f.ledger.listClaimCandidates.bind(f.ledger);
+    f.ledger.listClaimCandidates = async input => { discoveries++; return listClaimCandidates(input); };
+    const runScheduler = async dispatch => {
+      let persisted;
+      const operations = [];
+      const scheduler = new WorkContinuationScheduler({ ledger: f.ledger, clock: () => '2026-10-15T18:34:00.000Z',
+        store: { async read(_key, fallback) { return structuredClone(persisted ?? fallback); },
+          async write(_key, value) { persisted = structuredClone(value); } },
+        configurationReader: { async readActive() { return { configuration: { githubActions: { enabled: true, automaticOwnPrRepair: true } } }; } },
+        roleStateReader: { async read() { return { enabled: true, paused: false }; } } });
+      const cycle = await scheduler.runCycle({ dispatch, runOperation(operation) {
+        const pending = operation(); operations.push(pending); return pending;
+      } });
+      await Promise.all(operations);
+      assert.equal(cycle.skipped, null, 'pause must be checked by an admitted scheduler cycle');
+      return cycle;
+    };
+    const positiveCalls = [];
+    const positive = await runScheduler(async target => { positiveCalls.push(target.continuationTarget.itemId); });
+    assert.equal(positive.started, 1);
+    assert.deepEqual(positiveCalls, [f.root.itemId], 'the same enabled scheduler discovers this coordination return before pause');
+    assert(discoveries > 0);
+    const item = await f.read(scope === 'child' ? f.item.itemId : f.root.itemId);
+    const planner = f.graph.planner({ principalId: 'employee-orchestrator', scopeRootTaskId: f.root.itemId });
+    await planner.pauseTask({ taskId: item.itemId, expectedTaskRevision: item.revision,
+      expectedGraphRevision: (await f.graphReader.getSnapshot()).graph.revision, reason: 'Owner suspension' });
+    const before = await f.ledger.listItems();
+    const discoveriesBeforePause = discoveries;
+    let modelCalls = 0;
+    const cycle = await runScheduler(async () => { modelCalls++; });
+    assert(discoveries > discoveriesBeforePause, 'paused work is examined during candidate discovery');
+    assert.equal(cycle.started, 0);
+    assert.equal(modelCalls, 0);
+    assert.deepEqual(await f.ledger.listItems(), before);
+  }
 });

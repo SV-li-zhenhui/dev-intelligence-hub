@@ -52,6 +52,30 @@ function relatedProgressFixture() {
   return f;
 }
 
+test('coordination progress preserves the existing digest when there is no related nested return', () => {
+  const root = { itemId: 'root', revision: 1, status: 'queued', currentTarget: { type: 'role', id: 'orchestrator' },
+    graph: { parentItemId: null, dependsOnItemIds: [] } };
+  const child = { itemId: 'child', revision: 2, status: 'queued', graph: { parentItemId: 'root', dependsOnItemIds: [] } };
+  const items = [root, child];
+  // Captured before nested-return observations were added: unaffected roots
+  // must retain their persisted condition reference across this code change.
+  const existingDigest = '8852ff68a5424b5f10445ca623196a9f9dadefac851b20392e21de8803b716f8';
+  const read = () => indexWorkLedgerGraphProgress(items).graphProgressDigest(root);
+  assert.equal(read(), existingDigest);
+  const nested = { itemId: 'nested', kind: 'graph_task', revision: 1, status: 'queued',
+    currentTarget: { type: 'role', id: 'developer' }, graph: { parentItemId: child.itemId, dependsOnItemIds: [] } };
+  items.push(nested);
+  assert.equal(read(), existingDigest);
+  nested.revision++;
+  assert.equal(read(), existingDigest, 'ordinary nested work cannot reset a root coordination budget');
+  items.push({ ...root, itemId: 'unrelated-root' }, { ...nested, itemId: 'unrelated-return',
+    currentTarget: { type: 'role', id: 'orchestrator' }, graph: { parentItemId: 'unrelated-parent', dependsOnItemIds: [] } },
+  { ...child, itemId: 'unrelated-parent', graph: { parentItemId: 'unrelated-root', dependsOnItemIds: [] } });
+  assert.equal(read(), existingDigest, 'another root nested return cannot reset this budget');
+  nested.currentTarget.id = 'orchestrator';
+  assert.notEqual(read(), existingDigest);
+});
+
 test('an unassigned automatic Review waits across retries and restart until assignment changes', async () => {
   const f = fixture();
   f.config.githubActions.automaticReview = true;
