@@ -6,6 +6,7 @@ import {
   normalizePullRequestExecutionBinding,
   samePullRequestExecutionBinding,
 } from "../domain/pull-request-execution-binding.js";
+import { decodeInspectionEnvironmentEvidence, INSPECTION_ENVIRONMENT_RECOVERY_REASON } from '../domain/inspection-environment-recovery-evidence.js';
 import { roleContextError } from "./role-context-error.js";
 
 const JOB_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
@@ -94,6 +95,8 @@ export class FailedCodeJobContextReader {
           (entry.actorId === "automatic-own-pr-inspection-recovery" &&
             entry.details?.reason === "automatic_inspection_objects_ready" &&
             AUTOMATIC_INSPECTION_FAILURES.includes(entry.details.context?.code)) ||
+          (entry.actorId === "automatic-own-pr-inspection-recovery" &&
+            entry.details?.reason === INSPECTION_ENVIRONMENT_RECOVERY_REASON && entry.details.context?.code === AUTOMATIC_VERIFICATION_FAILURE) ||
           (entry.actorId === VERIFICATION_RECOVERY_ACTOR && entry.details?.reason === VERIFICATION_RECOVERY_REASON &&
             entry.details.context?.code === AUTOMATIC_VERIFICATION_FAILURE) ||
           (entry.actorId === CONFLICT_PREPARATION_RECOVERY_ACTOR && entry.details?.reason === CONFLICT_PREPARATION_RECOVERY_REASON &&
@@ -158,6 +161,15 @@ export class FailedCodeJobContextReader {
         profileId: recoveryEvidence.profileId, profileConfigDigest: recoveryEvidence.profileConfigDigest,
         workspaceRevision: recoveryEvidence.workspaceRevision,
       } : null;
+    const environmentEvidence = decodeInspectionEnvironmentEvidence(retry?.details.context?.evidenceRefs);
+    const environmentRecovery = retry?.actorId === 'automatic-own-pr-inspection-recovery' &&
+      retry.details.reason === INSPECTION_ENVIRONMENT_RECOVERY_REASON && retry.details.context.code === AUTOMATIC_VERIFICATION_FAILURE &&
+      failureCode === AUTOMATIC_VERIFICATION_FAILURE && job.operation === 'inspect' && job.writablePaths.length === 0 &&
+      historyComplete && job.observationCount === 1 && observedActions[0]?.actionType === 'run_profile' &&
+      observedActions[0].status === 'failed' && environmentEvidence?.headRefOid === expectedBinding.headRefOid &&
+      job.requiredProfiles.includes(environmentEvidence.profileId) ? {
+        at: retry.at, reason: INSPECTION_ENVIRONMENT_RECOVERY_REASON, failureCode, jobId, ...environmentEvidence,
+      } : null;
     const conflictEvidence = retry?.details.context?.evidenceRefs;
     const conflictRecovery = retry?.actorId === CONFLICT_PREPARATION_RECOVERY_ACTOR &&
       retry.details.reason === CONFLICT_PREPARATION_RECOVERY_REASON && retry.details.context.code === AUTOMATIC_CONFLICT_PREPARATION_FAILURE &&
@@ -189,7 +201,7 @@ export class FailedCodeJobContextReader {
         retry.details.context.code === failureCode &&
         historyComplete && job.observationCount === 0 ? {
           at: retry.at, reason: "automatic_inspection_objects_ready", failureCode, jobId,
-        } : conflictRecovery ?? recovery,
+        } : environmentRecovery ?? conflictRecovery ?? recovery,
     };
   }
 }

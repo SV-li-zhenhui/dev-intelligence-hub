@@ -58,3 +58,13 @@ test("cleanup preserves Docker ownership when no Windows execution exists", asyn
   await native.runner.cleanup({ executionId: "run", actionId: "action" });
   assert.equal(native.calls[0][0], "windows");
 });
+
+test('profile readiness delegates only to the configured Docker profile', async t => {
+  const f = await fixture(t), request = { profileId: 'docker' };
+  f.dockerRunner.readProfileReadiness = async value => { f.calls.push(value); return { ready: true }; };
+  assert.deepEqual(await f.runner.readProfileReadiness(request), { ready: true });
+  for (const profileId of ['native', 'build', 'unknown']) {
+    assert.equal(await f.runner.readProfileReadiness({ profileId }), null);
+  }
+  assert.deepEqual(f.calls, [request]);
+});

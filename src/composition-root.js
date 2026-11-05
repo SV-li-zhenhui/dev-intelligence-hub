@@ -2227,6 +2227,9 @@ export async function createApplication({
         ...(codeExecutorRuntime.settledVerificationReader ? {
           settledVerificationReader: frozenPort(codeExecutorRuntime.settledVerificationReader, ['read'], 'settled verification recovery reader'),
         } : {}),
+        ...(codeExecutorRuntime.inspectionEnvironmentReader ? {
+          inspectionEnvironmentReader: frozenPort(codeExecutorRuntime.inspectionEnvironmentReader, ['read'], 'inspection environment recovery reader'),
+        } : {}),
         confirmationSettlementReader: confirmationRuntime.confirmationSettlementReader,
         github, confirmations: Object.freeze({ ...confirmationRuntime.producerQueue, ...confirmationRuntime.queue }), codeJobReader,
         controlledCommitReader: codeExecutorRuntime.controlledCommitBuilder,

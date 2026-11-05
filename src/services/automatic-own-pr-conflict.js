@@ -63,12 +63,12 @@ export class AutomaticOwnPrConflict {
   #inspections = new Map();
 
   constructor({ configurationReader, store, ledger, github, confirmations, codeJobReader,
-    controlledCommitReader, objectSync, grantVerifier, conflictInspectionReader, codeJobControl, taskRuns, confirmationSettlementReader }) {
+    controlledCommitReader, objectSync, grantVerifier, conflictInspectionReader, codeJobControl, taskRuns, confirmationSettlementReader, inspectionEnvironmentReader }) {
     Object.assign(this, { configurationReader, store, ledger, github, confirmations, codeJobReader,
       controlledCommitReader, objectSync, grantVerifier, conflictInspectionReader, codeJobControl, taskRuns });
     this.inspectionRecovery = objectSync && typeof ledger.listItems === "function" && typeof ledger.transition === "function" &&
       typeof codeJobReader?.getDetail === "function" && typeof ledger.listTimeline === "function"
-      ? new AutomaticOwnPrInspectionRecovery({ store, ledger, codeJobReader, objectSync, current: binding => this.#current(binding, { inspectionRecovery: true }) }) : null;
+      ? new AutomaticOwnPrInspectionRecovery({ store, ledger, codeJobReader, objectSync, inspectionEnvironmentReader, current: binding => this.#current(binding, { inspectionRecovery: true }) }) : null;
     this.conflictRecovery = objectSync && conflictInspectionReader && typeof ledger.listOutbox === "function" &&
       typeof ledger.listItems === "function" && typeof ledger.transition === "function" &&
       typeof codeJobReader?.get === "function" && typeof codeJobReader.getDetail === "function"

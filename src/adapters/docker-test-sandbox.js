@@ -460,6 +460,12 @@ export class DockerTestSandbox {
     return this.#profile(profileId).fingerprint;
   }
 
+  async readProfileReadiness({ profileId }) {
+    const profile = this.#profile(profileId);
+    const imageId = await this.probe(profile.definition);
+    return { schemaVersion: 1, profileId, profileConfigDigest: profile.fingerprint, imageId };
+  }
+
   async run(request) {
     this.assertRunRequest(request);
     const profile = this.#profile(request.profileId);

@@ -734,3 +734,24 @@ test("cleanup proves absence and reports containers that remain", async (t) => {
     actionId: "action-one",
   });
 });
+
+test('profile readiness probes the configured Docker server and exact image without running a container', async t => {
+  const f = await fixture(t, [result({ stdout: '29.2.1' }), result({ stdout: `sha256:${'a'.repeat(64)}` })]);
+  assert.deepEqual(await f.sandbox.readProfileReadiness({ profileId: 'node-tests' }), {
+    schemaVersion: 1, profileId: 'node-tests', profileConfigDigest: f.sandbox.getProfileFingerprint('node-tests'),
+    imageId: `sha256:${'a'.repeat(64)}`,
+  });
+  assert.deepEqual(f.processRunner.calls.map(call => call.args.slice(2)), [
+    ['version', '--format', '{{.Server.Version}}'], ['image', 'inspect', '--format', '{{.Id}}', image],
+  ]);
+  assert.equal(f.processRunner.calls.some(call => call.args.includes('run')), false);
+});
+
+for (const [name, responses, code] of [
+  ['daemon unavailable', [result({ exitCode: 1 })], 'SANDBOX_UNAVAILABLE'],
+  ['image unavailable', [result({ stdout: '29.2.1' }), result({ exitCode: 1 })], 'SANDBOX_IMAGE_UNAVAILABLE'],
+]) test(`profile readiness preserves ${name}`, async t => {
+  const f = await fixture(t, responses);
+  await assert.rejects(f.sandbox.readProfileReadiness({ profileId: 'node-tests' }), { code });
+  assert.equal(f.processRunner.calls.some(call => call.args.includes('run')), false);
+});

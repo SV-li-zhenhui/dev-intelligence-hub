@@ -34,6 +34,11 @@ export class ConfiguredTestRunner {
   async run(request) {
     return this.#runner(request?.profileId).run(request);
   }
+  async readProfileReadiness(request) {
+    const runner = this.#profileRunners.get(request?.profileId);
+    if (!runner || runner !== this.dockerRunner || typeof runner.readProfileReadiness !== 'function') return null;
+    return runner.readProfileReadiness(request);
+  }
   async readSettledPreparationFailure(request) {
     const runner = this.#profileRunners.get(request?.profileId);
     if (!runner || runner !== this.windowsRunner || typeof runner.readSettledPreparationFailure !== 'function') return null;

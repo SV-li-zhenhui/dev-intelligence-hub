@@ -584,3 +584,73 @@ test("failed context readers reject accessor ports without invoking them", () =>
   assert.throws(() => new FailedCodeJobContextReader({ codeJobReader: { async getDetail() {} }, ledger }), TypeError);
   assert.equal(calls, 0);
 });
+
+// Docker availability recovery is distinct from zero-action Git preparation.
+async function environmentRecoveryFixture() {
+  const f = await ordinaryInspectionRecoveryFixture();
+  Object.assign(f.detail.job, { turn: 1, observationCount: 1,
+    latestObservation: { actionType: 'run_profile', status: 'failed', recordedAt: f.input.decisionContext.observedAt } });
+  f.detail.observations = [{ actionType: 'run_profile', status: 'failed', recordedAt: f.input.decisionContext.observedAt }];
+  f.detail.terminalDetail.code = AUTOMATIC_VERIFICATION_FAILURE;
+  const proof = { schemaVersion: 1, reason: 'docker_prestart_environment_restored', jobId: f.detail.job.jobId,
+    grantDigest: f.detail.job.grantDigest, inputBinding: f.detail.job.inputBinding,
+    headRefOid: f.detail.job.inputBinding.headRefOid, actionId: 'action-profile', executionId: 'execution-profile',
+    profileId: 'tests', profileConfigDigest: 'b'.repeat(64), workspaceRevision: '7'.repeat(64), imageId: `sha256:${'c'.repeat(64)}` };
+  let proofReads = 0, readProof = async () => structuredClone(proof);
+  f.dependencies.inspectionEnvironmentReader = { async read() { proofReads += 1; return readProof(); } };
+  f.service = new AutomaticOwnPrConflict(f.dependencies);
+  await f.service.recover();
+  return { ...f, proof, proofReads: () => proofReads, setReadProof(fn) { readProof = fn; } };
+}
+
+test('restored Docker requeues the same owned draft inspection once with effective-change evidence and unchanged old job', async () => {
+  const f = await environmentRecoveryFixture(), before = structuredClone(f.detail);
+  assert.equal((await f.service.runRecoveryCycle()).inspectionRecovery.requeued, 1);
+  const transition = f.calls.find(call => typeof call === 'object');
+  assert.equal(transition.reason, 'automatic_inspection_environment_restored');
+  assert.equal(transition.details.evidenceRefs.at(-1), `docker-image:${f.proof.imageId}`);
+  assert.equal(f.proofReads(), 2, 'readiness is freshly checked before requeue');
+  assert.deepEqual(f.detail, before);
+  f.page.items.unshift({ itemId: f.item.itemId, type: 'transitioned', actorId: transition.actorId,
+    at: '2026-08-02T06:03:00.000Z', details: { toStatus: 'queued', reason: transition.reason, context: transition.details } });
+  const context = await f.reader.read(f.input);
+  assert.equal(context.automaticRecovery.reason, transition.reason);
+  assert.equal(context.automaticRecovery.imageId, f.proof.imageId);
+  assert.equal(context.ownerRetry, null);
+  f.item.status = 'blocked';
+  f.detail.job.inputBinding = { ...f.detail.job.inputBinding, inputRevision: f.detail.job.inputBinding.inputRevision + 1 };
+  f.context.inputBinding = f.detail.job.inputBinding;
+  const restarted = new AutomaticOwnPrConflict(f.dependencies); await restarted.recover();
+  assert.equal((await restarted.runRecoveryCycle()).inspectionRecovery.requeued, 0);
+  assert.equal(f.calls.filter(call => typeof call === 'object').length, 1, 'fact revisions cannot replenish the Head budget');
+});
+
+for (const [scenario, change] of [
+  ['no-effective-change', f => f.setReadProof(async () => null)],
+  ['retired-root', f => { f.item.statusReason = 'pr_source_cross_root_cutover_retired'; }],
+  ['readiness-lost', f => f.setReadProof(async () => f.proofReads() === 1 ? structuredClone(f.proof) : null)],
+  ['changed-Head', f => { f.dependencies.objectSync.prepare = async () => { f.facts.headRefOid = '9'.repeat(40); }; }],
+  ['revision-race', f => { f.dependencies.objectSync.prepare = async () => { f.item.revision += 1; }; }],
+]) test(`Docker inspection recovery retains ${scenario} boundary`, async () => {
+  const f = await environmentRecoveryFixture(); change(f);
+  assert.equal((await f.service.runRecoveryCycle()).inspectionRecovery.requeued, 0);
+  assert.equal(f.item.status, 'blocked');
+  assert.equal(f.calls.some(call => typeof call === 'object'), false);
+});
+
+test('prepared Docker recovery resumes the same receipt after restart, separately from the Git preparation budget', async () => {
+  const f = await environmentRecoveryFixture(), key = 'automatic-own-pr-inspection-recovery-state';
+  f.state.set(key, { schemaVersion: 1, records: [1, 2, 3].map(attempt => ({
+    itemId: f.item.itemId, jobId: `code-job-git-${attempt}`, inputBinding: f.input.inputBinding, attempt, status: 'requeued' })) });
+  const transition = f.dependencies.ledger.transition;
+  f.dependencies.ledger.transition = async () => { throw Object.assign(new Error('revision race'), { code: 'WORK_LEDGER_REVISION_MISMATCH' }); };
+  f.service = new AutomaticOwnPrConflict(f.dependencies); await f.service.recover();
+  assert.equal((await f.service.runRecoveryCycle()).inspectionRecovery.requeued, 0);
+  assert.equal(f.state.get(key).records.length, 4);
+  assert.equal(f.state.get(key).records.at(-1).status, 'prepared');
+  f.dependencies.ledger.transition = transition;
+  const restarted = new AutomaticOwnPrConflict(f.dependencies); await restarted.recover();
+  assert.equal((await restarted.runRecoveryCycle()).inspectionRecovery.requeued, 1);
+  assert.equal(f.state.get(key).records.length, 4);
+  assert.equal(f.state.get(key).records.at(-1).status, 'requeued');
+});
