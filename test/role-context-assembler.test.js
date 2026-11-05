@@ -9,6 +9,7 @@ import {
 import { deliveryAcceptanceContractDigest } from "../src/domain/delivery-evidence-contract.js";
 import { createWorkGraphSnapshot } from "../src/domain/work-graph-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { createOwnerWorkRequestEvent, createOwnerIssueEvent } from "../src/domain/owner-work-request.js";
 import { createPullRequestExecutionBinding } from "../src/domain/pull-request-execution-binding.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import {
@@ -2554,6 +2555,27 @@ test("constructor rejects accessor ports without invoking them", () => {
     );
     assert.equal(getterCalls, 0);
   }
+});
+
+test("root coordination derives owner goal controls without treating payload claims or inherited child events as ownership", async () => {
+  const request = { schemaVersion: 1, requestId: "11111111-1111-4111-8111-111111111111", workType: "general", priority: "high",
+    title: "Continue the goal", description: "Replace child plans while retaining the owner goal.", acceptanceCriteria: ["Verified delivery"] };
+  for (const kind of ["work", "issue"]) {
+    const fixture = rootOrchestratorFixture();
+    fixture.item.event = kind === "work" ? createOwnerWorkRequestEvent(request, "2026-08-03T00:00:00.000Z") :
+      createOwnerIssueEvent({ ...request, schemaVersion: 6, issue: { repository: "octo/repo", number: 42 } }, "2026-08-03T00:00:00.000Z");
+    const packet = await assemble(fixture, { roleId: "orchestrator" });
+    const coordination = packet.context.requirements.coordination;
+    assert.deepEqual(coordination.goalControl, { rootTaskId: fixture.item.itemId, owner: "local-owner",
+      cancellableTaskIds: coordination.directChildren.map(child => child.taskId).sort() });
+    assert.equal(coordination.goalControl.cancellableTaskIds.includes(fixture.item.itemId), false);
+  }
+  const nonOwner = rootOrchestratorFixture();
+  nonOwner.item.event.payload.goalControl = { owner: "local-owner" };
+  assert.equal((await assemble(nonOwner, { roleId: "orchestrator" })).context.requirements.coordination.goalControl, undefined);
+  const child = graphFixture();
+  child.item.event = createOwnerWorkRequestEvent(request, "2026-08-03T00:00:00.000Z");
+  assert.equal((await assemble(child)).context.requirements.coordination, undefined);
 });
 
 test('root coordination exposes a settled proposal failure without inferring an unstarted or safe-to-retry job', async () => {

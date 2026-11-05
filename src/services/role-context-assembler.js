@@ -1,5 +1,6 @@
 import { isInternalRepairReviewEvent } from "../domain/internal-repair-review.js";
 import { isOwnerRequestedCiRepairEvent } from "./ci-repair-context-reader.js";
+import { coordinatorGoalControl } from "../domain/work-goal-ownership.js";
 import { createHash } from "node:crypto";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 import { deliveryAcceptanceContractDigest, deliveryEvidenceKindsForProposal } from "../domain/delivery-evidence-contract.js";
@@ -446,6 +447,7 @@ function normalizeItem(value) {
     eventId,
     eventType,
     sourceBinding,
+    source,
   };
 }
 
@@ -941,7 +943,7 @@ function projectCurrentTaskRejection(roleId, currentTask, deliveryState) {
   };
 }
 
-function projectRootCoordination(roleId, currentTask, snapshot) {
+function projectRootCoordination(roleId, currentTask, snapshot, item) {
   if (!isConfiguredRootOrchestrator(roleId, currentTask)) return null;
 
   const allChildren = [...snapshot.tasksById.values()]
@@ -1071,10 +1073,13 @@ function projectRootCoordination(roleId, currentTask, snapshot) {
   const code = selectedPayloads
     .filter(({ dataClass }) => dataClass === "code")
     .map(({ payload }) => payload);
+  const goalControl = coordinatorGoalControl({ rootTaskId: currentTask.taskId, parentTaskId: currentTask.parentTaskId,
+    event: item.event, source: item.source, childTaskIds: directChildren.map(child => child.taskId) });
   return {
     coordination: {
       schemaVersion: 2,
       rootTaskId: currentTask.taskId,
+      ...(goalControl === null ? {} : { goalControl }),
       directChildren,
       history: {
         supersededChildCount,
@@ -1506,7 +1511,7 @@ export class RoleContextAssembler {
     const { currentContract } = deliveryState;
     const currentAcceptanceContract = publicContract(currentContract);
     const dependencies = projectDependencies(currentTask, snapshot);
-    const coordination = projectRootCoordination(roleId, currentTask, snapshot);
+    const coordination = projectRootCoordination(roleId, currentTask, snapshot, item);
     const currentTaskRejection = projectCurrentTaskRejection(
       roleId,
       currentTask,

@@ -1,4 +1,5 @@
 import { normalizeWorkDecision } from "./work-intent.js";
+import { permitsCoordinatorCancellation } from "./work-goal-ownership.js";
 import {
   ORCHESTRATION_INTENT_JSON_SCHEMA,
   SUBMIT_DELIVERY_INTENT_JSON_SCHEMA,
@@ -343,6 +344,39 @@ export const MODEL_WORK_DECISION_JSON_SCHEMA = deepFreeze({
     },
   },
 });
+
+function currentGoalControl(context) {
+  const control = context?.requirements?.coordination?.goalControl;
+  if (control === undefined) return null;
+  if (control === null || control.owner !== "local-owner" || typeof control.rootTaskId !== "string" ||
+      !Array.isArray(control.cancellableTaskIds) || control.cancellableTaskIds.some(id => typeof id !== "string")) {
+    throw new StructuredBrainContractError("STRUCTURED_BRAIN_RESPONSE_INVALID", "Invalid current coordinator control view");
+  }
+  return control;
+}
+
+export function modelWorkDecisionSchema(context) {
+  const control = currentGoalControl(context);
+  if (control === null) return MODEL_WORK_DECISION_JSON_SCHEMA;
+  // Each request owns its schema. Neither concurrent contexts nor persisted
+  // intent contracts can inherit another goal's cancellation targets.
+  const schema = structuredClone(MODEL_WORK_DECISION_JSON_SCHEMA);
+  const orchestration = schema.properties.intent.oneOf.find(variant => variant.properties.type.const === "orchestrate");
+  orchestration.properties.action.oneOf = orchestration.properties.action.oneOf.filter(variant => {
+    if (variant.properties.type.const !== "cancel") return true;
+    if (control.cancellableTaskIds.length === 0) return false;
+    variant.properties.sourceTaskId.enum = [...control.cancellableTaskIds];
+    return true;
+  });
+  return deepFreeze(schema);
+}
+
+export function assertModelWorkDecisionControls(decision, context) {
+  const action = decision.intent.type === "orchestrate" ? decision.intent.action : null;
+  if (action?.type === "cancel" && !permitsCoordinatorCancellation(currentGoalControl(context), action.sourceTaskId)) {
+    throw new StructuredBrainContractError("STRUCTURED_BRAIN_RESPONSE_INVALID", "Cancel target is outside current coordinator controls");
+  }
+}
 
 function maximumBytesFrom(options) {
   if (

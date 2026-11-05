@@ -5,6 +5,8 @@ import { WORK_CONTINUATION_STATE_KEY, normalizeWorkContinuationState, migrateWor
 import { continuationFingerprint, normalizeContinuationTarget } from '../src/services/work-continuation-state.js';
 import { indexWorkLedgerGraphProgress } from '../src/services/work-ledger-graph-progress.js';
 import { TaskRunRegistry } from '../src/services/task-run-registry.js';
+import { RoleDecisionEngine } from '../src/services/role-decision-engine.js';
+import { coordinatorGoalControl } from '../src/domain/work-goal-ownership.js';
 
 const clone = value => structuredClone(value);
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
@@ -336,6 +338,51 @@ test('unchanged deterministic decision failures stop model retries across restar
     await run();
     assert.equal(calls, 4, `${change} rearms the existing task without a new enqueue`);
   });
+});
+
+test('owner root cancel responses stop through real decision and run receipts, then rearm only on effective change', async () => {
+  const f = relatedProgressFixture();
+  let calls = 0;
+  const runState = new Map();
+  const runStore = {
+    async read(key, fallback) { return clone(runState.get(key) ?? fallback); },
+    async write(key, value) { runState.set(key, clone(value)); },
+  };
+  const runs = new TaskRunRegistry({ store: runStore, receiptStore: runStore,
+    settleControl: async () => {}, clock: f.options.clock });
+  f.options.taskRuns = runs;
+  const root = f.items[0];
+  const control = coordinatorGoalControl({ rootTaskId: root.itemId, parentTaskId: null,
+    event: { source: { provider: 'local-owner' }, eventType: 'owner_request.created' }, childTaskIds: [f.items[1].itemId] });
+  const engine = new RoleDecisionEngine({ definition: { id: 'orchestrator', name: 'Coordinator', mission: 'Preserve the owner goal', enabled: true, scheduleMinutes: 5 },
+    permissions: { allowedIntents: ['orchestrate'] }, brain: { provider: 'fake', model: 'fake', remoteData: { requirements: false, code: false, memory: false } },
+    brainRouter: { describe: () => ({}), async generate() {
+      calls++;
+      return JSON.stringify({ schemaVersion: 1, confidence: 90, summary: 'Cancel plan',
+        intent: { schemaVersion: 1, type: 'orchestrate', summary: 'Cancel plan', action: { schemaVersion: 1, type: 'cancel',
+          sourceTaskId: root.itemId, sourceTaskRevision: root.revision, expectedGraphRevision: 1, reason: 'Failed child plan' } } });
+    } },
+  });
+  const dispatch = async () => {
+    await assert.rejects(runs.run({ kind: 'work-item', taskId: root.itemId, roleId: 'orchestrator', revision: root.revision,
+      title: 'Preserve the owner goal', subject: 'Owner request' },
+      () => engine.decide({ item: {}, context: { requirements: { coordination: { goalControl: control } } } })),
+    error => error.code === 'STRUCTURED_BRAIN_RESPONSE_INVALID');
+  };
+  let scheduler = new WorkContinuationScheduler(f.options);
+  const run = async () => { await scheduler.runCycle({ ...f, dispatch }); await f.drain(); };
+  for (let i = 0; i < 3; i++) { await run(); f.advance(90_000); }
+  assert.equal(calls, 6, 'three wakes, each with only the existing two correction attempts');
+  assert.equal(root.status, 'queued');
+  assert.equal(f.state().records[0].status, 'stalled');
+  assert.equal(f.state().records[0].nextAttemptAt, null);
+  assert.equal(f.state().records[0].recovery.action, 'await_condition');
+  scheduler = new WorkContinuationScheduler(f.options);
+  f.advance(3_600_000); await run();
+  assert.equal(calls, 6, 'restart and time cannot renew an unchanged rejected goal');
+  f.items[1].revision++; await run();
+  assert.equal(calls, 8, 'effective child progress rearms the same goal without a new enqueue');
+  assert.equal(root.status, 'queued');
 });
 
 test('configuration failures wait for effective changes instead of repeating every five minutes', async t => {

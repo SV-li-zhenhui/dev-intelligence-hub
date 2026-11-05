@@ -29,8 +29,9 @@ import {
   normalizeLedgerTarget,
   workLedgerError,
 } from "./work-ledger-values.js";
-import { currentWorkItemExecutionBinding, pullRequestHeadAdmission } from "./work-ledger-pr-source.js";
+import { currentWorkItemEvent, currentWorkItemExecutionBinding, pullRequestHeadAdmission } from "./work-ledger-pr-source.js";
 import { AUTO_RESUME_ON_CHILD_DELIVERY } from "./work-graph-wait-marker.js";
+import { coordinatorGoalControl, permitsCoordinatorCancellation } from "../domain/work-goal-ownership.js";
 
 const PAUSABLE_STATUSES = new Set(["queued", "blocked"]);
 const ESCALATABLE_STATUSES = new Set(["queued", "retry_wait", "blocked"]);
@@ -367,7 +368,7 @@ export function planScopedWorkGraphCancellation({ state, input, clock }) {
   );
   const item = requireScopedTask(state, authority, command.taskId);
   assertCoordinatableTask(item, state);
-  return planWorkGraphCancellation({
+  const mutation = planWorkGraphCancellation({
     state,
     clock,
     input: {
@@ -378,6 +379,12 @@ export function planScopedWorkGraphCancellation({ state, input, clock }) {
       reason: command.reason,
     },
   });
+  const control = coordinatorGoalControl({ rootTaskId: item.itemId,
+    parentTaskId: item.graph.parentItemId, source: item.source, event: currentWorkItemEvent(item) });
+  if (mutation.write !== false && !permitsCoordinatorCancellation(control, item.itemId)) {
+    throw workLedgerError("WORK_LEDGER_GRAPH_SCOPE_DENIED", "员工可调整子任务计划，不能取消所有者目标", 403);
+  }
+  return mutation;
 }
 
 // The Review recovery hint grants no execution authority. Reuse the ordinary

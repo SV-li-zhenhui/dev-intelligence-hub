@@ -1,6 +1,7 @@
 import { structuredPrTriage, isExternalRereview, hasRequiredReviewDeliverable, requiredReviewDeliverables, requiresReviewDelivery } from "../domain/pr-review-work-policy.js";
 import { createHash } from "node:crypto";
 import { permitsReviewPublicationSettlementIntent } from "./review-publication-settlement.js";
+import { coordinatorGoalControl, permitsCoordinatorCancellation } from "../domain/work-goal-ownership.js";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 
 import { deliveryAcceptanceContractDigest } from "../domain/delivery-evidence-contract.js";
@@ -1563,6 +1564,7 @@ export class OrchestratorService {
     if (intent.type === "orchestrate") {
       return this.#executeOrchestration({
         worker,
+        item,
         packet,
         intent,
         graph,
@@ -1612,6 +1614,7 @@ export class OrchestratorService {
 
   async #executeOrchestration({
     worker,
+    item,
     packet,
     intent,
     graph,
@@ -1633,6 +1636,13 @@ export class OrchestratorService {
       children,
     );
     const rootId = bindingTask.taskId;
+    const goalControl = coordinatorGoalControl({ rootTaskId: rootId, parentTaskId: bindingTask.parentTaskId,
+      event: item.value?.source?.current?.event ?? item.value?.event, source: item.value?.source ?? null,
+      childTaskIds: [...children] });
+    if (action.type === "cancel" && !["cancelled", "completed", "superseded"].includes(source.status) &&
+        !permitsCoordinatorCancellation(goalControl, source.taskId)) {
+      throw denied("The coordinator may replace child plans, but cannot cancel the owner's goal");
+    }
     const plan = await createOrchestrationPlan({
       action,
       source,

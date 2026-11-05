@@ -4,9 +4,32 @@ import {
   StructuredBrainContractError,
   WORK_DECISION_JSON_SCHEMA,
   MODEL_WORK_DECISION_JSON_SCHEMA,
+  modelWorkDecisionSchema,
+  assertModelWorkDecisionControls,
   parseStructuredWorkDecision,
   parseModelWorkDecision,
 } from "../src/domain/structured-brain-contract.js";
+
+test("owner goal model controls specialize only this request's cancel scope", () => {
+  const original = JSON.stringify(MODEL_WORK_DECISION_JSON_SCHEMA);
+  const context = ids => ({ requirements: { coordination: { goalControl: {
+    owner: "local-owner", rootTaskId: "owner-root", cancellableTaskIds: ids,
+  } } } });
+  const cancelVariant = schema => schema.properties.intent.oneOf.find(v => v.properties.type.const === "orchestrate")
+    .properties.action.oneOf.find(v => v.properties.type.const === "cancel");
+  const a = modelWorkDecisionSchema(context(["child-a"]));
+  const b = modelWorkDecisionSchema(context(["child-b"]));
+  assert.deepEqual(cancelVariant(a).properties.sourceTaskId.enum, ["child-a"]);
+  assert.deepEqual(cancelVariant(b).properties.sourceTaskId.enum, ["child-b"]);
+  assert.equal(cancelVariant(modelWorkDecisionSchema(context([]))), undefined);
+  assert.equal(modelWorkDecisionSchema({ requirements: {} }), MODEL_WORK_DECISION_JSON_SCHEMA);
+  assert.equal(JSON.stringify(MODEL_WORK_DECISION_JSON_SCHEMA), original);
+  const cancel = id => ({ intent: { type: "orchestrate", action: { type: "cancel", sourceTaskId: id } } });
+  assert.throws(() => assertModelWorkDecisionControls(cancel("owner-root"), context(["child-a"])),
+    error => error.code === "STRUCTURED_BRAIN_RESPONSE_INVALID");
+  assert.doesNotThrow(() => assertModelWorkDecisionControls(cancel("child-a"), context(["child-a"])));
+  assert.doesNotThrow(() => assertModelWorkDecisionControls(cancel("ordinary-root"), { requirements: {} }));
+});
 
 function decision(overrides = {}) {
   return {

@@ -9,6 +9,8 @@ import { createWorkIntentPolicy } from "../src/services/work-intent-policy.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
 import { WORK_LEDGER_STATE_SCHEMA_VERSION } from "../src/services/work-ledger-state.js";
 import { ledgerDigest } from "../src/services/work-ledger-values.js";
+import { createOwnerWorkRequestEvent, createOwnerIssueEvent, createOwnerPullRequestEvent } from "../src/domain/owner-work-request.js";
+import { createTaskRunSettler } from "../src/services/work-ledger-run-control.js";
 
 const STATE_KEY = "work-ledger-state";
 
@@ -180,6 +182,73 @@ function scopedTaskCommand(item, graphRevision, overrides = {}) {
     ...overrides,
   };
 }
+
+function ownerGoalRecord(kind = "work") {
+  const request = { schemaVersion: 1,
+    requestId: "11111111-1111-4111-8111-111111111111", workType: "general", priority: "high",
+    title: "Continue the requested repair", description: "Keep the business goal while revising its child plan.",
+    acceptanceCriteria: ["Deliver the verified repair"],
+  };
+  const at = "2026-08-03T00:00:00.000Z";
+  const target = { repository: "acme/dashboard", number: 42 };
+  const event = kind === "work" ? createOwnerWorkRequestEvent(request, at) : kind === "issue"
+    ? createOwnerIssueEvent({ ...request, schemaVersion: 6, issue: target }, at)
+    : createOwnerPullRequestEvent({ ...request, schemaVersion: 5, pullRequest: target,
+      predecessorRequestId: "22222222-2222-4222-8222-222222222222",
+      triage: { nextAction: "continue_draft", suggestedCapability: "development", expectedHeadRefOid: "a".repeat(40) } },
+    { ...target, title: request.title, state: "open", gitTarget: { schemaVersion: 1, provider: "github",
+      sourceAccountId: "owner", baseRepository: target.repository, headRepository: target.repository,
+      baseRefName: "main", headRefName: "repair", baseRefOid: "b".repeat(40), headRefOid: "a".repeat(40) } }, at);
+  const record = assignment(1);
+  record.event = event;
+  record.assignment.eventId = event.eventId;
+  return record;
+}
+
+for (const kind of ["work", "issue", "pr"]) test(`a delegated coordinator cannot cancel an owner goal and its child tree: ${kind}`, async () => {
+  const { service, store } = await fixture(1, { records: [ownerGoalRecord(kind)] });
+  let [root] = (await service.listItems()).items;
+  const { planner } = graphPorts(service, "employee-orchestrator", root.itemId);
+  await planner.createChild(createCommand({ parent: root, graphRevision: (await service.getSummary()).revision }));
+  root = await service.readItemForReconciliation({ itemId: root.itemId });
+  const before = await store.read(STATE_KEY);
+  await assert.rejects(planner.cancelTask(scopedTaskCommand(root, before.revision)),
+    error => error.code === "WORK_LEDGER_GRAPH_SCOPE_DENIED");
+  assert.deepEqual(await store.read(STATE_KEY), before, "root refusal cannot change any child, revision, timeline or outbox");
+  const spoofedOwner = graphPorts(service, "owner-task-control", root.itemId).planner;
+  await assert.rejects(spoofedOwner.cancelTask(scopedTaskCommand(root, before.revision)),
+    error => error.code === "WORK_LEDGER_GRAPH_SCOPE_DENIED");
+  assert.deepEqual(await store.read(STATE_KEY), before, "an actor name cannot change the delegated channel's ownership");
+});
+
+test("a failed child can be cancelled and replaced under the live owner root, then the owner can cancel normally", async () => {
+  const { service } = await fixture(1, { records: [ownerGoalRecord("pr")] });
+  let [root] = (await service.listItems()).items;
+  const { planner } = graphPorts(service, "employee-orchestrator", root.itemId);
+  await planner.createChild(createCommand({ parent: root, graphRevision: (await service.getSummary()).revision }));
+  let child = (await service.listItems()).items.find(item => item.graph.parentItemId === root.itemId);
+  child = await service.transition({ itemId: child.itemId, expectedRevision: child.revision, leaseId: null,
+    actorId: "work-ledger-system", toStatus: "blocked", reason: "plan_failed" });
+  root = await service.readItemForReconciliation({ itemId: root.itemId });
+  const preservedRoot = structuredClone(root);
+  await planner.cancelTask(scopedTaskCommand(child, (await service.getSummary()).revision));
+  assert.deepEqual(await service.readItemForReconciliation({ itemId: root.itemId }), preservedRoot);
+  await planner.createChild(createCommand({ parent: root, childKey: "replacement",
+    graphRevision: (await service.getSummary()).revision }));
+  root = await service.readItemForReconciliation({ itemId: root.itemId });
+  const replacement = (await service.listItems()).items.find(item => item.graph.parentItemId === root.itemId && item.itemId !== child.itemId);
+  assert.equal(root.status, "queued");
+  assert.equal(replacement.status, "queued");
+  assert.deepEqual(replacement.assignment.graphTask.sourceBinding, child.assignment.graphTask.sourceBinding);
+  assert.deepEqual(replacement.graph.acceptanceContracts, child.graph.acceptanceContracts);
+  await createTaskRunSettler({ ledger: service })({ task: { kind: "work-item", taskId: root.itemId,
+    revision: root.revision, leaseId: null }, command: "cancel" });
+  const cancelled = await service.readItemForReconciliation({ itemId: root.itemId });
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal((await service.readItemForReconciliation({ itemId: replacement.itemId })).status, "cancelled");
+  const noop = await planner.cancelTask(scopedTaskCommand(cancelled, (await service.getSummary()).revision));
+  assert.deepEqual(noop.cancelledItemIds, [], "already-cancelled scoped controls retain their idempotent no-op");
+});
 
 function escalationCommand(item, graphRevision, overrides = {}) {
   return scopedTaskCommand(item, graphRevision, {

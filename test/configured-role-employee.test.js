@@ -8,6 +8,8 @@ import { RoleWorkerDirectory } from "../src/services/role-worker-directory.js";
 import { BrainRouter } from "../src/services/brain-router.js";
 import { ConfiguredRoleEmployee } from "../src/services/configured-role-employee.js";
 import { RoleDecisionEngine } from "../src/services/role-decision-engine.js";
+import { coordinatorGoalControl } from "../src/domain/work-goal-ownership.js";
+import { MODEL_WORK_DECISION_JSON_SCHEMA } from "../src/domain/structured-brain-contract.js";
 
 class MemoryStore {
   constructor() {
@@ -288,6 +290,46 @@ test("internal own PR review rejects external publication and requires Head and 
     reason: "Review complete", verdict: "approve", body: "ok", evidence: [] } });
   await assert.rejects(fixedDecisionEngine("pr-engineer", external).decide(input),
     { code: "ROLE_DECISION_INTERNAL_REVIEW_ONLY" });
+});
+
+test("owner goal controls validate fake provider output within the correction budget and isolate concurrent schemas", async () => {
+  const original = JSON.stringify(MODEL_WORK_DECISION_JSON_SCHEMA);
+  const calls = [];
+  const seen = new Map();
+  const contextFor = (root, child) => ({ requirements: { coordination: { goalControl: coordinatorGoalControl({
+    rootTaskId: root, parentTaskId: null, event: { source: { provider: "local-owner" }, eventType: "owner_request.created" },
+    childTaskIds: [child],
+  }) } } });
+  const engine = new RoleDecisionEngine({ definition: definition("orchestrator"), permissions: permissions("orchestrate"), brain: brain(),
+    brainRouter: { describe: () => ({}), async generate(request) {
+      calls.push(request);
+      const context = JSON.parse(request.messages[1].content);
+      const control = context.requirements.coordination.goalControl;
+      const count = (seen.get(control.rootTaskId) ?? 0) + 1;
+      seen.set(control.rootTaskId, count);
+      assert.ok(request.messages[0].content.includes(JSON.stringify(request.schema)), "the described schema must be this request's schema");
+      await Promise.resolve();
+      const result = orchestrationDecision();
+      result.intent.action.type = "cancel";
+      result.intent.action.sourceTaskId = control.rootTaskId === "root-a" && count === 1 ? control.rootTaskId : control.cancellableTaskIds[0];
+      return JSON.stringify(result);
+    } },
+  });
+  const [a, b] = await Promise.all([
+    engine.decide({ item: {}, context: contextFor("root-a", "child-a") }),
+    engine.decide({ item: {}, context: contextFor("root-b", "child-b") }),
+  ]);
+  assert.equal(a.intent.action.sourceTaskId, "child-a");
+  assert.equal(b.intent.action.sourceTaskId, "child-b");
+  assert.equal(calls.length, 3, "one invalid root control uses the existing correction attempt");
+  assert.equal(JSON.stringify(MODEL_WORK_DECISION_JSON_SCHEMA), original);
+  for (const request of calls) {
+    const control = JSON.parse(request.messages[1].content).requirements.coordination.goalControl;
+    const cancel = request.schema.properties.intent.oneOf.find(v => v.properties.type.const === "orchestrate")
+      .properties.action.oneOf.find(v => v.properties.type.const === "cancel");
+    assert.deepEqual(cancel.properties.sourceTaskId.enum, control.cancellableTaskIds);
+    assert.equal(Object.isFrozen(cancel.properties.sourceTaskId.enum), true);
+  }
 });
 
 test("RoleDecisionEngine classifies context, routes the configured brain, and normalizes output", async () => {

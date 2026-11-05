@@ -18,6 +18,7 @@ import {
   projectPullRequestReadFactsContext,
 } from "../src/domain/pull-request-read-facts.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { createOwnerWorkRequestEvent } from "../src/domain/owner-work-request.js";
 import { RoleContextAssembler } from "../src/services/role-context-assembler.js";
 import { WorkGraphStore } from "../src/services/work-graph-store.js";
 import { WorkLedgerService } from "../src/services/work-ledger-service.js";
@@ -416,6 +417,23 @@ function rootFixture({
   });
   return { root, child, dependency, view, item, packet };
 }
+
+test("owner root cancellation is refused before planner creation even if supplied context claims permission", async () => {
+  const fixture = rootFixture();
+  fixture.item.event = createOwnerWorkRequestEvent({ schemaVersion: 1,
+    requestId: "11111111-1111-4111-8111-111111111111", workType: "general", priority: "high",
+    title: "Keep the goal", description: "A child failure does not withdraw this request.", acceptanceCriteria: ["Verified delivery"],
+  }, "2026-08-03T00:00:00.000Z");
+  fixture.packet.context.requirements.coordination.goalControl = { owner: "local-owner", rootTaskId: fixture.root.taskId,
+    cancellableTaskIds: [fixture.root.taskId] };
+  fixture.packet.contextDigest = canonicalJsonDigest(fixture.packet.context);
+  const fakes = fakePorts({ packet: fixture.packet, views: fixture.view });
+  await assert.rejects(serviceFrom(fakes).execute({
+    worker: { roleId: "orchestrator", workerId: "employee-orchestrator" }, item: fixture.item,
+    contextPacket: fixture.packet, intent: orchestrate(commonAction("cancel", fixture.root, fixture.view)),
+  }), error => error.code === "ORCHESTRATOR_AUTHORITY_DENIED");
+  assert.equal(fakes.calls.plannerFactory.length, 0);
+});
 
 function executeDeliveryDecision(fakes, fixture, type) {
   return serviceFrom(fakes).execute({
