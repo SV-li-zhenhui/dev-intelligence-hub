@@ -14,6 +14,7 @@ import {
   CONFIRMATION_HISTORY_MAX_ROLE_FACETS,
   ConfirmationExecutionError,
   ConfirmationQueue,
+  projectConfirmationMemoryState,
 } from "../src/services/confirmation-queue.js";
 import { configurationImpactDigest } from "../src/services/configuration-state.js";
 import {
@@ -1085,6 +1086,88 @@ test("confirmation memory pages are sanitized, high-water bound, and restart sta
     }),
     (error) => error?.code === "CONFIRMATION_MEMORY_SOURCE_CHANGED",
   );
+});
+
+test("confirmation memory pages keep their durable snapshot private across reload completion", async () => {
+  const store = new MemoryStore();
+  const queue = await readyQueue({ store });
+  await queue.enqueue(pullRequestExternalActionQueuePlan({ type: "comment", body: "Durable body" }));
+  const expected = projectConfirmationMemoryState(store.value);
+  let publicState = queue.state;
+  Object.defineProperty(queue, "state", {
+    configurable: true,
+    get: () => publicState,
+    set(value) {
+      publicState = value;
+      queueMicrotask(() => {
+        value.revision = 0;
+        value.items.length = 0;
+      });
+    },
+  });
+
+  const page = await queue.readMemoryPage({ cursor: 0, limit: 100, highWatermark: null });
+  assert.equal(publicState.items.length, 0);
+  assert.equal(page.highWatermark, expected.highWatermark);
+  assert.deepEqual(page.items, expected.items);
+  assert.equal(Object.isFrozen(page.items[0].action), true);
+});
+
+test("confirmation memory pagination rereads durable changes and rejects corrupted content", async () => {
+  const store = new MemoryStore();
+  const queue = await readyQueue({ store });
+  for (const suffix of ["c", "a", "b"]) {
+    await queue.enqueue(pullRequestExternalActionQueuePlan(
+      { type: "comment", body: `Memory body ${suffix}` },
+      { proposalId: `proposal-memory-${suffix}` },
+    ));
+  }
+  const expected = projectConfirmationMemoryState(store.value);
+  const beforeReads = store.readCount;
+  const beforeWrites = store.writeCount;
+  const items = [];
+  let cursor = 0;
+  do {
+    const page = await queue.readMemoryPage({ cursor, limit: 1, highWatermark: expected.highWatermark });
+    items.push(...page.items);
+    cursor = page.nextCursor;
+  } while (cursor !== null);
+  assert.deepEqual(items, expected.items);
+  assert.equal(store.readCount - beforeReads, 3);
+  assert.equal(store.writeCount, beforeWrites);
+  await assert.rejects(queue.readMemoryPage({ cursor: 4, limit: 1, highWatermark: null }), {
+    code: "INVALID_CONFIRMATION_MEMORY_QUERY",
+  });
+
+  const other = await readyQueue({ store });
+  await other.enqueue(pullRequestExternalActionQueuePlan(
+    { type: "comment", body: "Another writer" },
+    { proposalId: "proposal-memory-another-writer" },
+  ));
+  await assert.rejects(queue.readMemoryPage({ cursor: 0, limit: 1, highWatermark: expected.highWatermark }), {
+    code: "CONFIRMATION_MEMORY_SOURCE_CHANGED",
+  });
+  const current = await queue.readMemoryPage({ cursor: 0, limit: 100, highWatermark: null });
+  assert.equal(current.items.length, 4);
+  assert.equal(current.highWatermark, store.value.revision);
+  store.value.items[0].approvalBindingDigest = "0".repeat(64);
+  await assert.rejects(queue.readMemoryPage({ cursor: 0, limit: 100, highWatermark: null }), {
+    code: "CONFIRMATION_STATE_CORRUPTED",
+  });
+});
+
+test("exported confirmation memory projection still validates frozen caller input", async () => {
+  const store = new MemoryStore();
+  const queue = await readyQueue({ store });
+  await queue.enqueue(pullRequestExternalActionQueuePlan({ type: "comment", body: "Strict exported reader" }));
+  const malformed = structuredClone(store.value);
+  malformed.items[0].approvalBindingDigest = "0".repeat(64);
+  Object.freeze(malformed.items[0]);
+  Object.freeze(malformed.items);
+  Object.freeze(malformed);
+  assert.throws(() => projectConfirmationMemoryState(malformed), {
+    code: "CONFIRMATION_STATE_CORRUPTED",
+  });
 });
 
 test("application result snapshots sort deterministically and reject invalid cursors", async () => {

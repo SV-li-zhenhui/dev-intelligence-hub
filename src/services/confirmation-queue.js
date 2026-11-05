@@ -541,7 +541,10 @@ function isProjectablePullRequestMemoryItem(item) {
 }
 
 export function projectConfirmationMemoryState(value) {
-  const state = normalizeConfirmationState(value);
+  return projectNormalizedConfirmationMemoryState(normalizeConfirmationState(value));
+}
+
+function projectNormalizedConfirmationMemoryState(state) {
   return structuredClone({
     highWatermark: state.revision,
     items: state.items
@@ -893,8 +896,7 @@ export class ConfirmationQueue {
     const query = normalizeMemoryPageRequest(input);
     return this.operationQueue.enqueue(() =>
       this.exclusiveLease.run(async () => {
-        await this.#reload();
-        const state = normalizeConfirmationState(this.state);
+        const state = await this.#reload({ detachSnapshot: true });
         if (
           query.highWatermark !== null &&
           query.highWatermark !== state.revision
@@ -905,7 +907,7 @@ export class ConfirmationQueue {
             409,
           );
         }
-        const items = projectConfirmationMemoryState(state).items;
+        const items = projectNormalizedConfirmationMemoryState(state).items;
         if (query.cursor > items.length) {
           throw queueError(
             "INVALID_CONFIRMATION_MEMORY_QUERY",
@@ -1493,10 +1495,13 @@ export class ConfirmationQueue {
     this.state = normalized;
   }
 
-  async #reload() {
-    this.state = normalizeConfirmationState(
+  async #reload({ detachSnapshot = false } = {}) {
+    const state = normalizeConfirmationState(
       await this.store.read(STATE_KEY, defaultConfirmationState()),
     );
+    // A detached result stays private across the caller's await.
+    this.state = detachSnapshot ? structuredClone(state) : state;
+    return state;
   }
 
   #find(id) {
