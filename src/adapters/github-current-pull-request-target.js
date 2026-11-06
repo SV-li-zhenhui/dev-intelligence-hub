@@ -100,6 +100,7 @@ function projectCurrentPullRequestTarget(response, identity, discovery) {
     const headRepository = fields(pr.headRepository).nameWithOwner;
     if (typeof headRepository !== "string") throw invalid();
     const liveHeadOid = liveRef(pr.headRef, pr.headRefName, headRepository);
+    if (liveHeadOid.length !== pr.headRefOid.length) throw invalid();
     if (liveHeadOid !== pr.headRefOid) {
       // A branch can advance before the PR's head snapshot catches up. Validate
       // every target field, but grant neither commit executable authority until

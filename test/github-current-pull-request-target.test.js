@@ -112,3 +112,16 @@ test("a moved discovery head is unavailable only after every remaining target fi
       { code: "GITHUB_CURRENT_PR_TARGET_INVALID" });
   }
 });
+
+test("discovery rejects mixed object formats instead of hiding them as a moved head", async (t) => {
+  for (const [scalarLength, liveLength] of [[64, 40], [40, 64]]) {
+    await t.test(`PR head ${scalarLength}, live head and base ${liveLength}`, async () => {
+      const repo = repository();
+      repo.pullRequest.headRefOid = "b".repeat(scalarLength);
+      repo.pullRequest.headRef.target.oid = "c".repeat(liveLength);
+      repo.pullRequest.baseRef.target.oid = "a".repeat(liveLength);
+      await assert.rejects(readGitHubCurrentPullRequestTargetBatch(async () => ({ data: { r0: repo } }), [identity]),
+        { code: "GITHUB_CURRENT_PR_TARGET_INVALID" });
+    });
+  }
+});
