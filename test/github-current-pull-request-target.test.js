@@ -89,3 +89,26 @@ test("a deleted discovery ref cannot mask malformed surviving refs", async () =>
     await assert.rejects(readGitHubCurrentPullRequestTargetBatch(async () => ({ data: { r0: repo } }), [identity]));
   }
 });
+
+test("a moved discovery head is unavailable only after every remaining target field validates", async () => {
+  const repo = repository();
+  repo.pullRequest.headRef.target.oid = LIVE;
+  const [observed] = await readGitHubCurrentPullRequestTargetBatch(async () => ({ data: { r0: repo } }), [identity]);
+  assert.equal(observed.gitTarget, null);
+  assert.equal(observed.gitTargetUnavailableReason, "HEAD_REF_CHANGED");
+  assert.throws(() => projectGitHubCurrentPullRequestTarget(response(repo), identity), { code: "GITHUB_CURRENT_PR_TARGET_INVALID" });
+  for (const change of [
+    pr => { pr.baseRef = null; pr.headRef.target.oid = "invalid"; },
+    pr => { pr.baseRef.repository.nameWithOwner = "attacker/repo"; },
+    pr => { pr.baseRef.target.oid = "invalid"; },
+    pr => { pr.headRef.repository.nameWithOwner = "attacker/repo"; },
+    pr => { pr.headRefName = pr.headRef.name = "../unsafe"; },
+    pr => { pr.headRepository.nameWithOwner = undefined; },
+    pr => { delete pr.baseRef; },
+  ]) {
+    const malformed = structuredClone(repo);
+    change(malformed.pullRequest);
+    await assert.rejects(readGitHubCurrentPullRequestTargetBatch(async () => ({ data: { r0: malformed } }), [identity]),
+      { code: "GITHUB_CURRENT_PR_TARGET_INVALID" });
+  }
+});

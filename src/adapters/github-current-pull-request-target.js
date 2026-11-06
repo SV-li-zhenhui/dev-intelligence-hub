@@ -96,6 +96,20 @@ function projectCurrentPullRequestTarget(response, identity, discovery) {
     }
     return Object.freeze({ ...summary, gitTarget: null });
   }
+  if (discovery) {
+    const headRepository = fields(pr.headRepository).nameWithOwner;
+    if (typeof headRepository !== "string") throw invalid();
+    const liveHeadOid = liveRef(pr.headRef, pr.headRefName, headRepository);
+    if (liveHeadOid !== pr.headRefOid) {
+      // A branch can advance before the PR's head snapshot catches up. Validate
+      // every target field, but grant neither commit executable authority until
+      // GitHub observes a coherent pair. Keep this search member in the batch.
+      githubCurrentPullRequestGitTarget({ ...pr, headRefOid: liveHeadOid }, {
+        baseRepository: identity.repository, sourceAccountId: identity.sourceAccountId,
+      });
+      return Object.freeze({ ...summary, gitTarget: null, gitTargetUnavailableReason: "HEAD_REF_CHANGED" });
+    }
+  }
   const gitTarget = githubCurrentPullRequestGitTarget(repository.pullRequest, {
     baseRepository: identity.repository, sourceAccountId: identity.sourceAccountId,
   });

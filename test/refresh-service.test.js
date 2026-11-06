@@ -3,6 +3,11 @@ import test from "node:test";
 import { RefreshService } from "../src/services/refresh-service.js";
 import { WorkflowFactSource } from "../src/services/workflow-fact-source.js";
 import { OwnPrRepairProgressReader } from "../src/services/own-pr-repair-progress-reader.js";
+import { GitHubAdapter } from "../src/adapters/github-adapter.js";
+import { createWorkflowRouter } from "../src/domain/workflow-router.js";
+import { WorkflowRoutingService } from "../src/services/workflow-routing-service.js";
+import { WorkLedgerService } from "../src/services/work-ledger-service.js";
+import { workflowEventsFromSnapshots } from "../src/domain/workflow-snapshot-events.js";
 
 const REFRESH_STARTED_AT = "2026-08-13T01:02:03.004Z";
 
@@ -298,6 +303,106 @@ function pullRequest(overrides = {}) {
     ...overrides,
   };
 }
+
+test("an incoherent live head fences its PR while new assignments reach durable review roots", async () => {
+  const store = new MemoryStore();
+  let phase = "baseline";
+  let now = "2026-11-06T03:00:00.000Z";
+  const clock = () => new Date(now);
+  const target = (number) => ({
+    number, url: `https://github.com/acme/repo/pull/${number}`, state: "OPEN",
+    author: { login: "contributor" }, changedFiles: 1,
+    baseRefName: "main", baseRefOid: "d".repeat(40),
+    baseRef: { name: "main", repository: { nameWithOwner: "acme/repo" }, target: { oid: "a".repeat(40) } },
+    headRefName: `feature-${number}`, headRefOid: "b".repeat(40),
+    headRepository: { nameWithOwner: "acme/repo" },
+    headRef: { name: `feature-${number}`, repository: { nameWithOwner: "acme/repo" },
+      target: { oid: phase === "incoherent" && number === 8 ? "c".repeat(40) : "b".repeat(40) } },
+  });
+  const github = new GitHubAdapter({ run: async (_command, args) => {
+    if (args.some(value => value.includes("query MyDashboardCurrentPullRequestTargets"))) {
+      const query = args.find(value => value.startsWith("query="));
+      const aliases = [...query.matchAll(/(r\d+):repository\(owner:"acme",name:"repo"\)\s*\{\s*nameWithOwner pullRequest\(number:(\d+)\)/gu)];
+      const response = { data: Object.fromEntries(aliases.map(([, alias, number]) => [alias,
+        { nameWithOwner: "acme/repo", pullRequest: target(Number(number)) }])) };
+      if (phase === "partial") delete response.data[aliases[0][1]];
+      return response;
+    }
+    if (args[0] === "api") return { login: "runtime-user" };
+    if (args[0] === "search") return args.includes("--assignee=@me")
+      ? (phase === "baseline" ? [8] : [8, 9, 10, 11, 12]).map(number => ({
+        number, title: `Assigned PR ${number}`, url: target(number).url,
+        repository: { nameWithOwner: "acme/repo" }, author: { login: "contributor" },
+        state: "open", updatedAt: now,
+      })) : [];
+    if (args[0] === "pr") return { ...target(Number(args[2].split("/").at(-1))),
+      headRepository: { name: "repo", nameWithOwner: "acme/repo" }, headRepositoryOwner: { login: "acme" },
+      assignees: [{ login: "runtime-user" }], reviews: [], labels: [], statusCheckRollup: [],
+      mergeStateStatus: "CLEAN", isDraft: false,
+    };
+    assert.fail(`Unexpected command: ${args.join(" ")}`);
+  } });
+  github.searchIssues = async () => [];
+  github.versions = async () => [];
+  const refresh = new RefreshService({ github, store, clock, dingtalk: {}, brain: null, notifier: {},
+    config: { trackedRepositories: [], dingtalk: { enabled: false }, brain: { enabled: false } } });
+  const lease = { run: operation => operation() };
+  const routing = new WorkflowRoutingService({ store, clock, exclusiveLease: lease, router: createWorkflowRouter() });
+  await routing.recover();
+  await routing.replaceConfig({ expectedVersion: 0, changedBy: "owner", definition: {
+    schemaVersion: 1, enabled: true, maxHops: 8, rules: [{ id: "assigned-review", source: "root", enabled: true,
+      priority: 100, fallback: false, condition: { op: "equals", path: "payload.relation", value: "review_requested" },
+      targets: [{ type: "role", id: "pr-engineer" }], onMatch: "stop" }],
+  } });
+  let nextId = 0;
+  const ledger = new WorkLedgerService({ store, clock, exclusiveLease: lease, assignmentSource: routing,
+    idFactory: () => `discovery-test-${++nextId}` });
+  await ledger.recover();
+  await refresh.refresh();
+  const baseline = structuredClone(await store.read("snapshot"));
+  await routing.ingestSnapshot({ snapshot: baseline });
+  await ledger.intake();
+  const original = (await ledger.listItems()).items.find(item => item.source?.identity.pullRequestNumber === 8);
+  assert.ok(original, "the older assignment starts with a durable source root");
+
+  phase = "incoherent"; now = "2026-11-06T03:30:00.000Z";
+  await refresh.refresh();
+  const current = await store.read("snapshot");
+  assert.equal(current.sourceStatus.githubPullRequests.ok, true, "one incoherent head must not reject all assigned PRs");
+  assert.equal(current.sourceStatus.githubPullRequests.complete, true, "all search members remain represented");
+  const unavailable = current.items.find(item => item.number === 8);
+  assert.equal(unavailable.gitTargetAvailable, false);
+  assert.equal(unavailable.gitTargetUnavailableReason, "HEAD_REF_CHANGED");
+  assert.equal(Object.hasOwn(unavailable, "gitTarget"), false);
+  assert.equal(Object.hasOwn(unavailable, "baseRefOid"), false, "historical scalar is never executable authority");
+  const events = workflowEventsFromSnapshots(baseline, current);
+  assert.ok(events.every(event => event.eventType !== "pull_request.left_scope"));
+  const facts = new WorkflowFactSource({ store, clock });
+  assert.equal((await facts.read({ item: { event: original.source.current.event }, fact: "state" })).fresh, false);
+  await routing.ingestSnapshot({ snapshot: current });
+  await ledger.intake();
+  const roots = (await ledger.listItems()).items.filter(item => item.kind === "source_root");
+  assert.equal(roots.find(item => item.itemId === original.itemId).source.scope.active, true, "unknown target does not retire ownership");
+  for (const number of [9, 10, 11, 12]) {
+    const root = roots.find(item => item.source?.identity.pullRequestNumber === number);
+    assert.ok(root, `new assigned PR ${number} must reach a durable review source root`);
+    assert.equal(root.source.identity.targetRoleId, "pr-engineer");
+    assert.equal(root.source.current.event.payload.nextAction, "review");
+    assert.equal(root.source.current.event.payload.gitTarget.baseRefOid, "a".repeat(40));
+    assert.equal(root.source.current.event.payload.gitTarget.headRefOid, "b".repeat(40));
+  }
+  const candidates = await ledger.listClaimCandidates({ at: now, roleId: "pr-engineer" });
+  assert.deepEqual(candidates.items.map(item => item.source.identity.pullRequestNumber).sort((a, b) => a - b),
+    [9, 10, 11, 12], "only the four coherent assignments can be claimed");
+
+  phase = "partial"; now = "2026-11-06T03:40:00.000Z";
+  await refresh.refresh();
+  const retained = await store.read("snapshot");
+  assert.equal(retained.sourceStatus.githubPullRequests.complete, false, "truly missing batch members still fail closed");
+  assert.equal(retained.sourceStatus.githubPullRequests.stale, true);
+  assert.deepEqual(retained.items, current.items, "incomplete source keeps every prior member");
+  assert.deepEqual(workflowEventsFromSnapshots(current, retained), [], "incomplete facts cannot emit retirement");
+});
 
 test('refresh and retained fallback exclude authored PRs assigned to someone else', async () => {
   const outside = pullRequest({ id: 'reviewer-only', assignmentSource: 'reviewer', assignees: [], reviewRecipient: 'local-owner' });

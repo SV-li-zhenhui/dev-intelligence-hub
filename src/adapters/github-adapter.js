@@ -1031,6 +1031,9 @@ export class GitHubAdapter {
       milestone: detail.milestone?.title || "",
       headRefOid: detail.headRefOid || "",
       gitTargetAvailable: completePullRequestGitFacts(gitFacts),
+      ...(observation.gitTargetUnavailableReason
+        ? { gitTargetUnavailableReason: observation.gitTargetUnavailableReason }
+        : {}),
       ...(completePullRequestGitFacts(gitFacts)
         ? { ...gitFacts, gitTarget: gitTargetFromFacts(gitFacts) }
         : {}),
