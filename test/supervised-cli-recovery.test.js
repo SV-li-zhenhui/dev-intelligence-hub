@@ -10,6 +10,7 @@ import test from "node:test";
 import { createTestSupervisedCliBrainProvider } from "../src/adapters/supervised-cli-brain-provider.js";
 import { createTestSupervisedProcessRunner } from "../src/lib/supervised-process-runner.js";
 import { CodexCliSessionStore } from "../src/adapters/codex-cli-session-store.js";
+import { controlledProviderTime } from './support/controlled-provider-time.mjs';
 
 const success = () => ({ exitCode: 0, signal: null, stdoutBytes: Buffer.alloc(0), stderrBytes: Buffer.alloc(0) });
 const failure = (code = "STRUCTURED_PROVIDER_PROCESS_FAILED") => Object.assign(new Error("fixture failure"), { code });
@@ -61,19 +62,18 @@ test(deadlineFirst
   // Fixture preparation and capture can exceed a second under parallel load.
   // Own both clocks so cancellation follows observed runner settlement/result entry,
   // independently of parallel-suite disk latency. Exercise the opposite order too.
-  t.mock.timers.enable({ apis: ["setTimeout"] });
-  let monotonicTime = 10_000;
+  const time = controlledProviderTime(t);
+  const resultRead = time.phase('result-reader');
   const controller = new AbortController();
   let first = true;
   let resultReads = 0;
   const current = await fixture(t, {
-    monotonicClock: () => monotonicTime,
+    monotonicClock: time.monotonicClock,
     processRunner: { async run() {
       current.events.push("process-reaped");
       if (first && deadlineFirst) {
         first = false;
-        monotonicTime += 1_001;
-        t.mock.timers.tick(1_001);
+        time.advance(1_001);
       }
       return success();
     } },
@@ -82,14 +82,17 @@ test(deadlineFirst
       if (first) {
         first = false;
         assert.deepEqual(current.events, ["process-reaped", "credential-captured"]);
+        resultRead.enter();
         controller.abort();
       }
       return '{"ok":true}';
     },
   });
-  await assert.rejects(current.provider.generate(request({ signal: controller.signal })), {
+  const rejected = assert.rejects(current.provider.generate(request({ signal: controller.signal })), {
     code: deadlineFirst ? "STRUCTURED_PROVIDER_TIMEOUT" : "STRUCTURED_PROVIDER_CANCELLED",
   });
+  if (!deadlineFirst) await resultRead.waitFor(rejected);
+  await rejected;
   assert.equal(controller.signal.aborted, !deadlineFirst);
   assert.equal(resultReads, deadlineFirst ? 0 : 1);
   assert.deepEqual(current.events, ["process-reaped", "credential-captured", "release:true"]);
@@ -99,16 +102,17 @@ test(deadlineFirst
 }
 
 test("recovery waits for actual runner settlement after cancellation", async (t) => {
+  const time = controlledProviderTime(t);
   const controller = new AbortController();
-  let resolveStarted;
-  const started = new Promise((resolve) => { resolveStarted = resolve; });
+  const started = time.phase('runner-started');
   let rejectRunner;
   const current = await fixture(t, {
-    processRunner: { run() { resolveStarted(); return new Promise((_, reject) => { rejectRunner = reject; }); } },
+    monotonicClock: time.monotonicClock,
+    processRunner: { run() { started.enter(); return new Promise((_, reject) => { rejectRunner = reject; }); } },
   });
   let publicSettled = false;
   const outcome = current.provider.generate(request({ signal: controller.signal })).catch((error) => { publicSettled = true; return error; });
-  await started;
+  await started.waitFor(outcome);
   controller.abort();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(publicSettled, false);

@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { observePrivateDirectoryHelpers } from './support/private-directory-helper-diagnostics.mjs';
+import { controlledProviderTime } from './support/controlled-provider-time.mjs';
 
 import {
   createProductionSupervisedCliBrainProvider,
@@ -2903,6 +2904,17 @@ test("cleanup retains an invocation whose aggregate regular-file bytes exceed th
 });
 
 test("an unresolved cleanup operation is deadline-bounded and blocks providers sharing the root", async (t) => {
+  const time = controlledProviderTime(t);
+  const cleanupEntered = time.phase('cleanup-unlink');
+  const releaseCleanup = deferred();
+  const cleanupSettled = deferred();
+  let cleanupWasEntered = false;
+  let generation = null;
+  t.after(async () => {
+    releaseCleanup.resolve();
+    if (cleanupWasEntered) await cleanupSettled.promise;
+    await generation?.catch(() => {});
+  });
   const parent = await temporaryDirectory(t, "supervised-cli-cleanup-hang-");
   const temporaryRoot = path.join(parent, "runtime");
   let invocationDirectory;
@@ -2910,6 +2922,7 @@ test("an unresolved cleanup operation is deadline-bounded and blocks providers s
     invocationDirectory = invocation.cwd;
     const resultFile = argumentValue(invocation.args, "--output-last-message");
     await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
+    time.advance(200);
     return successfulProcess();
   });
   const first = createTestSupervisedCliBrainProvider(
@@ -2919,19 +2932,35 @@ test("an unresolved cleanup operation is deadline-bounded and blocks providers s
       commandLocator: recordingLocator(testDescriptor("codex-cli")),
       environment: { OPENAI_API_KEY: "credential" },
       temporaryRoot,
+      monotonicClock: time.monotonicClock,
       cleanupFileSystem: cleanupFileSystem({
-        async unlink() {
-          return new Promise(() => {});
+        async unlink(file) {
+          cleanupWasEntered = true;
+          cleanupEntered.enter();
+          await releaseCleanup.promise;
+          try { return await unlink(file); } finally { cleanupSettled.resolve(); }
         },
       }),
     },
   );
 
+  generation = first.generate(brainRequest());
+  let settled = false;
+  const rejected = assert.rejects(generation, {
+    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  });
+  void rejected.then(() => { settled = true; }, () => { settled = true; });
+  await cleanupEntered.waitFor(rejected);
+  assert.equal(firstRunner.calls.length, 1);
+  assert.equal(typeof invocationDirectory, 'string');
+  time.advance(999);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(firstRunner.calls[0].signal.aborted, true, 'the earlier request deadline has expired');
+  assert.equal(settled, false, 'cleanup owns its full original 1000ms budget');
+  time.advance(1);
   await within(
     3_000,
-    assert.rejects(first.generate(brainRequest()), {
-      code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
-    }),
+    rejected,
   );
   await assert.rejects(lstat(invocationDirectory), { code: "ENOENT" });
   assert.equal(
@@ -2940,7 +2969,10 @@ test("an unresolved cleanup operation is deadline-bounded and blocks providers s
   );
 
   const secondLocator = recordingLocator(testDescriptor("codex-cli"));
-  const secondRunner = recordingRunner(async () => successfulProcess());
+  const secondRunner = recordingRunner(async invocation => {
+    await writeFile(argumentValue(invocation.args, '--output-last-message'), codexOutput({ ok: true }), 'utf8');
+    return successfulProcess();
+  });
   const second = createTestSupervisedCliBrainProvider(
     providerOptions("codex-cli"),
     {
@@ -2948,6 +2980,7 @@ test("an unresolved cleanup operation is deadline-bounded and blocks providers s
       commandLocator: secondLocator,
       environment: { OPENAI_API_KEY: "credential" },
       temporaryRoot,
+      monotonicClock: time.monotonicClock,
     },
   );
   await assert.rejects(second.generate(brainRequest()), {
@@ -2955,6 +2988,17 @@ test("an unresolved cleanup operation is deadline-bounded and blocks providers s
   });
   assert.equal(secondLocator.calls.length, 0);
   assert.equal(secondRunner.calls.length, 0);
+  releaseCleanup.resolve();
+  await cleanupSettled.promise;
+  // Let the already admitted unlink settle before a fresh recovery inspects
+  // the retained quarantine. The original timeout must not fake completion.
+  await new Promise(resolve => setImmediate(resolve));
+  await assert.rejects(first.close(), { code: 'STRUCTURED_PROVIDER_CLEANUP_FAILED' });
+  assert.equal(await second.generate(brainRequest()), '{"ok":true}');
+  assert.deepEqual(await readdir(temporaryRoot), []);
+  assert.equal(secondRunner.calls.length, 1);
+  await first.close();
+  await second.close();
 });
 
 test("cancellation uses an independent cleanup budget after safe process settlement", async (t) => {
