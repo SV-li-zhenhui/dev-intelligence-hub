@@ -11,6 +11,22 @@ const item = {
   reviewReceivedAt: "2026-10-09T09:00:00Z", reviewReceivedFrom: "developer",
   reviewReceivedVia: "assignee", reviewRequestEventId: "event-1",
 };
+
+test("a reused old Review cannot make the same Assign supersede its already completed settlement", () => {
+  const target = { resourceId: "acme/repo#42", version: item.headRefOid };
+  const next = { id: "current-confirmation", kind: "github.work-proposal-review", actor: { accountId: "reviewer" },
+    target, approvalBindingDigest: "c".repeat(64) };
+  const previous = { status: "completed", actor: next.actor, target, action: { publishedReviewReuse: {} },
+    execution: { startedAt: "2026-10-09T09:50:00Z", outcome: "already" }, receipt: { createdAt: "2026-10-09T09:30:00Z" } };
+  const facts = { ...item, assignees: ["reviewer"], myLatestPublishedReviewAt: previous.receipt.createdAt,
+    myLatestPublishedReviewCommitOid: item.headRefOid, reviewReceivedAt: "2026-10-09T09:45:00Z" };
+  assert.equal(automaticReviewAssignmentSupersedes(previous, next, createAutomaticReviewAssignmentProof(next, facts, now)), false);
+  const fresh = { ...facts, reviewRequestEventId: "new-assign", reviewReceivedAt: "2026-10-09T09:55:00Z" };
+  assert.equal(automaticReviewAssignmentSupersedes(previous, next, createAutomaticReviewAssignmentProof(next, fresh, now)), true);
+  for (const outcome of ["unknown", "failed"]) assert.equal(automaticReviewAssignmentSupersedes({ ...previous,
+    execution: { ...previous.execution, outcome } }, next, createAutomaticReviewAssignmentProof(next, fresh, now)), false);
+  assert.equal(automaticReviewAssignmentSupersedes({ ...previous, status: "failed" }, next, createAutomaticReviewAssignmentProof(next, fresh, now)), false);
+});
 test('automatic Review uses the current assignment without an age, sender, or CI permission gate', () => {
   assert.equal(automaticReviewEligibility({ ...item, assignees: ['reviewer'],
     incomingReviewFactsAvailable: false, reviewRecipient: null, reviewReceivedAt: null,

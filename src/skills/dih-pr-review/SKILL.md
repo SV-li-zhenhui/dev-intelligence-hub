@@ -23,6 +23,11 @@ description: Review a pinned GitHub PR in the dashboard using native CLI skill i
 
 ## 分级与执行
 
+宿主提供 `code.reviewPublicationReuse.verifiedResult` 时，原标准代码 Review 的
+Head/Base、策略和业务材料覆盖已由宿主证明。直接复用该成果，不重复以下 T3
+独立深评或全量 diff 读取。额外交付、验收条件和当前任务的剩余判断仍须正常完成。
+只有 publication candidate 而没有 verifiedResult 时，仍执行以下完整流程。
+
 - **T1**：约 40 行以下、范围小且没有权限、持久化、并发、外部接口或硬件风险。
   主评审者按 quick-review 完成单次检查。
 - **T2**：其他普通改动。主评审者完成全量读取，再使用原生代理工具分派两名

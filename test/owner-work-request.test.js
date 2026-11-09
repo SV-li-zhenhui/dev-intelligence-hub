@@ -32,6 +32,7 @@ import { emptyWorkGraphMemoryProjection, reconcileMigratedWorkGraphMemoryAuthori
 import { normalizeWorkLedgerLimits } from "../src/services/work-ledger-state.js";
 import { ownerWorkRequestForItem } from "../public/manual-work-assignment.js";
 import { normalizeBoundWorkProposal, workProposalDigest, createWorkProposalResult } from "../src/domain/work-proposal-contract.js";
+import { standardReviewPurpose } from "../src/domain/review-result-proof.js";
 
 const REQUEST_ID = "123e4567-e89b-42d3-a456-426614174000";
 
@@ -72,6 +73,34 @@ function pullRequest(overrides = {}) {
     ...overrides,
   };
 }
+
+test("new owner Review UI requests carry explicit purpose while old request and source bytes remain unchanged", () => {
+  const original = pullRequest();
+  const legacy = normalizeOwnerWorkRequest(original);
+  assert.equal(Object.hasOwn(legacy, "reviewPurpose"), false);
+  assert.equal(JSON.stringify(legacy), JSON.stringify(original));
+  const item = { kind: "pull_request", repo: "acme/repo", number: 42, title: "Review PR", state: "open" };
+  const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "reviewer", baseRepository: "acme/repo",
+    baseRefName: "main", baseRefOid: "a".repeat(40), headRepository: "acme/repo", headRefName: "fix", headRefOid: "b".repeat(40) };
+  const resolved = { repository: "acme/repo", number: 42, title: "Review PR", state: "open", gitTarget };
+  const before = createOwnerPullRequestEvent(legacy, resolved, "2026-10-28T05:00:00.000Z");
+  assert.equal(Object.hasOwn(before.payload, "reviewPurpose"), false);
+  assert.equal(standardReviewPurpose(before), null, "unmarked direct legacy owner tasks have no reusable typed purpose");
+  const { eventId: _eventId, contentDigest: _contentDigest, ...rawEvent } = before;
+  assert.equal(normalizeWorkflowEvent(rawEvent).contentDigest, before.contentDigest);
+  for (const purpose of ["standard_current_pr_code_review/v1", "independent_review/v1"]) {
+    const ui = ownerWorkRequestForItem(item, { workType: "pull_request", priority: "high", requestId: REQUEST_ID,
+      ...(purpose === "independent_review/v1" ? { reviewPurpose: purpose } : {}) });
+    const normalized = normalizeOwnerWorkRequest(ui);
+    assert.equal(normalized.reviewPurpose, purpose);
+    const event = createOwnerPullRequestEvent(normalized, resolved, "2026-10-28T05:00:00.000Z");
+    assert.equal(event.payload.reviewPurpose, purpose);
+    assert.equal(ownerWorkRequestEventMatches(normalized, event, event.occurredAt), true);
+    assert.equal(ownerWorkRequestEventMatches({ ...normalized, reviewPurpose: purpose === "independent_review/v1"
+      ? "standard_current_pr_code_review/v1" : "independent_review/v1" }, event, event.occurredAt), false);
+  }
+  assert.equal(JSON.stringify(createOwnerPullRequestEvent(legacy, resolved, "2026-10-28T05:00:00.000Z")), JSON.stringify(before));
+});
 
 function issue(overrides = {}) {
   return {

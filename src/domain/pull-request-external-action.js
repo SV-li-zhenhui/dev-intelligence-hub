@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { normalizePublishedReviewReuse } from "./review-result-proof.js";
 import { isHeadRepairExecutionSource } from "./code-execution-source.js";
 import { types as utilTypes } from "node:util";
 
@@ -514,7 +515,7 @@ function normalizeConfirmationAction(kind, value) {
     return { type: expectedType, body: actionBody(value.body, "action.body"), inputBinding };
   }
   if (expectedType === "pull_request_review") {
-    exact(value, ["type", "reviewEvent", "body", "inputBinding"], "action");
+    exact(value, ["type", "reviewEvent", "body", "inputBinding", ...(Object.hasOwn(value, "publishedReviewReuse") ? ["publishedReviewReuse"] : [])], "action");
     normalizeBindingField();
     if (!Object.values(REVIEW_EVENTS).includes(value.reviewEvent)) {
       throw invalid("action.reviewEvent 无效");
@@ -524,6 +525,7 @@ function normalizeConfirmationAction(kind, value) {
       reviewEvent: value.reviewEvent,
       body: actionBody(value.body, "action.body"),
       inputBinding,
+      ...(Object.hasOwn(value, "publishedReviewReuse") ? { publishedReviewReuse: normalizePublishedReviewReuse(value.publishedReviewReuse) } : {}),
     };
   }
   if (expectedType === "pull_request_update_branch") {

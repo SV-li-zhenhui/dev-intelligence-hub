@@ -31,9 +31,16 @@ export function createAutomaticReviewAssignmentProof(item, facts, now) {
 
 export function automaticReviewAssignmentSupersedes(previous, item, proof) {
   const stored = proof && assignmentProofs.get(proof);
-  const publishedAt = Date.parse(previous.receipt?.createdAt || "");
+  // A reuse settles a later Assign without creating a newer GitHub Review.
+  // Its controlled execution time, not that old publication timestamp, is the
+  // boundary for admitting yet another Assign. Same-Assign duplicates stay shut.
+  let settledAt = Date.parse(previous.receipt?.createdAt || "");
+  if (previous.action?.publishedReviewReuse) {
+    if (!["applied", "already"].includes(previous.execution?.outcome)) return false;
+    settledAt = Math.max(settledAt, Date.parse(previous.execution?.startedAt || ""));
+  }
   return Boolean(stored && stored.id === item.id && stored.approvalBindingDigest === item.approvalBindingDigest &&
-    previous.status === "completed" && Number.isFinite(publishedAt) && stored.receivedAt > publishedAt &&
+    previous.status === "completed" && Number.isFinite(settledAt) && stored.receivedAt > settledAt &&
     sameLogin(previous.actor?.accountId, item.actor?.accountId) &&
     previous.target?.resourceId?.toLowerCase() === item.target?.resourceId?.toLowerCase() &&
     previous.target?.version === item.target?.version);

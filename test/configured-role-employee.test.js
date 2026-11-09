@@ -1920,3 +1920,53 @@ test("Review reuse requires a host candidate and the complete native material re
     brainRouter: { describe: () => ({ singleAttempt: true }), generate: async () => JSON.stringify(decision) } });
   await assert.rejects(noRead.decide({ item: assignedTask(), context }), { code: "ROLE_DECISION_REVIEW_REUSE_UNAVAILABLE" });
 });
+
+test("host-proven code Review uses a residual decision without native review tools and retains extra obligations", async t => {
+  const publicationReuse = { candidateId: "review-publication-candidate-" + "c".repeat(64), materialDigest: "d".repeat(64),
+    coverageDigest: "e".repeat(64), readProofId: "review-read-proof-" + "f".repeat(64) };
+  const decision = completeDecision({ intent: { schemaVersion: 1, type: "propose_github_review", summary: "Reuse proven code Review",
+    reason: "Host coverage proof", verdict: "approve", body: "Code Review reused; QA note remains pending", evidence: ["head:bbbbbbbb"],
+    deliverableId: "review", publicationReuse } });
+  let request, responseDecision = decision, brainCalls = 0;
+  const engine = new RoleDecisionEngine({ definition: definition("pr-engineer"), permissions: permissions("propose_github_review"), brain: brain(),
+    brainRouter: { describe: () => ({ singleAttempt: true, supportsReviewReading: true, supportsNativeReviewSkills: true }),
+      async generate(value) { brainCalls++; request = value; return JSON.stringify(responseDecision); } } });
+  const context = { requirements: { currentTask: { taskId: "owner-child", acceptanceContract: {
+    expectedDeliverables: [{ deliverableId: "review", kind: "github-review", required: true }, { deliverableId: "qa-note", kind: "text-report", required: true }] } } },
+    code: { sourceEvent: { subject: { number: 42 } }, pullRequest: { materialDigest: publicationReuse.materialDigest },
+      reviewPublicationReuse: { complete: true, candidates: [{ ...publicationReuse, verdict: "approve", deliverableId: "review" }],
+        verifiedResult: { ...publicationReuse, verdict: "approve", deliverableId: "review" } } } };
+  const fullContext = structuredClone(context);
+  delete fullContext.code.reviewPublicationReuse.verifiedResult;
+  fullContext.code.pullRequest.reviewMaterial = { patch: "diff preview ".repeat(5000), gitTarget: { schemaVersion: 1, provider: "github", sourceAccountId: "reviewer",
+    baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "a".repeat(40), headRepository: "acme/repo", headRefName: "fix", headRefOid: "b".repeat(40) } };
+  responseDecision = structuredClone(decision);
+  delete responseDecision.intent.publicationReuse.readProofId;
+  await engine.decide({ item: assignedTask(), context: fullContext });
+  const fullRequestBytes = Buffer.byteLength(JSON.stringify({ messages: request.messages, schema: request.schema }));
+  assert.ok(request.reviewTarget);
+  responseDecision = decision;
+  const result = await engine.decide({ item: assignedTask(), context });
+  assert.equal(brainCalls, 2);
+  t.diagnostic(JSON.stringify({ fixture: "same-task-same-brain-capture-only", fullRequestBytes,
+    reusedRequestBytes: Buffer.byteLength(JSON.stringify({ messages: request.messages, schema: request.schema })),
+    fullRoleBrainCalls: 1, reusedResidualBrainCalls: 1, fullNativeReviewReadingRequired: true, reusedNativeReviewReadingRequired: false,
+    nativeBillingMeasured: false }));
+  assert.equal(result.intent.type, "propose_github_review");
+  assert.equal(request.reviewTarget, undefined, "no reader, native skill or T3 reviewers should be launched");
+  assert.equal(JSON.stringify(request.messages).includes("diff preview"), false);
+  assert.match(request.messages[0].content, /without another T3 assessment/);
+  const supplied = JSON.parse(request.messages.find(m => m.role === "user").content);
+  assert.equal(supplied.requirements.currentTask.acceptanceContract.expectedDeliverables[1].required, true);
+  context.code.reviewPublicationReuse.verifiedResult.automaticSettlement = { kind: "automatic_review_settlement", taskId: "owner-child" };
+  responseDecision = completeDecision();
+  await assert.rejects(engine.decide({ item: assignedTask(), context }), { code: "ROLE_DECISION_REVIEW_REUSE_UNAVAILABLE" });
+  responseDecision = decision;
+  delete context.code.reviewPublicationReuse.verifiedResult.automaticSettlement;
+  const retainedReuse = decision.intent.publicationReuse;
+  delete decision.intent.publicationReuse;
+  await assert.rejects(engine.decide({ item: assignedTask(), context }), { code: "ROLE_DECISION_REVIEW_REUSE_UNAVAILABLE" });
+  decision.intent.publicationReuse = retainedReuse;
+  delete context.code.reviewPublicationReuse.verifiedResult;
+  await assert.rejects(engine.decide({ item: assignedTask(), context }), { code: "ROLE_DECISION_REVIEW_REUSE_UNAVAILABLE" });
+});

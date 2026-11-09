@@ -292,8 +292,373 @@ async function fullFeedbackFixture(body = "Full author evidence " + "证据".rep
       createdAt: "2026-10-28T05:00:00.000Z", updatedAt: "2026-10-28T05:00:00.000Z", url: "https://github.com/acme/repo/pull/42#issuecomment-1" }],
     reviews: [], reviewThreads: [], checks: [], truncation: { comments: false, reviews: false, reviewThreads: false, checks: false, byteBudget: false } });
   const materialDigest = projectPullRequestReadFactsContext(facts).materialDigest;
-  return { facts, materialDigest, body };
+  return { facts, materialDigest, body, event };
 }
+
+test("only completed host reads produce a durable Review result proof", async t => {
+  const { facts, materialDigest } = await fullFeedbackFixture("Author feedback");
+  const { reader } = fixture({ changed: 1 });
+  const records = [];
+  reader.currentReviewFeedbackReader = {
+    async read() { return facts; },
+    async recordReviewCoverage(value) { records.push(value); },
+  };
+  const session = await reader.open({ ...TARGET, feedbackSnapshot: { taskId: "review-child", materialDigest } });
+  t.after(() => session.close());
+  const intent = { type: "propose_github_review", verdict: "approve", body: "Reviewed current code" };
+  await assert.rejects(tool(session, "record_review_coverage", { verdict: "approve", readProofId: "model-forged-proof" }),
+    { code: "PR_REVIEW_READ_TOOL_NOT_ALLOWED" });
+  await assert.rejects(session.assertComplete(intent), { code: "PR_REVIEW_READ_INCOMPLETE" });
+  assert.equal(records.length, 0);
+  for (const document of ["review-manifest.json", "review.diff", "review-description.json", "review-feedback.json"]) {
+    await tool(session, "read_document", { document, offset: 0, length: 48000 });
+  }
+  await session.assertComplete(intent);
+  assert.equal(records.length, 1, "complete host reads must retain proof for later cross-task result reuse");
+  assert.equal(records[0].taskId, "review-child");
+  assert.equal(records[0].intent.body, intent.body);
+  assert.ok(records[0].coverage.feedbackDigest);
+});
+
+async function crossTaskReuseFixture(t, { proofWriteFailure = false } = {}) {
+  const { ReviewPublicationAdoptionStore } = await import("../src/services/published-review-adoption.js");
+  const { ReviewPublicationReuseService } = await import("../src/services/review-publication-reuse-service.js");
+  const { normalizeBoundWorkProposal, createWorkProposalResult } = await import("../src/domain/work-proposal-contract.js");
+  const { createGitHubReviewProposalConfirmationPlan } = await import("../src/domain/github-review-proposal-confirmation.js");
+  const { ConfirmationQueue } = await import("../src/services/confirmation-queue.js");
+  const { createPullRequestReadFacts, createPullRequestReadIdentity, projectPullRequestReadFactsContext } = await import("../src/domain/pull-request-read-facts.js");
+  const { normalizeWorkflowEvent } = await import("../src/domain/workflow-events.js");
+  const { createDeliveryEvidenceTarget } = await import("../src/domain/delivery-evidence-contract.js");
+  const { readGitHubReviewFeedbackSnapshot } = await import("../src/adapters/github-review-feedback-snapshot.js");
+  const original = await fullFeedbackFixture("Author feedback https://github.com/acme/product/issues/7");
+  const values = new Map();
+  let failProofWrite = proofWriteFailure;
+  const store = { async read(key, fallback) { return structuredClone(values.get(key) ?? fallback); },
+    async write(key, value) {
+      if (failProofWrite && value.readProofs?.length) { failProofWrite = false; throw new Error("Receipt storage temporarily unavailable"); }
+      values.set(key, structuredClone(value));
+    } };
+  const originalBinding = original.facts.identity.executionBinding;
+  const sourceTask = { taskId: "review-root", roleId: "pr-engineer", revision: 2, status: "working", rootStatus: "working",
+    inputBinding: originalBinding, event: original.event, requestedAt: "2026-10-28T05:00:00.000Z",
+    acceptanceContract: { revision: 1, acceptanceCriteria: [], expectedDeliverables: [] } };
+  const intent = { type: "propose_github_review", verdict: "approve", body: "Reviewed current code" };
+  let source = null, facts = original.facts, policyDigest = "d".repeat(64), description = "", linkedBody = "Original linked requirement";
+  let receiverProposal = null;
+  const tasks = new Map([[sourceTask.taskId, sourceTask]]);
+  const { reader } = fixture({ changed: 1 });
+  const baseRun = reader.run;
+  reader.run = async (...args) => {
+    if (args[1][3] === "repos/acme/product/issues/7") return { number: 7, title: "Linked requirement", body: linkedBody, state: "open",
+      user: { login: "qa" }, comments: 0, created_at: "2026-10-28T04:00:00Z", updated_at: "2026-10-28T05:00:00Z", html_url: "https://github.com/acme/product/issues/7" };
+    if (args[1][3] === "repos/acme/product/issues/7/comments?per_page=20&page=1") return [];
+    const value = await baseRun(...args);
+    return args[1][3] === "repos/acme/repo/pulls/42" ? { ...value, title: "Qt Fixture PR", body: description } : value;
+  };
+  const ports = receiptStore => ({ taskReader: { async read({ taskId }) { return structuredClone(tasks.get(taskId)); } },
+    factsReader: { async get() { return facts; } }, publicationSourceReader: { async listReviewPublicationSources() {
+      return { complete: true, items: [...(source ? [{ ...source, status: "succeeded", downstreamRef: null }] : []),
+        ...(receiverProposal ? [{ proposal: receiverProposal, status: "running", result: null, downstreamRef: null }] : [])] };
+    } }, confirmationReader: { async readSettlements() { return { queueRevision: source.confirmationSnapshot.queueRevision, items: [source.confirmationSnapshot.item] }; } },
+    materialsReader: { async read(input, options) { return readGitHubReviewFeedbackSnapshot({ target: {
+      gitTarget: input.gitTarget, pullRequestNumber: input.pullRequestNumber,
+      feedbackSnapshot: { taskId: input.taskId, materialDigest: projectPullRequestReadFactsContext(facts).materialDigest } },
+      factsReader: { async read() { return facts; } }, run: reader.run, options, excludedPublication: input.excludedPublication }); } },
+    receiptStore, inputAuthorityVerifier: { async verify(input) { return input; } },
+    policyReader: async () => policyDigest, clock: () => new Date("2026-10-28T05:05:00.000Z") });
+  let receiptStore = new ReviewPublicationAdoptionStore({ store });
+  let service = new ReviewPublicationReuseService(ports(receiptStore));
+  reader.currentReviewFeedbackReader = { async read() { return original.facts; }, recordReviewCoverage: value => service.recordReviewCoverage(value) };
+  const session = await reader.open({ ...TARGET, feedbackSnapshot: { taskId: sourceTask.taskId, materialDigest: original.materialDigest } },
+    { skillDocuments: { "review-skill/SKILL.md": "Review policy", "review-skill/manifest.json": JSON.stringify({ digest: policyDigest }) } });
+  t.after(() => session.close());
+  for (const document of ["review-manifest.json", "review.diff", "review-description.json", "review-feedback.json", "review-skill/SKILL.md", "review-skill/manifest.json", "linked-material-001.json"]) {
+    await tool(session, "read_document", { document, offset: 0, length: 48000 });
+  }
+  await session.assertComplete(intent);
+  assert.equal(values.get("review-publication-adoptions")?.readProofs?.length ?? 0, proofWriteFailure ? 0 : 1, "producer proof persistence is optional for ordinary publication");
+  const proposal = normalizeBoundWorkProposal({ proposalId: "work-intent-" + "a".repeat(64), policyVersion: 1,
+    kind: "github_review_proposal", requestedBy: { roleId: "pr-engineer", workItemId: sourceTask.taskId },
+    source: { assignmentId: "source-assignment", eventId: originalBinding.eventId },
+    binding: { eventId: originalBinding.eventId, subject: { repository: "acme/repo", number: 42 }, repository: "acme/repo",
+      pullRequestNumber: 42, headRefOid: originalBinding.headRefOid, inputBinding: originalBinding },
+    payload: { verdict: intent.verdict, body: intent.body, evidence: ["head:" + originalBinding.headRefOid], summary: "Review complete", reason: "Code read" } });
+  const at = "2026-10-28T05:02:00.000Z";
+  const queueValues = new Map();
+  const publicationQueueStore = { async read(k, f) { return structuredClone(queueValues.get(k) ?? f); }, async write(k, v) { queueValues.set(k, structuredClone(v)); } };
+  const queue = new ConfirmationQueue({ store: publicationQueueStore,
+    clock: () => new Date(at), exclusiveLease: { async acquire() {}, run: op => op(), async close() {} },
+    reviewHandoffPolicy: { testingOwnersByProduct: { qt: ["qa-user"] } },
+    executor: { async execute() { return { status: "applied", receipt: { id: "12345", url: "https://github.com/acme/repo/pull/42", createdAt: at } }; }, async reconcile() { assert.fail("No replay"); } } });
+  await queue.recover();
+  const publication = await queue.enqueue(createGitHubReviewProposalConfirmationPlan(proposal, { actorAccountId: "reviewer" }));
+  const { AutomaticReviewPublisher } = await import("../src/services/automatic-review-publisher.js");
+  const { ReviewHandoffReconciler } = await import("../src/services/review-handoff-reconciler.js");
+  await new AutomaticReviewPublisher({ enabled: true, queue, clock: () => new Date(at), testingOwnersByProduct: { qt: ["qa-user"] },
+    github: { async readIncomingReviewRequest() { return { kind: "pull_request", state: "open", isDraft: false, title: "Qt Fixture PR",
+      currentUser: "reviewer", author: "developer", assignees: ["reviewer"], headRefOid: originalBinding.headRefOid,
+      incomingReviewFactsAvailable: true, reviewRecipient: "reviewer", reviewReceivedFrom: "developer", reviewReceivedVia: "assignee",
+      reviewRequestEventId: "AE_original", reviewReceivedAt: "2026-10-28T05:00:00.000Z" }; } } }).publish(publication);
+  let oldHandoffs = 0;
+  const originalHandoff = new ReviewHandoffReconciler({ confirmations: queue, testingOwnersByProduct: { qt: ["qa-user"] },
+    ownerWorkRequests: { async submit() { assert.fail("Automatic source handoff is assignment only"); } },
+    githubAssignee: { async assignAssignee() { assert.fail("Use verdict routing"); }, async assignReviewOutcome() { oldHandoffs++; return { assigneeLogin: "qa-user" }; } } });
+  assert.equal((await originalHandoff.runCycle())[0].status, "completed");
+  assert.equal(oldHandoffs, 1);
+  source = { proposal, result: createWorkProposalResult({ proposal, sequence: 1, downstreamRef: null, at,
+    transition: { status: "succeeded", summary: "Published", evidence: ["confirmation:" + publication.id] } }),
+    confirmationSnapshot: await queue.readSettlement({ confirmationId: publication.id }) };
+  const { createPrTriageWorkRequest, createOwnerPullRequestEvent } = await import("../src/domain/owner-work-request.js");
+  const ownerRequest = createPrTriageWorkRequest({ requestKey: "future-owner-rereview", targetRoleId: "pr-engineer",
+    repository: "acme/repo", number: 42, nextAction: "rereview", expectedHeadRefOid: TARGET.gitTarget.headRefOid });
+  const event = createOwnerPullRequestEvent(ownerRequest, { repository: "acme/repo", number: 42, title: "Fixture PR",
+    state: "open", gitTarget: TARGET.gitTarget }, "2026-10-28T05:00:30.000Z");
+  const binding = { ...originalBinding, rootItemId: "owner-root", workKey: "owner-review", eventId: event.eventId, eventDigest: event.contentDigest };
+  const contract = { revision: 1, acceptanceCriteria: [{ criterionId: "qa-note", description: "Also deliver a separate QA execution note" }],
+    expectedDeliverables: [{ deliverableId: "review", kind: "github-review", description: "Code Review", required: true },
+      { deliverableId: "qa-note", kind: "text-report", description: "Additional QA note", required: true }] };
+  const task = { taskId: "owner-child", roleId: "pr-engineer", revision: 2, status: "working", rootStatus: "queued",
+    activeIntentId: null, inputBinding: binding, event, acceptanceContract: contract, requestedAt: event.occurredAt };
+  tasks.set(task.taskId, task);
+  const { contentDigest: _digest, schemaVersion: _version, ...content } = original.facts;
+  facts = createPullRequestReadFacts({ ...content, identity: createPullRequestReadIdentity({ executionBinding: binding, event }), observedAt: "2026-10-28T05:03:00.000Z",
+    reviews: [{ id: "PRR_published", author: "reviewer", state: "APPROVED", commitOid: binding.headRefOid, submittedAt: at,
+      body: intent.body, bodyTruncated: false, url: "https://github.com/acme/repo/pull/42#pullrequestreview-12345" }] });
+  // Reconstruct both readers from persisted bytes; no producer closure survives.
+  receiptStore = new ReviewPublicationAdoptionStore({ store });
+  service = new ReviewPublicationReuseService(ports(receiptStore));
+  const list = () => service.listCandidates({ taskId: task.taskId, materialDigest: projectPullRequestReadFactsContext(facts).materialDigest });
+  const catalog = await list();
+  assert.equal(Boolean(catalog.verifiedResult), !proofWriteFailure, "host must require actual persisted producer proof across restart");
+  const target = createDeliveryEvidenceTarget({ taskId: task.taskId, roleId: task.roleId, acceptanceContract: contract, deliverableId: "review" });
+  return { service, receiptStore, store, values, task, tasks, source, catalog, list, target, binding, event, publicationQueueStore,
+    changePolicy: () => { policyDigest = "e".repeat(64); }, changeDescription: () => { description = "Author changed requirements"; },
+    changeLinked: () => { linkedBody = "QA changed linked acceptance requirement"; },
+    changeFacts: change => { const { contentDigest, schemaVersion, ...c } = facts; facts = createPullRequestReadFacts(change(c)); },
+    normalizeBoundWorkProposal, createWorkProposalResult,
+    registerReceiverProposal(value) { receiverProposal = value; task.activeProposal = { proposalId: value.proposalId, contentDigest: value.contentDigest }; task.status = "waiting_external"; },
+    async asAutomaticReceiver() {
+      const { createPullRequestWorkSource } = await import("../src/services/work-ledger-pr-source.js");
+      const { createReviewAdoptionTaskReader } = await import("../src/services/review-publication-reuse-service.js");
+      const autoEvent = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.updated", occurredAt: "2026-10-28T05:04:00.000Z",
+        source: { provider: "github", scopeId: "github-dashboard" }, subject: original.event.subject,
+        payload: { gitTarget: TARGET.gitTarget, gitTargetAvailable: true, headRefOid: TARGET.gitTarget.headRefOid,
+          relation: "review_requested", assignees: ["reviewer"], reviewRecipient: "reviewer", reviewReceivedFrom: "developer",
+          reviewReceivedAt: "2026-10-28T05:04:00.000Z", reviewReceivedVia: "assignee", reviewRequestEventId: "AE_fresh_assignment" } });
+      const assignment = { assignmentId: "fresh-automatic-assignment", eventId: autoEvent.eventId, target: { type: "role", id: "pr-engineer" } };
+      const created = createPullRequestWorkSource({ sequence: 1, event: autoEvent, assignment });
+      assert.ok(created);
+      const autoItem = { itemId: "automatic-current-root", kind: "source_root", revision: 2, status: "working", sourceQuarantine: null,
+        activeIntentId: null, currentTarget: assignment.target, assignmentId: assignment.assignmentId, assignment, event: autoEvent,
+        source: created.source, inputDigest: created.source.current.inputDigest, createdAt: autoEvent.occurredAt,
+        graph: { acceptanceContracts: [{ revision: 1, acceptanceCriteria: [], expectedDeliverables: [] }] } };
+      const actualReader = createReviewAdoptionTaskReader({ async readReviewAdoptionContext() { return { item: autoItem, root: autoItem, activeDispatch: null }; } });
+      const automaticTask = await actualReader.read({ taskId: autoItem.itemId });
+      assert.equal(automaticTask.automaticSettlement.kind, "automatic_review_settlement");
+      tasks.delete(task.taskId); Object.assign(task, automaticTask); tasks.set(task.taskId, task);
+      const { contentDigest, schemaVersion, ...c } = facts;
+      facts = createPullRequestReadFacts({ ...c, identity: createPullRequestReadIdentity({ executionBinding: task.inputBinding, event: autoEvent }), observedAt: "2026-10-28T05:05:00.000Z" });
+      return { task, event: autoEvent, binding: task.inputBinding, catalog: await list() };
+    },
+    async fullReviewFallback() {
+      const currentCatalog = await list();
+      assert.equal(currentCatalog.verifiedResult, undefined);
+      assert.ok(currentCatalog.candidates.length > 0, "legacy full-reading candidate remains available");
+      reader.currentReviewFeedbackReader = { async read() { return facts; } };
+      const fullSession = await reader.open({ ...TARGET, feedbackSnapshot: { taskId: task.taskId,
+        materialDigest: projectPullRequestReadFactsContext(facts).materialDigest } });
+      try {
+        for (const document of ["review-manifest.json", "review.diff", "review-description.json", "review-feedback.json", "linked-material-001.json"]) {
+          await tool(fullSession, "read_document", { document, offset: 0, length: 48000 });
+        }
+        const c = currentCatalog.candidates[0];
+        const reuse = { candidateId: c.candidateId, materialDigest: c.materialDigest,
+          coverageDigest: JSON.parse(fullSession.manifestText).feedbackSnapshot.coverageDigest };
+        await fullSession.assertComplete({ type: "propose_github_review", publicationReuse: reuse });
+        const ordinary = normalizeBoundWorkProposal({ proposalId: "work-intent-" + "b".repeat(64), policyVersion: 1, kind: "github_review_proposal",
+          requestedBy: { roleId: "pr-engineer", workItemId: task.taskId }, source: { assignmentId: "target-assignment", eventId: event.eventId },
+          binding: { eventId: event.eventId, subject: event.subject, repository: "acme/repo", pullRequestNumber: 42,
+            headRefOid: binding.headRefOid, inputBinding: binding, evidenceTarget: target },
+          payload: { verdict: "approve", body: "Full current review completed", publicationReuse: reuse,
+            evidence: ["head:" + binding.headRefOid], summary: "Full current review", reason: "Read current materials" } });
+        task.status = "waiting_external"; task.activeProposal = { proposalId: ordinary.proposalId, contentDigest: ordinary.contentDigest };
+        assert.equal((await service.handle({ proposal: ordinary })).status, "succeeded");
+      } finally { await fullSession.close(); }
+    } };
+}
+
+test("real producer proof survives restart and reuses code Review across contracts without completing residual work", async t => {
+  const f = await crossTaskReuseFixture(t);
+  const v = f.catalog.verifiedResult;
+  const reuse = { candidateId: v.candidateId, materialDigest: v.materialDigest, coverageDigest: v.coverageDigest, readProofId: v.readProofId };
+  const proposal = f.normalizeBoundWorkProposal({ proposalId: "work-intent-" + "b".repeat(64), policyVersion: 1, kind: "github_review_proposal",
+    requestedBy: { roleId: "pr-engineer", workItemId: f.task.taskId }, source: { assignmentId: "owner-child-assignment", eventId: f.event.eventId },
+    binding: { eventId: f.event.eventId, subject: f.event.subject, repository: "acme/repo", pullRequestNumber: 42,
+      headRefOid: f.binding.headRefOid, inputBinding: f.binding, evidenceTarget: f.target },
+    payload: { verdict: v.verdict, body: "Host proved identical code Review coverage; QA note remains pending", publicationReuse: reuse,
+      evidence: ["head:" + f.binding.headRefOid], summary: "Reuse code Review", reason: "Verified producer coverage" } });
+  f.task.status = "waiting_external";
+  f.task.activeProposal = { proposalId: proposal.proposalId, contentDigest: proposal.contentDigest };
+  const result = await f.service.handle({ proposal });
+  assert.equal(result.status, "succeeded");
+  const receipt = await f.receiptStore.getForProposal({ proposalId: proposal.proposalId, proposalDigest: proposal.contentDigest });
+  assert.equal(receipt.assessment.readProofId, v.readProofId);
+  assert.equal(receipt.target.evidenceTarget.deliverables.length, 1);
+  assert.equal(receipt.target.evidenceTarget.deliverables[0].deliverableId, "review");
+  assert.equal(f.task.status, "waiting_external", "adoption must not finish the current task");
+  assert.equal(f.task.acceptanceContract.expectedDeliverables[1].deliverableId, "qa-note");
+  assert.equal(f.task.acceptanceContract.expectedDeliverables[1].required, true);
+});
+
+for (const scenario of ["description", "linked", "checks", "policy", "independent", "unknown", "missing-proof", "corrupt-proof", "author-comment", "body-forgery", "base", "head"])
+test(`result reuse falls back to full assessment after ${scenario}`, async t => {
+  const f = await crossTaskReuseFixture(t);
+  if (scenario === "description") f.changeDescription();
+  if (scenario === "linked") f.changeLinked();
+  if (scenario === "checks") f.changeFacts(c => ({ ...c, checks: [{ kind: "check_run", name: "CodeTest", status: "COMPLETED", conclusion: "FAILURE",
+    url: "https://ci.example/42", requirement: "required", startedAt: "2026-10-28T05:02:00.000Z", completedAt: "2026-10-28T05:03:00.000Z" }] }));
+  if (scenario === "policy") f.changePolicy();
+  if (scenario === "independent") f.task.event = { ...f.task.event, payload: { ...f.task.event.payload, reviewPurpose: "independent_review/v1" } };
+  if (scenario === "unknown") f.task.event = { ...f.task.event, payload: { ...f.task.event.payload, reviewPurpose: "unknown-purpose" } };
+  if (scenario === "missing-proof") f.values.get("review-publication-adoptions").readProofs = [];
+  if (scenario === "corrupt-proof") f.values.get("review-publication-adoptions").readProofs[0].bodyDigest = "0".repeat(64);
+  if (scenario === "author-comment") f.changeFacts(c => ({ ...c, comments: [...c.comments, { ...c.comments[0], id: "new-comment", body: "New author requirement",
+    createdAt: "2026-10-28T05:04:00.000Z", updatedAt: "2026-10-28T05:04:00.000Z" }] }));
+  if (scenario === "body-forgery") f.changeFacts(c => ({ ...c, reviews: c.reviews.map(r => ({ ...r, body: "Different published body" })) }));
+  if (["head", "base"].includes(scenario)) {
+    f.task.inputBinding = structuredClone(f.task.inputBinding);
+    f.task.inputBinding.gitTarget[scenario === "head" ? "headRefOid" : "baseRefOid"] = "f".repeat(40);
+  }
+  // A mismatched target may be rejected before candidate generation, which is
+  // equally fail-closed; no new model/queue/action is started by this reader.
+  let catalog;
+  try { catalog = await f.list(); } catch { catalog = {}; }
+  assert.equal(catalog.verifiedResult, undefined);
+  assert.notEqual(f.task.status, "completed");
+});
+
+for (const scenario of ["write-failed", "capacity", "corrupt-metadata"])
+test(`optimization ${scenario} leaves the real full-review and normal adoption path usable`, async t => {
+  const f = await crossTaskReuseFixture(t, { proofWriteFailure: scenario === "write-failed" });
+  if (scenario === "corrupt-metadata") f.values.get("review-publication-adoptions").readProofs = "invalid optimization metadata";
+  if (scenario === "capacity") {
+    const { canonicalJsonDigest } = await import("../src/lib/canonical-json-digest.js");
+    const first = f.values.get("review-publication-adoptions").readProofs[0];
+    const { readProofId, ...content } = first;
+    f.values.get("review-publication-adoptions").readProofs = Array.from({ length: 1000 }, (_, i) => {
+      const c = { ...content, producerTaskId: `other-task-${i}` };
+      return { ...c, readProofId: `review-read-proof-${canonicalJsonDigest(c)}` };
+    });
+    assert.deepEqual(await f.receiptStore.recordReadProof(first), { recorded: false, diagnostic: "REVIEW_READ_PROOF_CAPACITY" });
+    assert.equal(f.values.get("review-publication-adoptions").readProofs.length, 1000);
+  }
+  await f.fullReviewFallback();
+  assert.equal(f.values.get("review-publication-adoptions").records.length, 1);
+  f.values.get("review-publication-adoptions").records[0].adoptionId = "forged-original-record";
+  await assert.rejects(f.receiptStore.recover(), { code: "REVIEW_PUBLICATION_ADOPTION_CORRUPTED" }, "original record corruption remains strict");
+});
+
+async function automaticSettlementFixture(t, { enabled = true, changeBeforeExecution = false } = {}) {
+  const f = await crossTaskReuseFixture(t);
+  const current = await f.asAutomaticReceiver();
+  assert.ok(current.catalog.verifiedResult, "a fresh automatic Assign can reuse an older proven Review");
+  assert.equal(current.task.acceptanceContract.expectedDeliverables.length, 0, "no synthetic delivery contract");
+  const v = current.catalog.verifiedResult;
+  const reuse = { candidateId: v.candidateId, materialDigest: v.materialDigest, coverageDigest: v.coverageDigest, readProofId: v.readProofId };
+  const proposal = f.normalizeBoundWorkProposal({ proposalId: "work-intent-" + "b".repeat(64), policyVersion: 1, kind: "github_review_proposal",
+    requestedBy: { roleId: "pr-engineer", workItemId: current.task.taskId },
+    source: { assignmentId: current.task.automaticSettlement.assignmentId, eventId: current.event.eventId },
+    binding: { eventId: current.event.eventId, subject: current.event.subject, repository: "acme/repo", pullRequestNumber: 42,
+      headRefOid: current.binding.headRefOid, inputBinding: current.binding },
+    payload: { verdict: v.verdict, body: "Host verified the prior code Review; settle this current assignment", publicationReuse: reuse,
+      evidence: ["head:" + current.binding.headRefOid], summary: "Reuse code Review", reason: "Verified current business coverage" } });
+  f.registerReceiverProposal(proposal);
+  const { createPullRequestExternalActionExecutor } = await import("../src/services/pull-request-external-action-executor.js");
+  const { ConfirmationQueue } = await import("../src/services/confirmation-queue.js");
+  const { AutomaticReviewPublisher } = await import("../src/services/automatic-review-publisher.js");
+  const { GitHubReviewProposalHandler } = await import("../src/services/github-review-proposal-handler.js");
+  const { ReviewHandoffReconciler } = await import("../src/services/review-handoff-reconciler.js");
+  const counts = { reviewPost: 0, handoff: 0, verifiedExecution: 0 };
+  const authority = { async verify() { return structuredClone(current.binding); } };
+  const executor = createPullRequestExternalActionExecutor({ enabledActions: ["review"],
+    credentialSource: Object.freeze({ async acquire() { assert.fail("verified reuse must not post a Review"); } }),
+    transport: { async observe() { assert.fail("Reuse uses the exact original receipt, not a new marker search"); },
+      async perform() { counts.reviewPost++; assert.fail("A reused Review must never be posted again"); } },
+    inputAuthorityVerifier: authority, reviewResultVerifier: { async verify(envelope, options) { counts.verifiedExecution++; return f.service.verifyAutomaticSettlement(envelope, options); } } });
+  t.after(() => executor.close());
+  const queueStore = f.publicationQueueStore;
+  const clock = () => new Date("2026-10-28T05:06:00.000Z");
+  const createQueue = async () => {
+    const queue = new ConfirmationQueue({ store: queueStore, executor, clock,
+      exclusiveLease: { async acquire() {}, run: op => op(), async close() {} }, reviewHandoffPolicy: { testingOwnersByProduct: { qt: ["qa-user"] } } });
+    await queue.recover(); return queue;
+  };
+  let queue = await createQueue();
+  const incoming = { kind: "pull_request", state: "open", isDraft: false, author: "developer", assignees: ["reviewer"],
+    title: "Qt Fixture PR", currentUser: "reviewer",
+    headRefOid: current.binding.headRefOid, incomingReviewFactsAvailable: true, reviewRecipient: "reviewer", reviewReceivedFrom: "developer",
+    reviewReceivedAt: "2026-10-28T05:04:00.000Z", reviewReceivedVia: "assignee", reviewRequestEventId: "AE_fresh_assignment",
+    myReviewState: "APPROVED", myReviewCommitOid: current.binding.headRefOid, myLatestPublishedReviewAt: "2026-10-28T05:02:00.000Z" };
+  const createHandler = queue => new GitHubReviewProposalHandler({ confirmationProducer: queue, inputAuthorityVerifier: authority,
+    publicationAdopter: f.service, actorAccountId: "reviewer", clock, automaticReviewPublisher: {
+      async publish(item) {
+        if (changeBeforeExecution === "proof") f.values.get("review-publication-adoptions").readProofs = [];
+        else if (changeBeforeExecution === "authority") current.task.automaticSettlement.authorityEpoch++;
+        else if (changeBeforeExecution === "checks") f.changeFacts(c => ({ ...c, checks: [{ kind: "check_run", name: "CodeTest", status: "COMPLETED", conclusion: "FAILURE",
+          url: "https://ci.example/42", requirement: "required", startedAt: "2026-10-28T05:02:00.000Z", completedAt: "2026-10-28T05:03:00.000Z" }] }));
+        else if (changeBeforeExecution) f.changeDescription();
+        return new AutomaticReviewPublisher({ enabled, queue, clock, assignAfterReview: true,
+          testingOwnersByProduct: { qt: ["qa-user"] }, github: { async readIncomingReviewRequest() { return incoming; } } }).publish(item);
+      } } });
+  const handle = handler => handler.handle({ proposal, status: "pending_delivery", attempt: 1, downstreamRef: null });
+  const handoff = queue => new ReviewHandoffReconciler({ confirmations: queue, automaticAssignmentsEnabled: true,
+    testingOwnersByProduct: { qt: ["qa-user"] }, ownerWorkRequests: { async submit() { assert.fail("automatic handoff should remain assignment only"); } },
+    githubAssignee: { async assignAssignee() { assert.fail("Current verdict routing must be used"); },
+      async assignReviewOutcome(input) { counts.handoff++; assert.equal(input.headRefOid, current.binding.headRefOid); return { assigneeLogin: "qa-user" }; } } });
+  const result = await handle(createHandler(queue));
+  return { ...f, current, proposal, result, counts, queue, handoff,
+    async restart() { queue = await createQueue(); return { queue, result: await handle(createHandler(queue)) }; } };
+}
+
+test("fresh automatic receiver settles the prior Review through current confirmation and handoff without Review POST or replay", async t => {
+  const f = await automaticSettlementFixture(t);
+  assert.equal(f.source.confirmationSnapshot.item.reviewHandoff.status, "completed", "the first publication already completed its old handoff");
+  assert.equal(f.result.status, "succeeded");
+  assert.equal(f.counts.reviewPost, 0);
+  assert.equal(f.counts.verifiedExecution, 1, "executor must verify current proof at the action boundary");
+  const pending = await f.queue.readReviewHandoffs();
+  assert.equal(pending.length, 1);
+  assert.notEqual(pending[0].id, f.source.confirmationSnapshot.item.id, "current Assign has its own controlled confirmation");
+  const handoffResult = (await f.handoff(f.queue).runCycle())[0];
+  assert.equal(handoffResult.status, "completed", JSON.stringify(handoffResult));
+  assert.equal(f.counts.handoff, 1);
+  const again = await f.restart();
+  assert.equal(again.result.status, "succeeded");
+  assert.equal((await f.handoff(again.queue).runCycle()).length, 0);
+  assert.equal(f.counts.handoff, 1);
+  assert.equal(f.counts.verifiedExecution, 1);
+  assert.equal(f.counts.reviewPost, 0);
+});
+
+test("automatic result settlement retains the automatic Review switch and rejects coverage changes before execution", async t => {
+  const disabled = await automaticSettlementFixture(t, { enabled: false });
+  assert.equal(disabled.result.status, "waiting_confirmation");
+  assert.equal(disabled.counts.verifiedExecution, 0);
+  assert.equal((await disabled.queue.readReviewHandoffs()).length, 0);
+  const changed = await automaticSettlementFixture(t, { changeBeforeExecution: true });
+  assert.equal(changed.result.status, "stale");
+  assert.equal(changed.counts.reviewPost, 0);
+  assert.equal((await changed.queue.readReviewHandoffs()).length, 0);
+});
+
+for (const change of ["proof", "authority", "checks"])
+test(`automatic settlement rejects ${change} loss/change at execution before Review or handoff`, async t => {
+  const f = await automaticSettlementFixture(t, { changeBeforeExecution: change });
+  assert.equal(f.result.status, "stale");
+  assert.equal(f.counts.reviewPost, 0);
+  assert.equal(f.counts.handoff, 0);
+  assert.equal((await f.queue.readReviewHandoffs()).length, 0);
+});
 
 test("current author discussion is a required paged document rather than an inline preview", async (t) => {
   const { facts, materialDigest, body } = await fullFeedbackFixture();

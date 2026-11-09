@@ -89,6 +89,7 @@ import { ProactivePrEmployeeService } from "./services/proactive-pr-employee.js"
 import { PrEngineerService } from "./services/pr-engineer-service.js";
 import { BoundReviewFeedbackReader } from "./services/bound-review-feedback-reader.js";
 import { ReviewPublicationAdoptionStore } from "./services/published-review-adoption.js";
+import { loadNativeReviewSkill } from "./lib/native-review-skill.js";
 import { ReviewPublicationReuseService, createReviewAdoptionTaskReader } from "./services/review-publication-reuse-service.js";
 import { readGitHubReviewFeedbackSnapshot } from "./adapters/github-review-feedback-snapshot.js";
 import { projectPullRequestReadFactsContext } from "./domain/pull-request-read-facts.js";
@@ -550,7 +551,8 @@ function productionCliRuntimeFacts(value) {
       originalRepairFeedbackReader: frozenPort(feedbackReader, ["read"], "originalRepairFeedbackReader"),
     }),
     ...(currentFeedbackReader === undefined ? {} : {
-      currentReviewFeedbackReader: frozenPort(currentFeedbackReader, ["read"], "currentReviewFeedbackReader"),
+      currentReviewFeedbackReader: frozenPort(currentFeedbackReader,
+        ["read", ...(typeof currentFeedbackReader.recordReviewCoverage === "function" ? ["recordReviewCoverage"] : [])], "currentReviewFeedbackReader"),
     }),
   });
 }
@@ -1245,7 +1247,7 @@ export async function createApplication({
       currentReviewFeedbackReader: Object.freeze({ async read(input, options) {
         if (currentReviewFeedbackReader === null) throw Object.assign(new Error("PR_REVIEW_READ_FEEDBACK_UNAVAILABLE"), { code: "PR_REVIEW_READ_FEEDBACK_UNAVAILABLE" });
         return currentReviewFeedbackReader.read(input, options);
-      } }),
+      }, async recordReviewCoverage(input) { return currentReviewFeedbackReader?.recordReviewCoverage?.(input); } }),
       ...(typeof privateRuntimeDirectory === "string" &&
           path.isAbsolute(privateRuntimeDirectory) &&
           path.resolve(privateRuntimeDirectory) ===
@@ -2158,6 +2160,9 @@ export async function createApplication({
             : { timeoutMs: configuredGithubActions.timeoutMs }),
           transport,
           inputAuthorityVerifier,
+          reviewResultVerifier: Object.freeze({ async verify(envelope, options) {
+            return reviewPublicationReuse === null ? null : reviewPublicationReuse.verifyAutomaticSettlement(envelope, options);
+          } }),
           ...(controlledCommitVerifier === null
             ? {}
             : { controlledCommitVerifier }),
@@ -2725,7 +2730,7 @@ export async function createApplication({
       const getBoundReviewReader = () => boundReviewReader ??= new BoundReviewFeedbackReader({ ledger: workLedgerRuntime, factsReader: prEngineerService, inputAuthorityVerifier });
       currentReviewFeedbackReader = Object.freeze({ async read(input, options) {
         return getBoundReviewReader().read(input, options);
-      } });
+      }, async recordReviewCoverage(input) { return getReuseService().recordReviewCoverage(input); } });
       let reuseService = null;
       const getReuseService = () => reuseService ??= new ReviewPublicationReuseService({
         taskReader: createReviewAdoptionTaskReader(frozenPort(workLedgerRuntime, ["readReviewAdoptionContext"], "Review adoption task reader")),
@@ -2741,21 +2746,24 @@ export async function createApplication({
           return reader.readMany(input);
         } }),
         materialsReader: Object.freeze({ async read(input, options = {}) {
-          const facts = await getBoundReviewReader().readCurrent(input, options);
+          const { excludedPublication, ...request } = input;
+          const facts = await getBoundReviewReader().readCurrent(request, options);
           const materialDigest = projectPullRequestReadFactsContext(facts).materialDigest;
           if (typeof materialDigest !== "string") throw Object.assign(new Error("PR_REVIEW_READ_MATERIAL_CHANGED"), { code: "PR_REVIEW_READ_MATERIAL_CHANGED" });
           return readGitHubReviewFeedbackSnapshot({ target: { gitTarget: input.gitTarget, pullRequestNumber: input.pullRequestNumber,
             feedbackSnapshot: { taskId: input.taskId, materialDigest } }, factsReader: Object.freeze({ async read() { return facts; } }),
-            run: runJson, options: { ...options, env: { ...process.env, GH_HOST: "github.com" } } });
+            run: runJson, options: { ...options, env: { ...process.env, GH_HOST: "github.com" } }, excludedPublication });
         } }),
         receiptStore: new ReviewPublicationAdoptionStore({ store: frozenPort(store, ["read", "write"], "Review adoption receipt store") }),
         inputAuthorityVerifier: frozenPort(inputAuthorityVerifier, ["verify"], "Review adoption input verifier"),
+        policyReader: async () => (await loadNativeReviewSkill()).digest,
         ...clockOptions,
       });
       reviewPublicationReuse = Object.freeze({
         listCandidates: (input, options) => getReuseService().listCandidates(input, options),
         handle: (input, options) => getReuseService().handle(input, options),
         verifyProposal: input => getReuseService().verifyProposal(input),
+        verifyAutomaticSettlement: (input, options) => getReuseService().verifyAutomaticSettlement(input, options),
       });
       const pullRequestFacts = frozenPort(
         prEngineerService,

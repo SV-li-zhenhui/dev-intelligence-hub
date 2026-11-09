@@ -1512,7 +1512,7 @@ export function createWorkView({
     await loadWorkProjection();
   }
 
-  async function addHistoricalWork({ sourceUrl, workType, priority } = {}) {
+  async function addHistoricalWork({ sourceUrl, workType, priority, reviewPurpose } = {}) {
     if (historicalWorkInFlight) {
       throw new Error("历史任务正在加入，请稍候");
     }
@@ -1520,9 +1520,10 @@ export function createWorkView({
     if (item.kind === "issue" && workType === "pull_request") {
       throw new TypeError("Issue 不能分配为 PR Review，请选择开发、测试或需求梳理");
     }
-    const requestKey = `${item.url}\u0000${workType}\u0000${priority}`;
+    const requestKey = `${item.url}\u0000${workType}\u0000${priority}\u0000${reviewPurpose || ""}`;
     const requestId = historicalRequestId(requestKey);
     const request = ownerWorkRequestForItem(item, {
+      reviewPurpose,
       workType,
       priority,
       requestId,
@@ -1593,6 +1594,7 @@ export function createWorkView({
             await addHistoricalWork({
               sourceUrl: String(data.get("sourceUrl") || ""),
               workType: String(data.get("workType") || ""),
+              reviewPurpose: String(data.get("reviewPurpose") || "standard_current_pr_code_review/v1"),
               priority: String(data.get("priority") || ""),
             });
           } catch (error) {

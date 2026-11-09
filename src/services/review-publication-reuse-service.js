@@ -8,6 +8,7 @@ import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 import { currentWorkItemEvent, currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
 import { createWorkIntentDispatchBinding } from "../domain/work-intent-dispatch-binding.js";
 import { createReviewPublicationCandidate, createReviewPublicationAdoption, verifyReviewPublicationAdoption } from "./published-review-adoption.js";
+import { createReviewReadProof, matchesReviewReadProof, standardReviewPurpose } from "../domain/review-result-proof.js";
 
 const failure = code => Object.assign(new Error(code), { code });
 const same = (left, right) => canonicalJsonDigest(left) === canonicalJsonDigest(right);
@@ -48,20 +49,65 @@ export function createReviewAdoptionTaskReader(ledger) {
     return { taskId: item.itemId, revision: item.revision, roleId: item.currentTarget.id, status: item.status,
       activeIntentId: item.activeIntentId, activeProposal: activeReviewProposal(item, activeDispatch, inputBinding),
       rootStatus: root.status, inputBinding, event: currentWorkItemEvent(item),
-      acceptanceContract: structuredClone(item.graph?.acceptanceContracts?.at(-1) ?? null), requestedAt: root.createdAt };
+      acceptanceContract: structuredClone(item.graph?.acceptanceContracts?.at(-1) ?? null), requestedAt: root.createdAt,
+      ...(item.itemId === root.itemId && item.kind === "source_root" && root.source.scope.kind === "automatic" &&
+          root.source.identity.targetRoleId === "pr-engineer" && currentWorkItemEvent(item).payload?.relation === "review_requested"
+        ? { automaticSettlement: { kind: "automatic_review_settlement", taskId: item.itemId, assignmentId: item.assignmentId,
+          authorityEpoch: root.source.authorityEpoch } } : {}) };
   } });
 }
 
 // This service owns only local adoption receipts. It has no GitHub write port.
 export class ReviewPublicationReuseService {
   #ports;
-  constructor({ taskReader, factsReader, publicationSourceReader, confirmationReader, materialsReader, receiptStore, inputAuthorityVerifier, clock = () => new Date() }) {
+  #proofDiagnostic = null;
+  constructor({ taskReader, factsReader, publicationSourceReader, confirmationReader, materialsReader, receiptStore, inputAuthorityVerifier, policyReader = null, clock = () => new Date() }) {
     for (const [port, methods] of [[taskReader, ["read"]], [factsReader, ["get"]],
       [publicationSourceReader, ["listReviewPublicationSources"]], [confirmationReader, ["readSettlements"]],
       [materialsReader, ["read"]], [receiptStore, ["getForProposal", "record"]], [inputAuthorityVerifier, ["verify"]]]) {
       if (methods.some(method => typeof port?.[method] !== "function")) throw new TypeError("Invalid Review reuse port");
     }
-    this.#ports = { taskReader, factsReader, publicationSourceReader, confirmationReader, materialsReader, receiptStore, inputAuthorityVerifier, clock };
+    this.#ports = { taskReader, factsReader, publicationSourceReader, confirmationReader, materialsReader, receiptStore, inputAuthorityVerifier, policyReader, clock };
+  }
+  async recordReviewCoverage(value) {
+    try {
+      const task = await this.#task(value.taskId, null);
+      if (!samePullRequestExecutionBinding(task.inputBinding, value.inputBinding)) return;
+      const proof = createReviewReadProof({ ...value, task });
+      if (proof === null || typeof this.#ports.receiptStore.recordReadProof !== "function") return;
+      const result = await this.#ports.receiptStore.recordReadProof(proof);
+      this.#proofDiagnostic = result.diagnostic ?? null;
+      return result;
+    } catch { this.#proofDiagnostic = "REVIEW_READ_PROOF_UNAVAILABLE"; }
+  }
+  async #verifiedResult(task, candidate, signal) {
+    if (standardReviewPurpose(task.event) === null || typeof this.#ports.policyReader !== "function" ||
+        typeof this.#ports.receiptStore.readProofs !== "function") return null;
+    try {
+      const stored = await this.#ports.receiptStore.readProofs();
+      this.#proofDiagnostic = stored.diagnostic ?? this.#proofDiagnostic;
+      const possible = stored.records.filter(proof => proof.producerTaskId === candidate.source.producerTaskId &&
+        samePullRequestExecutionBinding(proof.inputBinding, candidate.source.inputBinding) &&
+        proof.bodyDigest === canonicalJsonDigest(candidate.source.publishedBody) && proof.verdict === candidate.source.publishedVerdict);
+      if (possible.length === 0) return null;
+      const policyDigest = await this.#ports.policyReader();
+      const material = await this.#ports.materialsReader.read({ taskId: task.taskId, gitTarget: task.inputBinding.gitTarget,
+        pullRequestNumber: task.inputBinding.pullRequestNumber, excludedPublication: candidate.source }, { signal });
+      check(signal);
+      const matches = possible.filter(proof => matchesReviewReadProof(proof, candidate.source, task, material.resultCoverage, policyDigest));
+      // Ambiguous producer coverage is not an optimization proof.
+      if (matches.length !== 1) return null;
+      return { readProofId: matches[0].readProofId, coverageDigest: material.feedbackSnapshot.coverageDigest,
+        candidateId: candidate.candidateId, materialDigest: candidate.materialDigest,
+        ...(candidate.target.evidenceTarget ? { deliverableId: candidate.target.evidenceTarget.deliverables[0].deliverableId } : {}),
+        ...(candidate.target.automaticSettlement ? { automaticSettlement: candidate.target.automaticSettlement } : {}),
+        verdict: candidate.source.publishedVerdict, reviewUrl: candidate.coverage.publishedReviewUrl,
+        purpose: matches[0].purpose };
+    } catch (error) {
+      check(signal);
+      this.#proofDiagnostic = "REVIEW_READ_PROOF_UNAVAILABLE";
+      return null;
+    }
   }
   async #task(taskId, signal) {
     check(signal);
@@ -77,6 +123,8 @@ export class ReviewPublicationReuseService {
   }
   #target(task, deliverableId) {
     try {
+      if (task.automaticSettlement) return { inputBinding: task.inputBinding, requestedAt: task.requestedAt,
+        automaticSettlement: task.automaticSettlement };
       return { inputBinding: task.inputBinding, requestedAt: task.requestedAt,
         evidenceTarget: createProposalDeliveryEvidenceTarget({ taskId: task.taskId, roleId: task.roleId,
           acceptanceContract: task.acceptanceContract, proposal: { kind: "github_review_proposal" }, deliverableId }) };
@@ -112,9 +160,9 @@ export class ReviewPublicationReuseService {
       if (references.length !== 1) continue;
       const confirmationSnapshot = settlements.get(references[0].slice("confirmation:".length));
       if (confirmationSnapshot == null) throw failure("REVIEW_PUBLICATION_REUSE_UNSETTLED_SOURCE");
-      for (const deliverable of requiredReviewDeliverables(task.acceptanceContract)) {
+      for (const deliverable of task.automaticSettlement ? [{ deliverableId: null }] : requiredReviewDeliverables(task.acceptanceContract)) {
         const candidate = createReviewPublicationCandidate({ source: { proposal: row.proposal, result: row.result, confirmationSnapshot },
-          target: this.#target(task, deliverable.deliverableId), facts });
+          target: this.#target(task, deliverable.deliverableId), facts, allowHistoricalResult: true });
         if (candidate !== null) candidates.push(candidate);
       }
     }
@@ -125,8 +173,17 @@ export class ReviewPublicationReuseService {
     const facts = normalizePullRequestReadFacts(await this.#ports.factsReader.get({ executionBinding: task.inputBinding, event: task.event }));
     if (projectPullRequestReadFactsContext(facts).materialDigest !== materialDigest) throw failure("REVIEW_PUBLICATION_REUSE_MATERIAL_CHANGED");
     const candidates = await this.#candidates(task, facts, signal);
-    return { complete: true, candidates: candidates.map(value => ({ candidateId: value.candidateId, materialDigest: value.materialDigest,
-      deliverableId: value.target.evidenceTarget.deliverables[0].deliverableId, verdict: value.source.publishedVerdict,
+    let verifiedResult = null;
+    const eligible = [];
+    for (const candidate of candidates) {
+      const verified = await this.#verifiedResult(task, candidate, signal);
+      if (verified && !verifiedResult) verifiedResult = verified;
+      if (verified || (!candidate.target.automaticSettlement && Date.parse(candidate.source.receipt.createdAt) >= Date.parse(task.requestedAt))) eligible.push(candidate);
+    }
+    return { complete: true, ...(verifiedResult ? { verifiedResult } : {}),
+      ...(this.#proofDiagnostic ? { diagnostic: this.#proofDiagnostic } : {}),
+      candidates: eligible.map(value => ({ candidateId: value.candidateId, materialDigest: value.materialDigest,
+      ...(value.target.evidenceTarget ? { deliverableId: value.target.evidenceTarget.deliverables[0].deliverableId } : {}), verdict: value.source.publishedVerdict,
       reviewUrl: value.coverage.publishedReviewUrl, publishedAt: value.source.receipt.createdAt, requiresCurrentReview: true })) };
   }
   #proposal(value) {
@@ -138,7 +195,8 @@ export class ReviewPublicationReuseService {
   async #assessment(proposal, signal) {
     const task = await this.#task(proposal.requestedBy.workItemId, signal);
     if (!samePullRequestExecutionBinding(task.inputBinding, proposal.binding.inputBinding) ||
-        !same(this.#target(task, proposal.binding.evidenceTarget?.deliverables?.[0]?.deliverableId).evidenceTarget, proposal.binding.evidenceTarget)) throw failure("REVIEW_PUBLICATION_REUSE_TARGET_CHANGED");
+        (task.automaticSettlement ? proposal.binding.evidenceTarget !== undefined :
+          !same(this.#target(task, proposal.binding.evidenceTarget?.deliverables?.[0]?.deliverableId).evidenceTarget, proposal.binding.evidenceTarget))) throw failure("REVIEW_PUBLICATION_REUSE_TARGET_CHANGED");
     const material = await this.#ports.materialsReader.read({ taskId: task.taskId, gitTarget: task.inputBinding.gitTarget,
       pullRequestNumber: task.inputBinding.pullRequestNumber }, { signal });
     check(signal);
@@ -146,7 +204,16 @@ export class ReviewPublicationReuseService {
     if (!samePullRequestExecutionBinding(facts.identity.executionBinding, task.inputBinding)) throw failure("REVIEW_PUBLICATION_REUSE_INPUT_CHANGED");
     const candidates = (await this.#candidates(task, facts, signal)).filter(value => value.candidateId === proposal.payload.publicationReuse.candidateId);
     if (candidates.length !== 1) throw failure("REVIEW_PUBLICATION_REUSE_CANDIDATE_STALE");
-    const coverageDigest = material.feedbackSnapshot.coverageDigest;
+    if (!proposal.payload.publicationReuse.readProofId && (task.automaticSettlement ||
+        Date.parse(candidates[0].source.receipt.createdAt) < Date.parse(task.requestedAt))) throw failure("REVIEW_PUBLICATION_REUSE_PROOF_UNAVAILABLE");
+    let verifiedResult = null;
+    if (proposal.payload.publicationReuse.readProofId) {
+      const verified = await this.#verifiedResult(task, candidates[0], signal);
+      if (!verified || verified.readProofId !== proposal.payload.publicationReuse.readProofId ||
+          verified.coverageDigest !== proposal.payload.publicationReuse.coverageDigest) throw failure("REVIEW_PUBLICATION_REUSE_PROOF_UNAVAILABLE");
+      verifiedResult = verified;
+    }
+    const coverageDigest = verifiedResult?.coverageDigest ?? material.feedbackSnapshot.coverageDigest;
     if (proposal.payload.publicationReuse.coverageDigest !== coverageDigest) throw failure("REVIEW_PUBLICATION_REUSE_COVERAGE_CHANGED");
     return { task, candidate: candidates[0], coverageDigest };
   }
@@ -154,6 +221,7 @@ export class ReviewPublicationReuseService {
     const proposal = this.#proposal(value);
     const assessment = await this.#assessment(proposal, signal);
     if (!["dispatch_pending", "waiting_external"].includes(assessment.task.status) || !ownsProposal(assessment.task, proposal)) throw failure("REVIEW_PUBLICATION_REUSE_TASK_UNAVAILABLE");
+    if (assessment.task.automaticSettlement) return { automaticSettlement: assessment.task.automaticSettlement };
     let receipt = await this.#ports.receiptStore.getForProposal({ proposalId: proposal.proposalId, proposalDigest: proposal.contentDigest });
     if (receipt !== null) {
       if (!verifyReviewPublicationAdoption({ ...assessment, receipt, proposal })) throw failure("REVIEW_PUBLICATION_REUSE_COVERAGE_CHANGED");
@@ -166,6 +234,22 @@ export class ReviewPublicationReuseService {
     if (!ownsProposal(current, proposal) || !same(this.#target(current, receipt.target.evidenceTarget.deliverables[0].deliverableId).evidenceTarget, receipt.target.evidenceTarget)) throw failure("REVIEW_PUBLICATION_REUSE_TARGET_CHANGED");
     return { status: "succeeded", summary: "已核实并采用既有 GitHub Review；未重复发布",
       evidence: [`adoption:${receipt.adoptionId}`, `confirmation:${receipt.source.confirmationId}`, `github-review:${receipt.source.receipt.id}`] };
+  }
+  async verifyAutomaticSettlement(envelope, { signal = null } = {}) {
+    try {
+      const reuse = envelope.action.publishedReviewReuse;
+      const scan = await this.#ports.publicationSourceReader.listReviewPublicationSources({ inputBinding: envelope.action.inputBinding, limit: 100, ...(signal ? { signal } : {}) });
+      if (scan?.complete !== true) return null;
+      const rows = scan.items.filter(row => row.proposal.proposalId === reuse.proposalId && row.proposal.contentDigest === reuse.proposalDigest);
+      if (rows.length !== 1) return null;
+      const proposal = this.#proposal(rows[0].proposal);
+      if (!samePullRequestExecutionBinding(envelope.action.inputBinding, proposal.binding.inputBinding) ||
+          !same(proposal.requestedBy, envelope.requestedBy) || !same(proposal.payload.publicationReuse, reuse.publicationReuse) ||
+          proposal.payload.body !== envelope.action.body || ({approve:"APPROVE",request_changes:"REQUEST_CHANGES",comment:"COMMENT"})[proposal.payload.verdict] !== envelope.action.reviewEvent) return null;
+      const assessed = await this.#assessment(proposal, signal);
+      if (!assessed.task.automaticSettlement || !ownsProposal(assessed.task, proposal)) return null;
+      return assessed.candidate.source.receipt;
+    } catch { return null; }
   }
   async verifyProposal({ proposal: value, result: rawResult, authority, signal = null }) {
     const proposal = this.#proposal(value), result = normalizeWorkProposalResult(rawResult);

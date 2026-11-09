@@ -646,7 +646,7 @@ export class NativeCodexBrainProvider {
           reader.commit();
           operationSignal.throwIfAborted();
         }
-        if (request.reviewTarget && reader && ['propose_github_review','complete','handoff'].includes(JSON.parse(result).intent?.type)) await reader.assertComplete();
+        if (request.reviewTarget && reader && ['propose_github_review','complete','handoff'].includes(JSON.parse(result).intent?.type)) await reader.assertComplete(JSON.parse(result).intent);
       } catch (caught) { error = caught; }
       finally {
         if (request.codeExecutionContext) {

@@ -216,6 +216,7 @@ const intentVariants = [
         candidateId: stringSchema(128, { ascii: true, pattern: "^review-publication-candidate-[a-f0-9]{64}$" }),
         materialDigest: stringSchema(64, { ascii: true, pattern: "^[a-f0-9]{64}$" }),
         coverageDigest: stringSchema(64, { ascii: true, pattern: "^[a-f0-9]{64}$" }),
+        readProofId: stringSchema(128, { ascii: true, pattern: "^review-read-proof-[a-f0-9]{64}$" }),
       },
     },
   }, { optional: ["deliverableId", "publicationReuse"] }),

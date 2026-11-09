@@ -250,10 +250,11 @@ export class GitHubReviewReader {
     })();
     signal?.addEventListener("abort", onAbort, { once: true });
     if (requestSignal.aborted) { await close(); requestSignal.throwIfAborted(); }
+    const thisRecorder = this.currentReviewFeedbackReader;
     return {
       url: `http://127.0.0.1:${server.address().port}${endpointPath}`,
       diffText, manifestText,
-      assertComplete() {
+      assertComplete(intent = null) {
         return withReviewSourceFailure(async () => {
           if (requiredDocuments.some((name) => !coversAll(reads[name], documents[name].length))) {
             throw failure("PR_REVIEW_READ_INCOMPLETE");
@@ -261,6 +262,17 @@ export class GitHubReviewReader {
           if (feedbackSnapshot) {
             const current = await readCurrentFeedback();
             if (current.feedbackSnapshot.snapshotDigest !== feedbackSnapshot.snapshotDigest) throw failure("PR_REVIEW_READ_MATERIAL_CHANGED");
+            if (intent?.type === "propose_github_review" && !intent.publicationReuse &&
+                typeof thisRecorder?.recordReviewCoverage === "function") {
+              // Only this host method can attest complete tool coverage. An
+              // unavailable optimization receipt must never block publication.
+              try { await thisRecorder.recordReviewCoverage({ taskId: target.feedbackSnapshot.taskId,
+                inputBinding: current.facts.identity.executionBinding,
+                intent, coverage: current.resultCoverage, observedAt: current.facts.observedAt,
+                policyDigest: skills.find(([name]) => name === "review-skill/manifest.json")
+                  ? JSON.parse(skills.find(([name]) => name === "review-skill/manifest.json")[1]).digest : null }); }
+              catch { /* Missing proof retains the original full-review path. */ }
+            }
           } else await checkTarget();
         }, { signal: requestSignal });
       },

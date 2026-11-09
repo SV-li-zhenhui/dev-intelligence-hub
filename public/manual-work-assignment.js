@@ -31,6 +31,13 @@ function option(value, selected) {
   return `<option value="${value}"${selected === value ? " selected" : ""}>${WORK_TYPE_LABELS[value]}</option>`;
 }
 
+function reviewPurposeControl() {
+  return `<label>PR 评审方式<select name="reviewPurpose">
+    <option value="standard_current_pr_code_review/v1">复用已核实的评审</option>
+    <option value="independent_review/v1">独立重新评审</option>
+  </select></label>`;
+}
+
 function invalidGitHubWorkUrl() {
   return new TypeError("GitHub PR 或 Issue 地址无效");
 }
@@ -106,6 +113,7 @@ export function manualHistoricalWorkMarkup(result = null) {
           <option value="urgent">紧急</option>
         </select>
       </label>
+      ${reviewPurposeControl()}
       <button class="refresh-button" type="submit">加入日常任务</button>
       <p class="manual-work-assignment-status" data-manual-historical-work-status aria-live="polite"></p>
     </form>
@@ -147,6 +155,7 @@ export function manualWorkAssignmentMarkup(item, result = null) {
           <option value="urgent">紧急</option>
         </select>
       </label>
+      ${item.kind === "pull_request" && !closedPullRequest ? reviewPurposeControl() : ""}
       <button class="refresh-button" type="submit">创建并分配</button>
       <p class="manual-work-assignment-status" data-manual-work-assignment-status aria-live="polite"></p>
     </form>
@@ -155,7 +164,7 @@ export function manualWorkAssignmentMarkup(item, result = null) {
 
 export function ownerWorkRequestForItem(
   item,
-  { workType, priority, requestId, responsiblePerson = null },
+  { workType, priority, requestId, responsiblePerson = null, reviewPurpose = "standard_current_pr_code_review/v1" },
 ) {
   if (!item || !["pull_request", "issue"].includes(item.kind)) {
     throw new TypeError("GitHub work item is required");
@@ -209,6 +218,10 @@ export function ownerWorkRequestForItem(
   if ([2, 3, 4].includes(request.schemaVersion)) {
     request.pullRequest = { repository: item.repo, number: item.number };
   }
+  if (workType === "pull_request" && [2, 4].includes(request.schemaVersion)) {
+    if (!["standard_current_pr_code_review/v1", "independent_review/v1"].includes(reviewPurpose)) throw new TypeError("reviewPurpose is invalid");
+    request.reviewPurpose = reviewPurpose;
+  }
   if (request.schemaVersion === 6) {
     request.issue = { repository: item.repo, number: item.number };
   }
@@ -224,11 +237,12 @@ export function ownerWorkRequestForItem(
 export function createManualWorkAssignmentAttempts(createRequestId = () => crypto.randomUUID()) {
   const pending = new Map();
   return {
-    requestFor(item, { workType, priority }) {
-      const key = JSON.stringify([item.kind, item.repo, item.number, workType, priority]);
+    requestFor(item, { workType, priority, reviewPurpose }) {
+      const purpose = workType === "pull_request" ? reviewPurpose ?? "standard_current_pr_code_review/v1" : undefined;
+      const key = JSON.stringify([item.kind, item.repo, item.number, workType, priority, purpose]);
       if (!pending.has(key)) {
         pending.set(key, ownerWorkRequestForItem(item, {
-          workType, priority, requestId: createRequestId(),
+          workType, priority, reviewPurpose: purpose, requestId: createRequestId(),
         }));
       }
       // Keep the whole payload, not only the ID: refreshed titles/summaries
@@ -360,6 +374,7 @@ export async function bindManualWorkAssignment(container, item, { fetchImpl = fe
             : attempts.requestFor(item, {
               workType: form.elements.namedItem("workType").value,
               priority: form.elements.namedItem("priority").value,
+              reviewPurpose: form.elements.namedItem("reviewPurpose")?.value,
             });
           if (!request) throw new Error("原分配请求不可用，请重新打开详情");
           const response = await fetchImpl("/api/work/requests", {

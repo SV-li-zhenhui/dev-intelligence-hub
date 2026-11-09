@@ -278,9 +278,8 @@ export function createPrTriageWorkRequest({
 
 export function normalizeOwnerWorkRequest(value) {
   const version = value?.schemaVersion;
-  exactKeys(
-    value,
-    version === 7
+  const hasReviewPurpose = value !== null && typeof value === "object" && Object.hasOwn(value, "reviewPurpose");
+  const requestKeys = version === 7
       ? INTERNAL_REVIEW_REQUEST_KEYS
       : version === 5
       ? ORCHESTRATED_PULL_REQUEST_KEYS
@@ -290,9 +289,10 @@ export function normalizeOwnerWorkRequest(value) {
       ? PULL_REQUEST_KEYS
       : [3, 4].includes(version)
         ? PERSON_PULL_REQUEST_KEYS
-        : REQUEST_KEYS,
-    "所有者工作请求",
-  );
+        : REQUEST_KEYS;
+  exactKeys(value, [...requestKeys, ...(hasReviewPurpose ? ["reviewPurpose"] : [])], "所有者工作请求");
+  if (hasReviewPurpose &&
+      (![2, 4, 5].includes(version) || !["standard_current_pr_code_review/v1", "independent_review/v1"].includes(value.reviewPurpose))) throw invalid("Review purpose 无效");
   if (
     ![1, 2, 3, 4, 5, 6, 7].includes(version) ||
     typeof value.requestId !== "string" ||
@@ -354,6 +354,7 @@ export function normalizeOwnerWorkRequest(value) {
       MAX_DESCRIPTION_BYTES,
     ),
     acceptanceCriteria,
+    ...(Object.hasOwn(value, "reviewPurpose") ? { reviewPurpose: value.reviewPurpose } : {}),
   };
   if ([2, 3, 4, 5, 7].includes(version)) {
     exactKeys(value.pullRequest, PULL_REQUEST_TARGET_KEYS, "pullRequest");
@@ -551,6 +552,7 @@ export function createOwnerPullRequestEvent(
       state: resolved.state,
       gitTargetAvailable: true,
       gitTarget: structuredClone(resolved.gitTarget),
+      ...(Object.hasOwn(request, "reviewPurpose") ? { reviewPurpose: request.reviewPurpose } : {}),
       ...(request.schemaVersion === 7 ? { internalReview: structuredClone(request.internalReview) } : {}),
       ...(request.schemaVersion === 5
         ? {
@@ -628,6 +630,7 @@ export function ownerWorkRequestEventMatches(requestValue, eventValue, at) {
       event.subject.number === request.pullRequest.number &&
       event.payload.description === request.description &&
       event.payload.workType === request.workType &&
+      event.payload.reviewPurpose === request.reviewPurpose &&
       event.payload.priority === request.priority &&
       JSON.stringify(event.payload.acceptanceCriteria) ===
         JSON.stringify(request.acceptanceCriteria) &&

@@ -510,6 +510,7 @@ class PullRequestExternalActionExecutor {
   #transport;
   #inputAuthorityVerifier;
   #controlledCommitVerifier;
+  #reviewResultVerifier;
   #pushAuthorization;
   #clock;
   #timeoutMs;
@@ -522,11 +523,13 @@ class PullRequestExternalActionExecutor {
     transport,
     inputAuthorityVerifier,
     controlledCommitVerifier,
+    reviewResultVerifier = null,
     pushAuthorization = null,
     clock = () => Date.now(),
     timeoutMs = 60_000,
   } = {}) {
     this.#enabledActions = normalizeEnabledActions(enabledActions);
+    this.#reviewResultVerifier = reviewResultVerifier;
     this.#pushAuthorization = pushAuthorization;
     if (typeof clock !== "function") throw new TypeError("clock is invalid");
     if (
@@ -587,6 +590,7 @@ class PullRequestExternalActionExecutor {
       if (!(await this.#authorityCurrent(envelope, operation))) {
         return { status: "stale" };
       }
+      if (envelope.action.publishedReviewReuse) return await this.#reuseReviewResult(envelope, operation);
       try {
         return await this.#withCredential(
           envelope,
@@ -676,6 +680,7 @@ class PullRequestExternalActionExecutor {
     }
     const operation = this.#beginOperation(envelope);
     try {
+      if (envelope.action.publishedReviewReuse) return await this.#reuseReviewResult(envelope, operation);
       return await this.#withCredential(
         envelope,
         operation,
@@ -704,6 +709,14 @@ class PullRequestExternalActionExecutor {
     } finally {
       this.#finishOperation(operation);
     }
+  }
+
+  async #reuseReviewResult(envelope, operation) {
+    if (envelope.action.type !== "pull_request_review" || typeof this.#reviewResultVerifier?.verify !== "function" ||
+        !await this.#authorityCurrent(envelope, operation)) return { status: "stale" };
+    const receipt = await this.#reviewResultVerifier.verify(envelope, { signal: operation.signal });
+    if (operation.signal.aborted || !receipt || !await this.#authorityCurrent(envelope, operation)) return { status: "stale" };
+    return { status: "already", receipt: normalizeConfirmationReceipt(receipt) };
   }
 
   #isEnabled(envelope) {

@@ -910,6 +910,29 @@ test("required external Review context exposes reuse candidates without treating
   assert.equal(Object.isFrozen(packet.context.code.reviewPublicationReuse), true);
 });
 
+test("verified standard Review result removes inline code but preserves the whole residual task contract", async t => {
+  const { fixture, pullRequestContext } = atomicPullRequestFixture();
+  const current = fixture.snapshot.graph.tasks.find(value => value.taskId === fixture.item.itemId);
+  current.acceptanceContracts = [contract(1, [expected("review", "review-report"), expected("qa-note", "text-report")])];
+  pullRequestContext.materialDigest = DIGEST_C;
+  pullRequestContext.reviewMaterial.patch = "diff preview ".repeat(5000);
+  const candidate = { candidateId: "review-publication-candidate-" + DIGEST_A, materialDigest: DIGEST_C,
+    deliverableId: "review", verdict: "approve", requiresCurrentReview: true };
+  let verifiedResult;
+  const options = { roleId: "pr-engineer", pullRequestContextReader: { async read() { return pullRequestContext; } },
+    publicationReuseReader: { async listCandidates() { return { complete: true, candidates: [candidate], ...(verifiedResult ? { verifiedResult } : {}) }; } } };
+  const full = await assemble(fixture, options);
+  verifiedResult = { ...candidate, readProofId: "review-read-proof-" + DIGEST_B, coverageDigest: DIGEST_B };
+  const reused = await assemble(fixture, options);
+  assert.equal(reused.context.code.pullRequest.reviewMaterial, undefined);
+  assert.deepEqual(reused.context.requirements.currentTask, full.context.requirements.currentTask);
+  assert.equal(reused.context.requirements.currentTask.acceptanceContract.expectedDeliverables.length, 2);
+  assert.ok(JSON.stringify(full.context).length - JSON.stringify(reused.context).length > 60000);
+  assert.equal(reused.context.code.authoritativeEvidence?.length ?? 0, 0, "candidate is not an accepted delivery");
+  t.diagnostic(JSON.stringify({ fixture: "same-current-task-context", fullContextBytes: Buffer.byteLength(JSON.stringify(full.context)),
+    reusedContextBytes: Buffer.byteLength(JSON.stringify(reused.context)), remainingDeliverables: 2 }));
+});
+
 test("root Review recovery uses current host candidates rather than one historical rejection code", async (t) => {
   for (const code of ["ROLE_DECISION_PR_REVIEW_REQUIRED", "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION"]) await t.test(code, async () => {
     const { fixture, pullRequestContext, gitTarget } = atomicPullRequestFixture();

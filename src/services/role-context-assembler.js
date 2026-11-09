@@ -1568,7 +1568,7 @@ export class RoleContextAssembler {
     const isPullRequest = item.eventType.startsWith("pull_request.");
     let reviewPublicationReuse = null;
     if (roleId === "pr-engineer" && isPullRequest && item.eventType !== "pull_request.internal_review_requested" && internalReview === null &&
-        this.#publicationReuseReader !== null && hasRequiredReviewDeliverable(currentAcceptanceContract) && typeof pullRequest?.materialDigest === "string") {
+        this.#publicationReuseReader !== null && (hasRequiredReviewDeliverable(currentAcceptanceContract) || item.event.source.provider === "github") && typeof pullRequest?.materialDigest === "string") {
       reviewPublicationReuse = canonicalValue(await this.#publicationReuseReader({ taskId: currentTask.taskId, materialDigest: pullRequest.materialDigest },
         signal === null ? {} : { signal }));
       signal?.throwIfAborted();
@@ -1662,7 +1662,10 @@ export class RoleContextAssembler {
     ) {
       context.code = {
         ...(isPullRequest ? { sourceEvent: item.event } : {}),
-        ...(pullRequest === null ? {} : { pullRequest }),
+        ...(pullRequest === null ? {} : { pullRequest: reviewPublicationReuse?.verifiedResult
+          ? Object.fromEntries(Object.entries(pullRequest).filter(([key]) =>
+            ["schemaVersion", "identityDigest", "contentDigest", "materialDigest", "observedAt", "summary", "checks"].includes(key)))
+          : pullRequest }),
         ...(reviewPublicationSettlement === null ? {} : { reviewPublicationSettlement }),
         ...(reviewPublicationReuse === null ? {} : { reviewPublicationReuse }),
         ...(reviewPublicationRecovery === null ? {} : { reviewPublicationRecovery }),

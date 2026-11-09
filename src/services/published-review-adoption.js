@@ -7,6 +7,7 @@ import { normalizeDeliveryEvidenceTarget } from "../domain/delivery-evidence-con
 import { samePullRequestGitTarget } from "../domain/git-tool-contract.js";
 import { normalizePullRequestReadFacts, projectPullRequestReadFactsContext, pullRequestReviewFeedbackDigest } from "../domain/pull-request-read-facts.js";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
+import { normalizeReviewReadProof } from "../domain/review-result-proof.js";
 
 const same = (left, right) => canonicalJsonDigest(left) === canonicalJsonDigest(right);
 
@@ -56,15 +57,17 @@ function publicationCandidateId(content) {
 
 // A candidate is not accepted evidence. A current reviewer must explicitly
 // assess coverage and propose adoption before the host can issue a receipt.
-export function createReviewPublicationCandidate({ source: sourceRecords, target, facts: readFacts } = {}) {
+export function createReviewPublicationCandidate({ source: sourceRecords, target, facts: readFacts, allowHistoricalResult = false } = {}) {
   try {
     const source = verifyReviewPublicationSource(sourceRecords);
     if (source === null) return null;
     const inputBinding = normalizePullRequestExecutionBinding(target.inputBinding);
-    const evidenceTarget = normalizeDeliveryEvidenceTarget(target.evidenceTarget);
-    if (inputBinding.schemaVersion !== 2 || evidenceTarget.deliverables.length !== 1 ||
-        !["github-review", "review-report"].includes(evidenceTarget.deliverables[0].kind) ||
-        evidenceTarget.roleId !== "pr-engineer" ||
+    const settlement = target.automaticSettlement;
+    const evidenceTarget = settlement ? null : normalizeDeliveryEvidenceTarget(target.evidenceTarget);
+    if (inputBinding.schemaVersion !== 2 || (settlement
+      ? settlement.kind !== "automatic_review_settlement" || settlement.taskId !== inputBinding.rootItemId ||
+        typeof settlement.assignmentId !== "string" || !Number.isSafeInteger(settlement.authorityEpoch) || settlement.authorityEpoch < 1
+      : evidenceTarget.deliverables.length !== 1 || !["github-review", "review-report"].includes(evidenceTarget.deliverables[0].kind) || evidenceTarget.roleId !== "pr-engineer") ||
         inputBinding.repository !== source.inputBinding.repository ||
         inputBinding.pullRequestNumber !== source.inputBinding.pullRequestNumber ||
         !samePullRequestGitTarget(inputBinding.gitTarget, source.inputBinding.gitTarget)) return null;
@@ -74,7 +77,7 @@ export function createReviewPublicationCandidate({ source: sourceRecords, target
     if (typeof materialDigest !== "string") return null;
     const publicationAt = Date.parse(source.receipt.createdAt);
     const requestedAt = Date.parse(target.requestedAt);
-    if (!Number.isFinite(requestedAt) || publicationAt < requestedAt || Date.parse(facts.observedAt) < publicationAt) return null;
+    if (!Number.isFinite(requestedAt) || (!allowHistoricalResult && publicationAt < requestedAt) || Date.parse(facts.observedAt) < publicationAt) return null;
     const urlMatches = review => {
       const url = new URL(review.url);
       return url.protocol === "https:" && url.hostname === "github.com" && url.search === "" &&
@@ -93,7 +96,7 @@ export function createReviewPublicationCandidate({ source: sourceRecords, target
         facts.reviews.some(other => other.id !== review.id && (timestampAfter(other.submittedAt, publicationAt) ||
           (other.author?.toLowerCase() === source.actorAccountId.toLowerCase() && Date.parse(other.submittedAt) === publicationAt)))) return null;
     const content = { schemaVersion: 1, policy: "current_review_adopts_verified_publication/v1", source,
-      target: { inputBinding, evidenceTarget, requestedAt: target.requestedAt },
+      target: { inputBinding, ...(settlement ? { automaticSettlement: structuredClone(settlement) } : { evidenceTarget }), requestedAt: target.requestedAt },
       coverage: { materialDigest, feedbackDigest: pullRequestReviewFeedbackDigest(facts), reviewNodeId: review.id, publishedReviewUrl: review.url,
         publishedBodyDigest: canonicalJsonDigest(review.body), requiresCurrentReview: true } };
     return { ...structuredClone(content), candidateId: publicationCandidateId(content),
@@ -134,10 +137,12 @@ export function createReviewPublicationAdoption({ candidate, proposal: stored, a
         proposal.binding.pullRequestNumber !== target.inputBinding.pullRequestNumber ||
         proposal.source.eventId !== target.inputBinding.eventId || proposal.binding.eventId !== target.inputBinding.eventId ||
         proposal.payload.verdict !== content.source.publishedVerdict || typeof proposal.payload.body !== "string" || !proposal.payload.body.trim() ||
-        !same(proposal.payload.publicationReuse, { candidateId: candidate.candidateId, materialDigest: candidate.materialDigest, coverageDigest })) return null;
+        !same(proposal.payload.publicationReuse, { candidateId: candidate.candidateId, materialDigest: candidate.materialDigest, coverageDigest,
+          ...(proposal.payload.publicationReuse?.readProofId ? { readProofId: proposal.payload.publicationReuse.readProofId } : {}) })) return null;
     const receipt = { ...content, outcome: "adopted_existing_review", candidateId: candidate.candidateId,
       assessment: { proposalId: proposal.proposalId, proposalDigest: proposal.contentDigest, roleId: proposal.requestedBy.roleId,
-        verdict: proposal.payload.verdict, coverageNote: proposal.payload.body, coverageNoteDigest: canonicalJsonDigest(proposal.payload.body), coverageDigest } };
+        verdict: proposal.payload.verdict, coverageNote: proposal.payload.body, coverageNoteDigest: canonicalJsonDigest(proposal.payload.body), coverageDigest,
+        ...(proposal.payload.publicationReuse.readProofId ? { readProofId: proposal.payload.publicationReuse.readProofId } : {}) } };
     return { ...structuredClone(receipt), adoptedAt, adoptionId: `review-publication-adoption-${canonicalJsonDigest(receipt)}` };
   } catch { return null; }
 }
@@ -186,14 +191,32 @@ export class ReviewPublicationAdoptionStore {
   async #state() {
     try {
       const state = await this.#store.read(ADOPTION_STATE_KEY, { schemaVersion: 1, records: [] });
-      assertWorkProposalExactKeys(state, ["schemaVersion", "records"]);
+      assertWorkProposalExactKeys(state, ["schemaVersion", "records", ...(Object.hasOwn(state, "readProofs") ? ["readProofs"] : [])]);
       if (state.schemaVersion !== 1) throw new Error();
       const records = workProposalArrayValues(state.records, 1000).map(normalizedAdoption);
       if (new Set(records.map(record => record.adoptionId)).size !== records.length) throw new Error();
-      return { schemaVersion: 1, records };
+      return { schemaVersion: 1, records, ...(Object.hasOwn(state, "readProofs") ? { readProofs: state.readProofs } : {}) };
     } catch (cause) { throw adoptionError("Publication adoption state is corrupted", "REVIEW_PUBLICATION_ADOPTION_CORRUPTED"); }
   }
   async recover() { return { records: (await this.#state()).records.length }; }
+  async readProofs() {
+    try {
+      const state = await this.#state();
+      return { records: workProposalArrayValues(state.readProofs ?? [], 1000).map(normalizeReviewReadProof), diagnostic: null };
+    } catch { return { records: [], diagnostic: "REVIEW_READ_PROOF_UNAVAILABLE" }; }
+  }
+  recordReadProof(value) {
+    return this.#queue.enqueue(async () => {
+      try {
+        const proof = normalizeReviewReadProof(value), state = await this.#state();
+        const proofs = workProposalArrayValues(state.readProofs ?? [], 1000).map(normalizeReviewReadProof);
+        if (proofs.some(record => record.readProofId === proof.readProofId)) return { recorded: true };
+        if (proofs.length >= 1000) return { recorded: false, diagnostic: "REVIEW_READ_PROOF_CAPACITY" };
+        await this.#store.write(ADOPTION_STATE_KEY, { ...state, readProofs: [...proofs, proof] });
+        return { recorded: true };
+      } catch { return { recorded: false, diagnostic: "REVIEW_READ_PROOF_UNAVAILABLE" }; }
+    });
+  }
   async get(adoptionId) {
     if (!/^review-publication-adoption-[a-f0-9]{64}$/.test(adoptionId ?? "")) throw adoptionError("Invalid adoption reference");
     return structuredClone((await this.#state()).records.find(record => record.adoptionId === adoptionId) ?? null);
@@ -212,7 +235,7 @@ export class ReviewPublicationAdoptionStore {
       const existing = state.records.find(record => record.adoptionId === receipt.adoptionId);
       if (existing) return structuredClone(existing);
       if (state.records.length >= 1000) throw adoptionError("Publication adoption storage is full", "REVIEW_PUBLICATION_ADOPTION_CAPACITY");
-      await this.#store.write(ADOPTION_STATE_KEY, { schemaVersion: 1, records: [...state.records, receipt] });
+      await this.#store.write(ADOPTION_STATE_KEY, { ...state, records: [...state.records, receipt] });
       return structuredClone(receipt);
     });
   }

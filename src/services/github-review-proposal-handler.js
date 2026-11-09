@@ -357,6 +357,9 @@ export class GitHubReviewProposalHandler {
     const input = normalizeHandlerInput(value);
     if (Object.hasOwn(input.proposal.payload, "publicationReuse")) {
       if (this.#adoptPublication === null) throw workProposalError("REVIEW_PUBLICATION_REUSE_UNAVAILABLE", "既有 Review 复用验证器不可用");
+      if (!input.proposal.binding.evidenceTarget && input.proposal.payload.publicationReuse.readProofId) {
+        return this.#handleAutomaticResultReuse(input, options);
+      }
       return this.#adoptPublication(input, options);
     }
     const initialPlan = createGitHubReviewProposalConfirmationPlan(input.proposal, {
@@ -507,6 +510,33 @@ export class GitHubReviewProposalHandler {
     }
     if (this.#automaticReviewPublisher !== null && item.status === "pending") {
       const published = await this.#automaticReviewPublisher.publish(item, { publicationAllowed: !selfAuthored });
+      if (published !== item) item = normalizeConfirmationItem(published, expected);
+    }
+    return transitionFor(item, this.#clock, this.#pollIntervalMs);
+  }
+
+  async #handleAutomaticResultReuse(input, options) {
+    const plan = createGitHubReviewProposalConfirmationPlan(input.proposal, { actorAccountId: this.#actorAccountId,
+      publishedReviewReuse: { proposalId: input.proposal.proposalId, proposalDigest: input.proposal.contentDigest,
+        publicationReuse: input.proposal.payload.publicationReuse } });
+    const expected = normalizeConfirmationPlan(plan);
+    if (input.downstreamRef !== null && input.downstreamRef !== expected.id) throw invalidConfirmation();
+    let item = null;
+    try { item = normalizeConfirmationItem(await this.#get(expected.id), expected); }
+    catch (error) { if (error?.code !== "CONFIRMATION_NOT_FOUND") throw error; }
+    // An exact completed confirmation is historical proof even after its own
+    // current handoff removes the assignment. Never create another handoff.
+    if (item && ["completed", "rejected", "stale"].includes(item.status)) return transitionFor(item, this.#clock, this.#pollIntervalMs);
+    const adoption = await this.#adoptPublication(input, options);
+    if (!adoption.automaticSettlement) throw invalidProposal("Automatic result reuse needs its current source settlement target");
+    const authority = await this.#currentAuthority(input.proposal.binding.inputBinding);
+    if (authority === null || authority.author?.toLowerCase() === this.#actorAccountId.toLowerCase()) {
+      if (item) return this.#invalidateChangedAuthorization(item, expected, input.proposal);
+      return { status: "stale", summary: "Review 复用的本轮授权已变化", evidence: ["authorization_changed"] };
+    }
+    if (item === null) item = normalizeConfirmationItem(await this.#enqueue(plan), expected);
+    if (this.#automaticReviewPublisher !== null && item.status === "pending") {
+      const published = await this.#automaticReviewPublisher.publish(item);
       if (published !== item) item = normalizeConfirmationItem(published, expected);
     }
     return transitionFor(item, this.#clock, this.#pollIntervalMs);
