@@ -9,6 +9,7 @@ import { currentWorkItemEvent, currentWorkItemExecutionBinding } from "./work-le
 import { createWorkIntentDispatchBinding } from "../domain/work-intent-dispatch-binding.js";
 import { createReviewPublicationCandidate, createReviewPublicationAdoption, verifyReviewPublicationAdoption } from "./published-review-adoption.js";
 import { createReviewReadProof, matchesReviewReadProof, standardReviewPurpose } from "../domain/review-result-proof.js";
+import { consumeCompletedReviewRead } from "../adapters/github-review-reader.js";
 
 const failure = code => Object.assign(new Error(code), { code });
 const same = (left, right) => canonicalJsonDigest(left) === canonicalJsonDigest(right);
@@ -69,8 +70,10 @@ export class ReviewPublicationReuseService {
     }
     this.#ports = { taskReader, factsReader, publicationSourceReader, confirmationReader, materialsReader, receiptStore, inputAuthorityVerifier, policyReader, clock };
   }
-  async recordReviewCoverage(value) {
+  async recordReviewCoverage(receipt) {
     try {
+      const value = consumeCompletedReviewRead(receipt);
+      if (value === null) return;
       const task = await this.#task(value.taskId, null);
       if (!samePullRequestExecutionBinding(task.inputBinding, value.inputBinding)) return;
       const proof = createReviewReadProof({ ...value, task });

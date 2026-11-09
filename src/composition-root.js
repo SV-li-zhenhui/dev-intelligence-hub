@@ -92,6 +92,7 @@ import { ReviewPublicationAdoptionStore } from "./services/published-review-adop
 import { loadNativeReviewSkill } from "./lib/native-review-skill.js";
 import { ReviewPublicationReuseService, createReviewAdoptionTaskReader } from "./services/review-publication-reuse-service.js";
 import { readGitHubReviewFeedbackSnapshot } from "./adapters/github-review-feedback-snapshot.js";
+import { GitHubReviewReader } from "./adapters/github-review-reader.js";
 import { projectPullRequestReadFactsContext } from "./domain/pull-request-read-facts.js";
 import { runJson } from "./lib/command-runner.js";
 import { RefreshService } from "./services/refresh-service.js";
@@ -488,11 +489,12 @@ function productionCliRuntimeFacts(value) {
     "supervisedCliTemporaryRoot",
     "originalRepairFeedbackReader",
     "currentReviewFeedbackReader",
+    "reviewReaderFactory",
   ]);
   if (
     !Object.hasOwn(descriptors, "protectedRoots") ||
     keys.length < 1 ||
-    keys.length > 5 ||
+    keys.length > 6 ||
     keys.some(
       (key) =>
         typeof key !== "string" ||
@@ -541,6 +543,8 @@ function productionCliRuntimeFacts(value) {
     throw new TypeError("Production CLI original feedback reader is invalid");
   }
   const currentFeedbackReader = descriptors.currentReviewFeedbackReader?.value;
+  const reviewReaderFactory = descriptors.reviewReaderFactory?.value;
+  if (reviewReaderFactory !== undefined && typeof reviewReaderFactory !== "function") throw new TypeError("Production review reader factory is invalid");
   return Object.freeze({
     protectedRoots: distinctAbsolutePaths(protectedRoots),
     ...(broker === undefined ? {} : { codexLoginCredentialBroker: broker }),
@@ -551,9 +555,9 @@ function productionCliRuntimeFacts(value) {
       originalRepairFeedbackReader: frozenPort(feedbackReader, ["read"], "originalRepairFeedbackReader"),
     }),
     ...(currentFeedbackReader === undefined ? {} : {
-      currentReviewFeedbackReader: frozenPort(currentFeedbackReader,
-        ["read", ...(typeof currentFeedbackReader.recordReviewCoverage === "function" ? ["recordReviewCoverage"] : [])], "currentReviewFeedbackReader"),
+      currentReviewFeedbackReader: frozenPort(currentFeedbackReader, ["read"], "currentReviewFeedbackReader"),
     }),
+    ...(reviewReaderFactory === undefined ? {} : { reviewReaderFactory }),
   });
 }
 
@@ -1145,6 +1149,7 @@ export async function createApplication({
   let obsoleteCodeJobSettler = null;
   let inputAuthorityVerifier = null;
   let currentReviewFeedbackReader = null;
+  let recordCompletedReviewRead = null;
   let reviewPublicationReuse = null;
   let codeJobDeliveryEvidenceReader = null;
   let codeJobControl = null;
@@ -1247,7 +1252,18 @@ export async function createApplication({
       currentReviewFeedbackReader: Object.freeze({ async read(input, options) {
         if (currentReviewFeedbackReader === null) throw Object.assign(new Error("PR_REVIEW_READ_FEEDBACK_UNAVAILABLE"), { code: "PR_REVIEW_READ_FEEDBACK_UNAVAILABLE" });
         return currentReviewFeedbackReader.read(input, options);
-      }, async recordReviewCoverage(input) { return currentReviewFeedbackReader?.recordReviewCoverage?.(input); } }),
+      } }),
+      // This closure fixes the transport, fact source and policy to host-owned
+      // producers. Callers cannot submit coverage or substitute reader options.
+      async reviewReaderFactory(target, { signal = null } = {}) {
+        const skill = await loadNativeReviewSkill();
+        return new GitHubReviewReader({ originalRepairFeedbackReader,
+          currentReviewFeedbackReader: { async read(input, options) {
+            if (currentReviewFeedbackReader === null) throw Object.assign(new Error("PR_REVIEW_READ_FEEDBACK_UNAVAILABLE"), { code: "PR_REVIEW_READ_FEEDBACK_UNAVAILABLE" });
+            return currentReviewFeedbackReader.read(input, options);
+          } }, onCompleteReviewRead: receipt => recordCompletedReviewRead?.(receipt),
+        }).open(target, { signal, skillDocuments: skill.documents });
+      },
       ...(typeof privateRuntimeDirectory === "string" &&
           path.isAbsolute(privateRuntimeDirectory) &&
           path.resolve(privateRuntimeDirectory) ===
@@ -2730,7 +2746,7 @@ export async function createApplication({
       const getBoundReviewReader = () => boundReviewReader ??= new BoundReviewFeedbackReader({ ledger: workLedgerRuntime, factsReader: prEngineerService, inputAuthorityVerifier });
       currentReviewFeedbackReader = Object.freeze({ async read(input, options) {
         return getBoundReviewReader().read(input, options);
-      }, async recordReviewCoverage(input) { return getReuseService().recordReviewCoverage(input); } });
+      } });
       let reuseService = null;
       const getReuseService = () => reuseService ??= new ReviewPublicationReuseService({
         taskReader: createReviewAdoptionTaskReader(frozenPort(workLedgerRuntime, ["readReviewAdoptionContext"], "Review adoption task reader")),
@@ -2759,6 +2775,7 @@ export async function createApplication({
         policyReader: async () => (await loadNativeReviewSkill()).digest,
         ...clockOptions,
       });
+      recordCompletedReviewRead = receipt => getReuseService().recordReviewCoverage(receipt);
       reviewPublicationReuse = Object.freeze({
         listCandidates: (input, options) => getReuseService().listCandidates(input, options),
         handle: (input, options) => getReuseService().handle(input, options),

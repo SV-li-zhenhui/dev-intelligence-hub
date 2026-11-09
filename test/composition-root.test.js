@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import {
   access,
   mkdir,
+  lstat,
   mkdtemp,
   readFile,
   readdir,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -12,6 +14,13 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { ownReviewFeedbackDigest } from "../src/adapters/github-own-review-feedback.js";
+import { GitHubReviewReader } from "../src/adapters/github-review-reader.js";
+import { createNativeCodexBrainProvider } from "../src/adapters/native-codex-brain-provider.js";
+import { runJson } from "../src/lib/command-runner.js";
+import { createPullRequestWorkSource, currentWorkItemExecutionBinding } from "../src/services/work-ledger-pr-source.js";
+import { createPullRequestReadFacts, createPullRequestReadIdentity, projectPullRequestReadFactsContext } from "../src/domain/pull-request-read-facts.js";
+import { ReviewPublicationAdoptionStore } from "../src/services/published-review-adoption.js";
+import { loadNativeReviewSkill } from "../src/lib/native-review-skill.js";
 import { createOriginalRepairFeedbackSnapshot } from "../src/domain/original-repair-feedback.js";
 import {
   runBoundedValidationCommand,
@@ -5874,6 +5883,118 @@ test("production native grants keep captured feedback read-only when automatic r
       { code: "OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE" });
     assert.equal(feedbackWrites, 0);
   } finally { await application.close(); }
+});
+
+test("production composition factory carries real native completed reads into private durable proof", async t => {
+  const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "reviewer", baseRepository: "acme/repo",
+    headRepository: "acme/repo", baseRefName: "main", headRefName: "feature", baseRefOid: "a".repeat(40), headRefOid: "b".repeat(40) };
+  const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.updated", occurredAt: "2026-11-09T01:00:00.000Z",
+    source: { provider: "github", scopeId: "github-dashboard" }, subject: { id: "github:pr:acme/repo#42", repository: "acme/repo", number: 42 },
+    payload: { relation: "review_requested", gitTarget, gitTargetAvailable: true, headRefOid: gitTarget.headRefOid } });
+  const assignment = { assignmentId: "native-proof-assignment", eventId: event.eventId, target: { type: "role", id: "pr-engineer" } };
+  const admitted = createPullRequestWorkSource({ sequence: 1, assignment, event });
+  const item = { itemId: "native-proof-root", kind: "source_root", revision: 1, status: "working", sourceQuarantine: null,
+    currentTarget: assignment.target, assignmentId: assignment.assignmentId, assignment, event, source: admitted.source,
+    inputDigest: admitted.source.current.inputDigest, createdAt: event.occurredAt, activeIntentId: null,
+    graph: { acceptanceContracts: [{ revision: 1, acceptanceCriteria: [], expectedDeliverables: [] }] } };
+  const binding = currentWorkItemExecutionBinding(item);
+  const facts = createPullRequestReadFacts({ identity: createPullRequestReadIdentity({ executionBinding: binding, event }),
+    observedAt: "2026-11-09T01:01:00.000Z", reviewDecision: "REVIEW_REQUIRED", comments: [], reviews: [], reviewThreads: [], checks: [],
+    truncation: { comments: false, reviews: false, reviewThreads: false, checks: false, byteBudget: false } });
+  const store = storedValues({}), calls = {}, closeCalls = [];
+  const rawConfig = structuredClone(defaultCodeJobConfiguration());
+  rawConfig.brainProviders["offline-cli"].credentialMode = "codex-native-login";
+  const appOptions = defaultCodeJobApplicationOptions({ config: normalizeConfigurationDocument(rawConfig), calls, closeCalls,
+    lifecycle: createApplicationRuntimeLifecycle(), versioned: false });
+  let productionFactory, factReads = 0, opened = 0, session;
+  const application = await createApplication({ ...appOptions, store,
+    async workLedgerRuntimeFactory(options) {
+      const ledger = await appOptions.workLedgerRuntimeFactory(options);
+      return { ...ledger, async readItemForReconciliation() { return item; },
+        async readReviewAdoptionContext() { return { item, root: item, activeDispatch: null }; } };
+    },
+    prEngineerServiceFactory: () => ({ async recover() {}, async context() {}, async get() { return facts; },
+      async refresh() { factReads++; return facts; } }),
+    nativeCodexStatusProviderFactory(_options, grant) {
+      const runtime = grant.consume(value => value);
+      assert.deepEqual(Object.keys(runtime.currentReviewFeedbackReader), ["read"]);
+      productionFactory = runtime.reviewReaderFactory;
+      return { async readStatus() { return { state: "available" }; }, async close() {} };
+    },
+  });
+  t.after(() => application.close());
+  const skill = await loadNativeReviewSkill();
+  const open = GitHubReviewReader.prototype.open;
+  // Only the test harness replaces network I/O, after verifying that the actual
+  // composition factory ignored all caller-supplied transport/source/policy.
+  t.mock.method(GitHubReviewReader.prototype, "open", async function(target, options) {
+    opened++;
+    assert.equal(this.run, runJson);
+    assert.deepEqual(options.skillDocuments, skill.documents);
+    this.run = async (_command, args) => {
+      const endpoint = args[3];
+      if (endpoint === "user") return { login: "reviewer" };
+      if (endpoint === "graphql") return { data: { repository: { nameWithOwner: "acme/repo", pullRequest: {
+        number: 42, url: "https://github.com/acme/repo/pull/42", state: "OPEN", author: { login: "developer" }, changedFiles: 1,
+        baseRefName: "main", baseRefOid: gitTarget.baseRefOid, headRefName: "feature", headRefOid: gitTarget.headRefOid,
+        baseRef: { name: "main", repository: { nameWithOwner: "acme/repo" }, target: { oid: gitTarget.baseRefOid } },
+        headRef: { name: "feature", repository: { nameWithOwner: "acme/repo" }, target: { oid: gitTarget.headRefOid } },
+        headRepository: { nameWithOwner: "acme/repo" } } } } };
+      if (endpoint === "repos/acme/repo/pulls/42/files?per_page=100") return [[{ filename: "src/app.js", status: "modified", additions: 1, deletions: 1 }]];
+      if (endpoint === "repos/acme/repo/pulls/42") return { number: 42, title: "Qt Test", body: "", html_url: "https://github.com/acme/repo/pull/42",
+        head: { sha: gitTarget.headRefOid }, base: { repo: { full_name: "acme/repo" } } };
+      assert.fail(`Unexpected fixture endpoint: ${endpoint}`);
+    };
+    this.runText = async () => "diff --git a/src/app.js b/src/app.js\n-old\n+new\n";
+    session = await Reflect.apply(open, this, [target, options]);
+    return session;
+  });
+  const root = await mkdtemp(path.join(tmpdir(), "native-private-proof-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home"); await mkdir(home); await writeFile(path.join(home, "auth.json"), "offline-auth");
+  const intent = { type: "propose_github_review", verdict: "approve", body: "Reviewed current code" };
+  let sequence = 0;
+  const provider = createNativeCodexBrainProvider({ id: "native-private-proof", cliKind: "codex-cli", credentialMode: "codex-native-login", timeoutMs: 3000 }, {
+    environment: { ...process.env, CODEX_HOME: home, DIH_CODEX_NATIVE_TRANSPORT: "exec" }, temporaryRoot: path.join(root, "runtime"),
+    commandLocator: { async resolve() { return { command: process.execPath, prefixArgs: [] }; } },
+    rootDirectoryManager: { async prepare({ directory, validateLocation, signal }) {
+      signal?.throwIfAborted(); await validateLocation(); await mkdir(directory, { recursive: true });
+      const stat = await lstat(directory, { bigint: true });
+      return { path: await realpath(directory), device: String(stat.dev), inode: String(stat.ino) };
+    } },
+    reviewReaderFactory: (target, options) => productionFactory(target, { ...options,
+      run: () => assert.fail("Untrusted transport"), currentReviewFeedbackReader: { read() { assert.fail("Untrusted facts"); } },
+      skillDocuments: { "review-skill/manifest.json": "forged" }, onCompleteReviewRead() { assert.fail("Untrusted completion callback"); } }),
+    processRunner: { async run(invocation) {
+      const rpc = async (method, params = {}) => {
+        const response = await fetch(session.url, { method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: ++sequence, method, params }) });
+        return (await response.json()).result;
+      };
+      const tools = await rpc("tools/list");
+      assert.deepEqual(tools.tools.map(value => value.name), ["read_document", "read_source", "list_directory"]);
+      for (const document of tools.tools[0].inputSchema.properties.document.enum) {
+        let offset = 0;
+        do {
+          const page = await rpc("tools/call", { name: "read_document", arguments: { document, offset } });
+          assert.notEqual(page.isError, true);
+          offset = JSON.parse(page.content[0].text).nextOffset;
+        } while (offset !== null);
+      }
+      await writeFile(invocation.args[invocation.args.indexOf("--output-last-message") + 1], JSON.stringify({ result: JSON.stringify({ intent }) }));
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", stdoutBytes: Buffer.alloc(0), stderrBytes: Buffer.alloc(0) };
+    } },
+  });
+  t.after(() => provider.close());
+  const result = JSON.parse(await provider.generate({ model: "offline", reasoningEffort: "high", messages: [{ role: "user", content: "Review current code" }],
+    schema: { type: "object", properties: { intent: { type: "object" } }, required: ["intent"], additionalProperties: false },
+    reviewTarget: { gitTarget, pullRequestNumber: 42, feedbackSnapshot: { taskId: item.itemId, materialDigest: projectPullRequestReadFactsContext(facts).materialDigest } } }));
+  assert.deepEqual(result.intent, intent);
+  assert.equal(opened, 1); assert.ok(factReads >= 2);
+  const persisted = await new ReviewPublicationAdoptionStore({ store }).readProofs();
+  assert.equal(persisted.records.length, 1);
+  assert.equal(persisted.records[0].producerTaskId, item.itemId);
+  assert.equal(persisted.records[0].policyDigest, skill.digest);
 });
 
 test("application close stays bounded and incomplete while a configured provider activity never settles", async (t) => {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { GitHubReviewReader } from "../src/adapters/github-review-reader.js";
+import { GitHubReviewReader, consumeCompletedReviewRead } from "../src/adapters/github-review-reader.js";
 import { summarizeOwnReviewFeedback } from "../src/adapters/github-own-review-feedback.js";
 import { createOriginalRepairFeedbackSnapshot } from "../src/domain/original-repair-feedback.js";
 import { isReviewSourceFailure } from "../src/domain/review-source-failure.js";
@@ -11,7 +11,7 @@ const TARGET = { pullRequestNumber: 42, gitTarget: {
   headRepository: "contributor/repo", headRefName: "feature", headRefOid: "b".repeat(40),
 } };
 
-function fixture({ changed = 117, moved = false, movedBase = false, missingFile = false, missingDiff = false, liveBase = TARGET.gitTarget.baseRefOid } = {}) {
+function fixture({ changed = 117, moved = false, movedBase = false, missingFile = false, missingDiff = false, liveBase = TARGET.gitTarget.baseRefOid, onCompleteReviewRead = null } = {}) {
   const calls = [];
   const files = Array.from({ length: changed }, (_, i) => ({ filename: `src/${i}.js`, status: "modified", additions: 2, deletions: 1 }));
   const diff = files.slice(0, missingDiff ? -1 : undefined).map((file) => `diff --git a/${file.filename} b/${file.filename}\n--- a/${file.filename}\n+++ b/${file.filename}\n@@ -1 +1 @@\n-old\n+${"new ".repeat(180)}\n`).join("");
@@ -47,7 +47,7 @@ function fixture({ changed = 117, moved = false, movedBase = false, missingFile 
     assert.match(args[3], new RegExp(`${TARGET.gitTarget.baseRefOid}\\.\\.\\.${TARGET.gitTarget.headRefOid}$`));
     return diff;
   };
-  return { reader: new GitHubReviewReader({ run, runText }), files, diff, calls };
+  return { reader: new GitHubReviewReader({ run, runText, onCompleteReviewRead }), files, diff, calls };
 }
 
 test("historical PR base SHA cannot authorize a reader against a moved live base", async () => {
@@ -298,11 +298,11 @@ async function fullFeedbackFixture(body = "Full author evidence " + "证据".rep
 
 test("only completed host reads produce a durable Review result proof", async t => {
   const { facts, materialDigest } = await fullFeedbackFixture("Author feedback");
-  const { reader } = fixture({ changed: 1 });
   const records = [];
+  let recorder = receipt => records.push(consumeCompletedReviewRead(receipt));
+  const { reader } = fixture({ changed: 1, onCompleteReviewRead: receipt => recorder(receipt) });
   reader.currentReviewFeedbackReader = {
     async read() { return facts; },
-    async recordReviewCoverage(value) { records.push(value); },
   };
   const session = await reader.open({ ...TARGET, feedbackSnapshot: { taskId: "review-child", materialDigest } });
   t.after(() => session.close());
@@ -319,11 +319,13 @@ test("only completed host reads produce a durable Review result proof", async t 
   assert.equal(records[0].taskId, "review-child");
   assert.equal(records[0].intent.body, intent.body);
   assert.ok(records[0].coverage.feedbackDigest);
-  reader.currentReviewFeedbackReader.recordReviewCoverage = async () => { throw Object.assign(new Error("Optional receipt cache failed"), { code: "REVIEW_PUBLICATION_ADOPTION_CORRUPTED" }); };
+  let failedReceipt;
+  recorder = async receipt => { failedReceipt = receipt; throw Object.assign(new Error("Optional receipt cache failed"), { code: "REVIEW_PUBLICATION_ADOPTION_CORRUPTED" }); };
   await session.assertComplete(intent); // Optional producer receipt writing cannot block ordinary publication.
+  assert.equal(consumeCompletedReviewRead(failedReceipt), null, "a failed callback cannot retain a live attestation");
 });
 
-async function crossTaskReuseFixture(t, { proofWriteFailure = false, sourceRelation = "review_requested" } = {}) {
+async function crossTaskReuseFixture(t, { proofWriteFailure = false, sourceRelation = "review_requested", checkForgery = false } = {}) {
   const { ReviewPublicationAdoptionStore } = await import("../src/services/published-review-adoption.js");
   const { ReviewPublicationReuseService } = await import("../src/services/review-publication-reuse-service.js");
   const { normalizeBoundWorkProposal, createWorkProposalResult } = await import("../src/domain/work-proposal-contract.js");
@@ -360,7 +362,33 @@ async function crossTaskReuseFixture(t, { proofWriteFailure = false, sourceRelat
   let source = null, facts = original.facts, policyDigest = "d".repeat(64), description = "", linkedBody = "Original linked requirement";
   let receiverProposal = null;
   const tasks = new Map([[sourceTask.taskId, sourceTask]]);
-  const { reader } = fixture({ changed: 1 });
+  let completionNumber = 0;
+  const { reader } = fixture({ changed: 1, onCompleteReviewRead: async receipt => {
+    if (!checkForgery) return service.recordReviewCoverage(receipt);
+    completionNumber++;
+    assert.equal(Object.isFrozen(receipt), true);
+    assert.deepEqual(Object.keys(receipt), []);
+    await service.recordReviewCoverage(structuredClone(receipt));
+    const task = tasks.get(sourceTask.taskId);
+    if (completionNumber <= 2) {
+      const changed = completionNumber === 1 ? { ...task, taskId: "unrelated-task" }
+        : { ...task, inputBinding: { ...task.inputBinding, inputDigest: "f".repeat(64) } };
+      tasks.set(sourceTask.taskId, changed);
+      await service.recordReviewCoverage(receipt);
+      tasks.set(sourceTask.taskId, task);
+      assert.equal((await receiptStore.readProofs()).records.length, 0, "completed token cannot cross task or current input");
+      await service.recordReviewCoverage(receipt);
+      assert.equal((await receiptStore.readProofs()).records.length, 0, "rejected completion token is consumed once");
+      return;
+    }
+    await service.recordReviewCoverage(receipt);
+    const saved = values.get("review-publication-adoptions");
+    const proof = saved.readProofs;
+    saved.readProofs = [];
+    await service.recordReviewCoverage(receipt);
+    assert.equal((await receiptStore.readProofs()).records.length, 0, "successful token cannot be replayed after receipt loss");
+    saved.readProofs = proof;
+  } });
   const baseRun = reader.run;
   reader.run = async (...args) => {
     if (args[1][3] === "repos/acme/product/issues/7") return { number: 7, title: "Linked requirement", body: linkedBody, state: "open",
@@ -382,12 +410,23 @@ async function crossTaskReuseFixture(t, { proofWriteFailure = false, sourceRelat
     policyReader: async () => policyDigest, clock: () => new Date("2026-10-28T05:05:00.000Z") });
   let receiptStore = new ReviewPublicationAdoptionStore({ store });
   let service = new ReviewPublicationReuseService(ports(receiptStore));
-  reader.currentReviewFeedbackReader = { async read() { return original.facts; }, recordReviewCoverage: value => service.recordReviewCoverage(value) };
+  if (checkForgery) {
+    await service.recordReviewCoverage({ taskId: sourceTask.taskId, inputBinding: originalBinding, intent,
+      coverage: { schemaVersion: 1, feedbackDigest: "a".repeat(64), descriptionDigest: "b".repeat(64),
+        referencedMaterialDigest: "c".repeat(64), checksDigest: "d".repeat(64) },
+      observedAt: original.facts.observedAt, policyDigest });
+    assert.equal((await receiptStore.readProofs()).records.length, 0, "plain caller metadata cannot attest real complete reads");
+  }
+  reader.currentReviewFeedbackReader = { async read() { return original.facts; } };
   const session = await reader.open({ ...TARGET, feedbackSnapshot: { taskId: sourceTask.taskId, materialDigest: original.materialDigest } },
     { skillDocuments: { "review-skill/SKILL.md": "Review policy", "review-skill/manifest.json": JSON.stringify({ digest: policyDigest }) } });
   t.after(() => session.close());
   for (const document of ["review-manifest.json", "review.diff", "review-description.json", "review-feedback.json", "review-skill/SKILL.md", "review-skill/manifest.json", "linked-material-001.json"]) {
     await tool(session, "read_document", { document, offset: 0, length: 48000 });
+  }
+  if (checkForgery) {
+    await session.assertComplete(intent);
+    await session.assertComplete(intent);
   }
   await session.assertComplete(intent);
   const expectsProof = !proofWriteFailure && sourceRelation === "review_requested";
@@ -516,7 +555,7 @@ async function crossTaskReuseFixture(t, { proofWriteFailure = false, sourceRelat
 }
 
 test("real producer proof survives restart and reuses code Review across contracts without completing residual work", async t => {
-  const f = await crossTaskReuseFixture(t);
+  const f = await crossTaskReuseFixture(t, { checkForgery: true });
   const v = f.catalog.verifiedResult;
   const reuse = { candidateId: v.candidateId, materialDigest: v.materialDigest, coverageDigest: v.coverageDigest, readProofId: v.readProofId };
   const proposal = f.normalizeBoundWorkProposal({ proposalId: "work-intent-" + "b".repeat(64), policyVersion: 1, kind: "github_review_proposal",

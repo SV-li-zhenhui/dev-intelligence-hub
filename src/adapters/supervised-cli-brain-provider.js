@@ -538,7 +538,7 @@ function productionDependencies(runtimeFacts = []) {
     codexResultReader: readCodexResult,
     codexLoginCredentialBroker,
     codexSessionStore,
-    reviewReaderFactory: (target, options) => new GitHubReviewReader({ originalRepairFeedbackReader, currentReviewFeedbackReader }).open(target, options),
+    reviewReaderFactory: runtimeFacts.reviewReaderFactory ?? ((target, options) => new GitHubReviewReader({ originalRepairFeedbackReader, currentReviewFeedbackReader }).open(target, options)),
   });
 }
 

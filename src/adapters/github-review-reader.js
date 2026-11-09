@@ -36,6 +36,14 @@ function coversAll(ranges, length) {
 }
 
 const integer = { type: "integer", minimum: 0 };
+// Only successful completion below can mint a receipt. Plain metadata and
+// serialized copies cannot cross this in-process producer boundary.
+const completedReads = new WeakMap();
+export function consumeCompletedReviewRead(receipt) {
+  const value = completedReads.get(receipt);
+  completedReads.delete(receipt);
+  return value ?? null;
+}
 const TOOLS = [
   { name: "read_document", description: "Read review-manifest.json or review.diff in successive pages. Use nextOffset until null. review.diff is the complete final three-dot diff, not a series of historical commit patches.", inputSchema: { type: "object", required: ["document", "offset"], additionalProperties: false, properties: { document: { type: "string", enum: ["review-manifest.json", "review.diff"] }, offset: integer, length: { type: "integer", minimum: 1, maximum: 48_000 } } } },
   { name: "read_source", description: "Read any related source file at the pinned head or base commit. Continue with nextOffset for large files. Paths are repository-relative, never host filesystem paths.", inputSchema: { type: "object", required: ["path", "revision", "offset"], additionalProperties: false, properties: { path: { type: "string" }, revision: { type: "string", enum: ["head", "base"] }, offset: integer, length: { type: "integer", minimum: 1, maximum: 48_000 } } } },
@@ -46,11 +54,13 @@ for (const tool of TOOLS) tool.annotations = { readOnlyHint: true, destructiveHi
 // GitHub credentials stay in the parent. The CLI receives only this invocation's
 // read endpoint, bound to one PR and immutable commit IDs, with no write tools.
 export class GitHubReviewReader {
-  constructor({ run = runJson, runText = runCommand, originalRepairFeedbackReader = null, currentReviewFeedbackReader = null } = {}) {
+  #onCompleteReviewRead;
+  constructor({ run = runJson, runText = runCommand, originalRepairFeedbackReader = null, currentReviewFeedbackReader = null, onCompleteReviewRead = null } = {}) {
     this.run = run;
     this.runText = runText;
     this.originalRepairFeedbackReader = originalRepairFeedbackReader;
     this.currentReviewFeedbackReader = currentReviewFeedbackReader;
+    this.#onCompleteReviewRead = onCompleteReviewRead;
   }
 
   async open(rawTarget, { signal = null, skillDocuments = {} } = {}) {
@@ -250,7 +260,7 @@ export class GitHubReviewReader {
     })();
     signal?.addEventListener("abort", onAbort, { once: true });
     if (requestSignal.aborted) { await close(); requestSignal.throwIfAborted(); }
-    const thisRecorder = this.currentReviewFeedbackReader;
+    const onCompleteReviewRead = this.#onCompleteReviewRead;
     return {
       url: `http://127.0.0.1:${server.address().port}${endpointPath}`,
       diffText, manifestText,
@@ -263,15 +273,20 @@ export class GitHubReviewReader {
             const current = await readCurrentFeedback();
             if (current.feedbackSnapshot.snapshotDigest !== feedbackSnapshot.snapshotDigest) throw failure("PR_REVIEW_READ_MATERIAL_CHANGED");
             if (intent?.type === "propose_github_review" && !intent.publicationReuse &&
-                typeof thisRecorder?.recordReviewCoverage === "function") {
+                typeof onCompleteReviewRead === "function") {
               // Only this host method can attest complete tool coverage. An
               // unavailable optimization receipt must never block publication.
-              try { await thisRecorder.recordReviewCoverage({ taskId: target.feedbackSnapshot.taskId,
+              const receipt = Object.freeze({});
+              try {
+                completedReads.set(receipt, structuredClone({ taskId: target.feedbackSnapshot.taskId,
                 inputBinding: current.facts.identity.executionBinding,
                 intent, coverage: current.resultCoverage, observedAt: current.facts.observedAt,
                 policyDigest: skills.find(([name]) => name === "review-skill/manifest.json")
-                  ? JSON.parse(skills.find(([name]) => name === "review-skill/manifest.json")[1]).digest : null }); }
+                  ? JSON.parse(skills.find(([name]) => name === "review-skill/manifest.json")[1]).digest : null }));
+                await onCompleteReviewRead(receipt);
+              }
               catch { /* Missing proof retains the original full-review path. */ }
+              finally { completedReads.delete(receipt); }
             }
           } else await checkTarget();
         }, { signal: requestSignal });
