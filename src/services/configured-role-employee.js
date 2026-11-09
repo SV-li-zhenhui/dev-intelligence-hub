@@ -104,6 +104,18 @@ function verificationRecoverySummary(stages) {
   return `；验证准备恢复：扫描 ${recovery.scanned} 项，入队 ${recovery.requeued} 项，失败 ${recovery.failed} 项${code}`;
 }
 
+const HOST_OUTCOME_REFERENCE_LABELS = new Map([
+  ["claim_not_acquired:WORK_LEDGER_GRAPH_BLOCKED", "首个未领取任务"],
+  ["blocked:ROLE_DECISION_INPUT_STALE", "首个输入校验任务"],
+]);
+
+function hostOutcomeReference(outcome, status, code) {
+  // These fields come from the host work stage, never decision text or evidence.
+  const label = HOST_OUTCOME_REFERENCE_LABELS.get(`${status}:${code}`);
+  return label && typeof outcome.itemId === "string" && outcome.itemId.length === 74 && /^work-item-[a-f0-9]{64}$/.test(outcome.itemId)
+    ? `；${label} ${outcome.itemId}` : "";
+}
+
 function runSummary(value) {
   const result = dataObject(value);
   const stages = result && dataObject(result.stages);
@@ -119,7 +131,7 @@ function runSummary(value) {
     ? work.workAttempts
     : 0;
   const counts = new Map();
-  let rejectedGraphItem = null;
+  let reference = "";
   if (Array.isArray(work.outcomes)) {
     for (const entry of work.outcomes) {
       const outcome = dataObject(entry);
@@ -131,8 +143,7 @@ function runSummary(value) {
           /^[A-Z][A-Z0-9_]{0,127}$/.test(outcome.code)
         ? outcome.code
         : null;
-      if (rejectedGraphItem === null && status === "claim_not_acquired" && code === "WORK_LEDGER_GRAPH_BLOCKED" &&
-          typeof outcome.itemId === "string" && /^work-item-[a-f0-9]{64}$/.test(outcome.itemId)) rejectedGraphItem = outcome.itemId;
+      if (!reference) reference = hostOutcomeReference(outcome, status, code);
       const aggregate = counts.get(status) ?? { count: 0, codes: new Set() };
       aggregate.count += 1;
       if (code) aggregate.codes.add(code);
@@ -150,9 +161,9 @@ function runSummary(value) {
   const summary = `${prefix}${
     statuses ? `：${statuses}` : ""
   }${recovery}`;
-  const bounded = recovery && Buffer.byteLength(summary, 'utf8') > 512 ? `${prefix}${recovery}` : summary;
-  const reference = rejectedGraphItem === null ? '' : `；首个未领取任务 ${rejectedGraphItem}`;
-  return Buffer.byteLength(bounded + reference, 'utf8') <= 512 ? bounded + reference : bounded;
+  if (Buffer.byteLength(summary + reference, "utf8") <= 512) return summary + reference;
+  const concise = `${prefix}${recovery}${reference}`;
+  return Buffer.byteLength(concise, "utf8") <= 512 ? concise : `${prefix}${recovery}`;
 }
 
 function continuationWorkOutcome(value, target) {

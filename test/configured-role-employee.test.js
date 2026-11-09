@@ -8,6 +8,11 @@ import { RoleWorkerDirectory } from "../src/services/role-worker-directory.js";
 import { BrainRouter } from "../src/services/brain-router.js";
 import { ConfiguredRoleEmployee } from "../src/services/configured-role-employee.js";
 import { RoleDecisionEngine } from "../src/services/role-decision-engine.js";
+import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
+import { WorkCoordinationService } from "../src/services/work-coordination-service.js";
+import { WorkLedgerService } from "../src/services/work-ledger-service.js";
+import { RoleContextAssembler } from "../src/services/role-context-assembler.js";
+import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { coordinatorGoalControl } from "../src/domain/work-goal-ownership.js";
 import { MODEL_WORK_DECISION_JSON_SCHEMA } from "../src/domain/structured-brain-contract.js";
 
@@ -1659,6 +1664,62 @@ test("a configured role exposes a bounded work-cycle outcome summary", async () 
   assert.equal(JSON.stringify(view).includes("private-item"), false);
 });
 
+test('a real stale developer outcome keeps its host task reference through coordination and restart', async () => {
+  const store = new MemoryStore(), at = "2026-11-09T14:00:00.000Z";
+  const clock = () => at;
+  const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "issue.observed", occurredAt: at,
+    source: { provider: "github", scopeId: "summary-fixture" },
+    subject: { id: "github:issue:acme/repo#42", repository: "acme/repo", number: 42 },
+    payload: { state: "open", updatedAt: at, title: "Synthetic development task" } });
+  const record = { sequence: 1, event, assignment: { assignmentId: "summary-fixture-assignment", eventId: event.eventId,
+    target: { type: "role", id: "developer" } } };
+  const ledger = new WorkLedgerService({ store, clock, idFactory: () => "summary-fixture-lease",
+    exclusiveLease: { run: operation => operation() },
+    assignmentSource: { async readAssignmentBatch({ afterSequence }) {
+      return { items: afterSequence === 0 ? [record] : [], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 };
+    } } });
+  await ledger.recover(); await ledger.intake();
+  const task = (await ledger.listItems()).items[0];
+  assert.match(task.itemId, /^work-item-[a-f0-9]{64}$/);
+  const modelReportedId = `work-item-${"b".repeat(64)}`;
+  const engine = fakeDecisionEngine("developer");
+  engine.decide = async () => {
+    // A host transition wins while the synthetic decision is being selected.
+    // The real loop must refuse that decision rather than stage its intent.
+    const current = await ledger.readItemForReconciliation({ itemId: task.itemId });
+    await ledger.transition({ itemId: current.itemId, expectedRevision: current.revision, leaseId: current.leaseId,
+      actorId: "employee-developer", toStatus: "blocked", reason: "synthetic_input_changed", details: { code: "SYNTHETIC_INPUT_CHANGED" } });
+    const decision = completeDecision({ summary: `private model report ${modelReportedId}` });
+    decision.intent.evidence = [modelReportedId];
+    return decision;
+  };
+  let coordination, observed;
+  const options = { definition: definition("developer"), permissions: permissions("complete"), brain: brain(),
+    decisionEngine: engine, store, clock, onRun: async ({ roleId, trigger, signal }) => {
+      observed = await coordination.runCycle({ roleId, trigger, includeWork: true, signal });
+      return observed;
+    } };
+  const employee = new ConfiguredRoleEmployee(options);
+  const loop = new ProactiveWorkLoop({ ledger, clock,
+    roleDirectory: new RoleWorkerDirectory({ workers: [employee.asRoleWorker()], legacyOwnedRoleIds: [] }),
+    roleContextAssembler: new RoleContextAssembler({ graphReader: { getSnapshot: () => ledger.getGraphSnapshot() } }),
+    orchestratorService: { async execute() { assert.fail("The stale decision cannot deliver work"); } } });
+  const idle = { async runCycle() { return {}; } };
+  coordination = new WorkCoordinationService({ ledger, workLoop: loop, workLimit: 1,
+    proposalResultReconciler: idle, attentionResultReconciler: idle, conditionWaker: idle,
+    dispatcher: { async dispatchPending() { return {}; } } });
+  await employee.run({ trigger: "scheduled" });
+  assert.deepEqual(observed.stages.work.result.outcomes.map(({ itemId, status, code }) => ({ itemId, status, code })),
+    [{ itemId: task.itemId, status: "blocked", code: "ROLE_DECISION_INPUT_STALE" }]);
+  assert.equal((await ledger.listOutbox()).items.length, 0, "the rejected model decision creates no intent");
+  const view = await employee.roleView();
+  assert.ok(view.lastRun.summary.includes(task.itemId), "the canonical host task ID must survive the aggregate projection");
+  assert.equal(view.lastRun.summary.includes(modelReportedId), false, "model text never supplies the host reference");
+  assert.equal(view.lastRun.summary.includes("private"), false);
+  assert.ok(Buffer.byteLength(view.lastRun.summary) <= 512);
+  assert.equal((await new ConfiguredRoleEmployee(options).roleView()).lastRun.summary, view.lastRun.summary);
+});
+
 test('a graph-rejected claim retains only a bounded canonical task reference across restart', async t => {
   for (const variant of ['canonical', 'raw-id', 'wrong-code', 'wrong-status', 'failed-stage']) await t.test(variant, async () => {
     const itemId = `work-item-${'a'.repeat(64)}`;
@@ -1678,6 +1739,66 @@ test('a graph-rejected claim retains only a bounded canonical task reference acr
     assert.equal(summary.includes('private-'), false);
     assert.ok(Buffer.byteLength(summary) <= 512);
     assert.equal((await new ConfiguredRoleEmployee(options).roleView()).lastRun.summary, summary);
+  });
+});
+
+test('stale-input summaries retain only a canonical host reference for the exact failed outcome', async t => {
+  for (const variant of ['canonical', 'raw-id', 'uppercase-id', 'short-id', 'wrong-code', 'wrong-status', 'malicious-code', 'malicious-status', 'malicious-id', 'trailing-newline', 'trailing-unicode-separator', 'model-only', 'failed-stage', 'accessor']) {
+    await t.test(variant, async () => {
+      const itemId = `work-item-${'a'.repeat(64)}`, otherId = `work-item-${'b'.repeat(64)}`;
+      const entry = { itemId, status: 'blocked', code: 'ROLE_DECISION_INPUT_STALE', message: 'private-message' };
+      if (variant === 'raw-id') entry.itemId = 'private-business-task';
+      if (variant === 'uppercase-id') entry.itemId = `work-item-${'A'.repeat(64)}`;
+      if (variant === 'short-id') entry.itemId = 'work-item-abcd';
+      if (variant === 'wrong-code') entry.code = 'ROLE_DECISION_FAILED';
+      if (variant === 'wrong-status') entry.status = 'retry_scheduled';
+      if (variant === 'malicious-code') entry.code = 'ROLE_DECISION_INPUT_STALE\nprivate-code';
+      if (variant === 'malicious-status') entry.status = 'blocked\nprivate-status';
+      if (variant === 'malicious-id') entry.itemId = `${itemId}\nprivate-id`;
+      if (variant === 'trailing-newline') entry.itemId = `${itemId}\n`;
+      if (variant === 'trailing-unicode-separator') entry.itemId = `${itemId}\u2028`;
+      if (variant === 'model-only') { delete entry.itemId; entry.summary = itemId; entry.modelReportedItemId = itemId; }
+      if (variant === 'accessor') Object.defineProperty(entry, 'itemId', { enumerable: true, get() { assert.fail('No untrusted getters'); } });
+      const options = { definition: definition('developer'), permissions: permissions('complete'), brain: brain(),
+        decisionEngine: fakeDecisionEngine('developer'), store: new MemoryStore(),
+        onRun: async () => ({ stages: { work: { ok: variant !== 'failed-stage', result: {
+          scanned: 1, workAttempts: 1, outcomes: [entry, { itemId: otherId, status: 'staged', code: 'ROLE_DECISION_INPUT_STALE', summary: 'private-message' }],
+        } } } }) };
+      const employee = new ConfiguredRoleEmployee(options);
+      await employee.run({ trigger: 'scheduled' });
+      const summary = (await employee.roleView()).lastRun.summary;
+      assert.equal(summary.includes(itemId), variant === 'canonical');
+      assert.equal(summary.includes(otherId), false);
+      assert.equal(summary.includes('private-'), false);
+      assert.ok(Buffer.byteLength(summary) <= 512);
+      assert.equal((await new ConfiguredRoleEmployee(options).roleView()).lastRun.summary, summary);
+    });
+  }
+});
+
+test('the first safe host reference is shared by graph and stale-input outcomes within the summary budget', async t => {
+  for (const [first, includeRecovery] of [['graph', false], ['stale', false], ['graph', true], ['stale', true]]) await t.test(`${first} recovery=${includeRecovery}`, async () => {
+    const firstId = `work-item-${'c'.repeat(64)}`, secondId = `work-item-${'d'.repeat(64)}`;
+    const graph = { status: 'claim_not_acquired', code: 'WORK_LEDGER_GRAPH_BLOCKED' };
+    const stale = { status: 'blocked', code: 'ROLE_DECISION_INPUT_STALE' };
+    const options = { definition: definition('developer'), permissions: permissions('complete'), brain: brain(),
+      decisionEngine: fakeDecisionEngine('developer'), store: new MemoryStore(),
+      onRun: async () => ({ stages: { work: { ok: true, result: { scanned: Number.MAX_SAFE_INTEGER, workAttempts: Number.MAX_SAFE_INTEGER,
+        outcomes: [{ itemId: 'private-invalid', ...stale }, { itemId: firstId, ...(first === 'graph' ? graph : stale) },
+          { itemId: secondId, ...(first === 'graph' ? stale : graph) },
+          ...Array.from({ length: 20 }, (_, index) => ({ status: 'blocked', code: `OTHER_HOST_FAILURE_${index}` }))],
+      } }, ...(includeRecovery ? { own_pr_material_recovery: { ok: true, result: { verificationRecovery: {
+        scanned: Number.MAX_SAFE_INTEGER, requeued: Number.MAX_SAFE_INTEGER, failed: Number.MAX_SAFE_INTEGER,
+        lastFailure: 'R'.repeat(128),
+      } } } } : {}) } }) };
+    const employee = new ConfiguredRoleEmployee(options);
+    await employee.run({ trigger: 'scheduled' });
+    const summary = (await employee.roleView()).lastRun.summary;
+    assert.equal(summary.includes(firstId), true, 'only the first valid reference survives even when details exceed 512 bytes');
+    assert.equal(summary.includes(secondId), false);
+    assert.equal(summary.includes('private-'), false);
+    assert.equal(summary.includes('验证准备恢复'), includeRecovery);
+    assert.ok(Buffer.byteLength(summary) <= 512);
   });
 });
 
