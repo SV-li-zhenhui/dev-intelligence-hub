@@ -497,7 +497,7 @@ function normalizeDispatchFailure(value, task) {
   const failure = exactData(value, ["intentId", "code", "downstreamCreated", "operation", "contractRevision",
     "contractDigest", "compatibleEvidenceKinds", "expectedDeliverables"], "dispatch failure");
   const operation = failure.get("operation"), contract = task?.acceptanceContracts.at(-1);
-  if (failure.get("downstreamCreated") !== false || !["verify", "modify"].includes(operation) || !contract ||
+  if (failure.get("downstreamCreated") !== false || !["inspect", "verify", "modify"].includes(operation) || !contract ||
       failure.get("contractRevision") !== contract.revision ||
       digest(failure.get("contractDigest"), "dispatchFailure.contractDigest") !== deliveryAcceptanceContractDigest(contract)) throw invalid("dispatch failure contract is stale");
   const kinds = denseArray(failure.get("compatibleEvidenceKinds"), "dispatch failure evidence kinds", 2).map(value => identifier(value, "evidence kind"));

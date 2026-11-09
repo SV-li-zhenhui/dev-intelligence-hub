@@ -1,6 +1,6 @@
 import { ledgerDigest } from './work-ledger-values.js';
 import { isDeepStrictEqual } from 'node:util';
-import { currentWorkItemExecutionBinding, verifyPullRequestExecutionBinding } from './work-ledger-pr-source.js';
+import { currentWorkItemEvent, currentWorkItemInputBinding, currentWorkItemExecutionBinding, verifyPullRequestExecutionBinding } from './work-ledger-pr-source.js';
 import { isParentCoordinationReturn } from './work-ledger-graph-responsibility.js';
 
 // A retained failure makes coordination ready; it never grants a child retry.
@@ -11,9 +11,21 @@ export function recordedFailureParentIds(state, failures) {
   for (const id of failures.keys()) {
     const child = items.get(id), parent = items.get(child?.graph?.parentItemId);
     if (parents.has(parent?.itemId)) continue;
-    if (parent?.kind !== 'source_root' || parent.currentTarget?.id !== 'orchestrator' ||
+    if (!parent || parent.graph?.parentItemId !== null || parent.currentTarget?.type !== 'role' || parent.currentTarget.id !== 'orchestrator' ||
         !['queued', 'retry_wait'].includes(parent.status) || parent.activeIntentId !== null ||
         parent.ownerId !== null || parent.leaseId !== null || parent.leaseUntil !== null || parent.sourceQuarantine !== null) continue;
+    if (parent.kind === 'assignment') {
+      const failure = failures.get(id), event = currentWorkItemEvent(parent);
+      if (failure.code !== 'delivery-evidence-incompatible' || failure.operation !== 'inspect' ||
+          event?.source?.provider !== 'github' || !event.eventType?.startsWith('issue.') || event.payload?.state !== 'open' ||
+          currentWorkItemInputBinding(parent) !== null || currentWorkItemInputBinding(child) !== null ||
+          !isDeepStrictEqual(event, currentWorkItemEvent(child)) || parent.decisionContext?.outcome === 'unknown' ||
+          (state.outbox ?? []).some(box => [parent.itemId, child.itemId].includes(box.itemId) &&
+            ['pending', 'dispatching', 'unknown'].includes(box.status))) continue;
+      parents.add(parent.itemId);
+      continue;
+    }
+    if (parent.kind !== 'source_root') continue;
     const binding = currentWorkItemExecutionBinding(parent);
     if (!binding || !isDeepStrictEqual(binding, currentWorkItemExecutionBinding(child))) continue;
     try { verifyPullRequestExecutionBinding(state, binding); } catch { continue; }

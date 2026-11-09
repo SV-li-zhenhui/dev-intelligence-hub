@@ -14123,6 +14123,131 @@ async function assertDispatchFailureWakesParent(fixture, parent) {
   }
 }
 
+async function rejectedIssueInspectionFixture() {
+  const f = await parentCoordinationLedgerFixture({ binding: "generic", returned: false });
+  let child = await f.read(f.child.itemId);
+  child = await f.service.claim({ itemId: child.itemId, expectedRevision: child.revision,
+    workerId: "employee-developer", leaseDurationMs: 30_000 });
+  await f.service.stageIntent({ itemId: child.itemId, expectedRevision: child.revision, leaseId: child.leaseId,
+    actorId: "employee-developer", roleId: "developer", intent: codeActionIntent({ operation: "inspect" }) });
+  let binds = 0, proposals = 0;
+  const dispatcher = new WorkIntentDispatcher({ ledger: f.service, clock: f.time.clock,
+    policy: { bind() { binds++; assert.fail("incompatible inspection must stop before policy binding"); } },
+    attentionProducer: { async create() { assert.fail("No attention request"); } },
+    proposalProducer: { async create() { proposals++; assert.fail("No downstream proposal"); } } });
+  const result = await dispatcher.dispatchPending();
+  assert.equal(result.blocked, 1);
+  assert.equal(result.items[0].code, "policy-binding-invalid", "the original safety rejection stays unchanged");
+  assert.equal(binds, 0); assert.equal(proposals, 0);
+  return f;
+}
+
+test("a rejected issue inspection wakes its existing parent coordinator without replay after restart", async () => {
+  const f = await rejectedIssueInspectionFixture(), child = f.child;
+  const before = f.store.stored(), failed = before.items.find(item => item.itemId === child.itemId);
+  assert.equal(failed.status, "blocked"); assert.equal(failed.currentTarget.id, "developer");
+  const box = before.outbox.find(entry => entry.itemId === child.itemId);
+  assert.equal(box.dispatchBinding, null); assert.equal(box.outcome.downstreamRef, undefined);
+  const restarted = await createFixture({ source: f.source, store: f.store, time: f.time });
+  const page = await restarted.service.listClaimCandidates({ at: f.time.clock(), roleId: "orchestrator" });
+  const fact = page.facts.find(entry => entry.itemId === f.root.itemId);
+  assert.equal(fact.graphBlocked, true);
+  assert.equal(fact.orchestrationReady, true, "the confirmed pre-binding rejection must reach its issue parent");
+  const assembler = new RoleContextAssembler({ graphReader: { getSnapshot: () => restarted.service.getGraphSnapshot() } });
+  const root = (await restarted.service.listItems()).items.find(item => item.itemId === f.root.itemId);
+  const packet = await assembler.assemble({ roleId: "orchestrator", item: root, trigger: "employee:orchestrator" });
+  const visible = packet.context.requirements.coordination.directChildren[0];
+  assert.equal(visible.blockingCondition, "delivery-evidence-incompatible");
+  assert.equal(visible.dispatchFailure.operation, "inspect");
+  assert.deepEqual(visible.dispatchFailure.compatibleEvidenceKinds, []);
+  assert.equal(visible.dispatchFailure.downstreamCreated, false);
+  const wakes = [], operations = [];
+  const scheduler = new WorkContinuationScheduler({ store: new MemoryStore(), ledger: restarted.service,
+    configurationReader: { readActive: async () => ({ configuration: { githubActions: { enabled: true, automaticOwnPrRepair: true } } }) },
+    roleStateReader: { read: async () => ({ enabled: true, paused: false }) }, clock: f.time.clock });
+  await scheduler.runCycle({ dispatch: async ({ roleId }) => { wakes.push(roleId); },
+    runOperation: operation => { const pending = operation(); operations.push(pending); return pending; } });
+  await Promise.all(operations);
+  assert.deepEqual(wakes, ["orchestrator"], "natural scheduling requests a fresh coordinating decision");
+  await assert.rejects(restarted.service.claim({ itemId: root.itemId, expectedRevision: root.revision,
+    workerId: "employee-orchestrator", leaseDurationMs: 30_000 }), { code: "WORK_LEDGER_GRAPH_BLOCKED" });
+  assert.deepEqual(f.store.stored(), before, "wake and diagnostic do not resume, replay, or rewrite failed history");
+
+  for (const variant of ["child-pause", "lease", "active-intent", "unknown-decision", "delivery", "bound", "pending", "unknown", "duplicate",
+    "changed-input", "new-contract", "wrong-operation", "wrong-code", "closed", "changed-event", "parent-pause", "parent-owned", "parent-unknown"]) {
+    const state = clone(before), current = state.items.find(item => item.itemId === child.itemId);
+    const parent = state.items.find(item => item.itemId === root.itemId), outbox = state.outbox.find(entry => entry.itemId === child.itemId);
+    if (variant === "child-pause") current.status = "paused";
+    if (variant === "lease") current.leaseUntil = "2026-08-03T00:00:00.000Z";
+    if (variant === "active-intent") current.activeIntentId = outbox.intentId;
+    if (variant === "unknown-decision") current.decisionContext = { outcome: "unknown" };
+    if (variant === "delivery") current.graph.deliveries.push({ status: "submitted" });
+    if (variant === "bound") outbox.dispatchBinding = {};
+    if (["pending", "unknown"].includes(variant)) state.outbox.push({ ...clone(outbox), status: variant });
+    if (variant === "duplicate") state.outbox.push(clone(outbox));
+    if (variant === "changed-input") outbox.inputDigest = "f".repeat(64);
+    if (variant === "new-contract") current.graph.acceptanceContracts.at(-1).recordedAt = "2026-08-03T00:00:00.000Z";
+    if (variant === "wrong-operation") outbox.intent.operation = "modify";
+    if (variant === "wrong-code") outbox.outcome.details.code = "policy-denied";
+    if (variant === "closed") parent.event.payload.state = "closed";
+    if (variant === "changed-event") parent.event.eventId = "changed-event";
+    if (variant === "parent-pause") parent.status = "paused";
+    if (variant === "parent-owned") parent.ownerId = "active-owner";
+    if (variant === "parent-unknown") parent.decisionContext = { outcome: "unknown" };
+    assert.equal(recordedFailureParentIds(state, indexUnstartedCodeDispatchFailures(state)).has(root.itemId), false, variant);
+  }
+});
+
+test("issue inspection failure reaches controlled parent replanning and stops waking once corrected work is pending", async () => {
+  const f = await rejectedIssueInspectionFixture(), before = f.store.stored();
+  const restarted = await createFixture({ source: f.source, store: f.store, time: f.time });
+  const graph = new WorkGraphStore({ ledger: restarted.service }), reader = graph.reader();
+  const assembler = new RoleContextAssembler({ graphReader: reader });
+  const host = new OrchestratorService({ contextAssembler: assembler, graphReader: reader, capabilityRoles: { development: "developer" },
+    scopedGraphPlannerFactory: { forRoot({ scopeRootTaskId }) { return graph.planner({ principalId: "employee-orchestrator", scopeRootTaskId }); } },
+    graphDelivererFactory: { forClaim() { assert.fail("Parent cannot acquire child delivery authority"); } } });
+  const schedulerStore = new MemoryStore(), options = { store: schedulerStore, ledger: restarted.service,
+    configurationReader: { readActive: async () => ({ configuration: { githubActions: { enabled: true, automaticOwnPrRepair: true } } }) },
+    roleStateReader: { read: async roleId => ({ enabled: roleId === "orchestrator", paused: false }) }, clock: f.time.clock };
+  let scheduler = new WorkContinuationScheduler(options), decisions = 0;
+  const dispatch = async ({ roleId }) => {
+    assert.equal(roleId, "orchestrator");
+    const items = (await restarted.service.listItems()).items, root = items.find(item => item.itemId === f.root.itemId);
+    const child = items.find(item => item.itemId === f.child.itemId);
+    const packet = await assembler.assemble({ roleId, item: root, trigger: "employee:orchestrator" });
+    const source = decisions === 0 ? child : root;
+    const action = { schemaVersion: 1, type: decisions === 0 ? "cancel" : "decompose", sourceTaskId: source.itemId,
+      sourceTaskRevision: source.revision, expectedGraphRevision: packet.binding.graphRevision, reason: "Continue original issue with compatible work" };
+    if (decisions === 1) Object.assign(action, { childKey: "corrected-development", capability: "development", dependsOn: [],
+      work: { title: "Continue issue implementation", description: "Produce the original required package through controlled modification" },
+      acceptanceContract: { revision: 1, acceptanceCriteria: [], expectedDeliverables: [{ deliverableId: "package", kind: "change-package",
+        description: "Original required package", required: true }] } });
+    assert.ok(decisions < 2, "unchanged pending child must not cause another parent model decision");
+    const result = await host.execute({ worker: { roleId, workerId: "employee-orchestrator" }, item: root, contextPacket: packet,
+      intent: { schemaVersion: 1, type: "orchestrate", summary: "Continue issue", reason: action.reason, action } });
+    assert.equal(result.applied, true); decisions++;
+  };
+  const cycle = async () => {
+    const operations = [];
+    await scheduler.runCycle({ dispatch, runOperation: operation => { const pending = operation(); operations.push(pending); return pending; } });
+    await Promise.all(operations);
+  };
+  await cycle();
+  assert.equal(decisions, 1, "real scheduler invokes the controlled coordinator to consume the failure");
+  await cycle();
+  assert.equal(decisions, 2, "related cancellation progress permits one corrected decomposition");
+  for (let index = 0; index < 3; index++) { f.time.advance(600_000); await cycle(); }
+  scheduler = new WorkContinuationScheduler(options);
+  await cycle();
+  assert.equal(decisions, 2, "restart and unchanged pending work never replay the old inspection or busy-loop parent decisions");
+  const after = f.store.stored(), failed = after.items.find(item => item.itemId === f.child.itemId);
+  assert.equal(failed.status, "cancelled");
+  assert.equal(failed.attempt, before.items.find(item => item.itemId === failed.itemId).attempt);
+  assert.deepEqual(failed.graph.acceptanceContracts, before.items.find(item => item.itemId === failed.itemId).graph.acceptanceContracts);
+  assert.deepEqual(after.outbox, before.outbox, "replanning preserves every original intent and creates no downstream proposal");
+  assert.equal(after.items.filter(item => item.graph.parentItemId === f.root.itemId && item.status === "queued").length, 1);
+});
+
 test("a historical unbound verification failure reaches its waiting orchestrator without changing child history", async () => {
   const record = ownerRequestedPrAssignment(1);
   record.assignment.target = { type: "role", id: "orchestrator" };

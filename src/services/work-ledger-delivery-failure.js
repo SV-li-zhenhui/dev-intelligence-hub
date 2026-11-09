@@ -1,7 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 import { createProposalDeliveryEvidenceTarget, deliveryAcceptanceContractDigest,
   deliveryEvidenceKindsForProposal, DELIVERY_EVIDENCE_ACTION_INCOMPATIBLE } from "../domain/delivery-evidence-contract.js";
-import { currentWorkItemInputBinding } from "./work-ledger-pr-source.js";
+import { currentWorkItemEvent, currentWorkItemInputBinding } from "./work-ledger-pr-source.js";
 import { hasExactLedgerKeys } from "./work-ledger-values.js";
 
 export function indexUnstartedCodeDispatchFailures(state) {
@@ -53,11 +53,20 @@ export function unstartedDeliveryContractFailure(item, outboxes) {
   if (item?.kind !== "graph_task" || item.status !== "blocked" || item.statusReason !== "intent_failed" ||
       item.activeIntentId !== null || item.ownerId !== null || item.leaseId !== null || item.sourceQuarantine !== null) return null;
   const binding = currentWorkItemInputBinding(item), contract = item.graph.acceptanceContracts.at(-1);
-  if (binding === null || !contract) return null;
+  const event = currentWorkItemEvent(item);
+  // Issue inspections cannot produce an authoritative package. A confirmed
+  // pre-binding rejection needs parent coordination just like a PR rejection;
+  // it does not authorize an inspection retry or a different delivery contract.
+  const issueInspection = binding === null && event?.source?.provider === "github" &&
+    event.eventType?.startsWith("issue.") && event.payload?.state === "open" &&
+    item.currentTarget?.type === "role" && item.currentTarget.id === "developer" &&
+    item.leaseUntil === null && item.decisionContext?.outcome !== "unknown" && item.graph.deliveries.length === 0;
+  if ((binding === null && !issueInspection) || !contract) return null;
   const matches = outboxes.filter(outbox => outbox.itemId === item.itemId && outbox.status === "failed" &&
     outbox.updatedAt === item.updatedAt && outbox.dispatchBinding === null && outbox.inputDigest === item.inputDigest &&
     isDeepStrictEqual(outbox.sourceBinding, binding) && outbox.requestedBy?.roleId === item.currentTarget.id &&
-    outbox.intent?.type === "propose_code_action" && ["verify", "modify"].includes(outbox.intent.operation) &&
+    outbox.intent?.type === "propose_code_action" &&
+    (issueInspection ? outbox.intent.operation === "inspect" : ["verify", "modify"].includes(outbox.intent.operation)) &&
     outbox.intent.deliverableId === undefined && outbox.outcome?.status === "failed" &&
     ["policy-binding-invalid", "delivery-evidence-incompatible"].some(code => isDeepStrictEqual(outbox.outcome.details, { code })) &&
     Number.isFinite(Date.parse(contract.recordedAt)) && Date.parse(contract.recordedAt) <= Date.parse(outbox.createdAt));
