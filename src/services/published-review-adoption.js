@@ -200,8 +200,8 @@ export class ReviewPublicationAdoptionStore {
   }
   async recover() { return { records: (await this.#state()).records.length }; }
   async readProofs() {
+    const state = await this.#state();
     try {
-      const state = await this.#state();
       return { records: workProposalArrayValues(state.readProofs ?? [], 1000).map(normalizeReviewReadProof), diagnostic: null };
     } catch { return { records: [], diagnostic: "REVIEW_READ_PROOF_UNAVAILABLE" }; }
   }

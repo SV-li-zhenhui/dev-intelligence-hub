@@ -23,7 +23,7 @@ export function normalizePublishedReviewReuse(value) {
 export function standardReviewPurpose(event) {
   if (event?.payload?.reviewPurpose !== undefined && event.payload.reviewPurpose !== STANDARD_REVIEW_PURPOSE) return null;
   if (event?.source?.provider === "github" && event.eventType?.startsWith("pull_request.") &&
-      event.payload?.relation !== "authored") return STANDARD_REVIEW_PURPOSE;
+      event.payload?.relation === "review_requested") return STANDARD_REVIEW_PURPOSE;
   if (event?.source?.provider === "local-owner" && event.eventType === "pull_request.owner_requested" &&
       ((event.payload?.workType === "pull_request" && event.payload.reviewPurpose === STANDARD_REVIEW_PURPOSE) || (event.payload?.workType === "general" &&
         event.payload.suggestedCapability === "pr-review" && ["review", "rereview", "complete_review"].includes(event.payload.nextAction)))) return STANDARD_REVIEW_PURPOSE;

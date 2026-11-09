@@ -105,6 +105,7 @@ export class ReviewPublicationReuseService {
         purpose: matches[0].purpose };
     } catch (error) {
       check(signal);
+      if (error?.code === "REVIEW_PUBLICATION_ADOPTION_CORRUPTED") throw error;
       this.#proofDiagnostic = "REVIEW_READ_PROOF_UNAVAILABLE";
       return null;
     }

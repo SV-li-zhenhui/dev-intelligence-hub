@@ -278,13 +278,14 @@ test("source paging reuses the decoded immutable blob and retries a failed fetch
 });
 
 
-async function fullFeedbackFixture(body = "Full author evidence " + "证据".repeat(10000)) {
+async function fullFeedbackFixture(body = "Full author evidence " + "证据".repeat(10000), { relation = "review_requested" } = {}) {
   const { normalizeWorkflowEvent } = await import("../src/domain/workflow-events.js");
   const { createPullRequestExecutionBinding } = await import("../src/domain/pull-request-execution-binding.js");
   const { createPullRequestReadIdentity, createPullRequestReadFacts, projectPullRequestReadFactsContext } = await import("../src/domain/pull-request-read-facts.js");
   const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.updated", occurredAt: "2026-10-28T05:00:00.000Z",
     source: { provider: "github", scopeId: "github-account:reviewer" }, subject: { id: "github:pr:acme/repo#42", repository: "acme/repo", number: 42 },
-    payload: { gitTarget: TARGET.gitTarget, gitTargetAvailable: true, headRefOid: TARGET.gitTarget.headRefOid } });
+    payload: { gitTarget: TARGET.gitTarget, gitTargetAvailable: true, headRefOid: TARGET.gitTarget.headRefOid,
+      ...(relation === null ? {} : { relation }) } });
   const executionBinding = createPullRequestExecutionBinding({ event, sourceBinding: { kind: "pull_request", rootItemId: "review-root", workKey: "review-42",
     inputRevision: 1, headRevision: 1, headRefOid: TARGET.gitTarget.headRefOid, eventId: event.eventId, eventDigest: event.contentDigest, inputDigest: "c".repeat(64) } });
   const facts = createPullRequestReadFacts({ identity: createPullRequestReadIdentity({ executionBinding, event }),
@@ -318,9 +319,11 @@ test("only completed host reads produce a durable Review result proof", async t 
   assert.equal(records[0].taskId, "review-child");
   assert.equal(records[0].intent.body, intent.body);
   assert.ok(records[0].coverage.feedbackDigest);
+  reader.currentReviewFeedbackReader.recordReviewCoverage = async () => { throw Object.assign(new Error("Optional receipt cache failed"), { code: "REVIEW_PUBLICATION_ADOPTION_CORRUPTED" }); };
+  await session.assertComplete(intent); // Optional producer receipt writing cannot block ordinary publication.
 });
 
-async function crossTaskReuseFixture(t, { proofWriteFailure = false } = {}) {
+async function crossTaskReuseFixture(t, { proofWriteFailure = false, sourceRelation = "review_requested" } = {}) {
   const { ReviewPublicationAdoptionStore } = await import("../src/services/published-review-adoption.js");
   const { ReviewPublicationReuseService } = await import("../src/services/review-publication-reuse-service.js");
   const { normalizeBoundWorkProposal, createWorkProposalResult } = await import("../src/domain/work-proposal-contract.js");
@@ -330,7 +333,22 @@ async function crossTaskReuseFixture(t, { proofWriteFailure = false } = {}) {
   const { normalizeWorkflowEvent } = await import("../src/domain/workflow-events.js");
   const { createDeliveryEvidenceTarget } = await import("../src/domain/delivery-evidence-contract.js");
   const { readGitHubReviewFeedbackSnapshot } = await import("../src/adapters/github-review-feedback-snapshot.js");
-  const original = await fullFeedbackFixture("Author feedback https://github.com/acme/product/issues/7");
+  const original = await fullFeedbackFixture("Author feedback https://github.com/acme/product/issues/7", { relation: sourceRelation });
+  const { createPullRequestWorkSource, currentWorkItemExecutionBinding } = await import("../src/services/work-ledger-pr-source.js");
+  const { createReviewAdoptionTaskReader } = await import("../src/services/review-publication-reuse-service.js");
+  const originalAssignment = { assignmentId: "source-assignment", eventId: original.event.eventId, target: { type: "role", id: "pr-engineer" } };
+  const admitted = createPullRequestWorkSource({ sequence: 1, assignment: originalAssignment, event: original.event });
+  assert.ok(admitted, "normalized legacy or known GitHub events really reach the supported ledger route");
+  const originalItem = { itemId: "review-root", kind: "source_root", revision: 2, status: "working", sourceQuarantine: null,
+    activeIntentId: null, currentTarget: originalAssignment.target, assignmentId: originalAssignment.assignmentId, assignment: originalAssignment,
+    event: original.event, source: admitted.source, inputDigest: admitted.source.current.inputDigest, createdAt: "2026-10-28T05:00:00.000Z",
+    graph: { acceptanceContracts: [{ revision: 1, acceptanceCriteria: [], expectedDeliverables: [] }] } };
+  const actualProducer = createReviewAdoptionTaskReader({ async readReviewAdoptionContext() { return { item: originalItem, root: originalItem, activeDispatch: null }; } });
+  const sourceTask = await actualProducer.read({ taskId: originalItem.itemId });
+  const originalBinding = currentWorkItemExecutionBinding(originalItem);
+  const { contentDigest: _originalDigest, schemaVersion: _originalVersion, ...originalContent } = original.facts;
+  original.facts = createPullRequestReadFacts({ ...originalContent, identity: createPullRequestReadIdentity({ executionBinding: originalBinding, event: original.event }) });
+  original.materialDigest = projectPullRequestReadFactsContext(original.facts).materialDigest;
   const values = new Map();
   let failProofWrite = proofWriteFailure;
   const store = { async read(key, fallback) { return structuredClone(values.get(key) ?? fallback); },
@@ -338,10 +356,6 @@ async function crossTaskReuseFixture(t, { proofWriteFailure = false } = {}) {
       if (failProofWrite && value.readProofs?.length) { failProofWrite = false; throw new Error("Receipt storage temporarily unavailable"); }
       values.set(key, structuredClone(value));
     } };
-  const originalBinding = original.facts.identity.executionBinding;
-  const sourceTask = { taskId: "review-root", roleId: "pr-engineer", revision: 2, status: "working", rootStatus: "working",
-    inputBinding: originalBinding, event: original.event, requestedAt: "2026-10-28T05:00:00.000Z",
-    acceptanceContract: { revision: 1, acceptanceCriteria: [], expectedDeliverables: [] } };
   const intent = { type: "propose_github_review", verdict: "approve", body: "Reviewed current code" };
   let source = null, facts = original.facts, policyDigest = "d".repeat(64), description = "", linkedBody = "Original linked requirement";
   let receiverProposal = null;
@@ -376,7 +390,9 @@ async function crossTaskReuseFixture(t, { proofWriteFailure = false } = {}) {
     await tool(session, "read_document", { document, offset: 0, length: 48000 });
   }
   await session.assertComplete(intent);
-  assert.equal(values.get("review-publication-adoptions")?.readProofs?.length ?? 0, proofWriteFailure ? 0 : 1, "producer proof persistence is optional for ordinary publication");
+  const expectsProof = !proofWriteFailure && sourceRelation === "review_requested";
+  assert.equal(values.get("review-publication-adoptions")?.readProofs?.length ?? 0, expectsProof ? 1 : 0,
+    "only positively known standard-review sources may persist a reusable producer proof");
   const proposal = normalizeBoundWorkProposal({ proposalId: "work-intent-" + "a".repeat(64), policyVersion: 1,
     kind: "github_review_proposal", requestedBy: { roleId: "pr-engineer", workItemId: sourceTask.taskId },
     source: { assignmentId: "source-assignment", eventId: originalBinding.eventId },
@@ -429,7 +445,7 @@ async function crossTaskReuseFixture(t, { proofWriteFailure = false } = {}) {
   service = new ReviewPublicationReuseService(ports(receiptStore));
   const list = () => service.listCandidates({ taskId: task.taskId, materialDigest: projectPullRequestReadFactsContext(facts).materialDigest });
   const catalog = await list();
-  assert.equal(Boolean(catalog.verifiedResult), !proofWriteFailure, "host must require actual persisted producer proof across restart");
+  assert.equal(Boolean(catalog.verifiedResult), expectsProof, "host must require actual persisted producer proof across restart");
   const target = createDeliveryEvidenceTarget({ taskId: task.taskId, roleId: task.roleId, acceptanceContract: contract, deliverableId: "review" });
   return { service, receiptStore, store, values, task, tasks, source, catalog, list, target, binding, event, publicationQueueStore,
     changePolicy: () => { policyDigest = "e".repeat(64); }, changeDescription: () => { description = "Author changed requirements"; },
@@ -437,13 +453,13 @@ async function crossTaskReuseFixture(t, { proofWriteFailure = false } = {}) {
     changeFacts: change => { const { contentDigest, schemaVersion, ...c } = facts; facts = createPullRequestReadFacts(change(c)); },
     normalizeBoundWorkProposal, createWorkProposalResult,
     registerReceiverProposal(value) { receiverProposal = value; task.activeProposal = { proposalId: value.proposalId, contentDigest: value.contentDigest }; task.status = "waiting_external"; },
-    async asAutomaticReceiver() {
+    async asAutomaticReceiver({ relation = "review_requested", contracted = false } = {}) {
       const { createPullRequestWorkSource } = await import("../src/services/work-ledger-pr-source.js");
       const { createReviewAdoptionTaskReader } = await import("../src/services/review-publication-reuse-service.js");
       const autoEvent = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.updated", occurredAt: "2026-10-28T05:04:00.000Z",
         source: { provider: "github", scopeId: "github-dashboard" }, subject: original.event.subject,
         payload: { gitTarget: TARGET.gitTarget, gitTargetAvailable: true, headRefOid: TARGET.gitTarget.headRefOid,
-          relation: "review_requested", assignees: ["reviewer"], reviewRecipient: "reviewer", reviewReceivedFrom: "developer",
+          ...(relation === null ? {} : { relation }), assignees: ["reviewer"], reviewRecipient: "reviewer", reviewReceivedFrom: "developer",
           reviewReceivedAt: "2026-10-28T05:04:00.000Z", reviewReceivedVia: "assignee", reviewRequestEventId: "AE_fresh_assignment" } });
       const assignment = { assignmentId: "fresh-automatic-assignment", eventId: autoEvent.eventId, target: { type: "role", id: "pr-engineer" } };
       const created = createPullRequestWorkSource({ sequence: 1, event: autoEvent, assignment });
@@ -451,14 +467,26 @@ async function crossTaskReuseFixture(t, { proofWriteFailure = false } = {}) {
       const autoItem = { itemId: "automatic-current-root", kind: "source_root", revision: 2, status: "working", sourceQuarantine: null,
         activeIntentId: null, currentTarget: assignment.target, assignmentId: assignment.assignmentId, assignment, event: autoEvent,
         source: created.source, inputDigest: created.source.current.inputDigest, createdAt: autoEvent.occurredAt,
-        graph: { acceptanceContracts: [{ revision: 1, acceptanceCriteria: [], expectedDeliverables: [] }] } };
+        graph: { acceptanceContracts: [contracted ? contract : { revision: 1, acceptanceCriteria: [], expectedDeliverables: [] }] } };
       const actualReader = createReviewAdoptionTaskReader({ async readReviewAdoptionContext() { return { item: autoItem, root: autoItem, activeDispatch: null }; } });
       const automaticTask = await actualReader.read({ taskId: autoItem.itemId });
-      assert.equal(automaticTask.automaticSettlement.kind, "automatic_review_settlement");
+      if (relation === "review_requested") assert.equal(automaticTask.automaticSettlement.kind, "automatic_review_settlement");
+      else assert.equal(automaticTask.automaticSettlement, undefined, "unknown relation cannot receive a typed automatic settlement target");
       tasks.delete(task.taskId); Object.assign(task, automaticTask); tasks.set(task.taskId, task);
       const { contentDigest, schemaVersion, ...c } = facts;
       facts = createPullRequestReadFacts({ ...c, identity: createPullRequestReadIdentity({ executionBinding: task.inputBinding, event: autoEvent }), observedAt: "2026-10-28T05:05:00.000Z" });
       return { task, event: autoEvent, binding: task.inputBinding, catalog: await list() };
+    },
+    async readCurrentFull() {
+      reader.currentReviewFeedbackReader = { async read() { return facts; } };
+      const current = await reader.open({ ...TARGET, feedbackSnapshot: { taskId: task.taskId,
+        materialDigest: projectPullRequestReadFactsContext(facts).materialDigest } });
+      try {
+        for (const document of ["review-manifest.json", "review.diff", "review-description.json", "review-feedback.json", "linked-material-001.json"]) {
+          await tool(current, "read_document", { document, offset: 0, length: 48000 });
+        }
+        await current.assertComplete({ type: "propose_github_review", verdict: "approve", body: "Full current code review" });
+      } finally { await current.close(); }
     },
     async fullReviewFallback() {
       const currentCatalog = await list();
@@ -508,6 +536,49 @@ test("real producer proof survives restart and reuses code Review across contrac
   assert.equal(f.task.status, "waiting_external", "adoption must not finish the current task");
   assert.equal(f.task.acceptanceContract.expectedDeliverables[1].deliverableId, "qa-note");
   assert.equal(f.task.acceptanceContract.expectedDeliverables[1].required, true);
+});
+
+test("canonical adoption record corruption propagates from the actual store through candidate preview", async t => {
+  const f = await crossTaskReuseFixture(t);
+  f.values.get("review-publication-adoptions").records = [{ adoptionId: "forged-canonical-record" }];
+  await assert.rejects(f.list(), { code: "REVIEW_PUBLICATION_ADOPTION_CORRUPTED" });
+  await assert.rejects(f.receiptStore.readProofs(), { code: "REVIEW_PUBLICATION_ADOPTION_CORRUPTED" });
+});
+
+test("damaged optional proof metadata preserves valid canonical adoption history and full reading", async t => {
+  const f = await crossTaskReuseFixture(t);
+  const v = f.catalog.verifiedResult;
+  const proofProposal = f.normalizeBoundWorkProposal({ proposalId: "work-intent-" + "c".repeat(64), policyVersion: 1, kind: "github_review_proposal",
+    requestedBy: { roleId: "pr-engineer", workItemId: f.task.taskId }, source: { assignmentId: "owner-child-assignment", eventId: f.event.eventId },
+    binding: { eventId: f.event.eventId, subject: f.event.subject, repository: "acme/repo", pullRequestNumber: 42,
+      headRefOid: f.binding.headRefOid, inputBinding: f.binding, evidenceTarget: f.target },
+    payload: { verdict: v.verdict, body: "Host proved identical Review coverage", publicationReuse: {
+      candidateId: v.candidateId, materialDigest: v.materialDigest, coverageDigest: v.coverageDigest, readProofId: v.readProofId },
+      evidence: ["head:" + f.binding.headRefOid], summary: "Reuse code Review", reason: "Verified coverage" } });
+  f.registerReceiverProposal(proofProposal);
+  assert.equal((await f.service.handle({ proposal: proofProposal })).status, "succeeded");
+  const state = f.values.get("review-publication-adoptions"), retained = structuredClone(state.records[0]);
+  state.readProofs = "damaged optional metadata";
+  assert.equal((await f.list()).verifiedResult, undefined);
+  assert.deepEqual(await f.receiptStore.get(retained.adoptionId), retained);
+  await f.fullReviewFallback();
+  assert.equal(f.values.get("review-publication-adoptions").records.length, 2);
+  assert.deepEqual(await f.receiptStore.get(retained.adoptionId), retained);
+});
+
+for (const sourceRelation of [null, "legacy_unknown"])
+test(`a normalized ${sourceRelation === null ? "missing" : "unknown"} GitHub relation cannot issue reusable proof through ledger and full reader`, async t => {
+  const f = await crossTaskReuseFixture(t, { sourceRelation });
+  assert.equal(f.catalog.verifiedResult, undefined);
+  await f.fullReviewFallback();
+});
+
+for (const relation of [null, "legacy_unknown"])
+test(`a known producer proof cannot skip full reading for a ${relation === null ? "missing" : "unknown"} receiver relation`, async t => {
+  const f = await crossTaskReuseFixture(t);
+  const current = await f.asAutomaticReceiver({ relation, contracted: true });
+  assert.equal(current.catalog.verifiedResult, undefined);
+  await f.readCurrentFull();
 });
 
 for (const scenario of ["description", "linked", "checks", "policy", "independent", "unknown", "missing-proof", "corrupt-proof", "author-comment", "body-forgery", "base", "head"])
