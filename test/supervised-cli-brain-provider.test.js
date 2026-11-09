@@ -22,7 +22,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { observePrivateDirectoryHelpers } from './support/private-directory-helper-diagnostics.mjs';
-import { controlledProviderTime } from './support/controlled-provider-time.mjs';
+import { controlledProviderTime, withinRealTime, CONTROLLED_PROVIDER_TEST_TIMEOUT_MS } from './support/controlled-provider-time.mjs';
 
 import {
   createProductionSupervisedCliBrainProvider,
@@ -2903,17 +2903,43 @@ test("cleanup retains an invocation whose aggregate regular-file bytes exceed th
   );
 });
 
-test("an unresolved cleanup operation is deadline-bounded and blocks providers sharing the root", async (t) => {
+test("an unresolved cleanup operation is deadline-bounded and blocks providers sharing the root", { timeout: CONTROLLED_PROVIDER_TEST_TIMEOUT_MS }, async (t) => {
   const time = controlledProviderTime(t);
   const cleanupEntered = time.phase('cleanup-unlink');
   const releaseCleanup = deferred();
   const cleanupSettled = deferred();
   let cleanupWasEntered = false;
+  let cleanupDidSettle = false;
+  let generationDidSettle = false;
+  let pendingGenerations = 0;
+  const generations = [];
+  const abortGenerations = new AbortController();
+  const generate = provider => {
+    const result = provider.generate(brainRequest({ signal: abortGenerations.signal }));
+    generations.push(result); pendingGenerations += 1;
+    const settled = () => { pendingGenerations -= 1; };
+    void result.then(settled, settled);
+    return result;
+  };
+  let completed = false;
   let generation = null;
   t.after(async () => {
     releaseCleanup.resolve();
-    if (cleanupWasEntered) await cleanupSettled.promise;
-    await generation?.catch(() => {});
+    abortGenerations.abort();
+    try {
+      // A failed assertion may leave the virtual recovery deadline one tick
+      // short. Expire it and release the real operation before waiting.
+      time.advance(1_000);
+      await withinRealTime(3_000, Promise.all([
+        cleanupWasEntered ? cleanupSettled.promise : Promise.resolve(),
+        ...generations.map(result => result.catch(() => {})),
+      ]));
+      await new Promise(resolve => setImmediate(resolve));
+    } finally {
+      const clockRestored = time.restore();
+      if (!completed) t.diagnostic(JSON.stringify({ fixture: 'cleanup-watchdog-teardown',
+        cleanupReleased: true, cleanupWasEntered, cleanupDidSettle, generationDidSettle, pendingGenerations, clockRestored }));
+    }
   });
   const parent = await temporaryDirectory(t, "supervised-cli-cleanup-hang-");
   const temporaryRoot = path.join(parent, "runtime");
@@ -2938,13 +2964,14 @@ test("an unresolved cleanup operation is deadline-bounded and blocks providers s
           cleanupWasEntered = true;
           cleanupEntered.enter();
           await releaseCleanup.promise;
-          try { return await unlink(file); } finally { cleanupSettled.resolve(); }
+          try { return await unlink(file); } finally { cleanupDidSettle = true; cleanupSettled.resolve(); }
         },
       }),
     },
   );
 
-  generation = first.generate(brainRequest());
+  generation = generate(first);
+  void generation.then(() => { generationDidSettle = true; }, () => { generationDidSettle = true; });
   let settled = false;
   const rejected = assert.rejects(generation, {
     code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
@@ -2958,7 +2985,7 @@ test("an unresolved cleanup operation is deadline-bounded and blocks providers s
   assert.equal(firstRunner.calls[0].signal.aborted, true, 'the earlier request deadline has expired');
   assert.equal(settled, false, 'cleanup owns its full original 1000ms budget');
   time.advance(1);
-  await within(
+  await withinRealTime(
     3_000,
     rejected,
   );
@@ -2983,7 +3010,7 @@ test("an unresolved cleanup operation is deadline-bounded and blocks providers s
       monotonicClock: time.monotonicClock,
     },
   );
-  await assert.rejects(second.generate(brainRequest()), {
+  await assert.rejects(generate(second), {
     code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
   });
   assert.equal(secondLocator.calls.length, 0);
@@ -2994,11 +3021,12 @@ test("an unresolved cleanup operation is deadline-bounded and blocks providers s
   // the retained quarantine. The original timeout must not fake completion.
   await new Promise(resolve => setImmediate(resolve));
   await assert.rejects(first.close(), { code: 'STRUCTURED_PROVIDER_CLEANUP_FAILED' });
-  assert.equal(await second.generate(brainRequest()), '{"ok":true}');
+  assert.equal(await generate(second), '{"ok":true}');
   assert.deepEqual(await readdir(temporaryRoot), []);
   assert.equal(secondRunner.calls.length, 1);
   await first.close();
   await second.close();
+  completed = true;
 });
 
 test("cancellation uses an independent cleanup budget after safe process settlement", async (t) => {

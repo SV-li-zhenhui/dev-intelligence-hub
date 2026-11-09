@@ -10,7 +10,7 @@ import test from "node:test";
 import { createTestSupervisedCliBrainProvider } from "../src/adapters/supervised-cli-brain-provider.js";
 import { createTestSupervisedProcessRunner } from "../src/lib/supervised-process-runner.js";
 import { CodexCliSessionStore } from "../src/adapters/codex-cli-session-store.js";
-import { controlledProviderTime } from './support/controlled-provider-time.mjs';
+import { controlledProviderTime, withinRealTime, CONTROLLED_PROVIDER_TEST_TIMEOUT_MS } from './support/controlled-provider-time.mjs';
 
 const success = () => ({ exitCode: 0, signal: null, stdoutBytes: Buffer.alloc(0), stderrBytes: Buffer.alloc(0) });
 const failure = (code = "STRUCTURED_PROVIDER_PROCESS_FAILED") => Object.assign(new Error("fixture failure"), { code });
@@ -58,13 +58,21 @@ async function fixture(t, overrides = {}) {
 for (const deadlineFirst of [false, true]) {
 test(deadlineFirst
   ? "recovery times out before a result-reader cancellation can be requested"
-  : "recovery cleans a safely reaped cancelled turn before admitting another login turn", async (t) => {
+  : "recovery cleans a safely reaped cancelled turn before admitting another login turn", { timeout: CONTROLLED_PROVIDER_TEST_TIMEOUT_MS }, async (t) => {
   // Fixture preparation and capture can exceed a second under parallel load.
   // Own both clocks so cancellation follows observed runner settlement/result entry,
   // independently of parallel-suite disk latency. Exercise the opposite order too.
   const time = controlledProviderTime(t);
   const resultRead = time.phase('result-reader');
   const controller = new AbortController();
+  let activeController = controller;
+  let generation;
+  t.after(async () => {
+    try {
+      activeController.abort(); time.advance(1_000);
+      await withinRealTime(3_000, generation?.catch(() => {}));
+    } finally { time.restore(); }
+  });
   let first = true;
   let resultReads = 0;
   const current = await fixture(t, {
@@ -88,7 +96,8 @@ test(deadlineFirst
       return '{"ok":true}';
     },
   });
-  const rejected = assert.rejects(current.provider.generate(request({ signal: controller.signal })), {
+  generation = current.provider.generate(request({ signal: controller.signal }));
+  const rejected = assert.rejects(generation, {
     code: deadlineFirst ? "STRUCTURED_PROVIDER_TIMEOUT" : "STRUCTURED_PROVIDER_CANCELLED",
   });
   if (!deadlineFirst) await resultRead.waitFor(rejected);
@@ -97,21 +106,30 @@ test(deadlineFirst
   assert.equal(resultReads, deadlineFirst ? 0 : 1);
   assert.deepEqual(current.events, ["process-reaped", "credential-captured", "release:true"]);
   assert.deepEqual(await readdir(current.temporaryRoot), []);
-  assert.equal(await current.provider.generate(request()), '{"ok":true}');
+  activeController = new AbortController();
+  generation = current.provider.generate(request({ signal: activeController.signal }));
+  assert.equal(await generation, '{"ok":true}');
 });
 }
 
-test("recovery waits for actual runner settlement after cancellation", async (t) => {
+test("recovery waits for actual runner settlement after cancellation", { timeout: CONTROLLED_PROVIDER_TEST_TIMEOUT_MS }, async (t) => {
   const time = controlledProviderTime(t);
   const controller = new AbortController();
   const started = time.phase('runner-started');
   let rejectRunner;
+  let outcome;
+  t.after(async () => {
+    try {
+      controller.abort(); rejectRunner?.(failure('STRUCTURED_PROVIDER_CANCELLED')); time.advance(1_000);
+      await withinRealTime(3_000, outcome);
+    } finally { time.restore(); }
+  });
   const current = await fixture(t, {
     monotonicClock: time.monotonicClock,
     processRunner: { run() { started.enter(); return new Promise((_, reject) => { rejectRunner = reject; }); } },
   });
   let publicSettled = false;
-  const outcome = current.provider.generate(request({ signal: controller.signal })).catch((error) => { publicSettled = true; return error; });
+  outcome = current.provider.generate(request({ signal: controller.signal })).catch((error) => { publicSettled = true; return error; });
   await started.waitFor(outcome);
   controller.abort();
   await new Promise((resolve) => setImmediate(resolve));
