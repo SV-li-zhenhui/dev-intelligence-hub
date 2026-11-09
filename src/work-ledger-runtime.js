@@ -123,6 +123,7 @@ export async function createWorkLedgerRuntime({
   obsoleteCodeJobSettler,
   hostContextRecoveryReader,
   reviewTestingRetirementReader,
+  attachHostHeadAncestry,
   createCandidateProcessor = createWorkerWorkLedgerCandidateProcessor,
   createGuard = (options) => new ProcessExclusiveGuard(options),
 } = {}) {
@@ -204,6 +205,14 @@ export async function createWorkLedgerRuntime({
       ...(reviewTestingRetirementReader === undefined ? {} : { reviewTestingRetirementReader }),
     });
     await service.recover();
+    if (attachHostHeadAncestry !== undefined) {
+      if (typeof attachHostHeadAncestry !== "function") throw new TypeError("Invalid host Head ancestry attachment");
+      attachHostHeadAncestry(Object.freeze({
+        readCandidates: options => admit(() => service.readHostHeadAncestryCandidates(options)),
+        readItemForReconciliation: options => admit(() => service.readItemForReconciliation(options)),
+        record: credential => admit(() => service.recordHostHeadAncestry(credential)),
+      }));
+    }
     const graph = new WorkGraphStore({ ledger: service });
     const graphReader = graph.reader();
     const graphPlanner = graph.planner({

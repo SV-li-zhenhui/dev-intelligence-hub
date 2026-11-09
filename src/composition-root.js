@@ -125,6 +125,7 @@ import { DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS } from "./domain/prioritizer.js";
 import { createPullRequestExecutionBinding, samePullRequestExecutionBinding } from "./domain/pull-request-execution-binding.js";
 import { AutomaticReviewScopeExitReader } from "./services/automatic-review-scope-exit-reader.js";
 import { AutomaticReviewReentryReader } from "./services/automatic-review-reentry-reader.js";
+import { AutomaticHeadAncestryReader } from "./services/automatic-head-ancestry-reader.js";
 import { AutomaticReviewTestingStopReader } from './services/automatic-review-testing-retirement.js';
 import { AutomaticRoleHandoffReader } from "./services/automatic-role-handoff-reader.js";
 
@@ -1116,6 +1117,7 @@ export async function createApplication({
   let codeAuthorizationRoleRegistry = null;
   let automaticReviewScopeExitReader = null;
   let automaticReviewReentryReader = null;
+  let automaticHeadAncestryReader = null;
   let automaticReviewTestingStopReader = null;
   let automaticRoleHandoffReader = null;
   let workflowRouting = null;
@@ -1368,6 +1370,9 @@ export async function createApplication({
       await workflowRoutingRuntimeFactory(config, {
         ...runtimeDependencies(workflowRoutingDependencies),
         store,
+        ...(config.githubActions?.enabled === true && config.githubActions.automaticOwnPrRepair === true ? {
+          headAncestryReader: Object.freeze({ read: options => automaticHeadAncestryReader?.read(options) ?? [] }),
+        } : {}),
         ...(config.githubActions?.enabled === true && config.githubActions.automaticReview === true ? {
           scopeExitRecoveryReader: Object.freeze({ async read(options) {
             if (!workLedgerRuntime) return [];
@@ -1575,6 +1580,19 @@ export async function createApplication({
           assignmentSource: workflowRouting,
           operationQueue: new OperationQueue(),
           hostContextRecoveryReader,
+          ...(config.githubActions?.enabled === true && config.githubActions.automaticOwnPrRepair === true &&
+            typeof github.readPullRequestRoleHandoffFacts === "function" && typeof github.isCommitAncestor === "function" ? {
+            attachHostHeadAncestry: ports => {
+              // Keep the producer and its writer capability inside composition.
+              // No runtime/read-only/native/CLI facade receives either object.
+              automaticHeadAncestryReader = new AutomaticHeadAncestryReader({
+                ledger: Object.freeze({ readCandidates: ports.readCandidates, readItemForReconciliation: ports.readItemForReconciliation }),
+                github: frozenPort(github, ["readPullRequestRoleHandoffFacts", "isCommitAncestor"], "Head ancestry GitHub reads"),
+                record: ports.record, account: config.githubActions.actorAccountId,
+                ...(workCoordinationDependencies.clock ? { clock: workCoordinationDependencies.clock } : {}),
+              });
+            },
+          } : {}),
           confirmationSettlementReader: Object.freeze({
             read: (input) => confirmationRuntime?.confirmationSettlementReader?.read(input),
           }),

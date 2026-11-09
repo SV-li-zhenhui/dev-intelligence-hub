@@ -94,6 +94,7 @@ function normalizeVersionedRead(result, expectedVersion) {
 }
 
 export class WorkflowRoutingService {
+  #headAncestryReader;
   constructor({
     store,
     router,
@@ -110,6 +111,7 @@ export class WorkflowRoutingService {
     scopeExitRecoveryReader = null,
     scopeReentryReader = null,
     roleHandoffReader = null,
+    headAncestryReader = null,
   } = {}) {
     if (
       !store ||
@@ -140,6 +142,8 @@ export class WorkflowRoutingService {
     this.scopeReentryReader = scopeReentryReader;
     if (roleHandoffReader !== null && typeof roleHandoffReader?.read !== "function") throw new TypeError("roleHandoffReader is invalid");
     this.roleHandoffReader = roleHandoffReader;
+    if (headAncestryReader !== null && typeof headAncestryReader?.read !== "function") throw new TypeError("headAncestryReader is invalid");
+    this.#headAncestryReader = headAncestryReader;
     this.operationQueue = operationQueue || new OperationQueue();
     this.exclusiveLease = exclusiveLease;
     this.runNewWorkAdmission = newWorkAdmissionRun(actionAdmissionGate);
@@ -283,7 +287,7 @@ export class WorkflowRoutingService {
   }
 
   async ingest({ event } = {}) {
-    if (event?.eventType === "pull_request.role_handoff") {
+    if (event?.eventType === "pull_request.role_handoff" || Object.hasOwn(event?.payload ?? {}, "headAncestryProof")) {
       throw workflowServiceError("WORKFLOW_EVENT_HOST_ONLY", "岗位责任交接只能由系统事实核验生成", 400);
     }
     this.#assertReady();
@@ -338,7 +342,7 @@ export class WorkflowRoutingService {
     const recoveredExits = this.scopeExitRecoveryReader !== null &&
       snapshot.sourceStatus?.githubPullRequests?.ok === true && snapshot.sourceStatus.githubPullRequests.complete === true
       ? await this.scopeExitRecoveryReader.read({ sourceScopeId }) : [];
-    const currentPullRequestEvents = (this.roleHandoffReader !== null || this.scopeReentryReader !== null) &&
+    const currentPullRequestEvents = (this.roleHandoffReader !== null || this.scopeReentryReader !== null || this.#headAncestryReader !== null) &&
       snapshot.sourceStatus?.githubPullRequests?.ok === true && snapshot.sourceStatus.githubPullRequests.complete === true &&
       snapshot.sourceStatus.githubPullRequests.stale !== true
       ? Object.freeze(workflowEventsFromSnapshots(null, currentCheckpoint,
@@ -347,6 +351,8 @@ export class WorkflowRoutingService {
       ? await this.roleHandoffReader.read({ events: currentPullRequestEvents }) : [];
     const reentries = this.scopeReentryReader !== null && currentPullRequestEvents !== null
       ? await this.scopeReentryReader.read({ events: currentPullRequestEvents }) : [];
+    const ancestryEvents = this.#headAncestryReader !== null && currentPullRequestEvents !== null
+      ? await this.#headAncestryReader.read({ events: currentPullRequestEvents }) : [];
     return this.#admitNewWork(() => this.#writeTransaction(async () => {
       const replay = this.#snapshotReplay(currentCheckpoint);
       const existingEventIds = new Set(
@@ -370,6 +376,15 @@ export class WorkflowRoutingService {
         if (!["pull_request.updated", "pull_request.created"].includes(event.eventType) ||
             event.source.provider !== "github" || event.source.scopeId !== sourceScopeId) {
           throw new TypeError("scope reentry reader may only reconnect its GitHub scope");
+        }
+        if (!existingEventIds.has(event.eventId)) extraEvents.push(event);
+      }
+      for (const value of ancestryEvents) {
+        const event = normalizeStoredWorkflowEvent(value);
+        if (!["pull_request.updated", "pull_request.created"].includes(event.eventType) || event.source.provider !== "github" ||
+            event.source.scopeId !== sourceScopeId || (event.eventType === "pull_request.updated" &&
+              !/^head-ancestry-[a-f0-9]{64}$/.test(event.payload.headAncestryProof))) {
+          throw new TypeError("Head ancestry producer may only prove its GitHub scope");
         }
         if (!existingEventIds.has(event.eventId)) extraEvents.push(event);
       }

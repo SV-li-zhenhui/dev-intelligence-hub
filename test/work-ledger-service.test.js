@@ -1,4 +1,5 @@
 import { digestValue } from "../src/domain/code-executor-contract.js";
+import { AutomaticHeadAncestryReader } from "../src/services/automatic-head-ancestry-reader.js";
 import { createBrainRecoveryIntent } from "../src/services/brain-recovery-intent.js";
 import { currentWorkItemExecutionBinding } from "../src/services/work-ledger-pr-source.js";
 import { indexRecordedProposalFailures } from '../src/services/work-ledger-proposal-failure.js';
@@ -6195,6 +6196,147 @@ function stoppedFenceRun(job) {
       roleId: job.requestedBy.roleId, runId: 'settled-native-fence', phase: 'failed', stopConfirmed: true,
       finishedAt: job.updatedAt, outcomeCode: 'INVALID_CODE_JOB_AUTHORITY', session: { transport: 'app-server' } } };
 }
+
+test("host ancestry reaches pending after restart while the old unknown executor still blocks cutover", async () => {
+  const f = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, fencedResult: true, reviseSource: false });
+  const original = await f.service.readItemForReconciliation({ itemId: f.item.itemId });
+  const job = await f.jobs.get(f.snapshot.item.receipt.id), oldJob = clone(job), oldBoxes = (await f.service.listOutbox({ itemId: original.itemId })).items;
+  const oldEvent = currentWorkItemEvent(original);
+  const exit = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.left_scope", occurredAt: "2026-08-02T01:20:00.000Z",
+    source: oldEvent.source, subject: oldEvent.subject, payload: oldEvent.payload });
+  f.source.records.push(prScopeLifecycleAssignment(2, exit)); f.source.highWatermark = 2;
+  await f.service.intake();
+  const input = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.observed", occurredAt: "2026-08-02T01:30:00.000Z",
+    source: oldEvent.source, subject: oldEvent.subject, payload: { ...oldEvent.payload, author: "runtime-user", assignees: ["runtime-user"],
+      state: "open", isDraft: false, relation: "authored", actionState: "action_now", nextAction: "address_review",
+      headRefOid: PR_HEAD_B, ...prGitFacts(PR_HEAD_B) } });
+  const producer = new AutomaticHeadAncestryReader({ account: "runtime-user", clock: f.time.clock,
+    ledger: { readCandidates: options => f.service.readHostHeadAncestryCandidates(options),
+      readItemForReconciliation: options => f.service.readItemForReconciliation(options) },
+    github: { isCommitAncestor: async () => true, readPullRequestRoleHandoffFacts: async () => ({
+      state: "open", isDraft: false, author: "runtime-user", assignees: ["runtime-user"], gitTarget: input.payload.gitTarget }) },
+    record: credential => f.service.recordHostHeadAncestry(credential) });
+  const events = await producer.read({ events: [input] });
+  assert.equal(events.length, 2);
+  const proven = f.store.stored();
+  assert.ok(proven.items.find(item => item.itemId === original.itemId).source.headAncestryReceipt);
+  await f.service.recover();
+  const bridge = authoredReviewRepairAssignment(3);
+  bridge.event = clone(events[0]); bridge.assignment.eventId = events[0].eventId;
+  f.source.records.push(bridge, prScopeLifecycleAssignment(4, events[1])); f.source.highWatermark = 4;
+  await f.service.intake();
+  let root = await f.service.readItemForReconciliation({ itemId: original.itemId });
+  assert.equal(root.source.current.headRefOid, PR_HEAD_A);
+  assert.equal(root.source.pending.headRefOid, PR_HEAD_B, "proof stores the real target without executing it");
+  assert.equal(root.decisionContext.outcome, "unknown");
+  assert.equal((await f.service.listItems()).items.filter(item => item.kind === "source_root").length, 1);
+  const run = stoppedFenceRun(job); run.receipt.stopConfirmed = false; run.receipt.phase = "unknown"; run.receipt.finishedAt = null;
+  f.service.obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader: f.jobs,
+    codeJobControl: { cancel: async () => assert.fail("An unknown old execution cannot be cancelled or replayed") },
+    taskRuns: { get: async () => clone(run) } });
+  const command = () => ({ itemId: root.itemId, expectedRevision: root.revision, expectedPendingRevision: root.source.pendingRevision,
+    expectedGraphRevision: f.store.stored().revision });
+  const blocked = await f.service.reconcilePullRequestSource(command());
+  assert.equal(blocked.applied, false);
+  await assert.rejects(f.service.claim({ itemId: root.itemId, expectedRevision: root.revision, workerId: "employee-developer", leaseDurationMs: 30000 }),
+    error => error.code === "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING");
+  await assert.rejects(f.service.verifyPullRequestExecutionBinding(f.proposal.binding.inputBinding), { code: "WORK_LEDGER_PR_EXECUTION_BINDING_STALE" });
+  assert.deepEqual(await f.jobs.get(job.jobId), oldJob);
+  assert.deepEqual((await f.service.listOutbox({ itemId: original.itemId })).items, oldBoxes);
+  await f.service.recover();
+  root = await f.service.readItemForReconciliation({ itemId: original.itemId });
+  assert.equal(root.source.pending.headRefOid, PR_HEAD_B);
+  assert.equal((await f.service.reconcilePullRequestSource(command())).applied, false, "restart cannot manufacture stop proof");
+  Object.assign(run.receipt, stoppedFenceRun(job).receipt);
+  assert.equal((await f.service.reconcilePullRequestSource(command())).applied, true, "only the existing strict stopped-executor settlement can activate it");
+  root = await f.service.readItemForReconciliation({ itemId: original.itemId });
+  assert.equal(root.source.current.headRefOid, PR_HEAD_B); assert.equal(root.source.pendingRevision, null);
+  assert.equal(root.status, "queued");
+  assert.deepEqual(await f.jobs.get(job.jobId), oldJob);
+  assert.deepEqual((await f.service.listOutbox({ itemId: original.itemId })).items, oldBoxes);
+});
+
+for (const variant of ["source-input-race", "other-authority-race", "other-root", "failed-write"]) {
+  test(`host ancestry private writer burns a credential on failed consumption (${variant})`, async () => {
+    const f = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, fencedResult: true, reviseSource: false });
+    const old = currentWorkItemEvent(f.item);
+    const exit = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.left_scope", occurredAt: "2026-08-02T01:20:00.000Z",
+      source: old.source, subject: old.subject, payload: old.payload });
+    f.source.records.push(prScopeLifecycleAssignment(2, exit)); f.source.highWatermark = 2; await f.service.intake();
+    const input = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.observed", occurredAt: "2026-08-02T01:30:00.000Z",
+      source: old.source, subject: old.subject, payload: { ...old.payload, author: "runtime-user", assignees: ["runtime-user"],
+        state: "open", isDraft: false, relation: "authored", actionState: "action_now", nextAction: "address_review",
+        headRefOid: PR_HEAD_B, ...prGitFacts(PR_HEAD_B) } });
+    let captured;
+    const producer = new AutomaticHeadAncestryReader({ account: "runtime-user", clock: f.time.clock,
+      ledger: { readCandidates: options => f.service.readHostHeadAncestryCandidates(options),
+        readItemForReconciliation: options => f.service.readItemForReconciliation(options) },
+      github: { isCommitAncestor: async () => true, readPullRequestRoleHandoffFacts: async () => ({
+        state: "open", isDraft: false, author: "runtime-user", assignees: ["runtime-user"], gitTarget: input.payload.gitTarget }) },
+      record: async credential => {
+        captured = credential;
+        if (variant === "other-root") return (await createFixture()).service.recordHostHeadAncestry(credential);
+        if (variant === "source-input-race") {
+          const changed = authoredReviewRepairAssignment(3, { occurredAt: "2026-08-02T01:25:00.000Z",
+            gitFacts: { ...prGitFacts(PR_HEAD_A), relation: "authored", actionState: "action_now", nextAction: "address_review" }, ciStatus: "FAILURE" });
+          f.source.records.push(changed); f.source.highWatermark = 3; await f.service.intake();
+        }
+        if (variant === "other-authority-race") {
+          f.source.records.push(ownerRequestedPrAssignment(3, { occurredAt: "2026-08-02T01:25:00.000Z", headRefOid: PR_HEAD_A }));
+          f.source.highWatermark = 3; await f.service.intake();
+        }
+        if (variant === "failed-write") {
+          const write = f.store.write.bind(f.store); let failed = false;
+          f.store.write = async (key, value) => {
+            if (!failed && key === STATE_KEY) { failed = true; throw new Error("Fixture unavailable store"); }
+            return write(key, value);
+          };
+        }
+        return f.service.recordHostHeadAncestry(credential);
+      } });
+    assert.deepEqual(await producer.read({ events: [input] }), []);
+    assert.ok(captured);
+    assert.equal(await f.service.recordHostHeadAncestry(captured), null, "failed consumption cannot be replayed");
+    assert.equal(await f.service.recordHostHeadAncestry(JSON.parse(JSON.stringify(captured))), null);
+    assert.equal((await f.service.readItemForReconciliation({ itemId: f.item.itemId })).source.headAncestryReceipt, undefined);
+  });
+}
+
+test("real Head ancestry candidate pages give a later provable root a bounded opportunity", async () => {
+  const records = Array.from({ length: 5 }, (_, index) => authoredReviewRepairAssignment(index + 1, { pullRequestNumber: 41 + index }));
+  const f = await createFixture({ records }); await f.service.intake();
+  const initial = (await f.service.listItems()).items.filter(item => item.kind === "source_root");
+  let sequence = 5;
+  for (const root of initial) {
+    const old = currentWorkItemEvent(root);
+    const exit = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.left_scope", occurredAt: "2026-08-02T01:20:00.000Z",
+      source: old.source, subject: old.subject, payload: old.payload });
+    f.source.records.push(prScopeLifecycleAssignment(++sequence, exit));
+  }
+  f.source.highWatermark = sequence; await f.service.intake();
+  const roots = (await f.service.listItems()).items.filter(item => item.kind === "source_root").sort((a, b) => a.itemId.localeCompare(b.itemId));
+  const events = roots.map((root, index) => {
+    const old = currentWorkItemEvent(root), head = (index + 11).toString(16).repeat(40);
+    return normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.observed", occurredAt: "2026-08-02T01:30:00.000Z",
+      source: old.source, subject: old.subject, payload: { ...old.payload, author: "runtime-user", assignees: ["runtime-user"], state: "open",
+        isDraft: false, relation: "authored", actionState: "action_now", nextAction: "address_review", headRefOid: head, ...prGitFacts(head) } });
+  });
+  let calls = 0;
+  const reader = new AutomaticHeadAncestryReader({ account: "runtime-user", clock: f.time.clock,
+    ledger: { readCandidates: options => f.service.readHostHeadAncestryCandidates(options),
+      readItemForReconciliation: options => f.service.readItemForReconciliation(options) },
+    github: { isCommitAncestor: async ({ headRefOid }) => { calls++; return headRefOid === events[4].payload.headRefOid; },
+      readPullRequestRoleHandoffFacts: async ({ number }) => { calls++; const event = events.find(e => e.subject.number === number);
+        return { state: "open", isDraft: false, author: "runtime-user", assignees: ["runtime-user"], gitTarget: event.payload.gitTarget }; } },
+    record: credential => f.service.recordHostHeadAncestry(credential) });
+  let emitted = [];
+  for (let round = 0; round < 3; round++) {
+    const before = calls; emitted.push(...await reader.read({ events })); assert.ok(calls - before <= 6);
+  }
+  assert.equal(emitted.length, 2);
+  assert.ok((await f.service.readItemForReconciliation({ itemId: roots[4].itemId })).source.headAncestryReceipt);
+  assert.equal((await f.service.listItems()).items.filter(root => root.source?.headAncestryReceipt).length, 1);
+});
 
 test('a stopped authority-fenced proposal_unknown activates a new Base after restart without rewriting its old outcome', async () => {
   const f = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, fencedResult: true, sameHeadBaseChange: true });

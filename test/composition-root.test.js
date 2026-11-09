@@ -15,6 +15,7 @@ import path from "node:path";
 import test from "node:test";
 import { ownReviewFeedbackDigest } from "../src/adapters/github-own-review-feedback.js";
 import { GitHubReviewReader } from "../src/adapters/github-review-reader.js";
+import { GitHubAdapter } from "../src/adapters/github-adapter.js";
 import { createNativeCodexBrainProvider } from "../src/adapters/native-codex-brain-provider.js";
 import { runJson } from "../src/lib/command-runner.js";
 import { createPullRequestWorkSource, currentWorkItemExecutionBinding } from "../src/services/work-ledger-pr-source.js";
@@ -48,6 +49,7 @@ import {
 } from "../src/services/code-action-proposal-handler.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { createWorkLedgerRuntime } from "../src/work-ledger-runtime.js";
+import { createWorkflowRoutingRuntime } from "../src/workflow-routing-runtime.js";
 import { createLocalWorkLedgerCandidateProcessor } from
   "../src/services/work-ledger-candidate-processor.js";
 import {
@@ -4425,6 +4427,85 @@ test("an explicit empty PR action allow-list remains inert and never reads trans
   assert.equal(confirmations, 1);
   assert.equal(authorityReads, 0);
   await application.close();
+});
+
+test("composition keeps the Head ancestry producer private and uses its real runtime receipt path", async t => {
+  const config = structuredClone(defaultCodeJobConfiguration());
+  config.workflowRouting.enabled = true;
+  config.changePackages = { enabled: true, gitCommand: config.codeExecutor.gitCommand };
+  config.githubActions = { enabled: true, actorAccountId: "review-account", tokenEnv: "TEST_GITHUB_TOKEN",
+    ghCommand: process.execPath, automaticOwnPrRepair: true, enabledActions: [] };
+  let head = "a".repeat(40), runtime, hostile = 0;
+  const account = config.githubActions.actorAccountId, target = () => ({ schemaVersion: 1, provider: "github", sourceAccountId: account,
+    baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "d".repeat(40),
+    headRepository: "acme/repo", headRefName: "feature", headRefOid: head });
+  const calls = [], closeCalls = [];
+  t.mock.method(GitHubAdapter.prototype, "readPullRequestRoleHandoffFacts", async input => {
+    assert.equal(input.account, account); calls.push("live");
+    return { state: "open", isDraft: false, author: account, assignees: [account], gitTarget: target() };
+  });
+  t.mock.method(GitHubAdapter.prototype, "isCommitAncestor", async input => {
+    assert.equal(input.ancestorOid, "a".repeat(40)); assert.equal(input.headRefOid, head); calls.push("ancestry"); return true;
+  });
+  const base = defaultCodeJobApplicationOptions({ config, calls: {}, closeCalls, versioned: true });
+  const application = await createApplication({ ...base, store: storedValues({}),
+    codeExecutorRuntimeFactory: async () => ({ ...await base.codeExecutorRuntimeFactory(),
+      changePackageTargets: [{ workspaceId: "dashboard" }], completedChangeExporter: { async export() {} },
+      auditArtifactReader: { async read() {} },
+      controlledCommitBuilder: { async create() {}, async find() {}, async verify() {} },
+      controlledCommitPublisher: { async publish() { assert.fail("No GitHub writes"); } },
+    }),
+    changePackageRuntimeFactory: async () => ({
+      packageProducer: { async create() {} }, packageReader: { async get() {} }, applicationProducer: { async prepareConfirmation() {} },
+      applicationExecutor: { async execute() {}, async reconcile() {} }, applicationReader: { async getResult() {} },
+      applicationProjectionReader: { async getForJob() {} }, applicationProjectionWriter: { async getCheckpoint() {}, async applySnapshot() {} }, async close() {},
+    }),
+    changePackageApplicationResultReconcilerFactory: () => ({ async runCycle() {}, async runThrough() {} }),
+    codeJobEvidenceReaderFactory: () => ({ async read() {} }),
+    codeJobRuntimeFactory: async options => ({ ...await base.codeJobRuntimeFactory(options),
+      changePackageDelivery: { async runCycle() {} }, pauseRecovery: { async runCycle() {} },
+    }),
+    confirmationRuntimeFactory: async () => ({ ...await base.confirmationRuntimeFactory(),
+      applicationResultSource: { async readSnapshot() {} },
+    }),
+    workProposalRuntimeFactory: async options => {
+      const runner = { async claim() {}, async advance() {} };
+      return workProposalRuntimePort({ runners: { "code-action-runner": runner, "github-pr-action-runner": runner, "github-review-runner": runner } });
+    },
+    versionedCodeJobAuthorityFactory: () => ({ async create() {}, async verify(value) { return value; }, async decide() {}, async close() {} }),
+    githubCredentialSourceFactory: async () => Object.freeze({ async acquire() { assert.fail("No external action credentials"); } }),
+    pullRequestExternalActionDependencies: { transport: { async observe() {}, async perform() { assert.fail("No external actions"); } } },
+    pullRequestExternalActionExecutorFactory: () => ({ async execute() { assert.fail("No external actions"); }, async reconcile() {}, async close() {} }),
+    pullRequestExternalActionProposalRunnerFactory: () => ({ async runCycle() {} }),
+    githubReviewProposalRunnerFactory: () => ({ async runCycle() {} }),
+    privateRuntimeDirectory: path.join(tmpdir(), "mydashboard-ancestry-composition"),
+    workLedgerDependencies: { attachHostHeadAncestry() { hostile++; } },
+    workflowRoutingDependencies: { headAncestryReader: { async read() { hostile++; return []; } } },
+    workLedgerRuntimeFactory: async options => {
+      runtime = await createWorkLedgerRuntime({ ...options, createCandidateProcessor: createLocalWorkLedgerCandidateProcessor,
+        createGuard: () => ({ ...inProcessExclusiveGuard(), acquire: async () => {} }) }); return runtime;
+    },
+    workflowRoutingRuntimeFactory: (configuration, dependencies) => createWorkflowRoutingRuntime(configuration, {
+      ...dependencies, createGuard: () => ({ ...inProcessExclusiveGuard(), acquire: async () => {} }),
+    }),
+  });
+  try {
+    const ingest = async (included, time) => {
+      const snapshot = { refreshedAt: time, sourceStatus: { githubPullRequests: { ok: true, stale: false, complete: true }, githubIssues: { ok: true } },
+        items: included ? [{ id: "github:pr:acme/repo#42", kind: "pull_request", repo: "acme/repo", number: 42, title: "Bounded ancestry",
+          state: "open", isDraft: false, author: account, assignees: [account], relation: "authored", actionState: "action_now",
+          nextAction: "address_review", headRefOid: head, gitTargetAvailable: true, gitTarget: target() }] : [] };
+      await application.workflowRouting.ingestSnapshot({ snapshot }); await runtime.intake();
+    };
+    await ingest(true, "2026-08-02T01:00:00.000Z"); await ingest(false, "2026-08-02T01:01:00.000Z");
+    head = "b".repeat(40); await ingest(true, "2026-08-02T01:02:00.000Z");
+    const roots = (await runtime.listItems()).items.filter(item => item.kind === "source_root");
+    assert.equal(roots.length, 1); assert.equal(roots[0].source.current.headRefOid, head);
+    assert.ok(roots[0].source.revisions.some(revision => revision.headAncestryProof));
+    assert.deepEqual(calls, ["live", "ancestry", "live"]); assert.equal(hostile, 0);
+    assert.equal(application.headAncestryReader, undefined); assert.equal(application.recordHostHeadAncestry, undefined);
+    assert.equal(runtime.recordHostHeadAncestry, undefined); assert.equal(runtime.attachHostHeadAncestry, undefined);
+  } finally { await application.close(); }
 });
 
 test("automatic own PR repair composes internal push with ownership guards and complete feedback readers", async (t) => {

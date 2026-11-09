@@ -6,6 +6,8 @@ import { isReviewTestingRetirementCandidate, reviewTestingRetirementCandidate, m
 import { indexRecordedDecisionFailures } from './work-ledger-decision-failure.js';
 import { indexRecordedProposalFailures } from './work-ledger-proposal-failure.js';
 import { indexUnstartedCodeDispatchFailures } from './work-ledger-delivery-failure.js';
+import { consumeHeadAncestryCredential } from './automatic-head-ancestry-reader.js';
+import { headAncestrySourceMatches } from '../domain/head-ancestry-receipt.js';
 import { recordedFailureParentIds } from './work-ledger-graph-progress.js';
 import { isParentCoordinationReturn, indexParentCoordinationReturns } from './work-ledger-graph-responsibility.js';
 import { ciMaterialRecoveryCandidate, ciMaterialRetirement, planCiMaterialRecovery } from "./work-ledger-ci-material-recovery.js";
@@ -346,6 +348,14 @@ function operationalPullRequestPredecessor(itemsById, root, authority, event) {
     );
   }
   return candidate;
+}
+
+function ownsHeadAncestryPredecessor(state, root) {
+  const predecessor = pullRequestTrustedPredecessor(state, root);
+  return predecessor !== null && predecessor.headRefOid === root.source.current.headRefOid &&
+    predecessor.sourceRootItemId === root.itemId &&
+    (predecessor.canonicalRootItemId === null || predecessor.canonicalRootItemId === root.itemId) &&
+    (predecessor.lastTrustedRootItemId === null || predecessor.lastTrustedRootItemId === root.itemId);
 }
 
 function newWorkAdmissionRun(value) {
@@ -900,6 +910,40 @@ export class WorkLedgerService {
           coordinationParents.has(item.itemId)) page.facts[index].orchestrationReady = true;
     });
     return page;
+  }
+
+  // These host producer ports are intentionally absent from public runtime,
+  // native, HTTP and CLI facades. A plain or replayed object never writes proof.
+  async readHostHeadAncestryCandidates({ events, afterItemId = null }) {
+    this.#assertReady();
+    const current = new Map(events.map(event => [event.subject.id, event]));
+    const candidates = this.state.items.filter(item => item.kind === "source_root" && item.currentTarget?.id === "developer" &&
+      item.source?.scope?.kind === "automatic" && item.source.scope.active === false &&
+      current.has(currentWorkItemEvent(item).subject.id) && ownsHeadAncestryPredecessor(this.state, item)).sort((a, b) => a.itemId.localeCompare(b.itemId));
+    const start = afterItemId === null ? 0 : candidates.findIndex(item => item.itemId > afterItemId);
+    const index = start < 0 ? 0 : start;
+    return cloneLedgerValue({ items: [...candidates.slice(index), ...candidates.slice(0, index)].slice(0, 2)
+      .map(root => ({ root, event: current.get(currentWorkItemEvent(root).subject.id) })) });
+  }
+
+  async recordHostHeadAncestry(credential) {
+    const receipt = consumeHeadAncestryCredential(credential);
+    if (receipt === null) return null;
+    return this.#writeTransaction(async () => {
+      const root = this.state.items.find(item => item.itemId === receipt.rootItemId), source = root?.source;
+      if (root?.revision !== receipt.rootRevision || root.kind !== "source_root" || root.currentTarget?.id !== "developer" ||
+          source?.scope?.kind !== "automatic" || source.scope.active !== false || root.sourceQuarantine !== null ||
+          root.ownerId !== null || root.leaseId !== null || root.leaseUntil !== null ||
+          !["blocked", "waiting_external"].includes(root.status) || source.pendingRevision !== null ||
+          source.workKey !== receipt.sourceWorkKey || source.inputRevision !== receipt.sourceInputRevision ||
+          source.current.inputDigest !== receipt.sourceInputDigest || source.authorityEpoch !== receipt.authorityEpoch ||
+          source.current.headRefOid !== receipt.ancestorHeadRefOid || !ownsHeadAncestryPredecessor(this.state, root)) return null;
+      const at = this.#now(), updated = { ...root, revision: root.revision + 1, updatedAt: at,
+        source: { ...source, headAncestryReceipt: receipt } };
+      return this.#commitMutation({ patch: { items: this.state.items.map(item => item.itemId === root.itemId ? updated : item) },
+        timelineEvents: [{ itemId: root.itemId, type: "pr_source_ignored", at, actorId: "host-head-ancestry-reader",
+          details: { disposition: "host_ancestry_attested", receiptId: receipt.receiptId } }], result: receipt });
+    });
   }
 
   async listPendingPullRequestSources(options = {}) {
@@ -2325,7 +2369,7 @@ export class WorkLedgerService {
           const previousActiveRevision = root.source.activeRevision;
           const previousActiveHeadRefOid = root.source.current.headRefOid;
           const previousAttempt = root.attempt;
-          const applied = applyPullRequestScopeLifecycle(root.source, envelope, { attemptAtActivation: previousAttempt });
+          let applied = applyPullRequestScopeLifecycle(root.source, envelope, { attemptAtActivation: previousAttempt });
           if (isIgnoredProtectedPullRequestReentry(root, envelope, applied)) {
             ignoreProtectedPullRequestReentry(root, envelope, assignmentItem, applied.disposition, false);
             continue;
@@ -2344,6 +2388,14 @@ export class WorkLedgerService {
             cutover,
             `lifecycle:${envelope.assignment.assignmentId}:${root.itemId}`,
           );
+          if (cutover.blockers.length > 0 && root.source.pending !== null &&
+              root.source.revisions.some(revision => revision.headAncestryProof !== undefined &&
+                revision.headRefOid === root.source.pending.headRefOid)) {
+            // The lineage witness proves a target, never execution settlement.
+            // Reentry may record responsibility while the old input remains
+            // current and the new target waits behind the existing cutover.
+            applied = applyPullRequestScopeLifecycle(root.source, envelope, { attemptAtActivation: previousAttempt, activate: false });
+          }
           if (cutover.blockers.length === 0) {
             root = applyReadyPullRequestSourceCutover({
               root,
@@ -2513,6 +2565,11 @@ export class WorkLedgerService {
       let disposition = "accepted";
       let headAdvanced = false;
       if (!root) {
+        if (Object.hasOwn(envelope.event.payload, "headAncestryProof")) {
+          knownAssignments.set(assignmentItem.assignmentId, { inputDigest: assignmentItem.inputDigest, sourceSequence: envelope.sequence });
+          received += 1;
+          continue;
+        }
         const pendingCrossRoot = [...itemsById.values()].find(
           (item) =>
             item.itemId !== rootCandidate.itemId &&
@@ -2632,6 +2689,14 @@ export class WorkLedgerService {
         });
       } else {
         const previousActiveHeadRefOid = root.source.current.headRefOid;
+        if (Object.hasOwn(envelope.event.payload, "headAncestryProof") &&
+            (root.revision !== root.source.headAncestryReceipt?.rootRevision + 1 ||
+              !ownsHeadAncestryPredecessor({ items: [...itemsById.values()] }, root) ||
+              !headAncestrySourceMatches(root.source.headAncestryReceipt, root.source, envelope.event))) {
+          knownAssignments.set(assignmentItem.assignmentId, { inputDigest: assignmentItem.inputDigest, sourceSequence: envelope.sequence });
+          received += 1;
+          continue;
+        }
         const previousActiveRevision = root.source.activeRevision;
         const previousAttempt = root.attempt;
         const predecessor = pullRequestTrustedPredecessor(

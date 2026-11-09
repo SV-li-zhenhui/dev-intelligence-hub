@@ -32,6 +32,7 @@ export async function createWorkflowRoutingRuntime(
     scopeExitRecoveryReader,
     scopeReentryReader,
     roleHandoffReader,
+    headAncestryReader,
     createGuard = (options) => new ProcessExclusiveGuard(options),
   } = {},
 ) {
@@ -74,6 +75,7 @@ export async function createWorkflowRoutingRuntime(
       ...(scopeExitRecoveryReader === undefined ? {} : { scopeExitRecoveryReader }),
       ...(scopeReentryReader === undefined ? {} : { scopeReentryReader }),
       ...(roleHandoffReader === undefined ? {} : { roleHandoffReader }),
+      ...(headAncestryReader === undefined ? {} : { headAncestryReader }),
       ...(clock ? { clock } : {}),
       ...(operationQueue ? { operationQueue } : {}),
     });

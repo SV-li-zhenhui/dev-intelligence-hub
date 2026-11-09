@@ -63,6 +63,7 @@ const INVALID_CONTROL = /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const IDENTIFIER_CONTROL = /\p{Cc}/u;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const PAYLOAD_FIELDS = new Set([
+  "headAncestryProof",
   "reviewPurpose",
   "roleHandoffProof",
   "actionState",
@@ -135,6 +136,7 @@ const FILE_FACT_FIELDS = new Set([
   "status",
 ]);
 const STRING_PAYLOAD_FIELDS = new Set([
+  "headAncestryProof",
   "reviewPurpose",
   "roleHandoffProof",
   "actionState",

@@ -6,9 +6,99 @@ import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { WorkflowRoutingService } from "../src/services/workflow-routing-service.js";
 import { MAX_WORKFLOW_STATE_BYTES } from "../src/services/workflow-routing-state.js";
 import { prettySerializedWorkflowBytes } from "../src/services/workflow-routing-values.js";
+import { AutomaticReviewReentryReader } from "../src/services/automatic-review-reentry-reader.js";
+import { withPrLifecycleRoutes } from "../src/domain/pr-lifecycle-routing.js";
+import { AutomaticHeadAncestryReader } from "../src/services/automatic-head-ancestry-reader.js";
+import { createWorkLedgerRuntime } from "../src/work-ledger-runtime.js";
+import { createLocalWorkLedgerCandidateProcessor } from "../src/services/work-ledger-candidate-processor.js";
 
 const STATE_KEY = "workflow-routing-state";
 const MAX_PAGE_SIZE = 100;
+
+test("returning own PR preserves a verified descendant target after a created-event causal gap", async () => {
+  const account = "runtime-user", a = "a".repeat(40), b = "b".repeat(40), c = "c".repeat(40);
+  const target = headRefOid => ({ schemaVersion: 1, provider: "github", sourceAccountId: account,
+    baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "d".repeat(40),
+    headRepository: "acme/repo", headRefName: "feature", headRefOid });
+  const item = head => pullRequest(42, { state: "open", author: account, assignees: [account], relation: "authored",
+    isDraft: false, actionState: "action_now", nextAction: "address_review", headRefOid: head,
+    gitTargetAvailable: true, gitTarget: target(head) });
+  let ledger, ancestryReader, reader, currentHead = a;
+  const github = { async isCommitAncestor({ ancestorOid, headRefOid }) {
+    assert.equal(ancestorOid, a); assert.equal(headRefOid, currentHead); return true;
+  }, async readPullRequestRoleHandoffFacts() {
+    return { state: "open", isDraft: false, author: account, assignees: [account], gitTarget: target(currentHead) };
+  } };
+  const routing = new WorkflowRoutingService({ store: new MemoryStore(), router: createWorkflowRouter(),
+    exclusiveLease: new ExclusiveLease(), clock: incrementingClock(), scopeReentryReader: {
+      async read(options) { return ledger ? reader.read(options) : []; }
+    }, headAncestryReader: {
+      async read(options) { return ledger ? ancestryReader.read(options) : []; }
+    } });
+  await routing.recover();
+  const definition = workflowConfig(); definition.rules[0].targets = [{ type: "role", id: "developer" }];
+  await configure(routing, withPrLifecycleRoutes(definition));
+  const ledgerStore = new MemoryStore();
+  let id = 0;
+  const boot = async () => {
+    const lease = new ExclusiveLease();
+    const runtime = await createWorkLedgerRuntime({ store: ledgerStore, assignmentSource: routing, clock: incrementingClock(),
+      idFactory: () => `bridge-lease-${++id}`,
+      createGuard: () => ({ acquire: async () => {}, run: action => lease.run(action), close: async () => {} }),
+      attachHostHeadAncestry: ports => { ancestryReader = new AutomaticHeadAncestryReader({ ledger: ports,
+        github, account, clock: incrementingClock(), record: ports.record }); } });
+    reader = new AutomaticReviewReentryReader({ ledger: runtime, github, account, automaticReview: false, automaticOwnPrRepair: true });
+    return runtime;
+  };
+  ledger = await boot();
+  assert.equal(ledger.recordHostHeadAncestry, undefined, "the host writer is absent from every runtime facade");
+  assert.equal(ledger.readHostHeadAncestryCandidates, undefined);
+  const ingest = async (head, time) => {
+    if (head) currentHead = head;
+    const snapshot = workflowSnapshot({ refreshedAt: time, items: head ? [item(head)] : [] });
+    snapshot.sourceStatus.githubPullRequests.complete = true;
+    await routing.ingestSnapshot({ snapshot }); await ledger.intake();
+  };
+  await ingest(a, "2026-08-02T01:00:00.000Z");
+  await ingest(null, "2026-08-02T01:01:00.000Z");
+  await ingest(b, "2026-08-02T01:02:00.000Z");
+  await ingest(c, "2026-08-02T01:03:00.000Z");
+  const roots = (await ledger.listItems()).items.filter(row => row.kind === "source_root");
+  assert.equal(roots.length, 1, "reentry must not create another execution root");
+  const root = roots[0];
+  assert.equal(root.source.revisions.some(row => row.headRefOid === b && row.previousHeadRefOid === null), true,
+    "created events correctly carry no invented previous Head");
+  assert.equal([root.source.current.headRefOid, root.source.pending?.headRefOid].includes(c), true,
+    "a host-verified ordinary descendant must become current or pending without rewriting old events");
+  assert.equal(root.status, "queued", "safe reentry remains naturally claimable through the original task");
+  const receipt = root.source.revisions.find(row => row.headAncestryProof).headAncestryProof;
+  assert.equal(Object.hasOwn(receipt.event.payload, "previousHeadRefOid"), false);
+  await ledger.close();
+  ledger = await boot();
+  assert.equal((await ledger.listItems()).items.find(row => row.kind === "source_root").source.current.headRefOid, c);
+  await ledger.close();
+  const good = ledgerStore.stored("work-ledger-state"), damaged = clone(good);
+  damaged.items.find(row => row.kind === "source_root").source.revisions.find(row => row.headAncestryProof)
+    .headAncestryProof.event.payload.gitTarget.baseRefOid = "f".repeat(40);
+  ledgerStore.replaceStored("work-ledger-state", damaged);
+  await assert.rejects(boot(), { code: "WORK_LEDGER_STATE_CORRUPTED" }, "restart detects altered protected proof content");
+  ledgerStore.replaceStored("work-ledger-state", good);
+  await assert.rejects(routing.ingest({ event: { schemaVersion: 1, eventType: "pull_request.updated", occurredAt: receipt.event.occurredAt,
+    source: receipt.event.source, subject: receipt.event.subject, payload: { ...receipt.event.payload, headAncestryProof: receipt.receiptId } } }),
+  { code: "WORKFLOW_EVENT_HOST_ONLY" }, "ordinary and historical client ingestion cannot manufacture a trusted receipt reference");
+  const historical = (await routing.readAssignmentBatch({ afterSequence: 0, limit: 100 })).items
+    .find(row => row.event.payload.headAncestryProof);
+  const lease = new ExclusiveLease();
+  const injected = await createWorkLedgerRuntime({ store: new MemoryStore(), clock: incrementingClock(), idFactory: () => "injected-lease",
+    createCandidateProcessor: createLocalWorkLedgerCandidateProcessor,
+    createGuard: () => ({ acquire: async () => {}, run: action => lease.run(action), close: async () => {} }),
+    assignmentSource: { readAssignmentBatch: async ({ afterSequence }) => ({
+      items: afterSequence === 0 ? [{ ...historical, sequence: 1 }] : [], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 }) } });
+  assert.equal((await injected.intake()).received, 1);
+  assert.equal((await injected.listItems()).items.some(row => row.kind === "source_root"), false,
+    "an injected historical proof reference cannot create a root without its protected host receipt");
+  await injected.close();
+});
 
 function clone(value) {
   return value === undefined ? undefined : structuredClone(value);

@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { normalizeHeadAncestryReceipt, headAncestrySourceMatches, headAncestryEvent } from "../domain/head-ancestry-receipt.js";
 import {
   createPullRequestExecutionBinding,
   normalizePullRequestExecutionBinding,
@@ -619,6 +620,7 @@ function acceptedHeadChange(source, input, causalHeadRefOid) {
   const observed = latestObservedInput(source);
   const predecessor = causalHeadRefOid ?? observed.headRefOid;
   if (input.headRefOid === predecessor) return true;
+  if (headAncestrySourceMatches(source.headAncestryReceipt, source, input.event)) return true;
   return (
     (input.event.eventType === "pull_request.updated" ||
       (input.event.eventType === "pull_request.owner_requested" && source.scope.kind === "owner_requested" &&
@@ -711,6 +713,8 @@ export function appendPullRequestWorkSource(
     input.headRefOid !== observed.headRefOid ||
     (causalHead !== null && input.headRefOid !== causalHead);
   const headProven = acceptedHeadChange(source, input, causalHead);
+  const ancestryReceipt = headAncestrySourceMatches(source.headAncestryReceipt, source, input.event)
+    ? source.headAncestryReceipt : null;
   const legacyDowngrade = gitTargetStateForEvent(input.event) === "legacy" &&
     [source.current, source.pending]
       .filter((pointer) => pointer !== null)
@@ -761,6 +765,10 @@ export function appendPullRequestWorkSource(
       ],
       bindings: [...source.bindings, bindingFrom(input, revision)],
     };
+  if (accepted && ancestryReceipt !== null) {
+    nextSource.revisions.at(-1).headAncestryProof = ancestryReceipt;
+    delete nextSource.headAncestryReceipt;
+  }
   const activatedSource = accepted && activate
     ? applyPullRequestDecisionBudgetAtActivation(source, nextSource, attemptAtActivation)
     : nextSource;
@@ -782,7 +790,7 @@ function acceptedCreatedLifecycleJoin(source, eventId) {
     previousLifecycle !== undefined && revision.revision > previousLifecycle.revision;
 }
 
-export function applyPullRequestScopeLifecycle(value, envelope, { attemptAtActivation } = {}) {
+export function applyPullRequestScopeLifecycle(value, envelope, { attemptAtActivation, activate = true } = {}) {
   const source = normalizePullRequestWorkSource(value);
   const input = normalizedEnvelope(envelope, source.identity.targetRoleId);
   if (input === null || !input.trustedLifecycle) {
@@ -794,7 +802,7 @@ export function applyPullRequestScopeLifecycle(value, envelope, { attemptAtActiv
   const active = ["pull_request.created", "pull_request.role_handoff"].includes(input.event.eventType);
   const authorityChanged = source.scope.active !== active;
   const appended = appendPullRequestWorkSource(source, envelope, {
-    activate: true,
+    activate,
     authorityEpochChanged: authorityChanged,
     attemptAtActivation,
   });
@@ -852,6 +860,17 @@ function normalizeIdentity(value) {
 }
 
 function normalizeRevision(value, expectedRevision) {
+  let headAncestryProof;
+  if (Object.hasOwn(value, "headAncestryProof")) {
+    headAncestryProof = normalizeHeadAncestryReceipt(value.headAncestryProof);
+    const { headAncestryProof: omitted, ...revision } = value;
+    value = revision;
+    if (headAncestryEvent(headAncestryProof).eventId !== value.eventId ||
+        headAncestryEvent(headAncestryProof).contentDigest !== value.eventDigest ||
+        headAncestryProof.event.payload.headRefOid !== value.headRefOid ||
+        headAncestryProof.sourceInputRevision + 1 !== expectedRevision || value.disposition !== "accepted" ||
+        headAncestryProof.ancestorHeadRefOid !== value.causalHeadRefOid) throw invalid("PR ancestry revision binding is invalid");
+  }
   let incomingReview;
   if (Object.hasOwn(value, "incomingReview")) {
     exact(value.incomingReview, ["eventId", "receivedAt"], "PR incoming Review");
@@ -911,6 +930,7 @@ function normalizeRevision(value, expectedRevision) {
       : undefined,
     ...(hasScopeRevocation ? { scopeRevocationApplied: true } : {}),
     ...(incomingReview ? { incomingReview } : {}),
+    ...(headAncestryProof ? { headAncestryProof } : {}),
     disposition,
   };
 }
@@ -955,6 +975,9 @@ function validateRevisionEpochHistory(revisions, expectedHeadRevision) {
       }
       continue;
     }
+    if (revision.headAncestryProof !== undefined &&
+        (revision.headAncestryProof.ancestorHeadRefOid !== previousAcceptedHead ||
+         revision.headAncestryProof.authorityEpoch !== previousHeadRevision)) throw invalid("PR ancestry predecessor is invalid");
     if (revision.authorityEpochCutover) cutoverCount += 1;
     const expectedRevision = previousHeadRevision === 0
       ? 1
@@ -970,7 +993,7 @@ function validateRevisionEpochHistory(revisions, expectedHeadRevision) {
       (revision.authorityEpochChanged &&
         previousHeadRevision > 0 &&
         (revision.causalHeadRefOid === null ||
-          (revision.headRefOid !== revision.causalHeadRefOid &&
+          (revision.headAncestryProof === undefined && revision.headRefOid !== revision.causalHeadRefOid &&
             revision.previousHeadRefOid !== revision.causalHeadRefOid))) ||
       (!revision.authorityEpochChanged &&
         previousHeadRevision > 0 &&
@@ -1081,6 +1104,12 @@ function normalizeEventPointer(
 }
 
 export function normalizePullRequestWorkSource(value) {
+  let headAncestryReceipt;
+  if (Object.hasOwn(value, "headAncestryReceipt")) {
+    headAncestryReceipt = normalizeHeadAncestryReceipt(value.headAncestryReceipt);
+    const { headAncestryReceipt: omitted, ...source } = value;
+    value = source;
+  }
   const legacySource = hasExactLedgerKeys(value, LEGACY_SOURCE_KEYS);
   const hasBudget = hasExactLedgerKeys(value, BUDGET_SOURCE_KEYS);
   if (!legacySource && !hasBudget) exact(value, SOURCE_KEYS, "PR source");
@@ -1113,7 +1142,7 @@ export function normalizePullRequestWorkSource(value) {
   );
   const rawRevisions = plainArray(value.revisions, "revisions");
   const hasIncompleteAuthorityHistory = rawRevisions.some((revision) => {
-    const { incomingReview, ...authority } = revision;
+    const { incomingReview, headAncestryProof, ...authority } = revision;
     return !hasExactLedgerKeys(authority, AUTHORITY_REVISION_KEYS) &&
       !hasExactLedgerKeys(authority, REVISION_KEYS) &&
       !hasExactLedgerKeys(authority, SCOPE_REVOCATION_REVISION_KEYS);
@@ -1181,6 +1210,7 @@ export function normalizePullRequestWorkSource(value) {
     pendingRevision,
     current: null,
     pending: null,
+    ...(headAncestryReceipt ? { headAncestryReceipt } : {}),
     revisions,
     bindings,
   };
@@ -1226,6 +1256,10 @@ export function normalizePullRequestWorkSource(value) {
     lastLifecycleRevision?.disposition === "accepted" &&
     lastLifecycleRevision.authorityEpochChanged === true &&
     lastLifecycleRevision.revision < source.activeRevision;
+  const pendingAncestryLifecycleMatches = source.scope.active === true && source.pending !== null &&
+    source.pending.eventId === source.scope.lastLifecycleEventId && source.pending.event.eventType === "pull_request.created" &&
+    revisions.some(revision => revision.headAncestryProof !== undefined && revision.revision < source.pendingRevision &&
+      revision.headRefOid === source.pending.headRefOid);
   const rejectedRevocationMatches =
     scope.active === false &&
     lastLifecycleRevision?.scopeRevocationApplied === true &&
@@ -1234,6 +1268,7 @@ export function normalizePullRequestWorkSource(value) {
     scope.lastLifecycleEventId !== null &&
     !currentLifecycleMatches &&
     !historicalLifecycleMatches &&
+    !pendingAncestryLifecycleMatches &&
     !rejectedRevocationMatches
   ) {
     throw invalid("PR scope 生命周期绑定无效");
@@ -1254,6 +1289,16 @@ export function normalizePullRequestWorkSource(value) {
     throw invalid("PR pending input 没有分派来源");
   }
   if (hasBudget) source.decisionBudget = normalizePullRequestDecisionBudget(value.decisionBudget, source);
+  for (const receipt of [headAncestryReceipt, ...revisions.map(revision => revision.headAncestryProof)].filter(Boolean)) {
+    if (identity.targetRoleId !== "developer" || scope.kind !== "automatic" || receipt.sourceWorkKey !== source.workKey ||
+        receipt.rootItemId !== `work-item-${ledgerDigest({ kind: "source_root", workKey })}` ||
+        receipt.event.source.provider !== identity.provider || receipt.event.source.scopeId !== identity.scopeId ||
+        receipt.event.subject.repository !== identity.repository || receipt.event.subject.number !== identity.pullRequestNumber ||
+        !revisions.some(revision => revision.disposition === "accepted" && revision.inputDigest === receipt.sourceInputDigest &&
+          revision.headRefOid === receipt.ancestorHeadRefOid && revision.headRevision === receipt.authorityEpoch)) {
+      throw invalid("PR ancestry source identity is invalid");
+    }
+  }
   return source;
 }
 
@@ -1638,7 +1683,8 @@ function evaluatePullRequestSubjectAuthority(state, root, preserveInactiveHistor
         observation.occurredAtMs >= trustedOccurredAtWatermark &&
         (predecessor === null ||
           observation.revision.headRefOid === predecessor.revision.headRefOid ||
-          observation.revision.previousHeadRefOid === predecessor.revision.headRefOid)
+          observation.revision.previousHeadRefOid === predecessor.revision.headRefOid ||
+          observation.revision.headAncestryProof?.ancestorHeadRefOid === predecessor.revision.headRefOid)
       ) {
         predecessor = observation;
         if (
@@ -1692,8 +1738,8 @@ function evaluatePullRequestSubjectAuthority(state, root, preserveInactiveHistor
        observation.pointer?.event.eventType === "pull_request.internal_review_requested");
     const causal = ownerRequestedAnchor || predecessor === null ||
       observation.revision.headRefOid === predecessor.revision.headRefOid ||
-      observation.revision.previousHeadRefOid ===
-        predecessor.revision.headRefOid;
+      observation.revision.previousHeadRefOid === predecessor.revision.headRefOid ||
+      observation.revision.headAncestryProof?.ancestorHeadRefOid === predecessor.revision.headRefOid;
     if (!causal) {
       validAuthorities.clear();
       canonical = null;
