@@ -6338,6 +6338,53 @@ test("real Head ancestry candidate pages give a later provable root a bounded op
   assert.equal((await f.service.listItems()).items.filter(root => root.source?.headAncestryReceipt).length, 1);
 });
 
+test("host ancestry proof cannot write after configuration admission closes", async () => {
+  const f = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, fencedResult: true, reviseSource: false });
+  const old = currentWorkItemEvent(f.item);
+  const exit = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.left_scope", occurredAt: "2026-08-02T01:20:00.000Z",
+    source: old.source, subject: old.subject, payload: old.payload });
+  f.source.records.push(prScopeLifecycleAssignment(2, exit)); f.source.highWatermark = 2; await f.service.intake();
+  const gate = readyActionAdmissionGate();
+  const { service } = await createFixture({ source: f.source, store: f.store, time: f.time, actionAdmissionGate: gate });
+  const input = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.observed", occurredAt: "2026-08-02T01:30:00.000Z",
+    source: old.source, subject: old.subject, payload: { ...old.payload, author: "runtime-user", assignees: ["runtime-user"], state: "open",
+      isDraft: false, relation: "authored", actionState: "action_now", nextAction: "address_review", headRefOid: PR_HEAD_B, ...prGitFacts(PR_HEAD_B) } });
+  const github = { isCommitAncestor: async () => true, readPullRequestRoleHandoffFacts: async () => ({
+    state: "open", isDraft: false, author: "runtime-user", assignees: ["runtime-user"], gitTarget: input.payload.gitTarget }) };
+  const readerFor = (ledger, record) => new AutomaticHeadAncestryReader({ account: "runtime-user", clock: f.time.clock, github, record,
+    ledger: { readCandidates: options => ledger.readHostHeadAncestryCandidates(options),
+      readItemForReconciliation: options => ledger.readItemForReconciliation(options) } });
+  const before = f.store.stored();
+  let deniedCredential;
+  const reader = readerFor(service, async credential => {
+    deniedCredential = credential;
+    await activateNextConfiguration(gate);
+    return service.recordHostHeadAncestry(credential);
+  });
+  assert.deepEqual(await reader.read({ events: [input] }), [], "a restart-required gate must prevent proof events");
+  assert.equal(gate.readStatus().mode, "restart_required");
+  await assert.rejects(service.intake(), { code: "RUNTIME_RESTART_REQUIRED" });
+  assert.deepEqual(f.store.stored(), before, "denied proof cannot write a receipt, revision, or timeline event");
+  assert.equal(await service.recordHostHeadAncestry(deniedCredential), null);
+  assert.equal(await service.recordHostHeadAncestry(JSON.parse(JSON.stringify(deniedCredential))), null);
+  assert.equal(reader.readDiagnostics().lastFailure, "RUNTIME_RESTART_REQUIRED");
+  const recoveredGate = new ActionAdmissionGate();
+  recoveredGate.bindEffective({ version: 2, configurationDigest: "2".repeat(64) });
+  const recovered = await createFixture({ source: f.source, store: f.store, time: f.time, actionAdmissionGate: recoveredGate });
+  assert.equal(await recovered.service.recordHostHeadAncestry(deniedCredential), null, "recovery cannot revive a rejected token");
+  let freshCredential;
+  const fresh = readerFor(recovered.service, credential => {
+    freshCredential = credential;
+    return recovered.service.recordHostHeadAncestry(credential);
+  });
+  const events = await fresh.read({ events: [input] });
+  assert.equal(events.length, 2); assert.notStrictEqual(freshCredential, deniedCredential);
+  const after = f.store.stored(), root = after.items.find(item => item.itemId === f.item.itemId);
+  assert.equal(after.revision, before.revision + 1); assert.ok(root.source.headAncestryReceipt);
+  assert.deepEqual(root.decisionContext, before.items.find(item => item.itemId === root.itemId).decisionContext);
+  assert.equal(root.status, "blocked", "fresh lineage proof still cannot resume the old unknown execution");
+});
+
 test('a stopped authority-fenced proposal_unknown activates a new Base after restart without rewriting its old outcome', async () => {
   const f = await revokedCodeConfirmationFixture({ createdJob: true, conflict: true, fencedResult: true, sameHeadBaseChange: true });
   const job = await f.jobs.get(f.snapshot.item.receipt.id), beforeJob = clone(job), beforeConfirmation = clone(f.snapshot.item);

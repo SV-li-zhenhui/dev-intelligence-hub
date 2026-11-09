@@ -929,7 +929,7 @@ export class WorkLedgerService {
   async recordHostHeadAncestry(credential) {
     const receipt = consumeHeadAncestryCredential(credential);
     if (receipt === null) return null;
-    return this.#writeTransaction(async () => {
+    return this.#admitNewWork(() => this.#writeTransaction(async () => {
       const root = this.state.items.find(item => item.itemId === receipt.rootItemId), source = root?.source;
       if (root?.revision !== receipt.rootRevision || root.kind !== "source_root" || root.currentTarget?.id !== "developer" ||
           source?.scope?.kind !== "automatic" || source.scope.active !== false || root.sourceQuarantine !== null ||
@@ -943,7 +943,7 @@ export class WorkLedgerService {
       return this.#commitMutation({ patch: { items: this.state.items.map(item => item.itemId === root.itemId ? updated : item) },
         timelineEvents: [{ itemId: root.itemId, type: "pr_source_ignored", at, actorId: "host-head-ancestry-reader",
           details: { disposition: "host_ancestry_attested", receiptId: receipt.receiptId } }], result: receipt });
-    });
+    }));
   }
 
   async listPendingPullRequestSources(options = {}) {
