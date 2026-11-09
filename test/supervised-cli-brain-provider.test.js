@@ -21,6 +21,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { observePrivateDirectoryHelpers } from './support/private-directory-helper-diagnostics.mjs';
 
 import {
   createProductionSupervisedCliBrainProvider,
@@ -2034,11 +2035,12 @@ test("Windows production root creation allows only supported non-mutating broad 
       "(A;OICI;0x1200A9;;;BU)",
   );
 
-  const identity = await managerModule.PRODUCTION_PRIVATE_DIRECTORY_MANAGER.prepare({
+  const diagnostics = observePrivateDirectoryHelpers(t);
+  const identity = await diagnostics.run(() => managerModule.PRODUCTION_PRIVATE_DIRECTORY_MANAGER.prepare({
     directory: root,
     signal: new AbortController().signal,
     validateLocation: async () => {},
-  });
+  }));
 
   assert.equal(path.resolve(identity.path), path.resolve(root));
   assert.equal((await lstat(root)).isDirectory(), true);
@@ -2057,10 +2059,11 @@ test("Windows production directory preparation accepts an omitted optional signa
     "(A;OICI;FA;;;{SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
   );
 
-  const identity = await managerModule.PRODUCTION_PRIVATE_DIRECTORY_MANAGER.prepare({
+  const diagnostics = observePrivateDirectoryHelpers(t);
+  const identity = await diagnostics.run(() => managerModule.PRODUCTION_PRIVATE_DIRECTORY_MANAGER.prepare({
     directory: root,
     validateLocation: async () => {},
-  });
+  }));
 
   assert.equal(path.resolve(identity.path), path.resolve(root));
   assert.equal((await lstat(root)).isDirectory(), true);
@@ -2079,14 +2082,15 @@ async function assertProductionRootAclRejected(t, name, extraAce) {
     "(A;OICI;FA;;;{SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" + extraAce,
   );
 
-  await assert.rejects(
+  const diagnostics = observePrivateDirectoryHelpers(t);
+  await diagnostics.run(() => assert.rejects(
     managerModule.PRODUCTION_PRIVATE_DIRECTORY_MANAGER.prepare({
       directory: root,
       signal: AbortSignal.timeout(30_000),
       validateLocation: async () => {},
     }),
     { code: "STRUCTURED_PROVIDER_UNAVAILABLE" },
-  );
+  ));
   await assert.rejects(lstat(root), { code: "ENOENT" });
 }
 
