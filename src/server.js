@@ -1401,6 +1401,45 @@ function requireOperationsBrowser(application, methods) {
   return browser;
 }
 
+const BACKUP_DIAGNOSTIC_CODES = new Set([
+  "BACKUP_CORRUPTED", "BACKUP_IO_FAILED", "BACKUP_QUIESCENCE_FAILED",
+  "BACKUP_QUIESCENCE_INVALID", "BACKUP_RELEASE_FAILED", "BACKUP_SOURCE_CHANGED",
+  "BACKUP_SOURCE_INVALID", "BACKUP_STORAGE_INVALID", "INVALID_BACKUP_MANIFEST",
+  "CHECKPOINT_CAPACITY_EXCEEDED", "CHECKPOINT_EMPTY", "CHECKPOINT_FILE_INVALID",
+  "CHECKPOINT_PATH_INVALID", "CHECKPOINT_ROOT_INVALID", "CHECKPOINT_SOURCE_CHANGED",
+  "CHECKPOINT_STORE_INVALID", "QUIESCENCE_ALREADY_ACTIVE", "QUIESCENCE_DRAIN_TIMEOUT",
+  "QUIESCENCE_TOKEN_INVALID",
+]);
+
+function reportBackupFailure(reportError, error) {
+  const diagnostic = {
+    code: BACKUP_DIAGNOSTIC_CODES.has(error?.code) ? error.code : "BACKUP_CREATE_FAILED",
+    stage: "create_backup",
+  };
+  let current = error;
+  for (let depth = 0; current && depth < 4; depth += 1, current = current.cause) {
+    if (depth > 0 && BACKUP_DIAGNOSTIC_CODES.has(current.code)) {
+      diagnostic.causeCode = current.code;
+    }
+    if (["metadata_preflight", "checkpoint_inventory", "checkpoint_release"].includes(current.stage)) {
+      diagnostic.stage = current.stage;
+    }
+    const counts = {};
+    for (const key of ["fileCount", "directoryCount", "totalBytes"]) {
+      const value = current.counts?.[key];
+      if (Number.isSafeInteger(value) && value >= 0) counts[key] = value;
+    }
+    if (Object.keys(counts).length > 0) diagnostic.counts = counts;
+  }
+  try {
+    // Never hand the original Error/cause to diagnostics: messages and stacks
+    // can carry private paths or payloads, including after the observer leaves.
+    reportError(JSON.stringify(diagnostic));
+  } catch {
+    // A failed log sink must not replace the backup outcome or prevent release.
+  }
+}
+
 function requiresOperationalAdmission(method) {
   return ["POST", "PUT", "PATCH", "DELETE"].includes(method);
 }
@@ -2798,7 +2837,19 @@ export function createDashboardServer(
           application,
           ["createBackup"],
         );
-        sendJson(response, 201, await operations.createBackup());
+        let created;
+        try {
+          created = await operations.createBackup();
+        } catch (error) {
+          reportBackupFailure(reportError, error);
+          if (!response.destroyed && !response.writableEnded) {
+            sendJson(response, Number.isInteger(error.statusCode) ? error.statusCode : 500, {
+              error: internalServerErrorMessage,
+            });
+          }
+          return;
+        }
+        if (!response.destroyed && !response.writableEnded) sendJson(response, 201, created);
         return;
       }
       if (

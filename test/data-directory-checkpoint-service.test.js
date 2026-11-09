@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import fsPromises, { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -31,6 +32,151 @@ async function fixture(t) {
   t.after(() => rm(root, { recursive: true, force: true }));
   return { root, data };
 }
+
+async function virtualCapacityFiles(t, data, count, bytes = 0) {
+  const original = { ...fsPromises };
+  const sample = await original.lstat(path.join(data, "code-executor", "artifacts", "evidence.bin"));
+  let payloadOpens = 0;
+  t.mock.method(fsPromises, "opendir", async (directory, ...args) => {
+    if (directory !== data) return original.opendir(directory, ...args);
+    const names = Array.from({ length: typeof count === "function" ? count() : count }, (_, index) => `entry-${index}.bin`);
+    return {
+      async *[Symbol.asyncIterator]() {
+        for (const name of names) yield {
+          name, isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false,
+        };
+      },
+    };
+  });
+  t.mock.method(fsPromises, "lstat", async (target, ...args) =>
+    path.dirname(target) === data && path.basename(target).startsWith("entry-")
+      ? Object.assign(Object.create(Object.getPrototypeOf(sample)), sample, { size: bytes })
+      : original.lstat(target, ...args));
+  t.mock.method(fsPromises, "open", async (target, ...args) => {
+    if (path.dirname(target) === data && path.basename(target).startsWith("entry-")) {
+      payloadOpens += 1;
+      throw new Error("payload opened before metadata capacity was accepted");
+    }
+    return original.open(target, ...args);
+  });
+  t.mock.method(fsPromises, "realpath", async (target, ...args) =>
+    path.dirname(target) === data && path.basename(target).startsWith("entry-")
+      ? target : original.realpath(target, ...args));
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  return { payloadOpens: () => payloadOpens };
+}
+
+test("oversized checkpoint metadata is rejected before closing admission or opening payloads", async (t) => {
+  const { data } = await fixture(t);
+  const observed = await virtualCapacityFiles(t, data, 100_001);
+  const gate = new OperationalQuiescenceGate();
+  let entries = 0;
+  const service = new DataDirectoryCheckpointService({ sourceDirectory: data, gate: {
+    enter() { entries += 1; return gate.enter(); },
+    leave: (token) => gate.leave(token), readStatus: () => gate.readStatus(),
+  } });
+  await assert.rejects(service.enter(), (error) => {
+    assert.equal(error.code, "CHECKPOINT_CAPACITY_EXCEEDED");
+    assert.equal(error.stage, "metadata_preflight");
+    assert.equal(error.counts.fileCount, 100_001);
+    return true;
+  });
+  assert.equal(entries, 0);
+  assert.equal(observed.payloadOpens(), 0);
+  assert.equal(gate.readStatus().mode, "open");
+});
+
+test("metadata capacity accepts exact file and byte boundaries without reading payloads", async (t) => {
+  for (const [count, bytes] of [[100_000, 0], [16, 4 * 1024 ** 3]]) {
+    await t.test(`${count} files of ${bytes} bytes`, async (child) => {
+      const { data } = await fixture(child);
+      const observed = await virtualCapacityFiles(child, data, count, bytes);
+      const stop = new Error("preflight accepted; stop before checkpoint");
+      const service = new DataDirectoryCheckpointService({ sourceDirectory: data, gate: {
+        enter() { throw stop; }, leave() {}, readStatus() { return { mode: "open" }; },
+      } });
+      await assert.rejects(service.enter(), (error) => error === stop);
+      assert.equal(observed.payloadOpens(), 0);
+    });
+  }
+});
+
+test("metadata rejects aggregate and individual byte overflows without closing admission", async (t) => {
+  for (const [count, bytes, code] of [
+    [17, 4 * 1024 ** 3, "CHECKPOINT_CAPACITY_EXCEEDED"],
+    [1, 4 * 1024 ** 3 + 1, "CHECKPOINT_FILE_INVALID"],
+  ]) {
+    await t.test(`${count} files of ${bytes} bytes`, async (child) => {
+      const { data } = await fixture(child);
+      const observed = await virtualCapacityFiles(child, data, count, bytes);
+      const gate = new OperationalQuiescenceGate();
+      const service = new DataDirectoryCheckpointService({ sourceDirectory: data, gate });
+      await assert.rejects(service.enter(), { code, stage: "metadata_preflight" });
+      assert.equal(observed.payloadOpens(), 0);
+      assert.equal(gate.readStatus().mode, "open");
+    });
+  }
+});
+
+test("metadata preflight permits admitted work and revalidates changes after closing", async (t) => {
+  const { data } = await fixture(t);
+  const gate = new OperationalQuiescenceGate();
+  const service = new DataDirectoryCheckpointService({ sourceDirectory: data, gate: {
+    async enter() {
+      assert.equal(gate.readStatus().mode, "open");
+      await gate.run(() => writeFile(path.join(data, ".late-hidden"), "unsafe"));
+      return gate.enter();
+    },
+    leave: (token) => gate.leave(token), readStatus: () => gate.readStatus(),
+  } });
+  await assert.rejects(service.enter(), { code: "CHECKPOINT_PATH_INVALID", stage: "checkpoint_inventory" });
+  assert.equal(gate.readStatus().mode, "open");
+});
+
+test("file growth after metadata preflight is rejected under the gate and releases it", async (t) => {
+  const { data } = await fixture(t);
+  let count = 1;
+  const observed = await virtualCapacityFiles(t, data, () => count);
+  const gate = new OperationalQuiescenceGate();
+  const service = new DataDirectoryCheckpointService({ sourceDirectory: data, gate: {
+    enter() { count = 100_001; return gate.enter(); },
+    leave: (token) => gate.leave(token), readStatus: () => gate.readStatus(),
+  } });
+  await assert.rejects(service.enter(), {
+    code: "CHECKPOINT_CAPACITY_EXCEEDED", stage: "checkpoint_inventory",
+  });
+  assert.equal(observed.payloadOpens(), 0);
+  assert.equal(gate.readStatus().mode, "open");
+});
+
+test("slow metadata preflight keeps write admission open", async (t) => {
+  const { data } = await fixture(t);
+  const originalOpendir = fsPromises.opendir;
+  let signalStarted;
+  const started = new Promise((resolve) => { signalStarted = resolve; });
+  let release;
+  const barrier = new Promise((resolve) => { release = resolve; });
+  let first = true;
+  t.mock.method(fsPromises, "opendir", async (...args) => {
+    if (first) { first = false; signalStarted(); await barrier; }
+    return originalOpendir(...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { release(); t.mock.restoreAll(); syncBuiltinESMExports(); });
+  const gate = new OperationalQuiescenceGate();
+  const service = new DataDirectoryCheckpointService({ sourceDirectory: data, gate });
+  const pending = service.enter();
+  await started;
+  try {
+    assert.equal(gate.readStatus().mode, "open");
+    await gate.run(() => writeFile(path.join(data, "new-store.json"), "{}\n"));
+  } finally { release(); }
+  const checkpoint = await pending;
+  assert.ok(checkpoint.files.some((file) => file.path === "new-store.json"));
+  await service.leave(checkpoint.token);
+  assert.equal(gate.readStatus().mode, "open");
+});
 
 test("a drained checkpoint binds store revisions and every durable file", async (t) => {
   const { data } = await fixture(t);
@@ -219,7 +365,7 @@ test("checkpoint release detects crossing filesystem writes and safely reopens",
   );
 
   await assert.rejects(() => service.leave(checkpoint.token), {
-    code: "CHECKPOINT_SOURCE_CHANGED",
+    code: "CHECKPOINT_SOURCE_CHANGED", stage: "checkpoint_release",
   });
   assert.deepEqual(gate.readStatus(), { mode: "open", activeOperations: 0 });
 });

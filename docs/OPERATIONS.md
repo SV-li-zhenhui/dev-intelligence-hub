@@ -816,12 +816,25 @@ state and restore a verified backup rather than editing the file manually.
 
 ## Create a consistent backup
 
-Use **系统 → 创建备份** while the service is running. The server closes global
-write admission, waits for admitted HTTP and background work to drain, captures
-a checkpoint of every declared durable store and file, copies and hashes the
+Use **系统 → 创建备份** while the service is running. The server first checks
+directory metadata without reading payloads or closing write admission. An
+oversized source is rejected at this stage. This is an early rejection only:
+concurrent writers can change the source, so the server discards the preflight
+facts, closes global write admission, waits for admitted HTTP and background
+work to drain, captures a checkpoint of every declared durable store and file, copies and hashes the
 payload, verifies the published backup, and then reopens admission. New writes
 receive HTTP 503 while the maintenance gate is closing or closed. A failed
 backup also reopens the gate in `finally`.
+
+The limits remain 100,000 files, 100,000 directories, depth 128, 4 GiB per file,
+256 MiB per root JSON store, 64 GiB total file bytes and a 16 MiB manifest.
+Passing metadata preflight does not promise that content, store validation or
+the manifest budget will pass. Metadata and content are checked again under
+the maintenance gate, and source integrity is checked again before release.
+Closing the browser or timing out its HTTP request does not cancel the backup.
+Backup failures are logged independently of that observer as bounded JSON
+containing allowlisted codes, a stage and optional numeric counts; raw error
+messages, paths, credentials and payloads are not included.
 
 The replaceable `data/playwright-browsers/` and
 `data/validation-profile-probe/` validation caches are explicitly outside the
@@ -859,6 +872,25 @@ or corrupted entries remain visible rather than being silently accepted.
 Keep independent copies according to your retention policy. MyDashboard does
 not currently delete old verified backups automatically, and deleting active
 data does not delete backups.
+
+If the complete source exceeds these limits, the current managed backup and
+restore format cannot represent it. Executor workspaces, Windows test resources,
+generated test-library files and durable artifacts are counted; their names do
+not authorize deleting or excluding them. The two declared validation caches
+above are already excluded. A managed lifecycle recovery snapshot preserves
+managed components in place and is not a complete independent backup.
+
+Keep the deployment blocked until a complete recovery point exists. An operator
+can separately authorize a consistent filesystem or volume backup to trusted
+external storage, after measuring the complete source and available destination
+space. Such a copy requires either a verified stopped writer or an approved
+consistent snapshot of every participating volume, preservation of all durable
+components and recovery configuration, and an isolated restore verification.
+It is a separate recovery procedure, not an input accepted by the current
+managed restore API. Do not assume a nearly full source volume has room for the
+copy. Expanding the managed format instead requires a coordinated change to
+checkpoint, manifest, payload verification and restore limits with capacity and
+restore tests; changing one constant or excluding unclassified state is unsafe.
 
 ## Restore a verified backup
 

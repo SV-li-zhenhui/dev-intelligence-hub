@@ -2212,17 +2212,21 @@ test("backup drains an admitted HTTP mutation while liveness and status remain i
 
 test("failed backup reopens admission and does not poison later HTTP work", async (t) => {
   let refreshCalls = 0;
+  const reports = [];
   const fixture = operationalApplication({
     async refresh() {
       refreshCalls += 1;
       return { dashboard: {} };
     },
     async createBackup() {
-      throw new Error("private backup failure");
+      throw Object.assign(new Error("private backup failure"), {
+        code: "BACKUP_private_credential", stage: "private backup failure",
+        counts: { fileCount: "private backup failure", private: 123 },
+      });
     },
   });
   const server = createDashboardServer(fixture.application, {
-    reportError() {},
+    reportError(value) { reports.push(value); },
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => server.shutdown());
@@ -2235,6 +2239,9 @@ test("failed backup reopens admission and does not poison later HTTP work", asyn
   });
   assert.equal(failed.status, 500);
   assert.equal(failed.body.includes("private backup failure"), false);
+  assert.deepEqual(reports.map((value) => JSON.parse(value)), [{
+    code: "BACKUP_CREATE_FAILED", stage: "create_backup",
+  }]);
   assert.equal(fixture.gate.readStatus().mode, "open");
 
   const laterMutation = await request(server, {
@@ -2247,6 +2254,88 @@ test("failed backup reopens admission and does not poison later HTTP work", asyn
   });
   assert.equal(laterMutation.status, 200);
   assert.equal(refreshCalls, 1);
+});
+
+test("backup failure diagnostics survive observer disconnect and contain only safe fields", async (t) => {
+  for (const disconnect of [false, true]) {
+    await t.test(disconnect ? "disconnected observer" : "connected observer", async (child) => {
+      const started = deferred();
+      const release = deferred();
+      const reported = deferred();
+      const observerClosed = deferred();
+      const reports = [];
+      const privateMarker = "credential-and-payload-must-never-be-logged";
+      const cause = Object.assign(new Error(privateMarker), {
+        code: "CHECKPOINT_CAPACITY_EXCEEDED", stage: "metadata_preflight",
+        counts: { fileCount: 100_001, directoryCount: 3, totalBytes: 42, privateMarker },
+      });
+      const failure = Object.assign(new Error(privateMarker, { cause }), {
+        code: "BACKUP_QUIESCENCE_FAILED", statusCode: 503,
+      });
+      const fixture = operationalApplication({ async createBackup() {
+        started.resolve();
+        await release.promise;
+        throw failure;
+      } });
+      const server = createDashboardServer(fixture.application, {
+        reportError(value) { reports.push(value); reported.resolve(); },
+      });
+      server.once("request", (_request, response) => response.once("close", observerClosed.resolve));
+      await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+      child.after(async () => { release.resolve(); await server.shutdown(); });
+      let outgoing;
+      const response = new Promise((resolve, reject) => {
+        outgoing = http.request({ host: "127.0.0.1", port: server.address().port,
+          method: "POST", path: "/api/system/backups",
+          headers: { host: "127.0.0.1:4173", "content-length": 2, ...trustedConfigurationHeaders() },
+        }, (incoming) => { incoming.resume(); incoming.once("end", () => resolve(incoming.statusCode)); });
+        outgoing.on("error", disconnect ? () => resolve(null) : reject);
+        outgoing.end("{}");
+      });
+      await started.promise;
+      if (disconnect) {
+        outgoing.destroy();
+        await observerClosed.promise;
+        assert.equal(fixture.gate.readStatus().mode, "closed");
+      }
+      release.resolve();
+      let timeout;
+      try {
+        await Promise.race([reported.promise, new Promise((_resolve, reject) => {
+          timeout = setTimeout(() => reject(new Error("backup failure diagnostic was lost")), 1000);
+        })]);
+      } finally { clearTimeout(timeout); }
+      assert.equal(await response, disconnect ? null : 503);
+      assert.equal(fixture.gate.readStatus().mode, "open");
+      assert.equal(reports.length, 1);
+      assert.equal(typeof reports[0], "string");
+      assert.equal(reports[0].includes(privateMarker), false);
+      assert.deepEqual(JSON.parse(reports[0]), {
+        code: "BACKUP_QUIESCENCE_FAILED", stage: "metadata_preflight",
+        causeCode: "CHECKPOINT_CAPACITY_EXCEEDED",
+        counts: { fileCount: 100_001, directoryCount: 3, totalBytes: 42 },
+      });
+      const next = await request(server, { method: "POST", path: "/api/refresh", headers: trustedConfigurationHeaders() });
+      assert.equal(next.status, 200);
+    });
+  }
+});
+
+test("a throwing backup diagnostic sink does not replace failure or prevent later work", async (t) => {
+  const fixture = operationalApplication({ async createBackup() {
+    throw Object.assign(new Error("private backup cause"), { code: "BACKUP_IO_FAILED", statusCode: 503 });
+  } });
+  const server = createDashboardServer(fixture.application, {
+    reportError() { throw new Error("private logging failure"); },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.shutdown());
+  const failed = await request(server, { method: "POST", path: "/api/system/backups",
+    headers: trustedConfigurationHeaders(), body: "{}" });
+  assert.equal(failed.status, 503);
+  assert.equal(failed.body.includes("private"), false);
+  assert.equal(fixture.gate.readStatus().mode, "open");
+  assert.equal((await request(server, { method: "POST", path: "/api/refresh", headers: trustedConfigurationHeaders() })).status, 200);
 });
 
 test("the same-origin process endpoint acknowledges before graceful shutdown", async () => {

@@ -224,17 +224,21 @@ function fileKind(relative) {
     : "immutable";
 }
 
-async function inventory(directory) {
+async function scanMetadata(directory) {
   const root = await verifiedRoot(directory);
   const pending = [{ relative: "", depth: 0 }];
   const files = [];
-  const stores = [];
   let directoryCount = 0;
   let totalBytes = 0;
+  const capacityFailure = (message, fileCount = files.length) => {
+    const error = failure("CHECKPOINT_CAPACITY_EXCEEDED", message);
+    error.counts = Object.freeze({ fileCount, directoryCount, totalBytes });
+    return error;
+  };
   while (pending.length > 0) {
     const current = pending.pop();
     if (current.depth > MAX_DEPTH || ++directoryCount > MAX_DIRECTORIES) {
-      throw failure("CHECKPOINT_CAPACITY_EXCEEDED", "数据目录深度或目录数超出限制");
+      throw capacityFailure("数据目录深度或目录数超出限制");
     }
     const currentPath = current.relative
       ? path.resolve(root, ...current.relative.split("/"))
@@ -295,34 +299,51 @@ async function inventory(directory) {
         throw failure("CHECKPOINT_FILE_INVALID", "数据目录包含不支持的文件类型");
       }
       if (files.length >= MAX_FILES) {
-        throw failure("CHECKPOINT_CAPACITY_EXCEEDED", "数据文件数量超出限制");
+        throw capacityFailure("数据文件数量超出限制", files.length + 1);
       }
       const isStore = !relative.includes("/") && relative.endsWith(".json");
-      const fact = await readFileFact(root, relative, { collectContent: isStore });
-      totalBytes += fact.bytes;
+      if (targetInfo.nlink !== 1 || targetInfo.size > MAX_FILE_BYTES ||
+          (isStore && targetInfo.size > MAX_STORE_BYTES)) {
+        throw failure("CHECKPOINT_FILE_INVALID", "数据文件身份或容量无效");
+      }
+      totalBytes += targetInfo.size;
       if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_TOTAL_BYTES) {
-        throw failure("CHECKPOINT_CAPACITY_EXCEEDED", "数据文件总量超出限制");
+        throw capacityFailure("数据文件总量超出限制", files.length + 1);
       }
       files.push(Object.freeze({
         path: relative,
         kind: fileKind(relative),
-        bytes: fact.bytes,
-        sha256: fact.sha256,
+        bytes: targetInfo.size,
       }));
-      if (isStore) {
-        const name = relative.slice(0, -".json".length);
-        if (!SAFE_STORE.test(name)) {
-          throw failure("CHECKPOINT_STORE_INVALID", "状态 store 名称无效");
-        }
-        stores.push(Object.freeze({
-          name,
-          revision: storeRevision(fact.content),
-          digest: fact.sha256,
-        }));
-      }
     }
   }
   files.sort((left, right) => left.path.localeCompare(right.path, "en"));
+  return { root, files };
+}
+
+async function inventory(directory) {
+  const metadata = await scanMetadata(directory);
+  const files = [];
+  const stores = [];
+  let totalBytes = 0;
+  for (const file of metadata.files) {
+    const isStore = !file.path.includes("/") && file.path.endsWith(".json");
+    const fact = await readFileFact(metadata.root, file.path, { collectContent: isStore });
+    totalBytes += fact.bytes;
+    if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_TOTAL_BYTES) {
+      throw failure("CHECKPOINT_CAPACITY_EXCEEDED", "数据文件总量超出限制");
+    }
+    files.push(Object.freeze({ ...file, bytes: fact.bytes, sha256: fact.sha256 }));
+    if (isStore) {
+      const name = file.path.slice(0, -".json".length);
+      if (!SAFE_STORE.test(name)) {
+        throw failure("CHECKPOINT_STORE_INVALID", "状态 store 名称无效");
+      }
+      stores.push(Object.freeze({
+        name, revision: storeRevision(fact.content), digest: fact.sha256,
+      }));
+    }
+  }
   stores.sort((left, right) => left.name.localeCompare(right.name, "en"));
   if (files.length === 0 || stores.length === 0) {
     throw failure("CHECKPOINT_EMPTY", "数据目录没有可恢复的 store 与文件");
@@ -359,6 +380,14 @@ export class DataDirectoryCheckpointService {
   }
 
   async enter() {
+    // Preflight is only an early rejection. Writers remain admitted here; the
+    // complete inventory is rebuilt after drain and never trusts these facts.
+    try {
+      await scanMetadata(this.#sourceDirectory);
+    } catch (error) {
+      if (error instanceof DataDirectoryCheckpointError) error.stage = "metadata_preflight";
+      throw error;
+    }
     const token = await this.#gate.enter();
     try {
       const checkpoint = await inventory(this.#sourceDirectory);
@@ -366,6 +395,7 @@ export class DataDirectoryCheckpointService {
       return Object.freeze({ token, ...checkpoint });
     } catch (error) {
       this.#gate.leave(token);
+      if (error instanceof DataDirectoryCheckpointError) error.stage = "checkpoint_inventory";
       throw error;
     }
   }
@@ -398,7 +428,10 @@ export class DataDirectoryCheckpointService {
     }
     this.#gate.leave(token);
     this.#activeCheckpoint = null;
-    if (integrityFailure !== null) throw integrityFailure;
+    if (integrityFailure !== null) {
+      integrityFailure.stage = "checkpoint_release";
+      throw integrityFailure;
+    }
     return this.#gate.readStatus();
   }
 
