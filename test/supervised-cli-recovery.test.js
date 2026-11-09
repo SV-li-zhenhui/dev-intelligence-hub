@@ -54,20 +54,49 @@ async function fixture(t, overrides = {}) {
   return { provider, events, temporaryRoot };
 }
 
-test("recovery cleans a safely reaped cancelled turn before admitting another login turn", async (t) => {
+for (const deadlineFirst of [false, true]) {
+test(deadlineFirst
+  ? "recovery times out before a result-reader cancellation can be requested"
+  : "recovery cleans a safely reaped cancelled turn before admitting another login turn", async (t) => {
+  // Fixture preparation and capture can exceed a second under parallel load.
+  // Own both clocks so cancellation follows observed runner settlement/result entry,
+  // independently of parallel-suite disk latency. Exercise the opposite order too.
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let monotonicTime = 10_000;
   const controller = new AbortController();
   let first = true;
+  let resultReads = 0;
   const current = await fixture(t, {
+    monotonicClock: () => monotonicTime,
+    processRunner: { async run() {
+      current.events.push("process-reaped");
+      if (first && deadlineFirst) {
+        first = false;
+        monotonicTime += 1_001;
+        t.mock.timers.tick(1_001);
+      }
+      return success();
+    } },
     codexResultReader: async () => {
-      if (first) { first = false; controller.abort(); }
+      resultReads += 1;
+      if (first) {
+        first = false;
+        assert.deepEqual(current.events, ["process-reaped", "credential-captured"]);
+        controller.abort();
+      }
       return '{"ok":true}';
     },
   });
-  await assert.rejects(current.provider.generate(request({ signal: controller.signal })), { code: "STRUCTURED_PROVIDER_CANCELLED" });
+  await assert.rejects(current.provider.generate(request({ signal: controller.signal })), {
+    code: deadlineFirst ? "STRUCTURED_PROVIDER_TIMEOUT" : "STRUCTURED_PROVIDER_CANCELLED",
+  });
+  assert.equal(controller.signal.aborted, !deadlineFirst);
+  assert.equal(resultReads, deadlineFirst ? 0 : 1);
   assert.deepEqual(current.events, ["process-reaped", "credential-captured", "release:true"]);
   assert.deepEqual(await readdir(current.temporaryRoot), []);
   assert.equal(await current.provider.generate(request()), '{"ok":true}');
 });
+}
 
 test("recovery waits for actual runner settlement after cancellation", async (t) => {
   const controller = new AbortController();
