@@ -56,4 +56,3 @@ async function probe(t, cancelAtSpawn) {
 
 test('diagnostic real ACL helper cancellation after spawn fails closed and confirms child exit', { timeout: 15_000 }, t => probe(t, true));
 test('diagnostic ordinary ACL helper retains its refusal and records real child exit without changing ACL', { timeout: 15_000 }, t => probe(t, false));
-
