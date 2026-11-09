@@ -4458,18 +4458,26 @@ test("healthy pending external Review children leave root model capacity for the
   }
 });
 
-async function blockedRootSweepLoop({ listReadinessItems, rootPriority = null, includeTail = false } = {}) {
+async function blockedRootSweepLoop({ listReadinessItems, rootPriority = null, includeTail = false, rootCount = 3, pullRequestRoots = false } = {}) {
   const time = controlledClock();
   const values = new Map();
   const store = {
     async read(key, fallback) { return clone(values.get(key) ?? fallback); },
     async write(key, value) { values.set(key, clone(value)); },
   };
-  const records = Array.from({ length: includeTail ? 5 : 4 }, (_, index) => {
+  const records = Array.from({ length: rootCount + (includeTail ? 2 : 1) }, (_, index) => {
     const item = workItem(501 + index, {
-      type: "role", id: index === 3 ? "pr-reviewer" : "orchestrator",
+      type: "role", id: index === rootCount ? "pr-reviewer" : "orchestrator",
     });
-    const event = normalizeWorkflowEvent(index < 3 && rootPriority !== null ? {
+    const event = normalizeWorkflowEvent(index < rootCount && pullRequestRoots ? {
+      schemaVersion: 1, eventType: "pull_request.owner_requested", occurredAt: item.createdAt,
+      source: { provider: "local-owner", scopeId: `owner-request:00000000-0000-4000-8000-${String(501 + index).padStart(12, '0')}` },
+      subject: { id: `github:pr:acme/repo#${501 + index}`, repository: "acme/repo", number: 501 + index },
+      payload: { workType: 'pull_request', title: 'Review current PR', description: 'Review current code', priority: 'normal',
+        acceptanceCriteria: [], headRefOid: "b".repeat(40), gitTargetAvailable: true,
+        gitTarget: { schemaVersion: 1, provider: "github", sourceAccountId: "reviewer", baseRepository: "acme/repo",
+          headRepository: "acme/repo", baseRefName: "main", headRefName: "feature", baseRefOid: "a".repeat(40), headRefOid: "b".repeat(40) } },
+    } : index < rootCount && rootPriority !== null ? {
       schemaVersion: 1, eventType: "owner_request.created", occurredAt: item.createdAt,
       source: { provider: "local-owner", scopeId: "owner-command-center" },
       subject: { id: `owner-request:00000000-0000-4000-8000-00000000050${index}`,
@@ -4502,9 +4510,9 @@ async function blockedRootSweepLoop({ listReadinessItems, rootPriority = null, i
     } },
   });
   await ledger.recover();
-  await ledger.intake();
-  const initialItems = (await ledger.listItems()).items;
-  const roots = initialItems.slice(0, 3);
+  await ledger.intake({ limit: 100 });
+  const initialItems = (await ledger.listItems({ limit: 100 })).items;
+  const roots = initialItems.slice(0, rootCount);
   const tail = includeTail ? initialItems.at(-1) : null;
   const children = [];
   for (const root of roots) {
@@ -4547,6 +4555,54 @@ async function blockedRootSweepLoop({ listReadinessItems, rootPriority = null, i
   return { loop, ledger, roots, tail, children, decisions, records,
     setRootDecision(decide) { decideRoot = decide; } };
 }
+
+for (const terminalCount of [1, 70]) test(`graph-rejected terminal claims preserve bounded fair progress past ${terminalCount} roots`, async t => {
+  const { loop, ledger, roots, children, decisions, setRootDecision } = await blockedRootSweepLoop({ rootCount: terminalCount + 1, pullRequestRoots: true });
+  setRootDecision(item => orchestrationDecision(item));
+  const healthy = roots.at(-1);
+  assert.ok(roots.every(root => root.kind === 'source_root' && root.source.scope.kind === 'owner_requested' &&
+    currentWorkItemExecutionBinding(root)?.gitTarget.headRefOid === 'b'.repeat(40)), 'real owner source authority and Head/Base bindings are retained');
+  const assemble = loop.roleContextAssembler.assemble;
+  const failed = new Set(roots.slice(0, -1).map(item => item.itemId));
+  loop.roleContextAssembler = { async assemble(input) {
+    if (failed.has(input.item.itemId)) throw terminalPullRequestFailure();
+    return assemble(input);
+  } };
+  loop.orchestratorService = { async execute() { return { applied: true }; } };
+  const before = await ledger.listItems({ limit: 200 });
+  const cycles = [];
+  for (let n = 0; n < 4 && !decisions.includes(healthy.itemId); n++) {
+    const cycle = await loop.runCycle({ roleId: "orchestrator", workLimit: 1 });
+    cycles.push(cycle);
+    assert.ok(cycle.claimAttempts <= 32, "claim scanning remains bounded per cycle");
+    assert.ok(cycle.workAttempts <= 1);
+  }
+  assert.deepEqual(decisions, [healthy.itemId], "guarded old claims cannot starve later valid root coordination");
+  assert.equal(cycles.at(-1).orchestrated, 1);
+  assert.equal(cycles.reduce((total, cycle) => total + cycle.claimAttempts, 0), terminalCount,
+    "each unchanged blocked root is scanned once across the sweep");
+  assert.ok(cycles.flatMap(cycle => cycle.outcomes).filter(row => failed.has(row.itemId))
+    .every(row => row.status === "claim_not_acquired" && row.code === "WORK_LEDGER_GRAPH_BLOCKED"));
+  assert.deepEqual(await ledger.listItems({ limit: 200 }), before, "no guarded root or child is claimed or retired");
+  if (terminalCount === 1) {
+    const root = await ledger.readItemForReconciliation({ itemId: roots[0].itemId });
+    await ledger.reviseGraphAcceptance({ authority: { actorId: 'employee-orchestrator', scopeRootTaskId: root.itemId },
+      command: { taskId: root.itemId, expectedTaskRevision: root.revision,
+        expectedGraphRevision: (await ledger.getSummary()).revision, reason: 'New owner acceptance input',
+        acceptanceContract: { revision: 2, acceptanceCriteria: [{ criterionId: 'updated', description: 'New acceptance input' }], expectedDeliverables: [] } } });
+    const revised = await loop.runCycle({ roleId: 'orchestrator', workLimit: 1 });
+    assert.equal(revised.claimAttempts, 1, 'changed root input immediately invalidates its prior sweep entry');
+    assert.equal(revised.claimed, 0, 'the graph guard still refuses the revised root with unsettled children');
+    const child = await ledger.readItemForReconciliation({ itemId: children[0].itemId });
+    const claimed = await ledger.claim({ itemId: child.itemId, expectedRevision: child.revision,
+      workerId: 'employee-developer', leaseDurationMs: 120_000 });
+    await ledger.complete({ itemId: claimed.itemId, expectedRevision: claimed.revision, leaseId: claimed.leaseId,
+      actorId: 'employee-developer', result: { outcome: 'done' } });
+    const next = await loop.runCycle({ roleId: 'orchestrator', workLimit: 1 });
+    assert.equal(next.blocked, 1, 'changed child progress immediately permits normal terminal settlement');
+    assert.equal((await ledger.readItemForReconciliation({ itemId: roots[0].itemId })).statusReason, 'pr_source_terminal');
+  }
+});
 
 test("unchanged blocked roots complete a fair sweep across role cycles without extra decisions or claims", async () => {
   const { loop, ledger, roots, decisions } = await blockedRootSweepLoop();

@@ -119,6 +119,7 @@ function runSummary(value) {
     ? work.workAttempts
     : 0;
   const counts = new Map();
+  let rejectedGraphItem = null;
   if (Array.isArray(work.outcomes)) {
     for (const entry of work.outcomes) {
       const outcome = dataObject(entry);
@@ -130,6 +131,8 @@ function runSummary(value) {
           /^[A-Z][A-Z0-9_]{0,127}$/.test(outcome.code)
         ? outcome.code
         : null;
+      if (rejectedGraphItem === null && status === "claim_not_acquired" && code === "WORK_LEDGER_GRAPH_BLOCKED" &&
+          typeof outcome.itemId === "string" && /^work-item-[a-f0-9]{64}$/.test(outcome.itemId)) rejectedGraphItem = outcome.itemId;
       const aggregate = counts.get(status) ?? { count: 0, codes: new Set() };
       aggregate.count += 1;
       if (code) aggregate.codes.add(code);
@@ -147,7 +150,9 @@ function runSummary(value) {
   const summary = `${prefix}${
     statuses ? `：${statuses}` : ""
   }${recovery}`;
-  return recovery && Buffer.byteLength(summary, 'utf8') > 512 ? `${prefix}${recovery}` : summary;
+  const bounded = recovery && Buffer.byteLength(summary, 'utf8') > 512 ? `${prefix}${recovery}` : summary;
+  const reference = rejectedGraphItem === null ? '' : `；首个未领取任务 ${rejectedGraphItem}`;
+  return Buffer.byteLength(bounded + reference, 'utf8') <= 512 ? bounded + reference : bounded;
 }
 
 function continuationWorkOutcome(value, target) {

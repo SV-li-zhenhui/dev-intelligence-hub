@@ -1659,6 +1659,28 @@ test("a configured role exposes a bounded work-cycle outcome summary", async () 
   assert.equal(JSON.stringify(view).includes("private-item"), false);
 });
 
+test('a graph-rejected claim retains only a bounded canonical task reference across restart', async t => {
+  for (const variant of ['canonical', 'raw-id', 'wrong-code', 'wrong-status', 'failed-stage']) await t.test(variant, async () => {
+    const itemId = `work-item-${'a'.repeat(64)}`;
+    const entry = { itemId, status: 'claim_not_acquired', code: 'WORK_LEDGER_GRAPH_BLOCKED', message: 'private-message' };
+    if (variant === 'raw-id') entry.itemId = 'private-item-with-business-text';
+    if (variant === 'wrong-code') entry.code = 'WORK_LEDGER_REVISION_CONFLICT';
+    if (variant === 'wrong-status') entry.status = 'staged';
+    const options = { definition: definition('orchestrator'), permissions: permissions('complete'), brain: brain(),
+      decisionEngine: fakeDecisionEngine('orchestrator'), store: new MemoryStore(),
+      onRun: async () => ({ stages: { work: { ok: variant !== 'failed-stage', result: {
+        scanned: 100, workAttempts: 0, outcomes: [entry, { ...entry, itemId: variant === 'raw-id' ? 'private-other-item' : `work-item-${'b'.repeat(64)}` }] } } } }) };
+    const employee = new ConfiguredRoleEmployee(options);
+    await employee.run({ trigger: 'scheduled' });
+    const summary = (await employee.roleView()).lastRun.summary;
+    assert.equal(summary.includes(itemId), variant === 'canonical');
+    assert.equal(summary.includes(`work-item-${'b'.repeat(64)}`), false, 'only one stable reference is retained');
+    assert.equal(summary.includes('private-'), false);
+    assert.ok(Buffer.byteLength(summary) <= 512);
+    assert.equal((await new ConfiguredRoleEmployee(options).roleView()).lastRun.summary, summary);
+  });
+});
+
 test('a continuation observer cannot attribute another task or ambiguous work outcomes to its target', async t => {
   for (const variant of ['other-task', 'duplicate', 'failed-stage', 'missing-code']) await t.test(variant, async () => {
     const target = { itemId: 'work-target', fingerprint: 'a'.repeat(64) };

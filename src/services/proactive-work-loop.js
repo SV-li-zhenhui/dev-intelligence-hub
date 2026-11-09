@@ -69,6 +69,7 @@ function isContextContention(error) {
 }
 const NON_BUDGET_CLAIM_FAILURE_CODES = new Set([
   "WORK_LEDGER_PR_SOURCE_CUTOVER_PENDING",
+  "WORK_LEDGER_GRAPH_BLOCKED",
 ]);
 const PR_PREPARATION_DEFERRED_CODES = new Set([
   "CONTROLLED_GIT_UNSUPPORTED_TREE",
@@ -1269,8 +1270,10 @@ export class ProactiveWorkLoop {
               options,
               graphBlocked: isGraphBlocked,
             });
-            if (fingerprint !== null && !processed.claimAttempted && !processed.claimed &&
-                processed.outcome.status === "graph_blocked") {
+            const graphClaimRejected = processed.claimAttempted && !processed.claimed &&
+              processed.outcome.status === "claim_not_acquired" && processed.outcome.code === "WORK_LEDGER_GRAPH_BLOCKED";
+            if (fingerprint !== null && !processed.claimed &&
+                ((!processed.claimAttempted && processed.outcome.status === "graph_blocked") || graphClaimRejected)) {
               blockedRootSweep.set(item.itemId, { revision: item.revision, fingerprint });
             } else {
               blockedRootSweep.delete(item.itemId);
@@ -1296,11 +1299,17 @@ export class ProactiveWorkLoop {
               workAttempts += 1;
             } else if (!rootContextDeferred) {
               availabilityBudgetUsed -= 1;
-              this.fencedClaimDeferrals.set(item.itemId, {
-                revision: item.revision,
-                retryAfterCycle: claimCycleSequence + 1,
-                scope,
-              });
+              if (graphClaimRejected && fingerprint !== null) {
+                // The related-progress sweep already defers this exact input;
+                // a child/dependency change must be able to invalidate it now.
+                this.fencedClaimDeferrals.delete(item.itemId);
+              } else {
+                this.fencedClaimDeferrals.set(item.itemId, {
+                  revision: item.revision,
+                  retryAfterCycle: claimCycleSequence + 1,
+                  scope,
+                });
+              }
             }
             if (processed.outcome.status === "orchestration_rejected") {
               this.fencedClaimDeferrals.set(item.itemId, {
